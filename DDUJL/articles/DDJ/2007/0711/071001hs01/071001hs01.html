@@ -1,0 +1,268 @@
+<html>
+<head>
+<title>Apply Critical Sections Consistently</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> November 2007</p>
+
+<h1>Apply Critical Sections Consistently</h1>
+<h2>Guaranteeing mutual exclusion on shared variables</h2>
+
+
+<h3>By Herb Sutter</h3>
+
+
+<I>Herb is a software architect at Microsoft and chair of the ISO C++ Standards committee. He can be contacted at www.gotw.ca.</I>
+
+<hr>
+
+<p>The critical section is our One True Tool for guaranteeing mutual exclusion on mutable shared variables. Table 1 summarizes several common ways to express exclusive critical sections (see last month's column [1] for details). A useful way to think about the synchronization in your program is as a daisy-chain of these "release-acquire" handoffs that stitch all the threads' critical sections together into some linear order, so that each one "acquires" the cumulative work done and is "released" by all the others that preceded it.</p>
+
+<p>Like most tools, these must be applied consistently, and with the intended meanings. A program must ensure that every use of a mutable shared object is properly protected using exactly one of these mechanisms at any given point in its lifetime. Chaos can erupt if code tries to avoid or invert these meanings (e.g., trying to abuse taking a lock or reading an atomic variable as a "critical section exit" operation; see Example 3), or tries to use inconsistent synchronization techniques at the same time.</p>
+
+<p>Let's consider some examples to illustrate the proper and improper uses of critical sections, to get us used to looking for where the critical sections' synchronization points should appear in the code.</p>
+
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+	<tr valign="top">
+		<td><b>Synchronization  Type</b></td> <td><b>To Enter a Critical Section</b></td> <td><b>To Exit a Critical Section</b></td> <td><b>Notes</b></td>
+	</tr>
+	<tr valign="top">
+		<td><b>Locks</b></td> <td>Acquire lock</td> <td>Release lock</td> <td>Preferred, despite their drawbacks [2]</td>
+	</tr>
+	<tr valign="top">
+		<td><b>Condition variables</b></td> <td>Wait for cv</td> <td>Notify cv</td> <td>Useful with locks to express an efficient wait point in the middle of a locked section</td>
+	</tr>
+	<tr valign="top">
+		<td><b>Semaphores</b></td> <td>Acquire semaphore</td> <td>Release semaphore</td> <td>Use judiciously; significant care required</td>
+	</tr>
+	<tr valign="top">
+		<td><b>Ordered atomics</b> <br> (e.g., Java/.NET  volatile, C++0x  atomic<T>)</td> <td>Read from variable *</td> <td>Write to variable **</td> <td>Use judiciously,  significant care  required</td>
+	</tr>
+	<tr valign="top">
+		<td><b>Unordered atomics and explicit fences </b> <br>(e.g., aligned  integers and Linux  mb or Win32  MemoryBarrier)</td> <td>Read from variable followed by fence***</td> <td>Fence followed by write to variable***</td> <td>Avoid, difficult  to use correctly and usually nonportable</td>
+	</tr>
+	<tr>
+		<td colspan="4">*  <i>or equivalent, such as calling a compare-and-swap function having at least acquire semantics</i></td>
+	</tr>
+	<tr>
+		<td colspan="4">** <i>or equivalent, such as calling a compare-and-swap function having at least release semantics</i></td>
+	</tr>
+	<tr>
+		<td colspan="4">*** <i>when in doubt, use a full fence</i></td>
+	</tr>
+</table>
+
+<div class="caption">
+Table 1: Common ways to express critical sections.
+</div>
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>Example 1: One Producer,  Many Consumers, Using Locks</h3>
+
+<p>Imagine we have a single Producer thread that produces a number of tasks for Consumer threads to perform. The Producer pushes the tasks into a shared <i>queue</i>, and finally pushes a special <i>done</i> sentinel to mark the end of the work. The <i>queue</i> object is protected at all times using mutex <i>mut</i>, which the Producer holds only as long as necessary for a single <i>push</i>, so that Consumers can start executing their tasks concurrently with the Producer. For further efficiency, to avoid making the Consumers busy-wait whenever the queue is initially or temporarily empty, the Producer will also signal condition variable <i>cv</i> every time something has been added to the queue:</p>
+
+<pre class="code">
+
+// One Producer thread
+//
+while( ThereAreMoreTasks() ) {
+  task = AllocateAndBuildNewTask();
+  mut.lock();   	// enter critical section
+  queue.push( task );	// add new task
+  mut.unlock();	// exit critical section
+  cv.notify();
+}
+mut.lock();     	// enter critical section
+queue.push( done );	// add sentinel value; that's all folks
+mut.unlock(); 	// exit critical section
+cv.notify();
+
+
+</pre>
+<p>On the consumption side, the Consumer threads each pull individual tasks  off the completed queue. Here, <i>myTask</i> is an ordinary variable local to each Consumer:</p>
+
+
+
+<pre class="code">
+// K Consumer threads
+//
+myTask = null;
+while( myTask != done ) {
+  mut.lock();  	// enter critical section
+  while( queue.empty() )	// if nothing's there, to avoid busy-waiting we'll
+    cv.wait( mut );  	// release and reenter critical section
+  myTask = queue.first();	// take a copy of the task
+  if( myTask != done ) 	// remove it from queue unless it was the sentinel, 
+    queue.pop();	// which we want to leave there for others to see
+  mut.unlock();	// exit critical section
+  if( myTask != done )
+    DoWork( myTask ); 
+}
+
+
+</pre>
+<p>All of these critical sections are easy to see. This code simply protects the data structure using the same mutex for its entire shared lifetime, and it's easy to check that you did it right&#151;just look to make sure the code only refers to <i>queue</i> when inside some critical section that holds a lock on <i>mut</i>.</p>
+
+<p>The primary expression of critical sections is the explicit locking done on the mutex. The condition variable is just icing on the cake&#151;an optimization that lets us express an efficient wait point in the middle of a locked section so that the Consumer race cars don't have to expend needless energy spinning their tires (in this case, their <i>lock/unlock</i> loop) while waiting for the Producer to give them the green light.</p>
+
+
+
+
+
+
+
+
+
+<h3>Example 2: One Producer,  Many Consumers,  Using Lock-Free Mailboxes</h3>
+
+<p>Next, let's consider a similar example, but instead of locks ,we'll use ordered atomic variables to synchronize the Producer-to-Consumers handoff...and no synchronization at all for interConsumers contention.</p>
+
+<p>The idea in this second approach is to use a set of ordered atomic variables (e.g., Java/.NET <i>volatile</i>, proposed C++0x <i>atomic</i>), one for each Consumer, that will serve as "mailbox" slots for the Consumers individually. Each mail slot can hold exactly one item at a time. As the Producer produces each new task, he puts it in the next mailbox that doesn't already contain an item using an atomic write; this lets the Consumers run concurrently with the Producer, as they check their slots and perform work while the Producer is still manufacturing and assigning later tasks. For further efficiency, to avoid making the Consumer busy-wait whenever its slot is initially or temporarily empty, we'll also give each Consumer a semaphore <i>sem</i> that the Producer will signal every time it puts a task into the Consumer's mail slot.</p>
+
+<p>Finally, once all the tasks have been assigned, the Producer starts to put "done" dummy tasks into mailboxes that don't already contain an item until every mailbox has received one. Here's the code:</p>
+
+<pre class="code">
+
+// One Producer thread: Changes any box from null to nonnull
+//
+curr = 0;  // keep a finger on the current mailbox
+
+// Phase 1: Build and distribute tasks (use next available box)
+while( ThereAreMoreTasks() ) {
+  task = AllocateAndBuildNewTask();
+  while( slot[curr] != null ) 	// acquire null: look for next
+        curr = (curr+1)%K;         	// empty slot
+  slot[curr] = task;         	// release nonnull: "You have mail!"
+  sem[curr].signal();
+}
+
+// Phase 2: Stuff the mailboxes with"done" signals
+numNotified = 0;
+while( numNotified &lt; K ) {
+  while( slot[curr] == done ) 	// acquire: look for next not-yet-
+       curr = (curr+1)%K;        	// notified slot
+  if( slot[curr] == null ) {   	// acquire null: check that the
+                                 	// mailbox is empty
+    slot[curr] = done;       	// release done: write sentinel
+    sem[curr].signal();
+    ++numNotified;
+  }
+}
+
+
+</pre>
+<p>On the other side of the mailbox wall, each Consumer checks only its own mailbox. If its slot holds a new task, the Consumer takes the task, resets its mail slot to "empty," and then processes the task. If the mailbox holds a "done" dummy task, the Consumer knows it can stop.</p>
+
+<pre class="code">
+
+// K Consumer threads (mySlot = 0..K-1):
+// Each changes its own box from non-null to null
+//
+myTask = null;
+while( myTask != done ) {
+  while( (myTask = slot[mySlot]) == null )	// acquire nonnull, 
+    sem[mySlot].wait();	// without busy-waiting
+  if( myTask != done ) {
+    slot[mySlot] = null;	// release null: tell
+                        	// him we took it
+    DoWork( myTask ); 
+  }
+}
+
+</pre>
+<p>A few notes: First, you can easily generalize this to replace each slot with a bounded queue; the previous example just expresses a bounded queue with a maximum size of 1. Second, this Producer code can needlessly busy-wait when it's trying to write a new task (or the remaining <i>done</i> sentinels) and there are no free slots. This can be addressed by adding another semaphore, which</p>
+
+<p> the Producer waits for when it has no free slots and that is signaled by each Consumer when it resets its slot to null. I've left that logic out for now to keep the example clearer.</p>
+
+<p>In Example 2, it's not quite as easy to check that we did it right as it was when we used locks back in Example 1, but we can reason about the code to convince ourselves that it is correct. First, note how each Consumer's read of its slot "acquires" whatever value the Producer last wrote there, and the Producer's read of each slot "acquires" whatever value the corresponding Consumer last wrote there. We avoid conflicts because while the slot is null, it's owned by the Producer (only the Producer can change a slot from null to non-null); and while it's nonnull, it's owned by its corresponding Consumer (only the Consumer can change its slot from nonnull to null).</p>
+
+
+
+
+
+
+
+
+
+<h3>Example 3: Don't Try to Turn  Critical Sections Inside Out</h3>
+
+<p>Although every entry/exit of a critical section implies a use of locks or atomics, not every use of locks or atomics correctly expresses a critical section. Consider this evil, smelly code of questionable descent, where <i>x</i> is initially zero (Note: this example is drawn from [3]):</p>
+
+<pre class="code">
+
+// Thread 1
+x = 1;	// a
+mut.lock();	// b
+... etc. ...
+mut.unlock();
+
+// Thread 2: wait for Thread 1 to take the lock, then use x
+while( mut.trylock() )	// try to take the lock...
+  mut.unlock();		// ... if we succeeded, unlock and loop
+r2 = x;		// not guaranteed to see the value 1!
+
+
+</pre>
+<p>This programmer is certainly nobody we would know or associate with. But what is he doing? He is trying to abuse the fact that locking is a global operation, and is visible in principle to all threads.</p>
+
+<p>Specifically, a thread can use a <i>trylock</i>-like facility to find out whether some other thread currently holds the lock, by trying to acquire the lock and seeing if that attempt succeeded or failed. Pretty much every threading library has a way to determine if someone else has entered a locked critical section: In Java, you can use <i>Lock.tryLock</i>; on Windows and .NET, there's <i>Monitor.TryEnter</i> or <i>WaitOne</i> with a timeout; in proposed C++0x, <i>try_lock</i> or <i>timed_lock</i>; and in pthreads, <i>pthread_mutex_trylock</i> and <i>pthread_mutex_timedlock</i>.</p>
+
+<p>Thread 2, which we might now refer to as Machiavelli, doesn't really want the lock. Machiavelli only wants to try to eavesdrop on Thread 1 in the next room, listening with a <i>trylock</i> glass against the wall until he hears the telltale sound that means Thread 1 got to line <i>b</i>, and therefore presumably has already set <i>x</i>.</p>
+
+<p>The most obvious red flag in this code is that the read and write of <i>x</i> are outside critical sections; that is, while we don't hold a lock on <i>mut</i>. That technique only works when there's enough synchronization to hand off an object from one thread to another (it belongs to one thread before the synchronization, and another thread after the synchronization), and there isn't enough synchronization here to do that. Let's see why.</p>
+
+<p>The problem is that this anti-idiom is trying to abusively invert the usual meanings of a locked section. Thread 2 is abusively trying to use Thread 1's entering a critical section as a release event, which it isn't. Remember, entering a critical section is an acquire event, and leaving a critical section is a release event. On this, the whole world depends, as we saw last month [1]. In particular, compiler and processor optimizations are guaranteed to respect normal critical section boundaries, and therefore not change the semantics of correctly synchronized code; specifically, they respect the rule that code can be reordered to move into, but not out of, a critical section. In the context of Thread 1, that means an optimizer or processor is free to actually execute line <i>a</i> after line <i>b</i>... and therefore, Thread 2 could well see a value of 0 for <i>x,</i> despite its attempts to abuse the global visibility of locking.</p>
+
+<p>In reality, the code may happen to work all the time on a given system that doesn't happen to reorder lines <i>a</i> and <i>b</i>. The original programmer might be long gone by the time some other poor sod tries to port it to a new compiler or platform that does manifest the race, and gets to experience the joy of debugging the intermittent problem over a holiday weekend. (Note that, besides the issues we've discussed, this code has other potential problems; for example, Thread 2 can wait forever if Thread 1's lock is taken too early.)</p>
+
+<p>Treat a critical section as you would treat another person: Turning either inside out is at least cruel, and usually illegal. For all the sensational, lurid, and unsavory details, see [3].</p>
+
+
+<h3>Summary</h3>
+
+<p>Apply critical sections consistently to protect shared objects: Enter a critical section by taking a lock or reading from an ordered <i>atomic</i> variable; and exit a critical section by releasing a lock or writing to an ordered <i>atomic</i> variable. Never pervert these meanings; in particular, don't abuse <i>trylock</i> to (try to) make a lock acquire in another thread act like the end of a critical section.</p>
+<h3></h3>
+<h3>Notes</h3>
+
+<p>[1] H. Sutter. "Use Critical Sections (Preferably Locks) to Eliminate Races," <i>Dr. Dobb's Journal</i>, October 2007.</p>
+
+<p>[2] H. Sutter. "The Trouble With Locks," <i>C/C++ Users Journal,</i> March 2005. Available at http://gotw.ca/publications/mill36.htm.</p>
+
+<p>[3] H. Boehm. "Reordering Constraints for Pthread-Style Locks," <i>Proceedings of the 12th ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming  (PPoPP'07)</i>, March 2007.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

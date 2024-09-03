@@ -1,0 +1,251 @@
+
+<html>
+<head>
+<title>March, 2006: Keeping C/C++  Code Scalable</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<p><i>Dr. Dobb's Journal</i>, March 2006</p>
+<h1>Keeping C/C++  Code Scalable</h1>
+<h2>Techniques for identifying committed virtual address space</h2>
+
+
+<h3>By Kirk J. Krauss</h3>
+
+
+<I>Kirk is a software developer working in the Rational Software division of IBM. He can be contacted at kjkrauss@us.ibm.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Many of today's 32-bit application programs are becoming limited by the amount of available virtual memory on 32-bit platforms. For those of us who must maintain 32-bit versions of our software, even as we begin to focus on 64-bit platforms, we need ways to ensure that both versions of our code remain scalable.</p>
+
+<p>Current memory profiling tools can help determine what's happening when peak memory usage occurs. But the focus of such tools is on allocated memory blocks, rather than total committed virtual address space. These two metrics don't necessarily have a direct correlation. Factors such as leaks, fragmentation, intrablock waste, and overly delayed deallocation can cause virtual memory to be unnecessarily committed. Runtime analysis tools such as IBM's Rational Purify or Parasoft's Inuse can provide descriptions of memory leaks and memory in use. This can be informative, but a particular memory block may or may not affect the virtual memory footprint. Even a small block in a fragmented heap memory range can directly contribute to the virtual memory footprint. On the other hand, any blocks&#151;even leaked ones&#151;in a range that is mostly getting active use will not make a difference to the virtual memory footprint unless there's a chance that every useful block in that range could get relocated to a more compacted range. That is something likely to occur in Java/managed applications during garbage collection, but it's highly unlikely for most native C/C++ applications, where memory blocks remain indefinitely in their original positions in the virtual address space.</p>
+
+<p>For native code, the actual problem of unnecessary virtual memory use can be more relevant than the theoretical problem of missed cleanup of memory blocks that are no longer in use. That missed cleanup may cause wasteful virtual memory overhead, or it may not. It all depends on whether the heap manager must commit more virtual memory to sustain the waste. A few small unused blocks generally will not cause unnecessary heap spread. Rather than leave you to guess which and how many wasted blocks cause the heap to spread, I present in this article ways for you to determine what is meaningful waste. By adding checks for missed opportunities to shrink each heap when it contains memory blocks that are no longer being accessed, you can identify the needed memory block cleanup that makes the most difference in your program's virtual memory requirements.</p>
+
+<p>To figure out which heap memory blocks to focus on, you need to build your program with some additional code that tracks heap memory ranges and allocated memory blocks. A special build, with conditional compilation of this extra code, is probably the best way to go.</p>
+
+<p>To get this done, you need to write a custom memory allocation routine that keeps track of each memory block, a custom deallocation routine, and routines that keep track of where the heap resides within the virtual address space using the algorithms in <a name="rl1"></a><a href="#l1">Listings One</a> and <a name="rl2"></a><a href="#l2">Two</a>. You also need custom accessor functions to tag memory blocks when they're accessed for use in determining when an opportunity to shrink the virtual memory footprint could have been taken sooner. All of this can be done without adding a great deal of memory overhead. On the other hand, the performance impact can be significant enough that if your program uses lots of heap memory, this technique should probably be applied only for relatively short runs.</p>
+<h3>Tracking  Heap Memory Blocks</h3>
+
+<p>Memory block tracking can be done via a custom memory allocator function. This function first calls an ordinary memory allocation function; for example, C programs typically call <i>malloc()</i>. Right afterwards, your custom memory allocator invokes a routine that does several things:</p>
+
+
+
+<ul>
+  <li>Tracks the newly allocated memory block in a list of currently allocated blocks.</li>
+  <li>Determines whether the system has committed virtual memory to accommodate the block.</li>
+  <li>If virtual memory has been committed, tracks the updated heap range containing that block, and updates the aforementioned list of that heap's memory blocks to indicate that none of them has been accessed since this time.</li>
+</ul>
+
+
+
+<p>You also need custom deallocator/ reallocator functions that jointly keep your list of memory blocks updated with the addresses and sizes of all the memory blocks in use by your program. Your list of tracked heap memory blocks should contain structures with these fields:</p>
+
+<ul>
+    <li>The memory block's base address.</li>
+  <li>Its size.</li>
+  <li>A Boolean value indicating whether the block has been accessed since the last time virtual memory was committed for the heap.</li>
+</ul>
+
+
+
+<p>When a memory block has been deallocated, the custom deallocator code invokes a routine that does the following:</p>
+
+
+
+<ul>
+  <li>Reports if the memory block's tracking element indicates that the block hasn't been accessed since the last time the heap spread.</li>
+  <li>Deletes that block's tracking element from the list.</li>
+  <li>Determines whether the system has decommitted the virtual memory containing that block.</li>
+  <li>If virtual memory has been decommitted, updates heap range tracking to reflect only the remaining ranges of the heap.</li>
+</ul>
+
+
+
+<p>When a memory block has been reallocated, your custom reallocator code may invoke both of the routines just outlined: First, the routine that updates memory block tracking after deallocation because the reallocated block may no longer be in the same position; and second, the routine that updates memory block tracking after allocation to track the new base address and size of the reallocated block. As an alternative, you can add a check for whether the reallocated block has moved. If it hasn't moved, you can simply update the memory block tracking list to indicate that the size of the tracked block has changed. But if it has grown while remaining at the same base address, you still need the check for heap spread, along with the same follow-up logic I've just outlined for typical allocation scenarios.  </p>
+<h3>Tracking the Heap Itself</h3>
+
+<p>Heap range tracking depends on making system calls to determine whether virtual memory has been committed or decommitted when memory blocks are allocated and deallocated, respectively. This lets you keep a list of tracked heap memory ranges, so you can know exactly where heaps reside in the virtual address space at any point during the run. Your list of tracked heap memory ranges should contain structures with these fields:</p>
+
+
+
+<ul>
+  <li>The range's base address.</li>
+  <li>Its size.</li>
+</ul>
+
+
+
+<p>On Microsoft Windows, these values can be determined by calling <i>HeapWalk()</i> and storing the results in a list. <i>HeapWalk()</i> is such an expensive function that you want your program to invoke it only as necessary, and not whenever memory is allocated and deallocated. That's why you need to consider fast ways to determine whether virtual memory is committed. One way to do this, again on Windows, is to use the <i>IsBadReadPointer()</i> function. When a memory block has been deallocated, you can call this function to quickly determine whether the virtual memory that contained the block has been decommitted. An alternative that may work on multiple platforms is to try to access the virtual memory that contained the block and to catch an access exception if one occurs. Only then do you need to make more expensive calls, such as <i>HeapWalk()</i> calls on Windows, to determine where the remaining nearby committed heap ranges are.</p>
+
+<p>Your list of tracked heap memory ranges will be populated via an algorithm that detects when heap memory is committed, outlined in <a name="rl1"></a><a href="#l1">Listing One</a>. Again, when your program allocates a memory block, your custom allocator code can track that memory block. It can also invoke the algorithm in <a name="rl1"></a><a href="#l1">Listing One</a> to update tracking for the ranges of the heap containing that memory block. If allocation of a memory block causes additional virtual memory to be committed, this will be clear from the fact that the virtual memory occupied by that block was previously free or perhaps used for some other purpose before. In either case, you'll want to update your heap range tracking list, conditionally, as outlined in <a name="rl1"></a><a href="#l1">Listing One</a>:</p>
+
+
+
+<ul>
+  <li>If you're already tracking the base of that committed range, then you only need to update the size of the range to indicate its new upper limit.</li>
+  <li>Otherwise, you have a new heap memory range to track.</li>
+</ul>
+
+
+
+<p>These conditions are only reached if a new memory block appears in a range that was not previously tracked as a heap range. This judicious use of system calls can help you to efficiently track heap memory ranges.</p>
+
+<p>When your program deallocates a memory block, your custom deallocator code can invoke the algorithm outlined in <a name="rl2"></a><a href="#l2">Listing Two</a>. This algorithm first determines whether the deallocated memory was associated with a tracked range of heap memory. If you find that this condition is often true, you may want to validate your implementation of the algorithm outlined in <a name="rl1"></a><a href="#l1">Listing One</a>. Next, there is a check for whether the space that was occupied by the deallocated block is still committed. If so, this indicates that the virtual memory footprint hasn't changed even though the memory block was deallocated. Otherwise, your code should make system calls as described toward the end of <a name="rl2"></a><a href="#l2">Listing Two</a>&#151;for example, to <i>HeapWalk()</i> on Windows&#151;to ensure that tracking for that heap is up to date now that the virtual memory that contained the heap memory block has been decommitted.</p>
+
+<p>If virtual memory has been decommitted, then you should check the range that used to contain the most recently deallocated heap memory block to find out whether any of that range is still committed. Any committed portion of that range should still be a heap memory range, particularly if it contains memory blocks tracked on your memory block list; you can validate that for extra accuracy. Then you can do the following, as in <a name="rl2"></a><a href="#l2">Listing Two</a>:</p>
+
+<ul>
+  <li>If any portion of the tracked heap memory range is still committed, update your tracking for that range.</li>
+  <li>Otherwise, delete the list element that tracks the range.</li>
+</ul>
+
+
+
+<p>It's possible that a heap memory range could be broken into multiple ranges if a portion of it, in the middle, is decommitted. You can check for this by walking through the old tracked range to find out which portions of that range are still committed, before you quit tracking the old range altogether.</p>
+
+<p>Your program may use multiple heaps. On Windows, this happens if you call <i>HeapCreate()</i> and then specify the returned handle in subsequent calls to <i>HeapAlloc(), HeapReAlloc(), </i>and <i>HeapFree().</i>  It also happens on Windows if you load multiple instances of the C Runtime DLL, each of which uses its own heap. You have the choice of tracking multiple heaps in separate lists, and you can track their memory blocks in separate lists, too. An advantage of doing so is that list lookups may be faster. Another advantage is that when a heap is destroyed, you can clean up all of the tracking for it with confidence. But this will require that you add code that runs when a heap is created and destroyed, to respectively set up and eliminate the appropriate lists. Otherwise, you can just manage one list of heap memory blocks, and one list of heap ranges, both of which can be established at the beginning of the run.</p>
+
+<p>The algorithms I described in "Range Tracking &amp; Comparison Algorithms" (<i>DDJ</i>, February 2006) may be useful in heap range tracking. That article presents an algorithm for creating a list of ranges, in which contiguous committed heap HASH(0x187d690) might be treated as a single combined range. When multiple ranges need to be updated, you can use an algorithm for splicing a new list of ranges into an existing list. A third algorithm describes a way to compare an old list of ranges with a new one. When ranges of virtual heap memory have been decommitted, you can use that algorithm to compare the decommitted ranges with your list of tracked memory blocks to identify any tracked blocks that no longer exist.</p>
+
+<p>Some professional runtime analysis tools perform tracking of allocated memory blocks and heap ranges, much like the custom allocator and deallocator described here. A professional tool can go further by tracking the underlying virtual memory HASH(0x187d690) as well, using that tracked information to make this and other higher level tracking reliable enough for accurate runtime error detection. But the scheme described here is sufficient to help you understand where opportunities may be found to decrease the virtual memory overhead created by the heap memory blocks that your program can control.</p>
+<h3>Finding Useful  Cleanup Opportunities</h3>
+
+<p>To use all this tracked information to pinpoint the heap memory blocks that are contributing the most to unnecessary virtual memory bloat, you will additionally record memory accesses, tagging the appropriate memory block tracking structure whenever your program reads from or writes to heap memory. Finding all the places where your code reads from and writes to memory will be simplest if your heap memory blocks are routinely accessed via accessor functions. In your conditionally compiled build, these accessors can look up the memory block to be accessed on your list of memory blocks and tag it by setting the Boolean flag described previously.</p>
+
+<p>When virtual memory is committed for a heap, your custom allocator code should "untag" all of the memory blocks in that heap. They'll subsequently be retagged, one by one, as your program accesses them. When an untagged block is deallocated and virtual memory is decommitted as a result, your custom deallocator routine can report the opportunity to keep the virtual memory footprint smaller by deallocating the block sooner.</p>
+
+<p>You can also arrange to run occasional scans through a heap's memory blocks, perhaps each time that virtual memory is committed for that heap. If a block remains untagged through multiple scans (that is, for sort of a long time), the virtual memory range containing that block may be subject to inspection by checking the number of tracked blocks in that range. If that block, or a set of similarly neglected blocks, is solely responsible for the commitment of virtual memory, then you may have found an opportunity to reduce the program's virtual memory requirement by deallocating or relocating those blocks.</p>
+
+<p>You may have to be pretty diligent to implement all of the memory block and heap range tracking code described here. And performance while all of this tracking is in place will be slow, particularly because of the list lookups at each heap memory access. The list lookup time can be reduced via fast list lookup schemes involving binary searches, skiplists, or the like. And as I mentioned earlier, you might be able to speed things up by using separate lists for tracking multiple heaps. If your program uses lots of heap memory blocks, your patience may pay off when you find ways to eliminate extra virtual memory overhead.</p>
+
+
+
+
+<p><b>DDJ</b></p>
+<p><b></b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>/* The Track Heap Commitment algorithm                        */
+/* Determines whether the specified memory range,             */
+/* corresponding to a recently allocated heap memory block,   */
+/* resides completely within the tracked committed HASH(0x187d690) of */
+/* the heap.  Tracks new heap ranges in a list.               */
+/* The caller should ascertain that the specified address     */
+/* actually belongs to a heap: in other words, that it is     */
+/* from a heap operation on a specific heap, or it is from a  */
+/* local or C runtime allocation and is therefore on the      */
+/* default local or C runtime heap.                           */
+
+/* Input parameters */
+ADDRESS        triggerAddr
+SIZE           triggerSize
+LIST           a list of tracked heap ranges
+
+IF (the virtual memory at triggerAddr is tracked on the list 
+    as part of a heap range)
+    DO
+    IF (triggerAddr + triggerSize &gt; 
+           (the tracked upper boundary of that heap range))
+        DO
+        /* An existing heap range has spread.                 */
+
+        make system call(s) to determine the base and extent of 
+        the newly committed range that contains the addresses 
+        from triggerAddr to (triggerAddr + triggerSize)
+
+        update the size of the tracked heap range to indicate 
+        its new upper limit
+        END
+    END
+ELSE DO
+    /* There is a new heap range at triggerAddr.              */
+      
+    make system call(s) to determine the base and extent of the 
+    newly committed range that contains the addresses from 
+    triggerAddr to (triggerAddr + triggerSize)
+
+    track the new committed range in the list of heap ranges
+    END</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>    /* The Track Heap Decommitment algorithm                      */ 
+    /*                                                            */ 
+    /* Determines whether the specified memory range,             */ 
+    /* corresponding to a recently deallocated heap memory block, */ 
+    /* has evidently become decommitted.  Cleans up tracking of   */ 
+    /* decommitted heap ranges.                                   */ 
+
+    /* Input parameters */ 
+    ADDRESS        triggerAddr 
+    SIZE           triggerSize 
+    LIST           a list of tracked heap ranges 
+    
+    /* Local variables */ 
+    ADDRESS        origRangeBase 
+    SIZE           origRangeSize 
+    BOOL           bFoundChange 
+
+    bFoundChange = FALSE 
+
+    IF (the virtual memory at triggerAddr is not tracked on the 
+        heap range list as part of a heap range) 
+        DO 
+        /* Looks like we already know about this decommitment. */ 
+        END 
+    ELSE IF (an access exception occurs when memory at triggerAddr 
+             is read) 
+        DO 
+        bFoundChange = TRUE 
+        END 
+
+    IF (bFoundChange) DO 
+        /* The set of virtual memory ranges occupied by the heap  */ 
+        /* has changed to decommit space formerly occupied by     */ 
+        /* memory blocks.                                         */ 
+        /*                                                        */             
+        make system calls to determine the bases and extents of the 
+        tracked committed heap ranges in the immediate vicinity of 
+        the decommitted range that includes the addresses from 
+        triggerAddr to (triggerAddr + triggerSize) 
+
+        /* Update heap range tracking to reflect only the         */ 
+        /* remaining committed ranges.                            */ 
+        /*                                                        */   
+        IF (any portion of the tracked heap range that contained the 
+            block at TriggerAddr is still committed) 
+            DO 
+            update the heap range list to track just the portion(s) 
+            of that range that remain committed 
+            END 
+        ELSE 
+            DO 
+            delete the list element that tracks the range 
+            END 
+        END </pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

@@ -1,0 +1,213 @@
+<html>
+<head>
+<title>December, 2004: Compatibilities</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>Compatibilities</h1>
+<p><i>C/C++ Users Journal</i> December, 2004</p>
+<h2>C++, the real world, and link and binary compatibility</h2>
+
+
+<h3>By Herb Sutter</h3>
+
+
+<I>Herb Sutter (<a href="http://www.gotw.ca/">http://www.gotw.ca/</a>) chairs the ISO C++ Standards committee and is a software  architect at Microsoft, where he is responsible for designing C++ language extensions for .NET programming (C++/CLI). His two most recent books are </i>Exceptional C++ Style<i> and </i>C++ Coding Standards<i>.</I>
+
+<hr>
+
+
+
+
+
+<p>This article is about things our Standard never told us, and that most of us had to learn on our own the hard way, out in the streets.</p>
+
+<p>I occasionally get mail from readers that starts with code like this:</p>
+
+<pre>
+// Example 1
+//
+void SomeFunction( std::string&amp; );
+
+</pre>
+
+<p>You're probably scratching your head, thinking: "Well, nothing seems wrong with that. It's too simple to be wrong." And then, perhaps an anxious moment of: "Is C++ so weird that there's a pitfall in something <i>this</i> straightforward?" Relax. The issue isn't with C++. The issue is one that affects pretty much every language, and that is portability&#151;specifically, the issue is link and binary portability.</p>
+
+<p>The problem with Example 1 happens to programmer after programmer in company after company. When I get e-mail about it, or when people ask about it during conference or training sessions, the question usually goes something like this: "I'm in shared library (or DLL) Lib1, calling <b>SomeFunction</b> in shared library (or DLL) Lib2. It doesn't work. Why not?"</p>
+
+<p>Here's the short answer: If you can guarantee that a function and all of the code that will ever call it will be compiled using:</p>
+
+
+
+<ul>
+  <li>the same compiler (including version),</li>
+  <li>compatible compiler switch settings, and </li>
+  <li>the same Standard Library implementation (including version) (if any Standard Library types appear in the function's interface, or any Standard Library facilities are shared), </li>
+</ul>
+
+
+
+<p><i>only then</i> can you use a user-defined type as a function parameter. And "user-defined types" include Standard Library types such as <b>std::string</b>, which brings us back to Example 1. (Aside: If you can't guarantee those things, you also can't reliably allocate memory in the function and deallocate it elsewhere, and vice versa, because the memory managers might be different. You can't reliably throw exceptions, either, because the exception-handling mechanisms might be different. I mention those for completeness, but in this article, I'm going to focus mainly on the issue of compatibility of user-defined types.)</p>
+
+<p>Now you know (and you probably already knew) the main points of this column. But please read on anyway as we delve into the details, because the consequences can be a source of subtle surprises in the real world.</p>
+<h3>Object Layout</h3>
+
+<p>Clearly, functions can't communicate via an object (for example, as a function parameter) unless they can agree on how the bits of the object are laid out in memory. This means that they must agree on the object's size, the internal offsets of base classes and data members, the internal locations of virtual function call mechanics, and any other necessary details.</p>
+
+<p>The C++ Standard, however, doesn't specify exactly how objects are laid out in memory.</p>
+
+<p>Specifically, it does not fully specify three things. First, compilers are generally free to arrange the base and member objects of a class in whatever way they want. The layout of a base class <b>B</b> subobject in a derived class can even be different from a <b>B</b> object's layout when it is instantiated standalone. The only constraint the Standard imposes is that all the members that appear in the class's definition without an intervening access specifier (<b>public:</b>, <b>protected:</b>, or <b>private:</b>) must physically appear in the order the programmer declared them; this minor constraint exists for the sake of C compatibility.</p>
+
+<p>For example, consider this class definition:</p>
+
+<pre>
+// Example 2
+//
+class C {
+private:
+  char c_;
+private:
+  int i_;
+  short s_;
+};
+
+</pre>
+
+<p>The compiler is required to generate an object layout for class <b>C</b> that puts <b>i_</b> before <b>s_</b>, because there are no intervening access specifiers between the declarations of <b>i_</b> and <b>s_</b>, but that's it. The compiler is free to put <b>c_</b> before or after <b>i_</b> and <b>s_</b>, or even to put it in between them. </p>
+
+<p>Second, the Standard doesn't specify what padding (if any) is placed between data members: Compilers are free to add extra padding for the sake of alignment. Certain processors, or certain instructions on some processors, want given data types to be aligned on certain byte or word boundaries (for example, Intel SSE instructions want <b>float</b> arrays to have 16-byte alignment). Depending on the processor, if data is improperly aligned, then either the operation is slower or else the processor halts the program outright. So it's the compiler's job to insert extra "blank spaces" of unused padding bytes inside objects so that all the members are aligned correctly, for either correctness or just for better performance. In addition to doing this automatically, most C++ compilers also provide switches and/or language extensions to control the alignment (<b>aligned(n), __declspec(align(n))</b>, for instance) and packing (for example, <b>#pragma pack</b>) on a class-by-class basis, or even on an object-by-object basis.</p>
+
+<p>By the way, in the preceding paragraph, did you notice one reason why using different switch settings on the very same compiler can generate different and binary-incompatible layouts for the same type? I said that many processors only prefer, but don't require, a given alignment, and therefore an object layout that violates the processor's preferred alignment can still be perfectly legal; some instructions may just not execute as quickly as they would if the data had been properly aligned. Therefore, you may find that your compiler could generate a different object layout for your classes, depending on whether you choose to optimize for space (favoring smaller objects with less padding) or for speed (favoring better speed with more alignment padding).</p>
+
+<p>Consider again Example 2. Assume a compiler is targeting a platform with 4-byte <b>int</b>s, 2-byte <b>short</b>s, and 1-byte <b>char</b>s. Also assume that this particular platform prefers, but does not require, that i<b>nt</b>s be aligned on a 4-byte boundary. If the compiler just lays out the members in declaration order without padding, you get:</p>
+
+<pre>
+char c_;   // 1 byte (byte 1)
+int i_;	   // 4 bytes (bytes 2-5)
+short s_;  // 2 bytes (bytes 6-7)
+          // total size = 7
+
+</pre>
+
+<p>This layout is probably fine, but it fails to align the <b>i_</b> member on a 4-byte boundary. What if the compiler lays out the members in declaration order, but aligns the <b>int</b>? Then you get:</p>
+
+<pre>
+char c_;     // 1 byte (byte 1)
+            // 3 unused bytes (bytes 2-4)
+int i_;     // 4 bytes (bytes 5-8)
+short s_;   // 2 bytes (bytes 9-10)
+	    // 2 unused padding bytes (bytes 11-12)
+	    // total size = 12
+
+</pre>
+
+<p>Note that the compiler generates internal padding after <b>c_</b> to ensure that <b>i_</b> is at a 4-byte offset from the start of the object, and then it also adds external padding at the end of the object so that when you make an array, each object still has the right alignment because the whole object's preferred alignment is now a multiple of 4 bytes.</p>
+
+<p>Of course, a compiler is unlikely to generate something as inefficient as that in Example 2. More likely, the compiler would take advantage of its ability to reorder the members and generate a layout similar to this:</p>
+
+<pre>
+int i_;     // 4 bytes (bytes 1-4)
+short s_;   // 2 bytes (bytes 5-6)
+char c_;    // 1 byte (byte 7)
+            // 1 unused byte (byte 8)
+            // total size = 8
+
+</pre>
+
+<p>This achieves the best possible alignment with the smallest padding overhead, and ensures that <b>i_</b> is always correctly aligned, including in every object in an array of this type. (If directed to optimize for space instead of speed, a compiler might omit the padding byte. If so, that would preserve <b>i_</b>'s alignment in all single objects but sacrifice <b>i_</b>'s alignment in seven out of every eight elements of an array of this type.)</p>
+
+<p>Third, and finally, the Standard doesn't specify the virtual function mechanics, and any machinery for dealing with virtual base classes. The compiler may insert a pointer to the class's vtable anywhere it likes inside the object layout (perhaps taking advantage of some space that would otherwise be mostly padding), if it uses a <b>vptr</b>/<b>vtable</b> scheme at all.</p>
+
+<p>Thus, the C++ Standard states:</p>
+
+<pre>
+void SomeFunction( std::string&amp; );
+
+</pre>
+
+<p>If you look in the object file, you probably won't see that name. Instead, you'll see an encoded name. The name of this particular function is encoded as follows on several popular compilers:</p>
+
+<pre>
+?SomeFunction@@YAXAAV?$basic_string@DU?
+  $char_traits@D@std@@V?$allocator@D@2@@std@@@Z
+
+</pre>
+
+<p>You can almost see the encoding of the string parameter type because <b>std::string</b> is a convenience <b>typedef</b> for <b>std::basic_string&lt;char, std::char_traits&lt;char&gt;, std::allocator&lt;char&gt; &gt;</b>.</p>
+
+<p>But the C++ Standard doesn't say that the compiler should mangle the name this particular way, or any particular way. It is silent on the matter, and lets compilers do whatever they want. That's actually a Really Good Thing, because this is one case where you really do want different compilers to use link-incompatible names for objects that aren't binary compatible with each other, so that you're less likely to accidentally succeed in linking them together!</p>
+
+<p>In Example 1, say that the function is compiled using a compiler that does the above name mangling, and you try to call it from a function that's being compiled with a different compiler that uses a different name-mangling convention&#151;and therefore generates a different mangled name when it tries to name <b>SomeFunction</b> in order to call it. From the linker's point of view, the caller is asking for a function that doesn't exist, and the linker will refuse to link the caller to the target function. And that is a good thing.</p>
+<h3>When Mangling Is "Too Compatible"</h3>
+
+<p>The difficulty arises when two compilers, or two settings for the same compiler, use the same name-mangling scheme even though they actually use different object layouts for the parameter and/or return types. Then the linker finds the name and dutifully links the caller to the callee, and the program fails at runtime because it turns out that the caller and callee don't actually agree on what the objects they're sharing actually mean&#151;how big they are, how they're laid out, what the bits really store. The results are liable to manifest as a quick crash.</p>
+
+<p>So now we can see what's going on in Example 1:</p>
+
+<pre>
+// Example 1 (reprise)
+//
+void SomeFunction( std::string&amp; );
+
+</pre>
+
+<p>To correctly call this function, a caller must be compiled using:</p>
+
+
+
+<ul>
+  <li>The same compiler (or one that guarantees binary compatibility for object layouts, which is rare).</li>
+  <li>Compatible switch settings, so that optimization or packing settings won't affect the layout of the object.</li>
+  <li>The same Standard Library implementation and version, because different Standard Library implementations can and do implement standard types very differently, especially <b>string</b> (see [4]), even across successive versions of the same library implementation.</li>
+</ul>
+
+
+
+<p>Finally, there is one last aspect of this problem: When people encounter this problem, they sometimes shake their heads (thinking it's the fault of their compiler vendor and/or Standard Library vendor) and say: "Well, heck, I guess we'll just have to wrap our uses of <b>std::string</b> in our own <b>StringWrapper</b> so that we can use that safely across modules." That sometimes works, if you know the problems above and are disciplined about ensuring perfect fidelity in the way to compile <b>StringWrapper</b> everywhere, but usually it just leads to the same problem as before, to the programmer's great consternation and despair. Why? Because unless you are very careful and have compilers that support binary compatibility, the layout of <b>StringWrapper</b> itself will now vary from compiler to compiler, or even from option to option in the same compiler.</p>
+<h3>Summary:  Guidelines for Module Boundaries</h3>
+
+<p>What applies to functions applies in particular to the boundary of any module (nonsource unit of release; for example, shared library, DLL, or object file), which tends to be where you have the least amount of control over perfect build agreement with all possible callers. In a module, if you want to do any of the following in an externally accessible function:</p>
+
+<p>     </p>
+
+<ul>
+  <li>Mention a user-defined type in the module's external interface (for example, as a parameter public or exported API).</li>
+  <li>Allocate memory in the module and deallocate it outside the module, or vice versa. (See Item 60 of [1].)</li>
+  <li>Allow an exception to propagate out of the module to a caller. (See Item 62 of [1].)</li>
+</ul>
+
+
+
+<p>then you must be able to guarantee that the module and all of the code that will ever call it will be compiled using the same compiler and compatible compiler switch settings. Just using the same compiler isn't enough: Popular compilers can and do generate incompatible code for all three of the above if you throw different switch settings. You also have to use the same Standard Library implementation, including the same version, if any Standard Library facilities are mentioned in an externally visible functions signature or are shared outside the module.</p>
+
+<p>Unless you are certain you can (and can afford to) guarantee and enforce that, you can't do the above-listed things. You have to use alternatives instead:</p>
+
+
+
+<ul>
+  <li>Instead of user-defined types, mention only fundamental types that all callers can agree on (for instance, <b>int</b> or <b>float</b>), or use opaque handles, usually<b> typedef</b>ed <b>void*</b>s, along with plain nonmember functions that wrap construction and destruction so that callers have a way to create and destroy objects.</li>
+  <li>Instead of directly deallocating memory, provide plain nonmember functions that callers can use, which keeps the actual allocation and deallocation code inside the module. Otherwise, if your code must deallocate memory that was obtained in another module, consider using a callback whereby the caller provides a pointer to a function in the correct module to actually perform the deallocation.</li>
+  <li>Instead of allowing exceptions to propagate out of the module, put <b>catch(...)</b>-all firewalls around all externally accessible functions and use error codes to communicate status to callers.</li>
+</ul>
+
+
+
+<p>For more, see also Item 63 of [1], and all of the Items in that section on Namespaces and Modules.</p>
+
+<p>Next time: A trip report from the fall 2004 ISO C++ Standards meeting. Stay tuned.</p>
+<h3>References</h3>
+
+<P>[1]	Sutter, H. and A. Alexandrescu. <i>C++ Coding Standards</i>, Addison-Wesley, 2005.</li>
+<P>[2]	Lippman, S. <i>The C++ Object Model</i>, Addison-Wesley, 1998.</li>
+<P>[3]	ISO/IEC 14882:2003(E), Programming Languages&#151;C++ (updated ISO and ANSI C++ Standard including the contents of the 1998 Standard plus errata corrections).</li>
+<P>[4]	Meyers, S. <i>Effective STL</i>, Addison-Wesley, 2001. </li></ol>
+
+
+
+
+
+
+</body>
+</html>

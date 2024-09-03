@@ -1,0 +1,183 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal June 1997: Embedded Systems </title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Watchdogs for Interrupt Monitoring </h1>
+
+<p><i>Dr. Dobb's Journal</i> June 1997
+</p>
+<h2>Keeping an eye out for missed interrupts and time margins</h2>
+
+<h3>By Rolf V. Oestergaard</h3>
+
+<I>Rolf is now chief engineer at COCOM in Copenhagen, Denmark. He can be contacted at rvo@cocom.dk or http://www.pip.dknet.dk/~pip732/.</I>
+
+<hr>
+
+<p>Many embedded systems operate on the basic assumptions that no interrupt will be missed, the watchdog will always be serviced, and no process will run for too long. For any number of reasons, these assumptions often fail to be verified. In this article, I'll present simple, yet practical, verification and "problem-spotting" toolsets called "IntMon" and "WdMon," which I've used in developing a variety of embedded systems, including Thrane &amp; Thrane's Inmarsat-C satellite telex/ e-mail transceiver.  </p>
+
+<p>Failing to answer an interrupt within the required time can cause all sorts of errors that are commonly observed as lost data on a serial interface or a time function that runs too slow. Finding bugs like these can be a time-consuming task, especially when the error frequency is low. Finding the last of these bugs might not happen at all, if the frequency is sufficiently low. The toolsets presented here significantly increase the chances of your finding problems, and ensure you have a safety margin in your shipped systems.</p>
+
+<h3>The System</h3>
+
+<p>The Inmarsat-C satellite transceiver hardware is fairly simple, consisting of the 80186-compatible Am186 microprocessor for protocols and interface, and the ADSP2105 digital signal processor for demodulating the received satellite signals. A GPS receiver module feeds the current position through a serial port to the CPU. Another serial port is connected to a terminal, or a PC for a more sophisticated user interface. The block diagram in <a name="rf1"><a href="9706gf1.htm">Figure 1</A> describes this architecture.</p>
+
+<p>The DSP interrupts the microprocessor 2400 times a second, delivering one "soft bit" at every interrupt. To decrease cost, FIFO or handshaking is not provided, establishing a hard real-time constraint that must be met. Other interrupt sources include three serial ports in the system running at speeds up to 38400 baud, but with 16-byte FIFOs. The software makes extensive use of CLI/STI instruction pairs to block any interrupts in critical sections (or PUSHF/CLI and POPF, to avoid making assumptions of the previous interrupt state). For the system to work as expected, I set a maximum interrupt-disabled time (or interrupt-latency time) at 250&micro;s.</p>
+
+<p>It is essential that you use some sort of watchdog device to supervise a microprocessor in equipment that needs to run unattended for extended periods of time. The satellite transceiver employs a Maxim device for supervising both supply voltage and software activity. The watchdog requires a port pin to be toggled at least every second or the system will reset. As the software is based on a nonpreemptive scheduler, the watchdog is toggled by the scheduler at every process shift. To accommodate for tolerance on the watchdog device time-out value and ensure a responsive system with a safe margin, I set a maximum run time for one process at 300 ms.</p>
+
+<h3>The Tools</h3>
+
+<p>I developed IntMon and WdMon using assembly language only. (The complete source code for the IntMon and WdMon toolset is available electronically; see "Availability," page 3.) The microprocessor, flash memory, SRAM, and almost everything else on the board is surface mounted, ruling out the use of in-circuit emulators. An HP16500 logic analyzer can be connected to the microprocessor, providing some facilities for monitoring the code running with its built-in inverse assembler. Setting up triggers for interrupt-latency time violations or watchdog-toggle times proved impossible.</p>
+
+<p>Our solution was to build a monitoring system right into the software, utilizing a spare timer and the unused, nonmaskable interrupt input. A trace on the printed-circuit board connects the output of the timer to the NMI input pin, allowing the timer to force an NMI every 250&micro;s. As the timer triggers both its own maskable interrupt and the nonmaskable interrupt, any inability to answer the maskable interrupt can be detected by simply testing, setting, and clearing a common flag in the two interrupt handlers. The watchdog-toggle time is measured by setting a counter at every toggle, and decrementing the same counter in the NMI handler.</p>
+
+<p>One of the benefits of building the tool into the software is that the monitor can be available to as many members of the programming team as the hardware allows. This means the monitor can run all the time, pointing out problems at the earliest possible point in the development cycle. The built-in monitor will not be able to provide a traceback, but it points out the address of the problem in <i>segment:offset</i> format. It is a straightforward process to make the tool monitor interrupts only from a certain priority level and up, simply by changing the priority of the maskable timer interrupt. <a name="rf2"><a href="9706gf2.htm">Figure 2</A> describes the timer and interrupt system.</p>
+
+<h3>Detailing IntMon</h3>
+
+<p>The interrupt-latency time monitor works off a single byte flag called <i>NmiIntFlag</i>. This flag is set to 3 by the (maskable) timer interrupt, and to 2 by the NMI handler. If the NMI handler sees a value of 2 already present, it indicates that the timer interrupt did not get a chance to run, and the interrupt-latency time requirement was violated by some part of the program. The NMI handler code changes the flag to 1 and records the <i>segment:offset</i> of the program from the stack. This might not necessarily be the code that should be changed, but in many cases it gives you a good idea. (In other cases it really gives you something to think about, like "why on earth is this code run with interrupts disabled?") <a name="rl1"><a href="9706g.htm#l1">Listing One</A> resents the body of the NMI handler.</p>
+
+<p>Since this code runs 4000 times a second, it has to be short. Any NMI handler in a system where critical sections are protected by CLI/STI instructions must be carefully written. It will not respect the critical sections. Thus, even if the code is otherwise written to be reentrant, that will normally not be the case when calling from the NMI handler. When the flag is set to 2, the only thing the NMI handler can do is store the program counter value snatched from the stack. Writing the error on the terminal cannot be safely done in the NMI handler, but is left to the maskable timer interrupt. <a name="rl2"><a href="9706g.htm#l2">Listing Two</A> runs only once every four times (that is, every 1 ms) if interrupts are not disabled for even longer.</p>
+
+<p>To ensure that printing the error message does not trigger another error message, the supervisor is turned off during the printing process by placing the value 0 in the flag. This is understood by both the NMI handler and timer-interrupt handler. Making sure the system can continue running, even when an error of this sort is detected, is vital to application programmers who must concentrate on the job at hand and ignore a few error messages from the monitor. If these errors required the system to reset, chances are the monitor would be turned off most of the time. A short reminder points out the violations when they occur, but does no other harm, allowing you to address the problem at the most convenient time.</p>
+
+<p>The interrupt-latency time monitor triggers anytime the timer interrupt is not allowed to run between two successive runs of the NMI handler. This happens when: </p>
+
+<ul>
+<li>Interrupts are disabled as by the CLI instruction.   <li>	Interrupts of higher priority run.
+  <li>End-of-interrupt is not signaled on the timer interrupt or any higher-priority interrupt. In this case, the timer interrupt is set at priority 2, as two critical interrupts are installed at priority 0 and 1. 
+</ul>
+
+<p>The timer interrupt is not able to interrupt the two critical handlers, so an error message is printed whenever these two handlers (and other code running with interrupt disabled) occupy the microprocessor between two or more runs of the NMI handler (250&micro;s).</p>
+
+<h3>Detailing WdMon</h3>
+
+<p>Considering the design of the interrupt-latency time monitor, it is relatively straightforward to implement the watchdog-toggle time monitor. The timing resolution needed is a thousand times lower, as the maximum toggle-time interval is set to 300 ms in this case, versus 250&micro;s for the maximum interrupt-latency time. Both the NMI handler and timer-interrupt handler are equipped with a counter to run this part of the handler once every four times, giving a resolution of 1 ms.</p>
+
+<p>You could argue that implementing the watchdog-toggle time monitor could be safely done using only the maskable timer interrupt, since a monitor for missed timer interrupts is already in place. By using both the NMI and timer interrupt, the implementation becomes independent of the interrupt-latency time monitor and serves as an example of how to roll your own software watchdog. The main advantage of using a software watchdog is that it is easy to adjust the time-out value. Using a short time-out value during development -- but shipping with a longer value -- gives you the margin. The main disadvantage of the software watchdog is that it can't perform the voltage supervision that most embedded systems need anyway.</p>
+
+<p>The watchdog-toggle time monitor (<a name="rl3"><a href="9706g.htm#l3">Listing Three</A>) runs one word-sized counter (<i>WatchdogCount</i>), which gets loaded with the time-out value (300) at every watchdog toggle and is decremented by the part of the NMI handler that runs every 1 ms. A value of FFFFh in the <i>WatchdogCounter</i> signals that the monitor is disabled, and the code skips everything. The same thing happens if the counter is at 0, since the error should be recorded only once. After decrementing the counter, the check for 0 is made, and the program-counter value is snatched from the stack if it is 0. Again, printing the error message is left to the timer interrupt to respect the critical sections of the program. </p>
+
+<p>If this was not only a monitor but a real software watchdog, a reset function could be called here. Notice that resetting only the microprocessor is, in many cases, not enough to get the program to work again, since a common problem is a "stuck" peripheral device/chip. Think of the watchdog as a device capable of returning the complete board to a known state, not only the microprocessor. I know it's impossible or impractical in many cases, but it's still a good starting point. The part of the monitor running in the timer-interrupt handler (<a name="rl4"><a href="9706g.htm#l4">Listing Four</A>) also runs every millisecond, and looks very much like the code used for the interrupt-latency time monitor.</p>
+
+<p>When the <i>WatchdogCounter</i> variable indicates the monitor has triggered on a time-out, the time-out value is reloaded. No toggle of the hardware watchdog is done here, as this would effectively disable the hardware watchdog. Since the hardware watchdog time-out is four times the monitor time-out, you might theoretically find four problem spots in the code before the hardware watchdog resets the system. Since printing the error message can be comfortably done within 250 ms, the monitor continues running while printing. The finished system would not require time for this, but it's a small margin.</p>
+
+<p>Toggling of the hardware watchdog is done through a function (<a name="rl5"><a href="9706g.htm#l5">Listing Five</A>) installed as software interrupt 63. First, the hardware port connected to the watchdog device is toggled. Next, the <i>WatchdogCounter</i> variable is reloaded with the time-out value if the monitor is not disabled or already timed-out. </p>
+
+<p>The nonpreemptive scheduler that runs the software in the satellite transceiver calls this interrupt only at every task shift. This ensures that no process runs longer than 300 ms before the monitor triggers, or longer than a second before the system is reset by the watchdog device.</p>
+
+<h3>Conclusion</h3>
+
+<p>With both monitors installed, problems are reported at the moment they occur. This is normally very convenient, but even though the problems are believed to be solved before the product ships, I recommend turning the monitor off anyway. A simple function can be installed as another software interrupt (72h) to turn the two monitors on and off under program control. This also means the monitors can easily be turned on manually, even in the shipped product (in case this capability should be needed for debugging on a released software version).</p>
+
+<p>Since the interrupt-latency time monitor runs only every 250&micro;s, you could argue that it really only guarantees that the maximum interrupt-latency time is below 500&micro;s. This is true, but since the test is performed continuously throughout the development cycle, chances are that any piece of code running with interrupts disabled for more than 250&micro;s will be found. Otherwise that code runs so seldom that it does not really matter.</p>
+
+<p>Systems that need interrupt-latency times in the order of 10-20 instructions (or less) will need another tool. The NMI handler will simply violate the requirement on its own, leaving no time for the real critical sections. You could use a logic analyzer to monitor the hardware interrupts, but it will only work for interrupts with associated hardware lines. Internal interrupts can't be measured that way. </p>
+
+<p>Virtually all embedded systems that need to run for extended periods of time need watchdogs. Shipping a product without a comfortable margin on the watchdog time-out can be dangerous. Verifying interrupt-latency time is difficult, but necessary. The toolsets I've presented here are simple, cost nothing, and accomplish important tasks that even $40,000 logic analyzers aren't capable of.</p>
+
+<p><b>DDJ</b></p>
+
+<H4><a name="l1">Listing One </H4>
+
+<pre>   MOV AL,[NmiIntFlag]      ; Get flag    CMP AL,3                ; Cleared by timer int?
+    JNZ @@GoOn              ; No, skip
+    MOV [NmiIntFlag],2      ; Yes, set again
+    JMP @@Exit              ; Done for now
+<p></p>
+    CMP AL,2                ; Already set by NMI?
+    JNZ @@Exit              ; No, Done for now
+    MOV [NmiIntFlag],1      ; Yes, set triggered!
+    MOV DX,[BP+4]           ; Get program pointer
+    MOV [NmiIntErrSeg],DX   ;  from the stack.
+    MOV DX,[BP+2]           ; Record segment
+    MOV [NmiIntErrOfs],DX   ;  and offset
+<p></p>
+<p></p>
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>    MOV AL,[NmiIntFlag]     ; Get flag    CMP AL,0                ; Off?
+    JZ  @@Exit              ; Yes, skip everything
+    CMP AL,1                ; Triggered?
+    JNZ @@Exit              ; No, skip 
+    MOV [NmiIntFlag],0      ; Set off
+    MOV BX,[NmiIntErrSeg]   ; Get segment
+    MOV CX,[NmiIntErrOfs]   ; Get offset
+    MOV AL,ERR_IntSlip      ; Get error code
+    CALL    WriteError      ; Write error message and address
+   MOV [NmiIntFlag],3       ; Set on again
+<p></p>
+<p></p>
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three</H4>
+
+<pre>    MOV AX,[WatchdogCount]    CMP AX,0FFFFh           ; Disabled?
+    JZ  @@Exit              ; Yes, skip
+    OR  AL,AH               ; Down?
+    JZ  @@Exit              ; Yes, skip
+    DEC [WatchdogCount]     ; Decrement count
+    JNZ @@Exit              ; If not 0, skip ahead
+    MOV DX,[BP+4]
+    MOV [NmiWdErrSeg],DX    ; Record segment
+    MOV DX,[BP+2]
+    MOV [NmiWdErrOfs],DX    ; Record offset
+<p></p>
+<p></p>
+</pre>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+<H4><a name="l4">Listing Four</H4>
+
+<pre>    MOV AX,[WatchdogCount]    OR  AL,AH                     ; Timed Out?
+    JNZ @@Exit                    ; No, skip
+    CMP AX,0FFFFh                 ; Off?
+    JZ  @@Exit                    ; Yes, skip
+    MOV [WatchdogCount],WDTIMEOUT ; Yes, restart
+    MOV BX,[NmiWdErrSeg]          ; Get segment
+    MOV CX,[NmiWdErrOfs]          ; Get offset
+    MOV AL,ERR_Watchdog           ; Get error code
+    CALL    WriteError            ; Write error message and address
+<p></p>
+<p></p>
+</pre>
+<P>
+<a href="#rl4">Back to Article</A>
+</P>
+<H4><a name="l5">Listing Five</H4>
+
+<pre>MOV DX,PDATA0                     ; Get I/O port addressIN  AX,DX
+    XOR AH,040h                   ; Toggle the WD port
+    OUT DX,AX
+CMP [WatchdogCount],0       
+    JZ  @@Exit                    ; Skip if timed out
+    CMP [WatchdogCount],0FFFFh
+    JZ  @@Exit                    ; Skip if OFF
+MOV [WatchdogCount],WDTIMEOUT     ; Set SW WD counter
+<p></p>
+<p></p>
+<p></p>
+<p></p>
+<P>
+<a href="#rl5">Back to Article</A>
+</P>
+<p><b>DDJ</b></p>
+
+
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

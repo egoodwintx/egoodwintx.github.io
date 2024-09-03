@@ -1,0 +1,771 @@
+<HTML>
+<HEAD><TITLE>DDJ, Spring1997: Listings</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+
+
+
+<H1>
+Extending Java Streams to Support Bit Streams</H1>
+<H3><i>by Laurence Vanhelsuw&eacute;</i></H3>
+
+<HR>
+<H2><A NAME="1"> Listing One  </A></H2>
+<PRE>
+import java.io.*;
+
+public class CharFreq {
+
+public static void main (String[] args) {
+InputStream file = null;
+int frequencies[] = new int[256];
+int ch;
+
+    if (args.length == 0) {
+        System.out.println("Usage: java CharFreq &lt;file&gt;");
+        System.exit(10);
+    }
+    try {
+        file = new FileInputStream(args[0]) );
+    } catch (FileNotFoundException unknownFile) {
+        System.out.println("'" + args[0] + "' could not be found.");
+        System.exit(100);
+    }
+    try {
+        while ( (ch = file.read()) != -1 ) {
+            frequencies[ ch ]++;
+        }
+    } catch (IOException error) {
+        System.out.println("An error occurred during reading: " + error);
+        System.exit(100);
+    }
+    try {
+        file.close();
+    } catch (IOException ignored) {}
+}
+} // End of Class CharFreq
+
+</PRE>
+
+<HR>
+<H2><A NAME="2"> Listing Two  </A></H2>
+<PRE>
+//---------------------------
+// Class BitStreamInputStream
+// --------------------------
+// Implements an enhanced InputStream which allows you to read a
+// stream of bit fields ranging in size from 1 bit (a true bit
+// stream) to 32 bits (a stream of integers). The size of the current
+// bitfield can be changed at any point while reading the stream.
+// (c) Laurence Vanhelsuwe 1996. E-Mail: LVA@telework.demon.co.uk
+//------------------------------------------------------------------
+
+import java.io.*;
+public class BitStreamInputStream extends FilterInputStream {
+final static int EIGHT = 8; // 8 bits per byte
+protected short buffer; // our BYTE bitstream read-ahead
+                        // buffer declared as short to cope with EOF
+protected int bitsInCache;  // how many unread bits left in our byte
+protected int fieldSize;    // current size of bitstream read fields
+
+//------------------------------------------------------------------
+public BitStreamInputStream(InputStream in) {
+
+    this(in, EIGHT);       // default to a normal byte stream
+}
+//------------------------------------------------------------------
+public BitStreamInputStream(InputStream in, int bitFieldSize) {
+    super(in);
+    setBitFieldSize(bitFieldSize);
+    bitsInCache = 0;        // we haven't got any cached bits
+}
+//------------------------------------------------------------------
+// Set the current bitfield size.
+//------------------------------------------------------------------
+public void setBitFieldSize(int bits) throws IllegalArgumentException {
+    if (bits&gt;32 || bits&lt;1) throw new IllegalArgumentException
+        (
+ "BitField size ("+ bits + ") no good. Has to be between 1 and 32."
+        );
+    this.fieldSize = bits;
+}
+//------------------------------------------------------------------
+public int getBitFieldSize() {
+    return this.fieldSize;
+}
+//------------------------------------------------------------------
+// Read a bitfield from the input stream. The number of bits read is
+// the current bitfield length. Bitfield can be on arbitrary bit boundaries.
+//------------------------------------------------------------------
+public long readBitField() throws IOException {
+
+int bitField;               // what we're going to return to caller
+int bitsToRead;             // remaining bits to assemble into BF
+int availableNumberOfBits;
+int OR_position;
+int rightAlignedBFPartial;
+    bitField    = 0;        // start with empty jigsaw
+    bitsToRead  = fieldSize;
+    OR_position = fieldSize;
+
+    while (bitsToRead &gt; 0) {
+        if (bitsInCache == 0) {
+            if ( (buffer = (short) in.read()) == -1) {
+                return -1;          // reached EOF
+            }
+            bitsInCache = EIGHT;    // we've got a full byte again
+        }
+        availableNumberOfBits = Math.min( bitsToRead, bitsInCache );
+        rightAlignedBFPartial = buffer &gt;&gt; (EIGHT - availableNumberOfBits);
+        // always keep next partial left aligned and clean
+        buffer &lt;&lt;= availableNumberOfBits;
+        buffer &amp;= 255;
+        OR_position -= availableNumberOfBits;
+        // add bitfield subfield
+        bitField |= rightAlignedBFPartial &lt;&lt; OR_position;
+        // track # of cached bits
+        // track how much left to do
+
+        bitsInCache -= availableNumberOfBits;
+        bitsToRead  -= availableNumberOfBits;
+    }
+    return bitField;
+}
+        //---------------------------------------------
+        // The remaining methods are methods we override
+        // from our parent class: FilterInputStream
+        //---------------------------------------------
+//------------------------------------------------------------------
+// Overridden read() still reads a byte, but on any bit boundary.
+//------------------------------------------------------------------
+public int read() throws IOException {
+int previousBFSize;
+int theByte;
+    previousBFSize = getBitFieldSize();
+    setBitFieldSize( EIGHT );
+    try {
+        theByte = (int) readBitField();
+    }
+    finally {
+        setBitFieldSize( previousBFSize );
+    }
+    return theByte;
+}
+//------------------------------------------------------------------
+// Override block read() methods to use basic read() as building block.
+// The implementation we want for this read() is the same as that
+// for class InputStream.
+// According to the Java language spec, two elegant (and short
+// solution should work:
+//   ((InputStream) this).read(..)      // i.e. a cast
+//   InputStream.read(..)               // i.e. fully specifiying
+// Unfortunately neither work, so I am forced to paste in the
+// original code for InputStream.read(byte b[], int off, int len).
+//------------------------------------------------------------------
+
+public int read(byte b[], int off, int len) throws IOException {
+
+    if (len &lt;= 0) {
+        return 0;
+    }
+    int c = read();
+    if (c == -1) {
+        return -1;
+    }
+    b[off] = (byte)c;
+    
+    int i = 1;
+    try {
+        for (; i &lt; len ; i++) {
+            c = read();
+            if (c == -1) {
+                break;
+            }
+            if (b != null) {
+                b[off + i] = (byte)c;
+            }
+        }
+    } catch (IOException ee) {}
+    return i;
+}
+//------------------------------------------------------------------
+// Overridden FilterInputStream.read(byte b[])
+//------------------------------------------------------------------
+public int read(byte b[]) throws IOException {
+    return read(b, 0, b.length);
+}
+//------------------------------------------------------------------
+// Overridden FilterInputStream.skip(long n)
+// If any client relies heavily on skipping multi-byte strings in
+// the bitstream, then this method has to be re-implemented to be more
+// efficient. Current implementation is functional but highly inefficient.
+//------------------------------------------------------------------
+public long skip(long n) throws IOException {
+long i;
+
+    for(i=0; i &lt; n; i++) {
+        if (read() == -1) break;
+    }
+    return i;
+}
+} // End of Class BitStreamInputStream
+
+</PRE>
+
+
+<HR>
+<H2><A NAME="3"> Listing Three </A></H2>
+<PRE>
+//----------------------------
+// Class BitStreamOutputStream
+// ---------------------------
+// Implements an enhanced OutputStream which allows you to write a
+// stream of bit fields ranging in size from 1 bit (a true bit
+// stream) to 32 bits (a stream of integers). The size of the current
+// bitfield can be changed at any point while writing the stream.
+// (c) Laurence Vanhelsuwe 1996. E-Mail: LVA@telework.demon.co.uk
+//------------------------------------------------------------------
+
+import java.io.*;
+
+public class BitStreamOutputStream extends FilterOutputStream {
+
+final static int EIGHT = 8;     // 8 bits per byte
+
+protected short buffer;         // our BYTE bitstream write buffer
+protected int bitsInCache;      // how many cached bits in our byte
+protected int fieldSize;        // current size of bitstream fields
+protected long maxFieldValue;   // max value that fits bitfield
+//------------------------------------------------------------------
+
+public BitStreamOutputStream(OutputStream out) {
+    this(out, EIGHT);           // default to a normal byte stream
+}
+//------------------------------------------------------------------
+public BitStreamOutputStream(OutputStream out, int bitFieldSize) {
+    super(out);                 // call FilterOutputStream constr.
+    setBitFieldSize(bitFieldSize);
+    bitsInCache = 0;            // we haven't got any cached bits
+    buffer      = 0;            // start w/ clean buffer (for ORs !)
+}
+//------------------------------------------------------------------
+public void setBitFieldSize(int bits) throws IllegalArgumentException {
+    if (bits&gt;32 || bits&lt;1) throw new IllegalArgumentException
+        (
+ "BitField size ("+ bits + ") no good. Has to be between 1 and 32."
+        );
+    this.fieldSize = bits;
+    this.maxFieldValue = (1L &lt;&lt; bits) - 1;  // precalc max bf value
+}
+//------------------------------------------------------------------
+public int getBitFieldSize() {
+    return this.fieldSize;
+}
+//------------------------------------------------------------------
+// Write a bitfield to the output stream. The number of bits written is
+// the current bitfield length. Bitfield can be on arbitrary bit boundaries.
+//------------------------------------------------------------------
+public void writeBitField(int bf) throws IOException {
+
+int bitsToWrite;            // how many bits left to write
+int capacity;               // how many bits fit in write buffer
+int partial, partialSize;   // partial bitfield and its size in bits
+int bfExtractPos;           // bitfield extract position (bit number)
+
+        // check that bitfield fits in current bitfield size
+    if (bf &gt; maxFieldValue ) {
+        throw new IllegalArgumentException
+            (
+     "Can not pack bitfield " + bf + " in " + fieldSize + " bits."
+            );
+    }
+    bitsToWrite  = fieldSize;
+    bfExtractPos = fieldSize;
+        // a single bitfield might have to be written out in several
+        // passes since the lot has to pass through the single byte
+        // write buffer. This inefficient situation is a result of
+        // the complex aligning required to append any bitfield to
+        // the currently written stream.
+    while (bitsToWrite &gt; 0) {
+        if (bitsInCache != EIGHT) {         // if capacity left
+            capacity = EIGHT - bitsInCache; // in write buffer...
+
+            partialSize = Math.min( bitsToWrite, capacity);
+            bfExtractPos -= partialSize;
+
+            partial = extract (bf, partialSize, bfExtractPos);
+            buffer |= partial &lt;&lt; (capacity - partialSize);
+            bitsToWrite -= partialSize;
+            bitsInCache += partialSize;
+        }
+        if (bitsInCache == EIGHT) {         // if write buffer full,
+            out.write((int) buffer);        // send it on its way
+            bitsInCache = 0;                // and continue with
+            buffer      = 0;                // clean buffer
+        }
+    }
+}
+//------------------------------------------------------------------
+// extract a bitfield of length 'bits' from an integer source.
+// bitfield starts at bit 'pos' and is returned right-aligned to bitpos 0
+//------------------------------------------------------------------
+private int extract (int source, int bits, int pos) {
+
+    source = source &gt;&gt; pos;     // align bitfield to bit 0
+    int mask = ~( (-1) &lt;&lt; bits);// create a mask to get clean bitfld
+    return source &amp; mask;       // return bitfield (0 bits padded)
+}
+        //---------------------------------------------
+        // The remaining methods are methods we override from
+        // our parent class: FilterOutputStream
+        //---------------------------------------------
+//------------------------------------------------------------------
+// Override write() method to write a byte on any bit boundary.
+//------------------------------------------------------------------
+public void write(int b) throws IOException {
+int previousBFSize;
+
+    previousBFSize = getBitFieldSize();
+    setBitFieldSize(EIGHT);
+    try {
+        writeBitField( b &amp; 0xFF );
+    }
+    // if writeBitField threw an exception, make sure we reset
+    // the current bitfield size before letting the exception thru
+    finally {
+        setBitFieldSize(previousBFSize);
+    }
+}
+
+//------------------------------------------------------------------
+// Override block write() methods to use basic write() as building block.
+//------------------------------------------------------------------
+public void write(byte b[], int off, int len) throws IOException {
+    for (int i = 0 ; i &lt; len ; i++) {
+        write(b[off + i]);
+    }
+}
+public void write(byte b[]) throws IOException {
+   write(b, 0, b.length);
+}
+
+//------------------------------------------------------------------
+// Override flush() method.
+//------------------------------------------------------------------
+public void flush() throws IOException {
+
+    // REFUSE to flush as this advances file pointer of underlying stream !
+}    
+//------------------------------------------------------------------
+// Override close() method to correctly flush any remaining bitfields
+// in write buffer before closing output chain.
+//------------------------------------------------------------------
+public void close() throws IOException {
+    if (bitsInCache != 0) {
+        out.write((int) buffer);
+    }
+    out.flush();
+    out.close();
+}    
+} // End of class BitStreamOutputStream
+</PRE>
+
+<HR>
+<H2><A NAME="4"> Listing Four </A></H2>
+<PRE>
+//-----------------------------
+// Class LZW (Lempel-Zif-Welch)
+// ----------------------------
+// This Java implementation of the LZW algorithm demonstrates the
+// use of the BitStreamInputStream and BitStreamOutputStream classes.
+// (c) Laurence Vanhelsuwe 1996  E-Mail: LVA@telework.demon.co.uk
+//------------------------------------------------------------------
+
+import java.io.*;
+
+//------------------------------------------------------------------
+public class LZW {
+
+protected LZWDictionary LZWdict;            // LZW look-up object
+protected       int bitFieldSize;           // current bitfield size
+protected final int STARTING_BF_SIZE = 9;
+
+//------------------------------------------------------------------
+// LZW compressor. For an explanation of the algorithm, see DDJ
+// October 1989.
+//------------------------------------------------------------------
+public boolean compress(InputStream plain, OutputStream compressed) {
+
+BufferedInputStream     b_in;   // these buffering streams are there
+BufferedOutputStream    b_out;  // purely to enhance I/O performance
+
+BitStreamOutputStream   out;    // the output stream for LZW data
+
+String  string, longerString;
+int     ch;
+    bitFieldSize = STARTING_BF_SIZE;
+
+
+    b_in    = new BufferedInputStream(plain);
+    b_out   = new BufferedOutputStream(compressed);
+
+    out     = new BitStreamOutputStream(b_out, bitFieldSize);
+
+    LZWdict = new LZWDictionary();
+
+    // STRING = get input character
+    try {
+        char initialChar = (char) b_in.read();
+        string = String.valueOf( initialChar );
+    
+        // WHILE there are still input characters DO
+        //   CHARACTER = get input character
+        while ( (ch = b_in.read()) != -1) {
+            longerString =  string + (char) ch;
+            // IF STRING+CHARACTER is in the string table THEN
+            if ( LZWdict.encountered(longerString) ) {
+                // STRING = STRING+character
+                string = longerString;
+            } else {
+                // output the code for STRING
+                // add STRING+CHARACTER to the string table
+                // STRING = CHARACTER
+                int code = LZWdict.stringCode(string);
+                try {
+                    out.writeBitField( LZWdict.stringCode(string) );
+                } catch (IllegalArgumentException bitFieldWontFit) {
+                    out.writeBitField( LZWDictionary.GROW_CODE );
+                    out.setBitFieldSize( ++bitFieldSize );
+                    out.writeBitField( LZWdict.stringCode(string) );
+                }
+                LZWdict.add(longerString);
+                string = String.valueOf( (char) ch);
+            }
+        }
+    // output the code for STRING
+    out.writeBitField( LZWdict.stringCode(string) );
+    } catch (Exception e) {
+        System.out.println("Exception: " + e);
+    }
+    try {
+        out.close();
+    } catch (Exception ignored) {}
+    return true;
+}
+//------------------------------------------------------------------
+// LZW decompressor. For an explanation of the algorithm, see DDJ
+// October 1989.
+//------------------------------------------------------------------
+public boolean decompress(InputStream compressedByteStream,
+                         OutputStream decompressed) {
+BufferedInputStream     b_in;
+
+BufferedOutputStream    b_out;
+BitStreamInputStream    in;
+DataOutputStream        out;
+
+long                    code;
+int                     oldCode, newCode;
+String                  string;
+char                    firstChar;
+
+    bitFieldSize = STARTING_BF_SIZE;
+
+    b_in    = new BufferedInputStream(compressedByteStream);
+    b_out   = new BufferedOutputStream(decompressed);
+
+    in      = new BitStreamInputStream(b_in, bitFieldSize);
+    out     = new DataOutputStream(b_out);
+    LZWdict = new LZWDictionary();
+
+    try {
+
+        // Read OLD_CODE
+        // output OLD_CODE
+    
+        oldCode = (int) in.readBitField();
+        out.write(oldCode);
+        firstChar = (char) oldCode;
+
+        // WHILE there are still input characters DO
+        while( (code = in.readBitField()) != -1) {
+            // Read NEW_CODE
+            newCode = (int) code;
+            switch (newCode) {
+                case LZWDictionary.GROW_CODE : 
+                    in.setBitFieldSize ( ++bitFieldSize );
+                    continue;       // carry on with while()
+            }
+            // STRING = get translation of NEW_CODE
+            string = LZWdict.codeString(newCode);
+            if (string == null) {
+                String prevString = LZWdict.codeString(oldCode);
+                string = prevString + firstChar;
+            }
+            // output STRING
+            out.writeBytes(string);
+    
+            // CHARACTER = first character in STRING
+            firstChar = string.charAt(0);
+    
+            // add OLD_CODE + CHARACTER to the translation table
+            String prevString = LZWdict.codeString(oldCode);
+            String compressedString = prevString + firstChar;
+            LZWdict.add(compressedString);
+  
+            // OLD_CODE = NEW_CODE
+
+            oldCode = newCode;
+    
+        } // End of while
+
+    } catch (Exception e) {
+        System.out.println("Exception: " + e);
+    }
+    try {
+        out.close();
+    } catch (Exception ignored) {}
+    return true;
+}} // End of Class LZW (Lempel-Zif-Welch)
+
+</PRE>
+
+<HR>
+<H2><A NAME="5"> Listing Five  </A></H2>
+<PRE>
+//--------------------
+// Class LZWDictionary
+// -------------------
+// This class encapsulates the core LZW string/compression code
+// associative data structure and its ADT manipulation methods.
+// (c) Laurence Vanhelsuwe 1996    email: LVA@telework.demon.co.uk
+//------------------------------------------------------------------
+
+import java.util.*;     // mainly for Hashtable
+
+//------------------------------------------------------------------
+class LZWDictionary {25
+
+
+private final static int ASCII_SET_SIZE = 256;
+private final static int COMMAND_CODES  = 1;
+private final static int FIRST_CODE     = ASCII_SET_SIZE + COMMAND_CODES;
+
+// List of command codes:
+public final static int GROW_CODE = FIRST_CODE - 1;
+
+protected Hashtable string2codeLUT;
+protected Hashtable code2stringLUT;
+protected int       nextCode;
+
+/------------------------------------------------------------------
+// LZWDictionary constructor
+// 1) create the two parallel string/code look-up tables
+// 2) initialize them to contain codes for every 8-bit ASCII char
+// 3) init compression code counter
+//------------------------------------------------------------------
+public LZWDictionary () {
+
+String string;      // the look-up table key
+Integer code;       // the look-up table value
+    string2codeLUT  = new Hashtable();
+    code2stringLUT  = new Hashtable();
+    for (int charCode=0; charCode &lt; ASCII_SET_SIZE; charCode++) {
+        string = String.valueOf( (char) charCode );
+        code   = new Integer(charCode);
+        string2codeLUT.put(string, code);
+        code2stringLUT.put(code, string);
+    }
+    nextCode = FIRST_CODE;
+}
+//------------------------------------------------------------------
+// Boolean function to determine whether a string sequence has
+// already been registered (and can therefore be compressed).
+//------------------------------------------------------------------
+public boolean encountered(String string) {
+    return string2codeLUT.containsKey(string);
+}
+//------------------------------------------------------------------
+// A new string needs to be recorded in the LZW dictionary.
+// The new string becomes associated with a unique compression code.
+// To be able to look up the code for a string and vice versa, two
+// Hashtable objects (containing essentially the same data) are
+// maintained and kept in sync.
+//------------------------------------------------------------------
+public void add(String string) {
+    Integer code = new Integer(nextCode);
+    string2codeLUT.put(string, code);
+    code2stringLUT.put( code, string);
+    nextCode++;
+}
+//------------------------------------------------------------------
+// Look up the compression code for a given string
+//------------------------------------------------------------------
+public int stringCode(String string) {
+Integer code;
+    code = (Integer) string2codeLUT.get(string);
+    return code.intValue();
+}
+//------------------------------------------------------------------
+// Look up a string associated with a given compression code
+//------------------------------------------------------------------
+public String codeString(int strCode) {
+Integer code;
+    code = new Integer(strCode);
+    return (String) code2stringLUT.get(code);
+}} // End of Class LZWDictionary
+</PRE>
+
+<HR>
+<H2><A NAME="6"> Listing Six  </A></H2>
+
+<PRE>
+//----------
+// LZWClient
+// ---------
+// Demonstration LZW (de)compressing utility which relies on the LZW
+// classes, which in turn build on the BitStream I/O classes.
+// (c) Laurence Vanhelsuwe 1996. E-Mail: LVA@telework.demon.co.uk
+//------------------------------------------------------------------
+
+import java.io.*;
+import java.util.*;
+
+
+public class LZWClient {
+
+private final static int ACTION_INVALID    = 0;
+private final static int ACTION_COMPRESS   = 1;
+private final static int ACTION_DECOMPRESS = 2;
+private final static String usage = 
+       "Usage: java LZW &lt;COMPRESS|DECOMPRESS&gt; &lt;file&gt;";
+public static void main (String[] args) {
+int action = ACTION_INVALID;
+
+    // need an action and filename as command line arguments
+    if (args.length != 2) {
+        System.out.println(usage);
+        System.exit(10);
+    }
+    // validate requested action
+    if (args[0].equals("COMPRESS")) {
+        action = ACTION_COMPRESS;
+    } else
+    if (args[0].equals("DECOMPRESS")) {
+        action = ACTION_DECOMPRESS;
+    }
+    switch (action) {
+        case ACTION_COMPRESS:
+            compressFile(args[1]); break;
+        case ACTION_DECOMPRESS:
+            decompressFile(args[1]); break;
+        case ACTION_INVALID:
+            System.out.println("Invalid action requested: " + args[0]);
+            System.out.println(usage);
+            System.exit(20);
+            break;                  // for consistency
+    }
+    System.out.println("LZWClient Done.");
+}
+//------------------------------------------------------------------
+// Compress a file to "compressed.out"
+//------------------------------------------------------------------
+protected static void compressFile( String filename ) {
+
+InputStream  inputFile      = null;
+OutputStream compressedFile = null;
+int originalSize, compressedSize;
+LZW lzw;
+    try {
+        inputFile = new FileInputStream( filename );
+
+        originalSize = fileLength( filename );
+    
+        lzw = new LZW();
+    
+        System.out.print("Compressing.."); System.out.flush();
+        compressedFile  = new FileOutputStream("compressed.out");
+    
+        Date timer = new Date();
+        lzw.compress(inputFile, compressedFile);
+    
+        compressedSize  = fileLength("compressed.out");
+        printCPS(timer, originalSize);
+    
+        printEfficiency(originalSize, compressedSize);
+
+    } catch (FileNotFoundException badFile) {
+        System.err.println("'" + filename + "' could not be found.");
+        System.exit(10);
+    } catch (IOException ioErr) {
+        System.out.println("IO Error: " + ioErr);
+        System.exit(10);
+    }
+}
+//------------------------------------------------------------------
+// Decompress a file to "original.out"
+//------------------------------------------------------------------
+protected static void decompressFile( String filename ) {
+
+InputStream  inputFile    = null;
+OutputStream restoredFile = null;
+int originalSize, compressedSize;
+LZW lzw;
+    try {
+        inputFile = new FileInputStream( filename );
+
+        lzw = new LZW();
+    
+        System.out.print("Decompressing.."); System.out.flush();
+        restoredFile = new FileOutputStream("original.out");
+    
+        Date timer = new Date();
+        lzw.decompress(inputFile, restoredFile);
+    
+        originalSize = fileLength("original.out");
+        printCPS(timer, originalSize);
+
+    } catch (FileNotFoundException badFile) {
+        System.err.println("'" + filename + "' could not be found.");
+        System.exit(10);
+    } catch (IOException ioErr) {
+        System.out.println("IO Error: " + ioErr);
+        System.exit(10);
+    }
+}
+//------------------------------------------------------------------
+// Utility function to determine a file's size
+//------------------------------------------------------------------
+public static int fileLength (String fileName) {
+File f;
+    f = new File(fileName);
+    return (int) f.length();
+}
+//------------------------------------------------------------------
+// Determine and print how well we've compressed a file
+//------------------------------------------------------------------
+public static void printEfficiency(int original, int compressed) {
+double percent;
+    percent         = 100.0 * ((double)compressed)/(double)original;
+    System.out.println("Original size   : " + original);
+    System.out.println("Compressed size : " + compressed);
+    System.out.println("% of original   : " + percent + "%");
+}
+//------------------------------------------------------------------
+// Determine and print how fast we've (de)compressed a file
+//------------------------------------------------------------------
+public static void printCPS( Date then, int numBytes) {
+double ms, cps;
+    ms  = (double) ( (new Date()).getTime() - then.getTime() );
+    cps = 1000.0 * ((double) numBytes) / ms;
+    System.out.println(" (at " + cps + " bytes per second)");
+}
+} // End of Class LZWClient
+
+End Listings
+</PRE>
+
+
+
+</BODY>
+</HTML>
+

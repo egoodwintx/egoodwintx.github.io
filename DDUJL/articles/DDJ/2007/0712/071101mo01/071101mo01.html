@@ -1,0 +1,332 @@
+<html>
+<head>
+<title>Query  Anything with SQLite</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> December 2007</p>
+
+<h1>Query Anything with SQLite</h1>
+<h2>Virtual tables are the foundation of  powerful features</h2>
+
+
+<h3>By Michael Owens</h3>
+
+
+<I>Michael is a  programmer and the author of the Apress book The Definitive Guide to SQLite. He can be contacted at mikeowens@gmail.com.</I>
+
+<hr>
+
+
+
+
+<p>SQLite is an embedded relational database engine implemented in ANSI C. It supports a large subset of ANSI SQL and many other features common to relational databases such as triggers, indexes, and auto-increment primary keys. It is known for its small size (256 Kb), reliability, ease-of-use, and elegant design. Also, SQLite's code is public domain and can be used free of charge for any purpose. SQLite (www.sqlite.org) is used in a variety of software, such as Mozilla Firefox, PHP5, Google Gears, and Adobe AIR, as well as embedded devices such as cell phones using Symbian OS.</p>
+
+<p>SQLite has a number of unique features, one of the most interesting of which is virtual tables. With virtual tables, you query not only what is in a database, but what is outside of it as well. For instance, with a little coding, you could use SQLite to search through your filesystem and issue queries such as:</p>
+
+<ul>
+  </ul>
+
+<pre class="code">
+create virtual table fs using filesystem;
+SELECT 
+  prot, uid, gid, size/(1024*1024)      as 'size (Mb)', 
+  dev, path || '/' || name as file from fs 
+WHERE 
+  path = '/usr/lib'
+  AND name like '%.so'"
+  AND size &gt; 1024*1024*4 
+ORDER BY size desc;  
+
+</pre>
+
+
+<p>You could also write a virtual table to read your log files or filter SNMP data. Basically, anything your program can parse, read, or grab is fair game.</p>
+
+<p>In this article, I present a virtual table that interfaces with the filesystem. It uses the Apache Portable Runtime, which enables it to work with multiple operating systems. Because SQLite is portable, it only makes sense to try to keep virtual tables portable as well, and the APR is helpful in this regard.</p>
+
+
+<h3>The API</h3>
+
+<p>You implement a virtual table using three structures. The first is the module structure, which is an array of function pointers. These are callbacks you implement to let SQLite operate on your table as if it were a native table. Some of these functions are mandatory, many are optional. For example, if you don't need to support transactions, you don't have to implement the related functions. You just set the respective callbacks to null.</p>
+
+<p>Listing One is the callback structure for our virtual table. The other two structures are the vtable and cursor structures (Listing Two).</p>
+
+
+<pre class="code">
+static sqlite3_module example_module = 
+{
+    0,              /* iVersion */
+    vt_create,      /* xCreate       - create a vtable */
+    vt_connect,     /* xConnect      - associate a vtable with a connection */
+    vt_best_index,  /* xBestIndex    - best index */
+    vt_disconnect,  /* xDisconnect   - disassociate a vtable with a connection */
+    vt_destroy,     /* xDestroy      - destroy a vtable */
+    vt_open,        /* xOpen         - open a cursor */
+    vt_close,       /* xClose        - close a cursor */
+    vt_filter,      /* xFilter       - configure scan constraints */
+    vt_next,        /* xNext         - advance a cursor */
+    vt_eof,         /* xEof          - indicate end of result set*/
+    vt_column,      /* xColumn       - read data */
+    vt_rowid,       /* xRowid        - read data */
+    NULL,           /* xUpdate       - write data */
+    NULL,           /* xBegin        - begin transaction */
+    NULL,           /* xSync         - sync transaction */
+    NULL,           /* xCommit       - commit transaction */
+    NULL,           /* xRollback     - rollback transaction */
+    NULL,           /* xFindFunction - function overloading */
+};
+
+</pre>
+<div class="caption">
+   Listing One
+</div>	
+	
+
+<pre class="code">
+/* vtab: represents a virtual table. */
+struct vtab
+{
+    sqlite3_vtab base;
+    sqlite3 *db;
+};
+/* vtab: represents a singe cursor with which it iterate over the virtual table. */
+struct vtab_cursor
+{
+    sqlite3_vtab_cursor base;
+};
+
+</pre>
+<div class="caption">
+   Listing Two
+</div>	
+	
+
+
+<p>Because all of the callback functions use pointers to reference these structures, you are free to extend them. SQLite only needs the <i>sqlite_vtab</i> and <i>sqlite3_vtab_cursor</i> portions of the structures to operate.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Initialization</h3>
+
+<p>The first callback function to implement is <i>xCreate()</i>, which creates the virtual table. This is called once&#151;specifically, when the first database connection declares the virtual table via the CREATE VIRTUAL TABLE statement.</p>
+
+<p><i>xCreate()</i>'s job is to set up the virtual table environment and initialize any necessary resources. The implementation (<i>vt_create()</i>) is in Listing Three. It allocates a <i>vtab</i> <i>struct</i> and passes it back to SQLite using the <i>vtable</i> pointer reference it passes in (<i>pp_vt</i>). SQLite also passes in a reference to the database connection, so you store a reference to it in your <i>vtab</i> structure. In so doing, SQLite has a reference to a new <i>vtab</i> <i>struct</i>, which in turn has a reference to the database connection.</p>
+
+<p>In addition to allocating a <i>vtab</i> structure, <i>vt_create()</i> also declares the table using <i>sqlite3_declare_table()</i>, passing SQLite the SQL (DDL) defining the virtual table's schema. Here, the SQL is contained in the global variable DDL in Listing Four (available online; see <a href="http://www.ddj.com/code/">www.ddj.com/code/</a>).</p>
+
+<p>The <i>xDestroy() </i>function is essentially the reverse of this <i>xCreate()</i> process, and is called to clean up the resources associated with the virtual table.</p>
+
+	
+
+<pre class="code">
+static int vt_create( sqlite3 *db, void *pAux, int argc, const char *const*argv,
+                      sqlite3_vtab **pp_vt, char **pzErr )
+{
+    int rc = SQLITE_OK;
+    vtab* p_vt;
+    /* Allocate the sqlite3_vtab/vtab structure itself */
+    p_vt = (vtab*)sqlite3_malloc(sizeof(*p_vt));
+
+    if(p_vt == NULL) {
+        return SQLITE_NOMEM;
+    }
+    p_vt-&gt;db = db;
+    apr_pool_create(&amp;p_vt-&gt;pool, NULL);
+    /* Declare the vtable's structure */
+    rc = sqlite3_declare_vtab(db, ddl);
+    /* Success. Set *pp_vt and return */
+    *pp_vt = &amp;p_vt-&gt;base;
+    return SQLITE_OK;
+}</pre>
+<div class="caption">
+   Listing Three
+</div>	
+	
+
+<p>The <i>xConnect()</i> and <i>xDisconnect() </i>functions are similar to <i>xCreate()/xDestroy() </i>with one exception. <i>xCreate() and xDestroy() </i>are designed to do one-time initialization/destruction of the virtual table, while <i>xConnect() and xDisconnect()</i> are intended to connect/disconnect a database with an existing virtual table. The distinction only matters if you have shared resource(s) associated with the virtual table that must be available to all database connections. If you don't have any, then these functions are essentially identical.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>Querying</h3>
+
+<p><i>xOpen()</i> is called when SQLite opens a cursor on a virtual table and prepares to iterate over it. <i>xOpen()</i> more or less just allocates a cursor object and passes it back. Similarly, when SQLite is done iterating over the table, it uses <i>xClose()</i> to clean up the cursor.</p>
+
+<p>All of this so far is intuitive. The query process, however, is more involved.</p>
+
+<p>SQLite's query process consists of three phases: compilation, execution, and finalization. The virtual table module interface addresses all three.</p>
+
+<p>In compilation (when you call <i>sqlite3_prepare()</i>), SQLite calls <i>xBestIndex()</i>. This is where you can, to a degree, tell SQLite about certain optimizations that can be made to narrow the size of the result set. </p>
+
+<p>In execution, SQLite calls <i>xFilter()</i> to initiate the search, followed by <i>xNext()</i> to iterate over each row of the result <i>set. xNext()</i> is called as a result of calling <i>sqlite3_step()</i>. <i>xColumn()</i> provides the values of each column of the current row. <i>xColumn()</i> is called as a result of calling one of the <i>sqlite3_column_xxx()</i> functions. SQLite uses <i>xRowid() </i>to obtain the primary key value for any given row, and <i>xEof()</i> to tell whether it has reached the end of the result set.</p>
+<h3>Using Indexes</h3>
+
+<p>Without <i>xBestIndex()</i>, the query process is really just a glorified <i>for</i> loop that iterates over the same set of data each time. In this case, it would just be a matter of starting at the root filesystem and recursively descending into each directory until you reach the end.</p>
+
+<p>In this case, however, it would be horrible performance-wise to have to search the entire filesystem every time you did a query. What if you only wanted to search your home directory? It would be a complete waste of time for the virtual table to search every other directory outside of it as part of the search. This is where <i>xBestIndex()</i> comes in.</p>
+
+<p>In some ways, <i>xBestIndex()</i> may be the most important part of the virtual table implementation. It is the only place where you can really dramatically reduce the size of your search path. And it may strongly influence the rest of your implementation, such as the contents of your <i>vtab</i> and cursor structures. Therefore, this is the area where we want to concentrate.</p>
+
+<p><i>xBestIndex()</i> and <i>xFilter()</i> work together, implementing a specific protocol whereby a set of columns can be identified as indexes. <i>xBestIndex()</i> works at query compile time and identifies the columns to be used as indexes. <i>xFilter()</i> works at runtime and obtains the constraint values for those columns.</p>
+
+<p>To start, the <i>xBestIndex()</i> implementation is given by <i>vt_best_index(</i>), whose declaration is:</p>
+
+
+
+<pre class="code">
+static int vt_best_index(sqlite3_vtab 
+                         *tab, sqlite3_index_info *p_info)
+
+</pre>
+<p>SQLite passes <i>xBestIndex()</i> a reference to a <i>sqlite3_index_info</i> structure (<i>p_info</i>), which contains extensive information on the compiled query. This structure is organized into input and output sections. The input is an array of <i>sqlite3_index_constraint</i> pointers (Listing Five, available online). The output is an array of <i>sqlite3_index_constraint_usage</i> pointers (Listing Six, available online).</p>
+
+<p>The <i>aConstraint</i> and <i>aConstraintUsage</i> contain the same number of elements, and each of their elements corresponds to the other. That is, <i>aConstraintUseage[i]</i> and <i>aConstraint[i]</i> both refer to the same column.</p>
+
+<p>Consider the query:</p>
+
+<p> </p>
+
+<pre class="code">
+SELECT * from fs WHERE name=   'foo' AND path='/var/log'
+
+</pre>
+<p>The constraint <i>name='foo' AND path='/var/log'</i> would be represented in <i>xBestIndex() </i>as:</p>
+
+<ul>
+  </ul>
+
+<pre class="code">
+p_info-&gt;aConstraint[0].iColumn = 0
+p_info-&gt;aConstraint[0].op      =    SQLITE_INDEX_CONSTRAINT_EQ
+
+p_info-&gt;aConstraint[1].iColumn = 1
+p_info-&gt;aConstraint[1].op      =    SQLITE_INDEX_CONSTRAINT_EQ
+
+</pre>
+<p>In this case, the <i>name</i> column is referenced in <i>aConstraint[0]</i>. We know it is the <i>name</i> column because its ordinal is 0 (given by <i>aConstraint[0].iColumn</i>), and according to our table schema, column ordinal 0 corresponds to <i>name</i>. The same follows for <i>path</i>. Furthermore, we are given the relational operator used in the expression as well. These operators are: </p>
+
+
+
+<pre class="code">
+#define SQLITE_INDEX_CONSTRAINT_EQ    2
+#define SQLITE_INDEX_CONSTRAINT_GT    4
+#define SQLITE_INDEX_CONSTRAINT_LE    8
+#define SQLITE_INDEX_CONSTRAINT_LT    16
+#define SQLITE_INDEX_CONSTRAINT_GE    32
+#define SQLITE_INDEX_CONSTRAINT_MATCH 64
+
+</pre>
+<p>Thus, we have the flexibility of choosing not only the column of interest, but the equality conditions under which it is being used.</p>
+
+<p>Here, <i>xBestIndex()</i> reads through the inputs (<i>p_info-&gt;aConstraint[]</i>) and specifies which columns it wants to use in the output (<i>p_info-&gt;aConstraintUsage[]</i>). To use both columns as indexes in <i>xFilter()</i>, you would do this in <i>xBestIndex()</i>:</p>
+
+<pre class="code">
+p_info-&gt;aConstraintUsage[0] = 1
+p_info-&gt;aConstraintUsage[1] = 2
+
+</pre>
+<p>The values assigned to the <i>aConstraintUsage[]</i> elements are significant. They specify the order in which they are passed to <i>xFilter()</i>. In the example, this says "pass <i>xFilter()</i> the <i>name</i> column first, then the <i>path</i> column." </p>
+
+<p>To understand how this works, you need to know a little about <i>xFilter()</i>. The declaration of <i>xFilter()</i> is as follows:</p>
+
+
+
+<pre class="code">
+  static int vt_filter     ( sqlite3_vtab_cursor *p_vtc,
+int idxNum, const char *idxSint    argc, sqlite3_value **argv );
+
+</pre>
+<p>The values from <i>xBestIndex()</i> are passed via the <i>argc</i> and <i>argv</i> arguments. <i>argc</i> contains the size of <i>argv</i>, and <i>argv</i> values themselves. The order of the values in <i>argv</i> follows the order specified in <i>p_info-&gt;aConstraintUsage</i> in <i>xBestIndex()</i>. So, in our example above, <i>argc</i> will be 2 and <i>argv</i> will be as follows:</p>
+
+<pre class="code">
+argv[0] = 'foo'
+argv[1] = '/var/log'
+
+</pre>
+<p>Now that <i>xFilter()</i> has this information, its job is to set up the cursor object so it can iterate through a specific set of data. In this case, we know that since <i>path='/var/log'</i>, we will be limiting our search to just that directory (and not searching the whole filesystem). From that point forward, the cursor basically holds the state and iterates through all the files and directories in <i>/var/log</i>. The implementation is straightforward&#151;it's just a standard recursive directory search using the APR library.</p>
+
+
+
+
+
+
+
+
+
+<h3>The match() Function</h3>
+
+<p>Here's where things get tricky. Consider the query:</p>
+
+
+
+<pre class="code">
+SELECT * FROM fs WHERE    path='/var/log' OR      path='/usr/lib';
+
+
+</pre>
+<p>What happens here? Well, you might think that you simply intercept the <i>path</i> column in <i>xBestIndex()</i> and pass it on to <i>xFilter()</i>, but as it turns out SQLite never calls <i>xBestIndex()</i> here.</p>
+
+<p>Why? Because <i>xBestIndex()</i> is subject to SQLite's index conditions just like any other query. There are times when SQLite will use indexes, and times when it will use sequential scans. When you use OR for multiple constraints on a given column, SQLite uses a sequential scan. That puts us right back into the situation where we have to search the whole filesystem again, instead of just two directories.</p>
+
+<p>Fortunately, there is a way around this&#151;the <i>match()</i> function. If you notice , one of the defined relational operators is SQLITE_INDEX_CONSTRAINT_MATCH. So for example, if we recast the aforementioned query to</p>
+
+
+
+<pre class="code">
+SELECT * from fs WHERE path    match('/var/log', '/usr/lib');
+
+</pre>
+<p>then SQLite calls <i>xBestIndex()</i> with the <i>path</i> column, and specifies that the SQLITE_INDEX_CONSTRAINT_MATCH operator was used. This is our solution.</p>
+
+<p>To do this, however, you must register a function to handle the <i>match()</i> SQL function. By default it is unimplemented and will trigger an error if you try to use it. To register it, we use the <i>xFindFunction()</i> callback, which we implement as <i>vt_find_function() </i>(Listing Seven, also available online).</p>
+
+<p>When a SQL function uses a column from a virtual table, SQLite calls <i>xFindFunction()</i> to give the virtual table an opportunity to overload the function. The first three parameters are inputs: the virtual table, the number of arguments to the function, and the name of the function. To overload the function, <i>xFindFunction()</i> passes a function pointer back via <i>*pxFunc</i> (and any user data via <i>*ppArg</i>) and returns 1. If it doesn't want to overload it, then <i>xFindFunction()</i> simply returns 0.</p>
+
+<p>In this case, you just want SQLite to see <i>match()</i> as a valid function so it will use <i>xBestIndex()</i>. You don't really care what <i>match()</i> does. In fact, our implementation of <i>match</i> always returns <i>true</i> (meaning everything matches no matter what). What matters here is that you get the values of <i>match()</i> into <i>xFilter()</i> so you can narrow your search path. So what you look for in <i>xBestIndex() </i>is any column whose ordinal is 1 (<i>p_info-&gt;aConstraint[x].iColumn == 1</i>) and whose relational operators are equality (SQLITE_INDEX_CONSTRAINT_EQ) or match (SQLITE_INDEX_CONSTRAINT_MATCH). If you see that, then you pass that column on to <i>xFilter()</i>.</p>
+
+<p>So <i>xFilter()</i> simply looks for a string containing one or more paths in <i>argv</i>. In the example, <i>argc</i> is <i>1</i> and <i>argv</i> will be: </p>
+
+
+
+<pre class="code">
+argv[0] = "'/var/log','/usr/lib'"
+
+</pre>
+<p>It is your responsibility to interpret the argument passed to <i>match()</i>. Thus, you have to parse the string looking for paths. In this implementation, I use the convention that paths are separated by commas. I parse everything between commas and build a list of directories to search. This is then stored in the cursor structure. The search works just as before, except instead of recursively searching one directory, I search multiple directories. The search logic is the same, I just repeat it for every directory passed into <i>match()</i>.</p>
+
+<p>Again, for each row in the result set, SQLite calls <i>xColumn() </i>to get at the values for each row in the result set. It passes <i>xColumn()</i> the ordinal of the column whose value is to return. To fulfill the request, you just implement a switch statement covering all ordinals in our virtual table, passing back the appropriate value for each column. This works similar to SQLite's user-defined function interface.</p>
+
+<p>This then is the basic workings of an optimized virtual table. The full implementation is given in the file fs.c (available online; see <a href="http://www.ddj.com/code/">www.ddj.com/code/</a>). Additionally, there is a stripped down, bare-bones virtual table that does nothing in the file example.c.</p>
+
+
+<h3>Conclusion</h3>
+
+<p>While powerful in themselves, virtual tables are the foundation of some of SQLite's larger features, such as full text search (FTS). Even more powerful is the idea that you can join virtual tables like any other tables, thus cross referencing disparate information. Also, you can use virtual tables as a way to aggregate information. You could, for example, use the filesystem table to generate a reference list of all files in the filesystem, and then issue queries each day to scan for changes. The possibilities abound. With virtual tables, the world is your database.</p>
+
+
+
+
+</body>
+</html>

@@ -1,0 +1,363 @@
+<HTML>
+<META NAME="year" CONTENT="1994">
+<HEAD>
+<TITLE>JUN94: Optimizing MC68882 Code</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Optimizing MC68882 Code<a name="01bd_0003"></h1><P>
+<h2><a name="01bd_0001"><a name="01bd_0000">Squeezing more performance out of pipeline architectures</h2><P>
+<h3>Gary McGrath</h3><P>
+<p><i><a name="01bd_0002"><a name="01bd_0000">Gary has a PhD in physics and is currently working on the B factory at the Stanford Linear Accelerator Center. He can be reached at mcgrath@slac.stanford.edu.</i></p><hr><P>
+The MC68882 floating-point coprocessor (FPCP) adds 46 instructions to the MC68020/030 32-bit microprocessor, substantially increasing the speed of floating-point calculations. The FPCP implements the ANSI-IEEE 754-1985 binary floating-point arithmetic standard and performs calculations in 80-bit extended precision (64-bit mantissa, sign bit, and 15-bit signed exponent), as well as six other formats: byte, word, long word, single, double, and packed decimal. Along with implementing floating-point calculations in hardware, the FPCP performs many of its calculations concurrently with the MPU for additional speed benefits.<P>
+In short, the FPCP is a powerful addition to the MPU, not only because of their parallel operation, but because of the FPCP's pipeline architecture. The use of a pipeline allows certain instructions to execute either partially or fully concurrently within the FPU itself. Thus, efficient programs not only take advantage of the coprocessor, but follow a few basic rules that ensure optimal use of the pipeline. This article examines how certain instruction combinations are faster than others, and how to use that knowledge when programming the FPU.<P>
+<h3><a name="01bd_0004">Programming Model<a name="01bd_0004"></h3><P>
+The MC68882 maintains the sequential- programming model of its predecessor, the MC68881. Although instructions can execute either partially or fully concurrently through the pipeline, a coprocessor interface register (CIR) ensures that, if a certain result is required, that instruction will complete before the next instruction begins. This makes the MC68882 completely downward compatible with the MC68881, while still providing the opportunity for enhanced performance.<P>
+The FPU has eight 80-bit floating-point user registers (FP0--FP7) that always contain extended precision numbers, a control register (FPCR), a status register (FPSR), and an instruction-address register (FPIAR). Instructions can operate directly to memory or to user registers, and most speed optimizations result from properly utilizing the user registers to minimize memory accesses; this is accomplished by keeping the most-frequently accessed variables in registers. In addition to providing user registers for frequently used variables, the FPU provides many frequently used constants in on-chip ROM that can be moved directly into a register, which is much faster than moving them from memory.<P>
+The FPU utilizes a conversion unit (CU) to operate on and return data in seven formats (B,W,L,S,D,X,P). Moreover, a floating-point formatted number can appear as normalized, denormalized, zero, infinity, or not-a-number (NaN). Because the calculations are performed internally in extended precision, variables are kept in the extended-precision format to minimize the number of format conversions, and this often results in speed gains.<P>
+Writing FPU code directly in assembly language permits many speed and code-size optimizations. For instance, you can often make better use of registers than possible with compiler-generated code. There are also many peephole optimizations which come to light in assembly language; for example, replacing <I>fsin</I> and <I>fcos</I> combinations with <I>fsincos</I> is difficult--if at all possible--in a high-level language, yet trivial in assembly.<P>
+<h3><a name="01bd_0005">MC68882-Specific Optimizations<a name="01bd_0005"></h3><P>
+Beyond the usual advantages of assembly-language programming, the MC68882 architecture benefits from code written specifically to maximize use of the pipeline. There are several general techniques for making sure the code is properly written, including unrolling loops, eliminating register conflicts, utilizing FPU instruction concurrency, and achieving concurrency with the MPU.<P>
+To quantize the differences in execution times for different instruction combinations, you can measure times directly or calculate them from a table of execution times.<B> </B><a href="#01bd_000c">Table 1</A> is a partial list of execution times for the instructions used in this article; the complete listing is available in <I>MC68881/MC68882 Floating-Point Coprocessor User's Manual</I> (Prentice Hall, 1989). The times are expressed in clock cycles and separated into two categories: head times and tail times.<P>
+The head times in <a href="#01bd_000c">Table 1</A> combine all the times for pipeline units that can operate concurrently with the arithmetic-processing unit (APU); the tail gives the time for the APU execution itself. If there are no conflicts, parallel execution effectively eliminates the HEAD time, up to a maximum of the preceding tail. In other words, as long as the result is needed, the pipeline units will begin working on the next instruction while the APU is busy. This ability to perform parallel execution is the basis for all pipeline optimizations. Four specific programming techniques can greatly improve the pipeline efficiency for many routines.<P>
+<h3><a name="01bd_0006">Eliminate Register Conflicts<a name="01bd_0006"></h3><P>
+Eliminating register conflicts is the most important technique for improving pipeline efficiency, as it is necessary for the other techniques to work. A register conflict occurs when the destination register is the source register of the next concurrent instruction. Because the MC68882 adheres to a sequential programming model, register conflicts force the second instruction to wait for the first to complete, thereby foregoing the savings from the concurrency for concurrent instructions. As evident from <a href="#01bd_000c">Table 1</A>, register conflicts can increase the time for an instruction like <I>fadd </I>from 35 to 56 cycles. For fully concurrent instructions like <I>fmove</I>, the difference is 100 percent, as the instruction was otherwise free.<P>
+Unfortunately, register conflicts are common because of the tendency to program linearly, which results in instructions that depend on the immediate results of their predecessors. For example, if two <I>fadd</I> instructions occur sequentially, the second instruction typically depends on the result from the first; see <a href="#01bd_000d">Example 1(a)</A>. Therefore, the second instruction must wait for the first to complete. If the second instruction were to instead utilize registers that are not in conflict, then the result would be as in <a href="#01bd_000d">Example 1(b)</A>.<P>
+Once the CU and bus-interface unit (BIU) finish with FP0, the CPU hands off the data to the APU, and the MPU can launch the next instruction. That next instruction puts FP2 through the CU and BIU, after which it waits for the APU to become free; thus, the effective head time is 0. All in all, the second instruction pair is approximately 16 percent faster than the first.<P>
+<h3><a name="01bd_0007">Unroll Loops<a name="01bd_0007"></h3><P>
+A normal loop contains instructions that operate once during each indexed iteration, and unrolling these loops is one of the best optimizations for creating efficient MC68882 code. The primary reason why loop unrolling is associated with more efficient code is that it allows one to better perform the other optimizations, like eliminating register conflicts and maximizing <I>fmove</I> concurrency. In addition, the unrolled version usually has fewer or less-complex instructions because some of the index-addressing calculations have been eliminated.<P>
+Because loop unrolling seeks to minimize pipeline stalls, fewer branching instructions are associated with the unrolled version, which leads to fewer pipeline stalls--an additional benefit. When the MPU or FPU comes to a branch instruction, it must flush the pipeline by waiting for the instructions currently executing to finish. Thus, tight loops usually result in inefficient use of the pipeline, because the pipeline is flushed for each index value, so eliminating branching <P>instructions like <I>dbra</I> can be especially <P>beneficial.<P>
+Unrolling a loop is trivial if the loop index runs over a fixed range of values, without variation. For example, if a routine were to total the elements of a three-dimensional vector, it might take the form of a small loop. The rolled loop might look like <a href="#01bd_000e">Example 2(a)</A>, and the unrolled like <a href="#01bd_000e">Example 2(b)</A>. The unrolled version better utilizes the pipeline and eliminates the branching instruction.<P>
+<h3><a name="01bd_0008">Maximize FPU Concurrency<a name="01bd_0008"></h3><P>
+Once pipeline concurrency is available, proper instruction placement can further maximize the concurrency. As evident from <a href="#01bd_000c">Table 1</A>, the <I>fmove</I> instructions will execute fully concurrently with others if there are no register conflicts. In <a href="#01bd_000f">Example 3(a)</A>, the <I>fmove</I> execution occurs sequentially. However, eliminating the register conflict, as in <a href="#01bd_000f">Example 3(b)</A>, permits the <I>fmove</I> to execute concurrently, making the second segment 29 percent faster.<P>
+To best use this concurrency, it is beneficial to rearrange code so that the longest <I>fmove</I> instructions follow the longest arithmetic instructions; doing so minimizes the chance of the APU completing before the <I>fmove</I> finishes.<P>
+Code written to follow the logical order of an operation often results in like instructions being grouped. In <a href="#01bd_0010">Example 4(a)</A>, unrolling a routine that normalizes a three-dimensional vector leaves such a grouping. Unfortunately, the ordering of these instructions stalls the pipeline in a few places, as the next instruction waits for the previous to finish. However, vector operations naturally lend themselves to concurrency optimizations, as the grouped instructions seldom rely upon one another. For instance, the execution time of <a href="#01bd_0010">Example 4(a)</A> can be reduced by alternating between mathematical operations and the <I>fmove</I> instructions, while still minimizing register conflicts. Applying this technique to <a href="#01bd_0010">Example 4(a)</A> yields <a href="#01bd_0010">Example 4(b)</A>.<P>
+Switching around a few lines lets a few more <I>fmove</I> instructions be executed in parallel with the APU. A timing profile indicates that this simple trick yielded a routine that is approximately 11 percent faster than its predecessor; at the same time, the readability of the source code is not dramatically impaired.<P>
+<h3><a name="01bd_0009">Utilizing MPU Concurrency<a name="01bd_0009"></h3><P>
+<a href="#01bd_0011">Example 5</A> demonstrates how code is written so that like instructions are clustered together. For instance, FPU instructions tend to appear sequentially with other FPU instructions. Since the execution times for FPU instructions tend to be much longer than those for the MPU, the MPU is usually underutilized through a block of FPU instructions, unless those instructions require complex memory-address calculations--the MPU performs address calculations for the FPU. After the MPU launches an FPU instruction and performs the necessary address calculations, it is idle and ready to execute the next instruction. If that instruction is for the FPU, it must wait for the FPU to request it; otherwise it may proceed and execute the next MPU instruction.<P>
+If the FPU instruction is time consuming, as almost all of them are, there is ample time for the MPU to complete at least one MPU instruction between FPU instructions. Therefore, one can globally minimize a program's execution time by maximizing FPU/MPU concurrency. To utilize this concurrency, you must rearrange instructions so that the code alternates between MPU and FPU instructions as much as possible. Moreover, an ideal optimization would pair the longest MPU instruction just after the longest FPU instructions.<P>
+Although time matching is seldom feasible, the basic interleaving of instructions will shield a large fraction of the MPU instruction times from the overall execution time, because they will be performed in what was previously idle time. As a simple example of this, you can insert MPU instructions between two long FPU instructions; see <a href="#01bd_0011">Example 5(a)</A>. Execution time does not change if two average-length MPU instructions are put in between, as in <a href="#01bd_0011">Example 5(b)</A>, demonstrating that many MPU instructions can be executed for free, if they occur in the right place. Although these situations are somewhat rare, sizable gains are possible for the few occasions that arise.<P>
+<h3><a name="01bd_000a">The Net Effect<a name="01bd_000a"></h3><P>
+Reductions in execution time are made possible by following a few simple rules to best utilize the MC68882 pipeline, but the examples given thus far only hint at some of the possibilities. Therefore, we'll examine the net effect of the various techniques on a larger routine: a three-dimensional, vector-rotating routine optimization.<P>
+<a href="#01bd_0012">Listing One</A> (page 98) shows a simple vector-rotation routine written in C with many coding tricks already applied. This routine is specific to three-dimensional vectors, so the loops are completely unrolled. Additionally, some strength reduction is achieved by substituting multiplications for <I>pow()</I> calls (divisions are intentionally left as is). <a href="#01bd_0014">Listing Two</A> (page 98) shows a handcoded assembly-language version. Notice that the natural structure of the routine has a fairly minimal number of register conflicts.<P>
+If you doubt the effectiveness of rewriting a few target routines in assembly language, you should note that the execution time of this assembly-language version is approximately 46 percent shorter than the THINK C compiled version on a 16-MHz 68020/68882 combination. However, the focus here is on pipeline optimizations, so the measurement uses the version in <a href="#01bd_0014">Listing Two</A> as the baseline.<P>
+After removing the comments and applying these techniques, the routine is more efficient for the MC68882 pipeline; <a href="#01bd_0016">Listing Three</A> (page 99) is the result. Although theoretically possible, it is treacherous to calculate the difference in execution times from the table of head and tail times. Instead, measuring the execution times illustrates the savings. In this example, the optimized version is approximately 14 percent faster than its assembly-language predecessor, and roughly 54 percent faster than the compiled version. Because this routine is the most frequently used in my Monte Carlo simulation, the increase is substantial for the entire application.<P>
+<h3><a name="01bd_000b">Conclusion<a name="01bd_000b"></h3><P>
+The addition of a FPCP to the MC68020/<P>030 greatly increases the floating-point performance, but the MC68882 is especially advantageous over the MC68881 because of its pipeline architecture. Although assembly-language programming can result in substantial execution speed gains and/or reductions in code size, further optimizations to maximize pipeline efficiency can increase the FPU performance even more, and the readability of the code deteriorates only slightly because the optimizations are usually local.<P>
+The tactics I've described here do not require much effort to implement, yet they offer an easy way to increase the performance of a routine. In addition to better programming the MC68882, these skills and ideas are important, as they pertain to many other pipeline architectures. Although these techniques will not make up for inefficient algorithms, sometimes the best algorithms are not enough. Next time your application needs to squeeze out all the floating-point performance it can, following these simple rules can result in faster code with relatively little added effort.<P>
+<h4><a name="01bd_000c"><B>Table 1:</B> Execution times (register to register) expressed in cycles.<a name="01bd_000c"></h4><P>
+<PRE>
+     Instruction    Head     Tail     Total
+
+     <I>fadd</I>            17       35      56
+     <I>fsub</I>            17       35      56
+     <I>fmul</I>            17       55      76
+     <I>fdiv</I>            17       87     108
+     <I>fsqrt</I>           17       89     110
+     <I>fmove</I>           21        0      21
+     <I>fmovecr</I>         10        0      32
+     <I>fsin</I>            17      373     394
+     <I>fcos</I>            17      373     394
+     <I>fsincos</I>         17      433     454
+</pre>
+
+<h4><a name="01bd_000d"><B>Example 1: </B>Dealing with register conflicts. (a) If two fadd instructions occur sequentially, the second instruction depends on the result of the first; (b) if the second instruction utilizes registers that aren't in conflict, this is the result.<a name="01bd_000d"></h4><P>
+<pre>
+<b>(a)</b>
+
+fadd.x  fp0, fp1  ; HEAD=17, TAIL=35
+fadd.x  fp1, fp2  ; HEAD=17, TAIL=35
+
+
+<b>(b)</b>
+
+fadd.x  fp0, fp1  ; HEAD=17, TAIL=35
+fadd.x  fp2, fp3  ; (HEAD=17), TAIL=35
+
+</pre><P>
+<h4><a name="01bd_000e"><B>Example 2: </B>(a) A small loop that totals the elements of a three-dimensional vector; (b) the unrolled version of the small loop better utilizes the pipeline.<a name="01bd_000e"></h4><P>
+<pre>
+<b>(a)</b>
+    lea Array. a0
+    move.l  3, d0
+    fmovecr #0xf, fp0
+@loop:  fadd.x  (a0), fp0
+    lea #0xfff4(a0), a0
+    dbra    d0, loop
+
+<b>(b)</b>
+lea Array. a0
+fmovecr #0xf, fp0
+fadd.x  (a0), fp0
+
+fadd.x 12(a0), fp0
+fadd.x  24(a0), fp0
+</pre>
+
+<h4><a name="01bd_000f"><B>Example 3: </B>The fmove execution in (a) occurs sequentially; (b) eliminating the register conflict permits the fmove to execute concurrently, making it 29 percent faster.<a name="01bd_000f"></h4>
+
+<pre>
+<b>(a)</b>
+
+fadd.x  fp0, fp1  ; HEAD=17, TAIL=35
+fmove.x fp1, fp2  ; HEAD=21
+
+<b>(b)</b>
+
+fadd.x  fp0, fp1   ; HEAD=17, TAIL=35
+fmove.x fp2, fp3   ; (HEAD=21)
+</pre>
+
+<h4><a name="01bd_0010"><B>Example 4: </B>(a) Unrolling a routine that normalizes a three-dimensional vector leaves a grouping; (b) improving the execution time by alternating between mathematical operations and the fmove instructions, while still minimizing register conflicts.<a name="01bd_0010"></h4>
+
+<pre>
+<b>(a)</b>
+move.l  a0, -(sp)
+movea.l Array, a0
+fmovecr #0xf, fp0
+fmove.x (a0), fp1
+fmove.x 12(a0), fp2
+fmove.x 24(a0), fp3
+fadd.x  fp1, fp0
+fadd.x  fp2, fp0
+fadd.x  fp3, fp0
+fdiv.x  fp0, fp1
+fdiv.x  fp0, fp2
+fdiv.x  fp0, fp3
+fmove.x fp3, 24(a0)
+fmove.x fp2, 12(a0)
+fmove.x fp1, (a0)
+move.l  (sp)+, a0
+
+<b>(b)</b>
+move.l  a0, -(sp)
+movea.l Array, a0
+fmovecr #0xf, fp0
+fmove.x (a0), fp1
+fmove.x 12(a0), fp2
+fadd.x  fp1, fp0
+fmove.x 24(a0), fp3
+fadd.x  fp2, fp0
+fadd.x  fp3, fp0
+fdiv.x  fp0, fp1
+fdiv.x  fp0, fp2
+fmove.x fp1, (a0)
+fdiv.x  fp0, fp3
+fmove.x fp2, 12(a0)
+fmove.x fp3, 24(a0)
+move.l  (sp)+, a0
+</pre>
+
+<h4><a name="01bd_0011"><B>Example 5: </B>(a) Two long FPU instructions; (b) there is no difference in execution time if two average length MPU instructions are put in between them.<a name="01bd_0011"></h4>
+
+<pre>
+<b>(a)</b>
+fsin.x  fp1, fp0
+fcos.x  fp1, fp0
+
+<b>(b)</b>
+fsin.x  fp1, fp0
+add.w   d0, d1
+add.w   d0, d1
+fcos.x  fp1, fp0
+</pre>
+
+
+<h4><a name="01bd_0012"><a name="01bd_0013"><B>[LISTING ONE]</B></H4>
+
+<PRE>
+
+
+#include&lt;math.h&gt;
+#include&lt;asm.h&gt;
+
+void RotVect( double *Cx, double *Cy, double *Cz, double theta, double phi )
+{
+double pd1, pd2, pd3, pd4, V, Cxx, Cyy, Czz, x, y, z;
+
+    x = *Cx;
+    y = *Cy;
+    z = *Cz;
+
+    pd1 = sin( theta );
+    pd2 = cos( theta );
+    pd4 = sin( phi );
+    pd3 = cos( phi );
+
+    V = sqrt( 1.0 - z*z );
+
+    Cxx = pd1/V*(y*pd3 - x*z*pd4) + x*pd2;
+    Cyy = -pd1/V*(x*pd3 + z*y*pd4) + y*pd2;
+    Czz = pd1*V*pd4 + z*pd2;
+
+    V = sqrt( Cxx*Cxx + Cyy*Cyy + Czz*Czz );
+    *Cx = Cxx/V;
+    *Cy = Cyy/V;
+    *Cz = Czz/V;
+return;
+}
+
+
+</PRE>
+
+<h4><a name="01bd_0014"><a name="01bd_0015"><B>[LISTING TWO]</B></H4>
+
+<PRE>
+
+
+#include&lt;asm.h&gt;
+
+void FRotVect( double *Cx, double *Cy, double *Cz, double theta, double phi )
+{
+    asm 68020, 68882{
+        fmovem  fp4-fp7, -(a7)  ;Save the registers
+        move.l  a2, -(a7)
+
+        movea.l Cz(a6), a2
+        fmove.x (a2), fp7   ; Cz -&gt; fp7
+
+        fmove.x fp7, fp0
+        fmul.x  fp0, fp0
+        fmovecr #0x32, fp5  ; 1.0 -&gt; fp5
+        fsub.x  fp0, fp5
+        fsqrt.x fp5         ; V -&gt; fp5
+
+        fsincos.x   theta(a6), fp4:fp3  ; pd2, pd1
+        fsincos.x   phi(a6), fp1:fp2    ; pd4, pd3
+
+        fmove.x fp3, fp0    ;\
+        fmul.x  fp5, fp0    ; |   pd1*V*pd4
+        fmul.x  fp2, fp0    ;/
+
+        fdiv.x  fp5, fp3    ; pd1/V -&gt; fp3
+
+        fmove.x fp7, fp6
+        fmul.x  fp4, fp6
+        fadd.x  fp6, fp0    ; Czz -&gt; fp0
+
+        movea.l Cx(a6), a0  ;
+        fmove.x (a0), fp5   ; Cx -&gt; fp5
+        movea.l Cy(a6), a1  ;
+        fmove.x (a1), fp6   ; Cy -&gt; fp6
+
+        fmove.x fp0, (a1)   ; save Czz to memory
+
+        fmove.x fp4, fp0
+        fmul.x  fp5, fp0    ; Cx*pd2 -&gt; fp0
+        fmove.x fp0, (a0)   ; save to memory
+        fmul.x  fp6, fp4    ; Cy*pd2 -&gt; fp4
+
+        fmove.x fp2, fp0
+        fmul.x  fp7, fp0
+        fmul.x  fp5, fp0    ; Cx*Cz*pd4 -&gt; fp0
+        fmul.x  fp6, fp2
+        fmul.x  fp7, fp2    ; Cz*Cy*pd4 -&gt; fp2
+        fmul.x  fp1, fp6    ; Cy*pd3 -&gt; fp6
+        fsub.x  fp0, fp6    ; ( ... ) -&gt; fp6
+
+        fmul.x  fp3, fp6
+        fadd.x  (a0), fp6   ; Cxx -&gt; fp6
+
+        fmul.x  fp1, fp5
+        fadd.x  fp5, fp2
+        fmul.x  fp2, fp3
+        fsub.x  fp3, fp4    ; Cyy -&gt; fp4
+
+        fmove.x fp6, fp2
+        fmul.x  fp2, fp2    ; Cxx*Cxx -&gt; fp2
+        fmove.x fp4, fp3
+        fmul.x  fp3, fp3    ; Cyy*Cyy -&gt; fp3
+
+        fmove.x (a1), fp5   ; get Czz from memory
+        fmove.x fp5, fp0
+        fmul.x  fp0, fp0    ; Czz*Czz -&gt; fp0
+
+        fadd.x  fp3, fp0
+        fadd.x  fp2, fp0
+        fsqrt.x fp0
+        fdiv.x  fp0, fp6    ;\
+        fdiv.x  fp0, fp4    ; |   Cx, Cy, Cz
+        fdiv.x  fp0, fp5    ;/
+        fmove.x fp6, (a0)   ;\
+        fmove.x fp4, (a1)   ; |  and move to memory
+        fmove.x fp5, (a2)   ;/
+
+        move.l  (a7)+, a2
+        fmovem  (a7)+, fp4-fp7
+    }
+}
+
+
+</PRE>
+
+<h4><a name="01bd_0016"><a name="01bd_0017"><B>[LISTING THREE]</B></H4>
+
+<PRE>
+
+
+#include&lt;asm.h&gt;
+
+void FRotVect( double *Cx, double *Cy, double *Cz, double theta, double phi )
+{
+    asm 68020, 68882{
+        fmovem  fp4-fp7, -(a7)
+        fsincos.x   theta(a6), fp4:fp3
+        move.l  a2, -(a7)
+        movea.l Cz(a6), a2
+        fmove.x (a2), fp7
+        fmovecr #0x32, fp5
+        fmove.x fp7, fp0
+        movea.l Cx(a6), a0
+        fmul.x  fp0, fp0
+        fsincos.x   phi(a6), fp1:fp2
+        fsub.x  fp0, fp5
+        fmove.x fp3, fp0
+        fsqrt.x fp5
+        movea.l Cy(a6), a1
+        fmul.x  fp5, fp0
+        fmul.x  fp2, fp0
+        fdiv.x  fp5, fp3
+        fmove.x fp7, fp6
+        fmul.x  fp4, fp6
+        fmove.x (a0), fp5
+        fadd.x  fp6, fp0
+        fmove.x (a1), fp6
+        fmove.x fp0, (a1)
+        fmove.x fp4, fp0
+        fmul.x  fp5, fp0
+        fmul.x  fp6, fp4
+        fmove.x fp0, (a0)
+        fmove.x fp2, fp0
+        fmul.x  fp7, fp0
+        fmul.x  fp6, fp2
+        fmul.x  fp5, fp0
+        fmul.x  fp7, fp2
+        fmul.x  fp1, fp6
+        fsub.x  fp0, fp6
+        fmul.x  fp3, fp6
+        fadd.x  (a0), fp6
+        fmul.x  fp1, fp5
+        fadd.x  fp2, fp5
+        fmul.x  fp3, fp5
+        fmove.x (a1), fp2
+        fsub.x  fp5, fp4
+        fmove.x fp6, fp2
+        fmove.x fp4, fp3
+        fmul.x  fp2, fp2
+        fmul.x  fp3, fp3
+        fmove.x fp5, fp0
+        fadd.x  fp2, fp3
+        fmul.x  fp0, fp0
+        fadd.x  fp3, fp0
+        fsqrt.x fp0
+        fdiv.x  fp0, fp5
+        fdiv.x  fp0, fp6
+        fmove.x fp5, (a2)
+        fdiv.x  fp0, fp4
+        move.l  (a7)+, a2
+        fmove.x fp6, (a0)
+        fmove.x fp4, (a1)
+        fmovem  (a7)+, fp4-fp7
+    }
+}
+
+</pre><HR>
+Copyright &copy; 1994, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

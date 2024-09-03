@@ -1,0 +1,282 @@
+
+<html>
+<head>
+<title>Listing 5</title>
+
+
+</head><body bgcolor="ffffff">
+<b>Listing 5. The vote program.</b>
+
+<pre>
+  0  #!/usr/bin/perl -Tw
+  1  # -*- perl -*-
+
+  2  use strict;
+  3  use CGI qw(:standard *table *Tr *dl);
+  4  use DBI;
+
+  5  use constant REGISTRATION_CODE_LENGTH =&gt; 100;
+  6  use vars qw(@CANDIDATES @PARTIES @OFFICES @CANDIDATE_NAME);
+  7  $ENV{PATH} = '/bin';
+
+  8  # connect to database
+  9  my $DB = DBI-&gt;connect('dbi:mysql:CEA') or die "Can't connect: $DBI::errstr";
+
+ 10  ########################
+ 11  # create the page
+ 12  ########################
+ 13  print header,
+ 14    start_html(-title   =&gt; 'Indecision 2000',
+ 15               -bgcolor =&gt; 'white'
+ 16              ),
+ 17    h1({-align=&gt;'CENTER'},
+ 18       img({-src=&gt;'/icons/star.gif'}) x 3,
+ 19       'Indecision 2000',
+ 20       img({-src=&gt;'/icons/star.gif'}) x 3);
+
+ 21  # load global variables
+ 22  get_globals();
+
+ 23  # If the VOTE button is pressed, validate and enter the ballot
+ 24  if (param('VOTE') &amp;&amp; (my $registration = validate())) {
+ 25      enter_ballot($registration);
+ 26  }
+
+ 27  # Otherwise print the ballot
+ 28  else {
+ 29      generate_ballot();
+ 30  }
+
+ 31  # end of page
+ 32  print end_html;
+ 33  $DB-&gt;disconnect;
+
+ 34  exit 0;
+
+ 35  ###############################################################
+ 36  # get_globals() loads the @CANDIDATES, @CANDIDATE_NAME,
+ 37  # @PARTIES and @OFFICES globals from information in the
+ 38  # database.
+ 39  ###############################################################
+ 40  sub get_globals {
+
+ 41      # fetch the matrix of candidates, parties and offices
+ 42      my $query =&lt;&lt;END;
+ 43  SELECT candidate_id,first_name,last_name,party_name,
+ 44         office_name,candidate.party_id,candidate.office_id
+ 45    FROM candidate,party,office 
+ 46    WHERE candidate.office_id=office.office_id
+ 47    AND candidate.party_id=party.party_id
+ 48  END
+ 49  ;
+
+ 50      my $sth = $DB-&gt;prepare($query) or die "Can't prepare: ",$DB-&gt;errstr;
+ 51      $sth-&gt;execute;
+
+ 52      while (my($candidate_id,$first,$last,$party,$office,$party_id,$office_id) 
+ 53             = $sth-&gt;fetchrow_array) {
+ 54          $CANDIDATES[$party_id-1][$office_id-1] = $candidate_id;
+ 55          $CANDIDATE_NAME[$candidate_id] = "$first $last";
+ 56          $PARTIES[$party_id-1] = $party;
+ 57          $OFFICES[$office_id-1] = $office;
+ 58      }
+ 59      $sth-&gt;finish;
+ 60  }
+
+ 61  ###############################################################
+ 62  # generate_ballot(), voting_matrix(), validation_number() and vote()
+ 63  # create various parts of the page see by the voter
+ 64  ###############################################################
+ 65  sub generate_ballot {
+ 66      print start_multipart_form;
+ 67      voting_matrix();
+ 68      registration_number();
+ 69      vote();
+ 70      print end_form;
+ 71  }
+
+ 72  # This generates the table containing the ballot.
+ 73  sub voting_matrix {
+ 74      print img({-src=&gt;'/icons/HandPointing.gif',-align=&gt;'LEFT'}),
+ 75        h2('Step 1: Fill in your E-Ballot');
+
+ 76      print
+ 77        start_table({-cellspacing =&gt; 0,-border=&gt;1}),
+ 78        Tr(th(''),th(\@OFFICES));
+
+ 79      for (my $party=0; $party &lt; @PARTIES; $party++) {
+ 80          print start_Tr,th($PARTIES[$party]);
+
+ 81          for (my $office=0; $office &lt; @OFFICES; $office++) {
+
+ 82              my $candidate = $CANDIDATES[$party][$office];
+ 83              print td({-bgcolor=&gt;$office %2 ? 'white' : '#E0E0E0'},
+ 84                        $candidate ? radio_group(-name    =&gt; $office,
+ 85                                                 -value   =&gt; $candidate,
+ 86                                                 -labels  =&gt; {$candidate=&gt;$CANDIDATE_NAME[$candidate]},
+ 87                                                 -default =&gt; '-',
+ 88                                              )
+ 89                                  : '&amp;nbsp;'
+ 90                      );
+ 91          }
+
+ 92          print end_Tr;
+ 93      }
+
+ 94      # Handle write-ins.
+ 95      print Tr(th('&amp;nbsp;'),
+ 96               td([map {radio_group(-name  =&gt; $_, -value =&gt; 'Write in:').
+ 97                         textfield(-name  =&gt; "writein $_",
+ 98                                  -value =&gt; '',
+ 99                                -override =&gt; defined param($_) &amp;&amp; param($_)=~/^\d+$/
+100                     )} (0..$#OFFICES)]
+101                 )
+102              ),
+103        end_table;
+104  }
+
+
+
+105  # generate the field for entering voter registration number
+106  sub registration_number {
+107      print hr,
+108        img({-src =&gt; '/icons/HandPointing.gif', -align =&gt; 'LEFT'}),
+109        h2('Step 2: Enter your Registered Voter Code'),
+110        blockquote(
+111                   b('EITHER:'), 'Cut and paste the code here:',
+112                   textarea(-name =&gt; 'registration_id', -rows =&gt;4 , -cols =&gt; 70, -wrap =&gt; 'physical'), br,
+113                   b('OR:'), 'Select voter registration file for upload here:', br,
+114                   filefield(-name =&gt; 'registration_file')
+115                 );
+116  }
+
+117  # generate the VOTE button
+118  sub vote {
+119      print hr,
+120        img({-src =&gt; '/icons/HandPointing.gif', -align =&gt; 'LEFT'}),
+121      h2('Step 3:','Cast your Ballot'),
+122      blockquote(b(submit('VOTE')));
+123  }
+
+
+124  ###############################################################
+125  # validate() validates the ballot to discourage fraud
+126  ###############################################################
+127  sub validate {
+128      # first check that the voter registration field is filled out
+129      return error('The voter registration ID field is missing.')
+130        unless param('registration_id') || param('registration_file');
+
+131      # check that the voter has voted for at least one office
+132      return error('The ballot has not been filled out.')
+133        unless grep {param($_) ne 'Write in:' || param("writein $_")} 0..@OFFICES-1;
+
+134      # check that no office has more than one vote
+135      for (0..@OFFICES-1) {
+136          my @votes = param($_);
+137          return error("You have voted for $OFFICES[$_] more than once.") if @votes &gt; 1;
+138      }
+
+139      # recover the registration ID
+140      my $registration_id;
+141      if (my $fh = param('registration_file')) {
+142          while (&lt;$fh&gt;) {
+143              chomp;
+144              next unless /--REGISTRATION-START--/../--REGISTRATION-END--/;
+145              next unless /^\d+$/;
+146              $registration_id .= $_;
+147          }
+148      }
+149      $registration_id ||= param('registration_id');
+150      $registration_id =~ s/\D//g;  # get rid of all non-digits
+151      return error('Your registration code is the incorrect length.')
+152        unless length $registration_id == REGISTRATION_CODE_LENGTH;
+
+153      # check that this is a registered voter
+154      my $sth = $DB-&gt;prepare('SELECT registration_used FROM registration WHERE registration_id=?')
+155        or die "prepare registration: ",$DB-&gt;errstr;
+156      my $rows = $sth-&gt;execute($registration_id);
+157      return error("The registration code provided is not on the list of eligible voters.")
+158        unless $rows &gt; 0;
+
+159      # check that registration ID has not already been used
+160      my ($used) = $sth-&gt;fetchrow_array;
+161      return error("That voter registration code has already been used.")
+162        unless $used == 0;
+163      $sth-&gt;finish;
+
+164      return $registration_id;
+165  }
+
+166  ###############################################################
+167  # enter_ballot() updates the database
+168  ###############################################################
+169  sub enter_ballot {
+170      my $registration = shift;
+
+171      # lock this registration number so that it can't be used again
+172      $DB-&gt;do("UPDATE registration SET registration_used=1
+173               WHERE registration_id='$registration'
+174               AND registration_used=0")&gt;0
+175        or die "Can't update registration: ",$DB-&gt;errstr;
+
+176      # generate a ballot ID
+177      my $id = random_digits(100);
+
+178      # prepare the SQL for regular and write-in votes
+179      my $regular_vote = $DB-&gt;prepare("INSERT INTO tally VALUES('$id',?,?,NULL)")
+180        or die "Can't prepare: ",$DB-&gt;errstr;
+
+181      my $writein_vote = $DB-&gt;prepare("INSERT into writein VALUES('$id',?,?,NULL)")
+182        or die "Can't prepare: ",$DB-&gt;errstr;
+
+183      # begin user confirmation
+184      print h2('Save this Information for your Records');
+185      print start_dl;
+186      for my $office (0..$#OFFICES) {
+187          my $selection      = param($office);
+188          my $writein        = param("writein $office");
+189          my $candidate_name = $writein || $CANDIDATE_NAME[$selection] || '-none-';
+
+190          # update database with the candidate's vote
+191          if ($writein) {
+192              $writein_vote-&gt;execute($office+1,$writein)   or die "can't update tally: ", $DB-&gt;errstr;
+193          } elsif ($selection) {
+194              $regular_vote-&gt;execute($office+1,$selection) or die "can't update tally: ", $DB-&gt;errstr;
+195          }
+
+196          # update confirmation page
+197          print dt(b($OFFICES[$office])),dd($candidate_name);
+198      }
+199      print end_dl;
+200      $writein_vote-&gt;finish;
+201      $regular_vote-&gt;finish;
+
+202      # show user his confirmation number
+203      $id =~ s/(.{50})/$1\n/;
+204      print h3('Ballot Confirmation Number'),pre($id);
+205  }
+
+206  ###############################################################
+207  # utilities
+208  ###############################################################
+
+209  # generate some random digits for the ID
+210  sub random_digits {
+211      my $digits_desired = shift;
+212      open(RAND, '/dev/urandom') or die "Can't open random number device: $!";
+213      my $data;
+214      read(RAND,$data,$digits_desired) or die "Can't read random bytes: $!";
+215      my @digits = map {$_ % 10} unpack('C*',$data);
+216      return join '', @digits[0..$digits_desired-1];
+217  }
+
+218  # all-purpose error message
+219  sub error {
+220      print p(font({-size=&gt;'+2',-color=&gt;'red'}, @_, br,
+221                   'Please correct and try again.'));
+222      return;
+223  }
+</pre>
+</body>
+</html>

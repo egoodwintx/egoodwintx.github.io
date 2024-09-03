@@ -1,0 +1,217 @@
+
+<html>
+<head>
+<title>December, 2004: Real-Time Systems &amp;  RT CORBA</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Real-Time Systems &amp;  RT CORBA</h1>
+<p><i>Dr. Dobb's Journal</i> December, 2004</p>
+<h2>Managing distributed real-time systems with CORBA extensions</h2>
+
+
+<h3>By William Nagel</h3>
+
+
+<I>William is the Chief Software Engineer for Stage Logic LLC, a small software development company. He specializes in developing CORBA-based real-time systems. He can be contacted at bill@stagelogic.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Once thought to be the panacea of distributed computing, CORBA's complex structure often made it impractical in much of the rapid design world of enterprise computing. However, CORBA is far from dead. In fact, it lives on in the world of real-time distributed computing. In the real-time computing arena, CORBA's flexibility makes it ideal for systems where speed and predictability are every bit as important as time to market.</p>
+
+<p>The ability to use CORBA for real-time applications is provided by the Real-Time CORBA Specifications (http://www.omg.org/technology/documents/formal/real-time_CORBA.htm). The RT CORBA spec is a set of CORBA extensions that lets systems with real-time scheduling requirements meet those requirements across multiple CORBA objects, possibly residing on different object-request brokers (ORBs).</p>
+
+<p>The RT CORBA extensions reside on top of the operating system. The only interaction that an RT CORBA client or servant need have with the underlying operating systems' real-time mechanisms is through the use of priority mappings, which map cross-platform CORBA priorities to local OS-level priorities. This level of disconnect lets the RT CORBA ORB have no real-time OS constraints, which would require an RTOS that provided certain features. Because it has no such requirements, RT CORBA is not limited to real-time operating systems. On a nonreal-time OS, you lose the hard real-time predictability provided by the RTOS but still benefit from the prioritized scheduling features of RT CORBA, which may be sufficient for many soft real-time applications.</p>
+<h3>Priority Mapping</h3>
+
+<p>Priority mappings are the most important basic concept in RT CORBA. Priority mappings let individual CORBA components specify their priority using cross-platform CORBA priorities, which range from 0 to 32767. These CORBA priorities are then mapped to OS native priorities using a definable priority mapping.</p>
+
+<p>For example, consider a system for routing sensor data to processors that handle the data. I have a number of different sensor processes, each running on a different embedded device, which receives a stream of data from input equipment. The different sensors process a myriad of different types of data, each of which has a different importance to the system. Additionally, specific data can affect the importance of a sensor at any given time. The sensors send their data to a central router, which analyzes incoming data and routes it to one or more data sinks for processing. </p>
+
+<p>As data comes in to the sensors, they do some rudimentary processing to analyze the priority of the data at that point in time, and categorize it into one of four importance levels: low, medium, high, and emergency. These levels could simply have been mapped to the CORBA priorities 0 through 3, but I want room to expand to more priority levels later on down the road. Consequently, I (semiarbitrarily) chose to map them to 1024, 2048, 4096, and 8192.</p>
+
+<p>Now that I have my priority levels chosen, it might be nice to have them mapped to native priority levels on the system. While 32,000-plus priority levels are fun, they're not practical on most platforms. I accomplish this feat by extending the <i>RTCORBA::PriorityMapping</i> class and write <i>to_native()</i> and <i>to_corba()</i> methods (see the <i>SensorPriorityMapping</i> class in <a name="rl1"></a><a href="#l1">Listing One</a>). For robustness, I also extend the mapping to use ranges that encompass my four levels earlier. That way, if I later extend my list to encompass more levels, I won't risk crashing any older devices in the system.</p>
+
+<p>How do I start using this new priority mapping? That's a good question. The RT CORBA specification leaves out any standardized method for installing the mapping. Instead, the spec leaves it up to individual ORBs to decide. In my case, I was using TAO (The ACE ORB; http://www.cs.wustl.edu/~schmidt/TAO.html) as my ORB implementation, and this was done through a <i>PriorityMappingManager</i>. Your ORB of choice will almost certainly do it differently (unless, of course, your ORB of choice is TAO).</p>
+
+<p>Again, the sensors in my system prioritize the data that they receive into four categories. Once a sensor has performed its analysis and made the categorization, it adjusts its own thread priority to match the priority for the data. The priority for a thread in a CORBA client or server is held in an <i>RTCORBA::Current</i> object. To change its priority, a thread simply has to set the <i>base_priority</i> attribute in the <i>Current</i> object and a native priority change is immediately executed, using the previously installed priority mapping. <a name="re1"></a><a href="0412oe1.html">Example 1</a> shows that my sensor setting is priority based on the data analysis, prior to sending that data to the router.</p>
+<h3>Priority Propagation</h3>
+
+<p>Priority inversions are bad. Inversions occur when a thread of the execution's priority is implicitly (and unintentionally) reduced by a dependency on a lower priority thread. For example, say, I have Thread <i>A</i> running at priority 50, Thread <i>B</i> running at priority 40, and Thread <i>C</i> running at priority 30. If Thread <i>A</i> requests data from Thread <i>C</i>, it blocks until Thread <i>C</i> returns that data. Thread <i>C</i>, however, won't get to run until Thread <i>B</i> finishes its own processing. Thread <i>B</i> has now implicitly gained a higher priority than Thread <i>A</i>, which is almost certainly not desired.</p>
+
+<p>To avoid priority inversions in my sensor system, I want the threads in the router and data processors that handle data from the sensors to increase their own priority to match the sensor's priority, if they were previously lower. Fortunately, RT CORBA provides a mechanism for just such a propagation model, the "client propagated priority model."</p>
+
+<p>The propagation model used is set on a per-POA basis, by passing a priority model policy when the POA is created. (The Portable Object Adapter, or POA, manages server-side resources for scalability.) The policy to use is created by a call to <i>create_priority_model_policy()</i> on the RTORB, which is obtained by resolving the initial reference "RTORB." The name of the policy to be set for the objects in my sensor system is <i>CORBA::CLIENT_PROPAGATED</i>, which means exactly what it sounds like. When a client makes a call to a CORBA object, that object's servant adjusts its priority upward to meet the client's priority, if necessary. <a name="re2"></a><a href="0412oe2.html">Example 2</a> shows how I create a POA for the sensor router, with the client propagated priority policy. The <i>initCORBA()</i> and <i>activateRouter()</i> functions in <a name="rl2"></a><a href="#l2">Listing Two</a> provide a more complete example showing the activation of the <i>SensorRouter</i> object.</p>
+
+<p>The other priority model available in RT CORBA is <i>SERVER_DECLARED</i>, which means that the server has a set priority that it runs at, no matter what the client's priority is. Clients can, however, query the server's declared priority. The server declared model can be useful for objects, such as a video controller, that need to run at a constant priority. The priority that a server-declared object is running at is distributed within that object's reference, and can be obtained by retrieving the <i>PriorityModelPolicy</i> from the reference using <i>_get_policy()</i>.</p>
+<h3>Threadpools</h3>
+
+<p>To this point, I've mostly been discussing the actual sensors in a sensor processing system. That makes sense, because there are a lot of them. A lot of sensors means a lot of data, and all that data has to go through my router, which determines which data sinks to send the data to for processing. Simple enough, but a few minutes thought should make it obvious that my router is going to quickly become a bottleneck in the system. Things might be better if I fully distributed things and took it out of the mix; just have the sensors send data directly to the appropriate data sinks.</p>
+
+<p>Unfortunately, sensors sending data directly to sinks doesn't work. A full picture of what data is flowing is necessary to make decisions about which sinks to send data to, and that kind of knowledge and processing is far too data and processor intensive for my sensor devices. That means that I need to make sure my router can efficiently handle all of the data being sent its way.</p>
+
+<p>The naive approach to handling the data would be for the router to deal with things on a first in, first out (FIFO) basis. This can lead to priority inversions, though, if a high-priority piece of data ends up waiting on a low-priority piece that got there first. The solution, of course, is to make the router multithreaded. Just adding more threads doesn't solve the problem by itself, though. If I have 100 threads, I can still get a priority inversion if high-priority data ends up waiting for the 100 low-priority data streams that got there first. Fortunately, RT CORBA provides a solution to this problem, too, in the form of threadpools and threadpools with lanes.</p>
+
+<p>Threadpools let you specify static and dynamic threads on an ORB-wide or per-POA basis. When a POA is created, it creates a pool of static threads, which are kept around to process requests. The dynamic threads, on the other hand, are only created when the static threads are all busy and an additional request is received. When they are done processing the request, they go away.</p>
+
+<p>Threadpool lanes let you create pools of different priority threads. When a request is received, it is filtered into the appropriate threadpool lane and executed. If desired, lanes can also let lower priority lanes be borrowed to run at higher priority if a higher priority request is received and there are no high-priority lanes available. Lanes can also be configured to buffer requests received if there are no lanes available to process a request.</p>
+
+<p>In my sensor processing router, I chose to create four lanes of threadpools&#151;one for each of my four priorities (low, medium, high, and emergency). For each lane, I assign a fixed number of static threads, which will be created when the router is instantiated. Additionally, for each lane, I set an upper limit on the number of dynamic threads it can use, which are created on demand by the ORB.</p>
+
+<p>To construct the lanes, I create an <i>RTCORBA::ThreadpoolLane</i> for each lane, and fill out the appropriate data. These are then compiled into an <i>RTCORBA::ThreadpoolLanes</i> sequence, and passed to <i>create_threadpool_with_lanes()</i>, which is invoked on the real-time ORB; see <a name="re3"></a><a href="0412oe3.html">Example 3</a>. <i>Create_threadpool_with_lanes()</i> returns an <i>RTCORBA::ThreadpoolId</i>, which can be used to associate the threadpool with a POA by setting it as a policy. It can also be used to override the policy of an existing object reference, as in <a name="re4"></a><a href="0412oe4.html">Example 4</a>.</p>
+<h3>Invocation Timeouts</h3>
+
+<p>Once the data reaches the router, it needs to be sent to one or more data sinks to be processed. The processing, though, is time sensitive. If the data hasn't been properly processed within a fixed amount of time, it's better to just drop it and move on to the next piece of data (assuming the priority is less than emergency level). Since the delay could be due to the method call to send the data waiting in a buffer queue for too long, it would be insufficient to just time the duration of the method's processing, internal to the method. Therefore, I need to set an invocation timeout, to constrain the maximum time that the call takes.</p>
+
+<p>Setting a timeout on an invocation is done through the <i>Messaging::RelativeRoundtripTimeoutPolicy</i> interface, which is actually a standard CORBA-specified interface and not specific to RT CORBA. I want to apply this timeout to almost every call that the router makes, so I set the policy for the entire ORB by invoking <i>set_policy_overrides()</i> on the <i>PolicyManager</i>; see <a name="re5"></a><a href="0412oe5.html">Example 5</a>.</p>
+
+<p>As mentioned, though, when an "emergency" priority data packet comes from a sensor, it must get processed, so the timeout needs to be turned off when that data is sent to the sinks. To do that, I make a call <i>to _set_policy_overrides()</i> on my reference to the sink, to get a reference with the overridden timeout policy. In the case of emergency data, predictability is also important, so to avoid any potential delays, I create these policy overridden object references for the data sinks when the sink is registered with the router. It then becomes a simple matter of checking the priority that I have set, and making the call on the appropriate reference.</p>
+<h3>Mutex</h3>
+
+<p>In my router, I have a fixed number of data types, each of which can be sent from multiple sensors. Once the router has received data of a given type, it needs to route it to one or more data sinks. It is important, however, that data of a given type be strictly ordered across the sinks. If Sensor <i>A</i> sends a type of data, and Sensor <i>B</i> sends the same type of data, bad things could happen if one sink gets data from <i>A</i> then <i>B</i>, and another receives <i>B</i> before <i>A</i>. </p>
+
+<p>To ensure the ordering of my sensor data happens appropriately, I take advantage of RT CORBA's mutex feature. The RTCORBA::Mutex interface lets me create a mutex that locks processing of data types across different router threads. Each thread simply acquires a lock on the mutex before processing received data, then releases it when it's done, as in <a name="re6"></a><a href="0412oe6.html">Example 6</a>. The <i>Mutex</i> object uses the same priority inheritance model as the ORB that creates it, so in this case, it will inherit the client propagated model. This gives higher priority data streams priority when acquiring a lock, which prevents the dreaded inversion. I create a new <i>Mutex</i> by calling <i>rtorb-&gt;create_mutex()</i>.</p>
+<h3>Conclusion</h3>
+
+<p>Overall, the RT CORBA Standard is fairly small&#151;the formal specification is less than 100 pages. However, it's enough to make CORBA useful in distributed real-time systems. Experienced developers know that real-time systems are hard. Scheduling predictability is not an easy task to manage. Scheduling predictability across a network is a nightmare waiting to happen. Real-time CORBA provides a framework that takes the grunt work out of the process and lets you focus on the actual logic of your system.</p>
+
+
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>class SensorPriorityMapping : public RTCORBA::PriorityMapping
+{
+  public:
+    virtual
+    CORBA::Boolean to_native(RTCORBA::Priority corba_priority,
+                             RTCORBA::NativePriority&amp; native_priority);
+    virtual
+    CORBA::Boolean to_CORBA(RTCORBA::NativePriority native_priority,
+                            RTCORBA::Priority&amp; corba_priority);
+};
+CORBA::Boolean
+SensorPriorityMapping::to_native(RTCORBA::Priority corba_priority,
+                                 RTCORBA::NativePriority&amp; native_priority)
+{
+  if(corba_priority &lt;= 1024) {
+    native_priority = 32;
+  }
+  else if(corba_priority &lt;= 2048) {
+    native_priority = 64;
+  }
+  else if(corba_priority &lt;= 4096) {
+    native_priority = 128;
+  }
+  else {
+    native_priority = 192;
+  }
+  return true;
+}
+CORBA::Boolean
+SensorPriorityMapping::to_corba(RTCORBA::NativePriority native_priority,
+                                RTCORBA::Priority&amp; corba_priority)
+{
+  if(native_priority &lt;= 32) {
+    corba_priority = 1024;
+  }
+  else if(native_priority &lt;= 64) {
+    corba_priority = 2048;
+  }
+  else if(native_priority &lt;= 128) {
+    corba_priority = 4096;
+  }
+  else {
+    corba_priority = 8192;
+  }
+  return true;
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>#define LOW_PRIORITY       1024
+#define MEDIUM_PRIORITY    2048
+#define HIGH_PRIORITY      4096
+#define EMERGENCY_PRIORITY 8192
+
+CORBA::ORB_var orb;
+RTCORBA::RTORB_var rtorb;
+
+SensorRouterImpl* sensorRtrServant;
+SensorRouter_var sensorRouter;
+
+void initCORBA(int argc, char** argv)
+{
+  // Initialize the ORB, and assign it to the CORBA::ORB reference orb
+  orb = CORBA::ORB_init(argc, argv);
+  
+  // Resolve the real-time ORB, and assign it to the
+  // RTCORBA::RTORB reference rtorb
+  CORBA::Object_var object = orb-&gt;resolve_initial_references("RTORB");
+  rtorb = RTCORBA::RTORB::_narrow(object);
+}
+void activateRouter(void)
+{
+  // Create a list of policies to assign to the POA
+  CORBA::PolicyList policies(2);
+  policies.length(2);
+  // Create the propagation policy
+  policies[0] = 
+    _rtorb-&gt;create_priority_model_policy(RTCORBA::CLIENT_PROPAGATED, 
+                                         MEDIUM_PRIORITY);
+  // Create threadpool lanes for each priority level
+  // Values are (in order): 
+  //   Default priority, # of static threads, # of dynamic threads
+  RTCORBA::ThreadpoolLane lowPriorityLane = {LOW_PRIORITY, 20, 20};
+  RTCORBA::ThreadpoolLane mediumPriorityLane = {MEDIUM_PRIORITY, 20, 30};
+  RTCORBA::ThreadpoolLane highPriorityLane = {HIGH_PRIORITY, 10, 10};
+  RTCORBA::ThreadpoolLane emergencyPriorityLane = 
+    {EMERGENCY_PRIORITY,  2, 5};
+  RTCORBA::ThreadpoolLanes lanes(4);
+  lanes.length(4);
+  lanes[0] = lowPriorityLane;
+  lanes[1] = mediumPriorityLane;
+  lanes[2] = highPriorityLane;
+  lanes[3] = emergencyPriorityLane;
+  // Create the threadpool, with the no default stacksize, 
+  // thread borrowing, or request buffering
+  RTCORBA::ThreadpoolId tpoolId =
+    rtorb-&gt;create_threadpool_with_lanes(0, lanes, false, false, 0, 0);
+  // Create the threadpool policy to associate with the POA
+  RTCORBA::ThreadpoolPolicy_var tpoolPolicy =
+    rtorb-&gt;create_threadpool_policy(tpoolId);
+  policies[1] = tpoolPolicy;
+  // Create POA to use for creating router, using the above policies
+  PortableServer::POA_var routerPOA = _rootPOA-&gt;create_POA("RouterPOA", 
+                            PortableServer::POAManager::_nil(), policies);
+  // Create an instance of the servant class
+  sensorRtrServant = new SensorRouterImpl;
+  // Activate the servant with the POA
+  CORBA::Object_var object = routerPOA-&gt;activate_object(sensorRtrServant);
+  sensorRouter = SensorRouter::_narrow(object);
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

@@ -1,0 +1,295 @@
+<html>
+<head>
+<title>Mar01: COM Object Reference Counting</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>COM Object Reference Counting</h1>
+<p><i>Dr. Dobb's Journal</i> March 2001</p>
+<h2>Finding unbalanced reference count  of COM objects</h2>
+
+<h3>By Noam Cohen</h3>
+
+<I>
+Noam is chief technology officer at Vsoft. He can be contacted at noam@vsoft.com.</I>
+
+<hr>
+
+<a name="rs1"><a href="0103es1.htm">COM Cyclic Reference Counting</a><hr>
+
+<p>Using COM objects involves maintaining the reference count for each object. Smart pointers or Visual Basic can save you from this labor, but for those of us who use pointers to COM interfaces, reference counting is required. The penalty for incorrect reference counts is severe. If an object is not released &#151; that is, more <i>AddRef</i> calls than <i>Release</i> calls--a memory leak (and possibly resource leaks) results. If there are more <i>Release</i>s than <i>AddRef</i>s, you crash.</p>
+<p>In simple systems, reference counting is manageable by intuition. But when there are more than a few objects, problems such as cyclic reference can occur (see the accompanying text box entitled "COM Cyclic Reference Counting"). </p>
+<DDJADVERTISEMENT INLINE>
+
+<p>During the development and debugging of a complex subsystem of Vsoft's VideoClick server, it occurred to me that life would be easier if I had a log of each call to <i>AddRef/Release</i>. Consequently, I built just such a tool, which I call "RefCatcher" (see <A NAME="rf1"><A HREF="0103ef1.htm">Figure 1</A>). For each COM object I build, RefCatcher (source code available electronically; see "Resource Center," page 5) tracks the number of <i>AddRef/Release</i> calls, the source file, line number, and function it was called from (if available). When the application terminates, RefCatcher reports unbalanced reference counts.</p>
+
+<p>To build the tool, I first had to resolve a few issues, including how to:</p>
+
+
+<ul>
+  <li>Hook into the <i>AddRef/Release</i>.
+  <li>Get the function name, line number, and source-file name of the caller to <i>AddRef/Release</i>.
+
+  <li>Test the count balance at the program's end.
+
+</ul>
+
+<h3>Hooking Into AddRef/Release</h3>
+
+
+<p>The general solution requires a wrapper around the interface--tedious work indeed. However, it was relatively easy for us to implement the wrapper because most of our COM objects are created in-house and are built using a framework based on classes from Dale Rogerson's <i>Inside COM</i> (Microsoft Press, 1997).</p>
+
+
+<p>As <A NAME="rl1"><A HREF="#l1">Listing One</A> shows, all of our COM classes inherit from <i>CUnknown,</i> so all I had to do is modify the <i>AddRef/Release</i> implementation.</p>
+
+
+
+<h3>Getting Symbolic Information</h3>
+
+
+<p>The fun part is actually getting the symbolic information. Visual C++ lets you store debugging information in a separate file. You can then use the Program Data Base (PDB) in run time to associate between addresses and symbolic information. Contrary to common belief, this information does not degrade performance and is available in release builds as well. To get symbolic information, I used DbgHelp.dll (documented in the MSDN).</p>
+
+
+
+
+<h3>Testing at the End of the Application</h3>
+
+
+<p>You have a couple of alternatives when calling a function at program end: calling <i>atexit()</i> or using the destructor of a global object. I used the latter. You only need to make sure that this global object is allocated before any COM objects are instantiated.</p>
+
+
+
+
+<h3>Participating Classes </h3>
+
+
+<p>As <A NAME="rf2"><A HREF="0103ef2.htm">Figure 2</A> illustrates, implementing the tool requires three classes:</p>
+
+
+<p></p>
+
+<ul>
+  <li>The COM object itself is modified to register the calls to <i>AddRef/Release</i> (see <A NAME="rl2"><A HREF="#l2">Listing Two</A>).
+  <li>A <i>SymbolHandler</i> that is responsible for supplying symbolic information (function name, line number, and so on).
+
+  <li><i>RefCountingRot</i>, a repository of the calls is kept in a singleton object, which tests at the end of the program for a mismatch between the calls. (ROT is short for "Running Object Table," a term borrowed from the COM standard.) 
+
+</ul>
+
+<h3>Finding Who Called AddRef/Release</h3>
+
+
+<p>Looking at the stack is not for the faint of heart. In this case, the task at hand is simple: The last value pushed into the stack before calling a function is always the return address. Supplying the return address to the <i>SymbolHandler</i> object gives the source-file name, line number, and function name.</p>
+
+
+<p>The magic lies in getting the <i>ebp</i> register. I used assembly code for this:</p>
+
+<blockquote><p>
+unsigned int _ebp;</p>
+
+<p>
+__asm { mov _ebp, ebp }</p>
+
+</blockquote>
+
+<p>The <i>ebp</i> register contains the stack pointer at the moment the function enters. Taking the stack content just above the <i>_ebp</i> gives the return address.</p>
+
+<p>Before finding symbol information, the symbol table for the module has to be loaded by calling <i>SymLoadModule().</i> This function can be called after the executable is loaded. Because I was dealing with in-process COM objects (DLLs), I called the function in the PROCESS_ATTACH event in <i>DllMain()</i>; see <A NAME="rl3"><A HREF="#l3">Listing Three</A>.</p>
+
+<p>Using the data acquired by the <i>RefCountingRot</i>, each object is identified by its pointer value. It is much more informative if, instead of seeing "object with this == 0x2761C30," you can have "TS demuxer(object # 4)" as the title for each report. This can be achieved if the object implements another interface &#151; <i>INamedObject2</i>. This optional interface lets you query the object for its user-friendly name, CLSID, and unique object ID; see <A NAME="rl5"><A HREF="#l5">Listing Five</A>. When the <i>RefCountingRot</i> adds object data for the first time, it checks to see if the object implements this interface. If it does, the interface is used to get the name data. If it does not, the <i>this</i> pointer is used as the object name.</p>
+
+
+
+<h3>Internal Data Structure</h3>
+
+
+<p>Each COM object is identified by its <i>IUnknown</i> pointer. The current implementation simply uses this pointer as the key in a map. A more precise solution is to always use the <i>IUnknown</i> pointer. Imagine an object with several interfaces, all calling <i>AddRef() </i>at some time. How would <i>RefCountingRot</i> know it is the same object? <A NAME="rf3"><A HREF="0103ef3.htm">Figure 3</A> illustrates the structure of the value in the map, while <A NAME="rl4"><A HREF="#l4">Listing Four</A> shows how the map is constructed.</p>
+
+
+
+
+<h3>Performance Considerations</h3>
+
+
+<p>RefCatcher is to be used only during the debugging phase. Although it can be used in release build, it is not intended to be part of the final product.</p>
+
+
+<p>To use RefCatcher, define a macro DBG_REF_COUNT in the project settings. This macro enables the correct compilation of the <i>DllMain() </i>and some <i>CUnknown </i>class declaration. You then rebuild all COM objects participating in the project. Next, link with VsoftDbgCom.lib, which replaces the usual <i>DllMain</i> and <i>CUnknown</i> implementations. Finally, run the program. When it ends, if there are interface leaks, a message box opens showing all calls to the offending interfaces.</p>
+
+
+
+<h3>Future Enhancements</h3>
+
+
+<p>Among the enhancements you could make to RefCatcher are:</p>
+
+
+<p></p>
+
+<ul>
+  <li>Inlining <i>AddRef/Release</i>. If the compiler inlines these functions, the return address calculation is invalidated. The simple cure is to force these functions not to inline; after all, performance is not an issue at this stage.
+  <li>RefCatcher reports unbalanced <i>AddRef/Release</i>. If there are more <i>Release</i> calls, the application usually crashes after referencing an invalid interface pointer. RefCatcher can be augmented to report the current list of calls by calling <i>ReferenceCountingRot::CheckBalance() </i>from a crash handler. (A crash handler is a function called when the application crashes; it is set by calling <i>SetUnhandledExceptionFilter().</i>) Using this technique, you get the reports even if the application crashes.
+
+  <li>Write the information to a file immediately, avoiding data loss during crashes.
+
+</ul>
+
+
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>// code snippet from CUnknown.h from "Inside COM" by Dale Rogerson, 
+// Microsoft Press.
+// Modified by Noam Cohen.
+///////////////////////////////////////////////////////////
+class CUnknown : public INondelegatingUnknown
+{
+public:
+    // Nondelegating IUnknown implementation
+    // ...
+protected:
+    // ...
+    // helper functions to register the parameters of the caller
+    // of AddRef and Release()
+    void RegisterAddRef(DWORD _ebp);
+    void RegisterRelease(DWORD _ebp);
+private:
+    // ...
+    // Reference count for this object
+    // helper function. get information on the caller of 
+    // the function whose ebp == _ebp
+    HRESULT ParamsOfCaller(IN DWORD _ebp, OUT ULONG &amp;line,
+            OUT char* szSymbolName, IN  UINT    nSymNameLen,
+            OUT char* szFileName, INT nFileNameLen,
+            OUT ULONG &amp;displacement);
+}; // CUnknown
+
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two</H4>
+
+
+<pre>///////////////////////////////////////////////////////////
+// Delegating IUnknown
+//   - Delegates to the nondelegating IUnknown, or to the
+//     outer IUnknown if the component is aggregated.
+#define DECLARE_IUNKNOWN                                     \
+    virtual HRESULT __stdcall                                \
+        QueryInterface(const IID&amp; iid, void** ppv)           \
+    {                                                        \
+        return GetOuterUnknown()-&gt;QueryInterface(iid,ppv) ;  \
+    } ;                                                      \
+    virtual ULONG __stdcall AddRef()                           \
+    {                                                          \
+        unsigned int _ebp;                                   \
+        __asm {mov _ebp, ebp}                                \
+        RegisterAddRef(_ebp);                                \
+        return GetOuterUnknown()-&gt;AddRef() ;                 \
+    } ;                                                      \
+    virtual ULONG __stdcall Release()                          \
+    {                                                          \
+        unsigned int _ebp;                                   \
+        __asm {mov _ebp, ebp}                                \
+        RegisterRelease(_ebp);                               \
+        return GetOuterUnknown()-&gt;Release() ;                \
+    } ;
+
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+<H4><A NAME="l3">Listing Three</H4>
+
+
+<pre>BOOL APIENTRY DllMain(HINSTANCE hModule, DWORD dwReason, void* /*lpReserved*/)
+{
+    if (dwReason == DLL_PROCESS_ATTACH)
+    {
+        CFactory::s_hModule = hModule ;
+        // even if we fail, business as usual
+        (void)ghSym.LoadSymbols(); 
+    }
+    return TRUE;
+}
+
+</pre>
+<P>
+<A HREF="#rl3">Back to Article</A>
+</P>
+<H4><A NAME="l4">Listing Four</H4>
+
+
+<pre>// ObjData contains all the data relevant to one key (the interface pointer)
+typedef struct { 
+ObjectName objName;
+    ParamList addRefed;
+    ParamList released;
+}  ObjData;
+// the container of all the &lt;interface pointer, value&gt; associations
+typedef std::map&lt;void*, ObjData&gt; ObjectsMap;
+
+</pre>
+<P>
+<A HREF="#rl4">Back to Article</A>
+</P>
+<H4><A NAME="l5">Listing Five</H4>
+
+
+<pre>/* This interface can be exposed by a COM object that exposes 
+some identifying properties. */
+interface INamedObject2 : IUnknown
+{
+    /*------------------------------------------------------------------
+    Get a name for this object's clas ( e.g. "TS demuxer" )
+    Return: 
+        null terminated string
+    */
+    virtual const char* GetClassName() = 0;
+    /*-------------------------------------------------------------------
+    Get the CLASS id of this COM object.
+    It is recommended to return the CLSID used when creating this object
+    Return: 
+        S_OK
+        E_NOTIMPL
+    */
+    virtual HRESULT GetClassId(const GUID &amp;) = 0;
+    /*-------------------------------------------------------------------
+    Get a name for this object ( e.g. "object in server 34" )
+    Return: 
+        null terminated string
+    */
+    virtual const char* GetObjectName() = 0;
+    /*-------------------------------------------------------------------
+    Get the INSTANCE id of this COM object.
+    Return: 
+        S_OK
+        E_NOTIMPL
+    */
+    virtual HRESULT GetObjectId(const GUID &amp;) = 0;
+}; // INamedObject2
+
+// helper macro for those lazy people who need minimal functionality
+#define CLASS_NAME_IMPL(szClassName) \
+    const char* GetClassName(){return szClassName;} \
+    HRESULT GetClassId(const GUID &amp;){ return E_NOTIMPL;}\
+    const char* GetObjectName(){return "";}\
+    HRESULT GetObjectId(const GUID &amp;){ return E_NOTIMPL;}
+#endif
+
+
+
+
+</pre>
+<P>
+<A HREF="#rl5">Back to Article</A>
+</P>
+
+
+</body>
+</html>

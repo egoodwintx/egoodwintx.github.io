@@ -1,0 +1,577 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE><title>v03, i02: Listing 2: The probe script</title></TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#990000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink><a href="a2.htm">Article</a></span></td>
+		<td><span class=navbarLink><a href="a2_l1.htm">Listing 1</a></span></td>
+		<td><span class=navbarLink>Listing 2</span></td>
+		<td><span class=navbarLink><a href="a2_l3.htm">Listing 3</a></span></td>
+		<td><span class=navbarLink><a href="a2_s1.htm">Sidebar 1</a></span></td>
+		<td><a href="../../../../source/SA/1994/mar94.tar"><b class=codeListing>mar94.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<H1>Listing 2: The probe script</H1><p>
+<PRE>
+#!/opt/bin/perl
+#
+# Listing #2
+#
+#                  health_probe
+#
+$ver = '(03jan94)';
+$debug = ''; # Null for production program.
+#
+# SunOS 4.1.x, Solaris 2.x version, Perl 4.036
+# John Lees, Department of Computer Science,
+# Michigan State University, A714 Wells Hall,
+# East Lansing MI 48824-1027, lees@cps.msu.edu
+#
+# Available by anonymous FTP from:
+#   ftp.cps.msu.edu:/pub/prip/lees/sysadmin/
+#
+# Probe hosts under a netgroup for interesting things:
+#  - Check that xntpd is running and time is good
+#  - Disk usage on common filesystems
+#  - Load and number of users
+#  - Check that important deamons are running
+#  - Uptime, in days
+#  - Ypwhich
+#
+$help = 'Usage: probe [-h] [-m] [-n NETGROUP] [-s]
+-h  Help.
+-m  Mail only, nothing to stdout.
+-n  Netgroup to use as top of tree. Default is &quot;cps&quot;.
+-s  Stdout only, do not mail reports to lab managers.
+';
+#------------------------------------------------------
+# There is a main program and three subprograms:
+#
+#   do_poll(host)
+#      Interrogate a host.
+#
+#   do_print(&quot;s&quot; or &quot;b&quot;, string to print)
+#      Where &quot;s&quot; means to stdout only, &quot;b&quot; means both
+#      stdout and mail to the manager of the current
+#      netgroup/lab.
+#
+#   getngrp(netgroup)
+#      Build array of host groups.
+#------------------------------------------------------
+
+# Things go crazy with two pipes if stdout is piped.
+select((select(STDOUT), $| = 1)[0]);
+
+#
+### Global variables.
+#
+require 'getopts.pl';
+do Getopts('hmn:s');
+
+chop($date = `date`);
+chop($hostname = `uname -n`);
+$current = '';                  # Used by do_print.
+@getngrp_stack = ();            # Used by getngrp.
+%getngrp_hosts = ();            # Used by getngrp.
+# Skip these. Leading and trailing blanks needed.
+$getngrp_skipgroup = ' dumb_pc ';
+$getngrp_skiphost = ' bogus.cps.msu.edu ';
+
+$lab = '';                      # Current lab.
+#          1         2         3         4         5
+#012345678901234567890123456789012345678901234567890
+$status_head =
+'Xntpd    / /usr /var /home Load Usr Daemon  Up Ypwhich'
+;
+# Returns for newping. Newping was published in Volume
+# 2 Number 4 of Sys Admin magazine. As published it was
+# not usable. We use a modified version. Original
+# version from ftp.uu.net:/published/sysadmin/1993/.
+# Our version for Solaris is available from:
+# ftp.cps.msu.edu:/pub/prip/lees/sysadmin/
+@pmsg = ('okay',
+'connection timed out (dead machine)?',
+'response timed out (hung or overloaded machine)?',
+'connection refused (permissions)?',
+'network or hardware problem?',
+'host unreachable?',
+'confused?');
+
+# ===== BEGIN MAIN PROGRAM =====
+&amp;do_print('s',
+&quot;Health Probe $ver from $hostname\n$date\n&quot;);
+
+if ($opt_h) {   # Help.
+print &quot;\n$help&quot;;
+exit;
+}
+
+# Build the list of hosts. See the getngrp routine for
+# a description of how our netgroups are organized.
+if ($opt_n) {
+do getngrp($opt_n);
+}
+else {
+do getngrp('cps');
+}
+
+# Foreach subgroup, foreach host.
+foreach $key (sort(keys %getngrp_hosts)) {
+split(/\s/, $key);
+
+# The highest level subgroup is an NIS domain. We
+# will send mail to manager@$lab later.
+$lab = $_[1];
+$subgroup = join(' ', @_[1 .. $#_]);
+&amp;do_print('b', sprintf(&quot;\n%s\n%16.16s  %s\n&quot;,
+$subgroup, ' ', $status_head));
+
+# Go through the hosts for this lab.
+foreach $host (split(/\s/, $getngrp_hosts{$key})) {
+&amp;do_poll($host);
+}
+}
+
+exit 0;
+# ===== END MAIN PROGRAM =====
+
+#------------------------------------------------------
+# do_poll | Subroutine to check things on a host.
+#----------
+sub do_poll {
+local($host) = $_[0];
+local(@ntp, @offset);
+# We do substrs into this:
+$status_line =
+'                                               ';
+@rsh = ();
+
+print $host &quot;\n&quot;;
+
+# First make sure the beastie is alive. Give it 4
+# seconds.
+if (system(&quot;/opt/bin/newping $host 4&quot;
+.&quot; &gt;/dev/null 2&gt;&amp;1&quot;)) {
+# Nope, but try again just in case.
+if ($nprc = system(&quot;/opt/bin/newping $host 3&quot;
+.&quot; &gt;/dev/null 2&gt;&amp;1&quot;)) {
+$nprc = $nprc / 256;
+$prc = $nprc;
+if ($nprc &lt; 0 || $nprc &gt; 5) {
+$prc = 6;
+}
+# Print message corresponding to error from
+# newping.
+&amp;do_print('b',
+sprintf(&quot;%16.16s:  NEWPING(%x): %s\n&quot;,
+$host, $nprc, $pmsg[$prc]));
+}
+}
+else {
+# The machine seems to be alive.
+# Try to talk to the xntp daemon and analyze
+# what is returned. cps_probe_ntp is the ntp
+# program from the version 2 xntp package.
+@ntp = split(/\s+/,
+`/opt/bin/cps_probe_ntp $host 2&gt;&amp;1`);
+@offset = split(/:/, $ntp[2]);
+if ( $offset[0] ne 'offset') {
+if ($ntp[2] eq 'refused') {
+substr($status_line, 0, 5) = 'DEAD!';
+}
+else {
+substr($status_line, 0, 5) = 'HUH??';
+}
+}
+else {
+# We got a proper report back from the daemon.
+$offset =
+substr($ntp[2], index($ntp[2], ':')+1);
+# Absolute value of offset.
+$offset = $offset &lt; 0 ? 0 - $offset : $offset;
+# Make offset line up if it is small enough.
+if ($offset &lt; 10) {
+substr($status_line, 0, 5) =
+sprintf(&quot;%5.3f&quot;, $offset);
+}
+else {
+substr($status_line, 0, 5) =
+substr($offset, 0, 5);
+}
+}
+#
+# Check a bunch of stuff. Another way to do this
+# would be to have a &quot;probe_client&quot; which is run
+# on each system, tailored to the architecture
+# and OS, perhaps. But then there would be two
+# (or more) programs to maintain.
+$dfroot = ''; $dfusr = ''; $dfhome = '';
+$dfvar = ''; $ostype = ''; $users = '';
+$load = ''; $ypwhich = ''; $uptime = '0';
+
+# This mess with fork is an attempt to keep the
+# probe from getting stuck on hung machines. It
+# is usually successful.
+$redo_count = 0;
+FORK: {
+if ($pid = fork) {
+# Parent. Give the child ample time to write
+# the /tmp file.
+for ($i = 0; $i &lt; 15; $i++) {
+# Sleep for one second.
+select(undef, undef, undef, 1.0);
+if (-s &quot;/tmp/probe-$$&quot;) {
+last;
+}
+}
+# Sleep for one-half second.
+select(undef, undef, undef, 0.5);
+# If the child still has not written to the
+# file, assume it is hung and try to kill it.
+if (-z &quot;/tmp/probe-$$&quot;) {
+kill(1, $pid);
+select(undef, undef, undef, 0.5);
+kill(9, $pid);
+}
+
+} elsif (defined $pid) {
+# We're the child. Write to a /tmp file.
+$parent = getppid;
+open(TMP, &quot;&gt;/tmp/probe-$parent&quot;);
+# ostype is a local shell script.
+$cmd = &quot;'ostype;&quot;
+.&quot; df / /usr /var /home; uptime; ypwhich'&quot;;
+print(TMP
+`/usr/ucb/rsh -n $host $cmd 2&gt;&amp;1`);
+close(TMP);
+exit;
+} elsif ($! =~ /No more process/) {
+# EAGAIN
+if ($redo_count &lt; 5) {
+sleep 5;
+redo FORK;
+} else {
+die &quot;Out of processes at host&quot;
+.&quot; \&quot;$host\&quot;\n&quot;;
+}
+} else {
+# Fork error.
+die &quot;Argh, cannot fork for host&quot;
+.&quot; \&quot;$host\&quot;: $!\n&quot;;
+}
+} # FORK:
+
+# Back together again. There should be something
+# in the /tmp file. The &quot;wait&quot; is necessary to
+# reap the child.
+wait;
+if (open(TMP, &quot;&lt;/tmp/probe-$$&quot;)) {
+@rsh = &lt;TMP&gt;;
+close(TMP);
+unlink(&quot;/tmp/probe-$$&quot;);
+}
+else {
+# Nothing from the child process.
+$rsh[0] = 'NO RESPONSE!';
+}
+
+# It is not safe to make assumptions about how
+# many lines are returned by the rsh. The df
+# will return additional lines if the mountpoint
+# names are long.
+chop($ostype = $rsh[0]);
+foreach $line (@rsh) {
+@line = split(/\s+/, $line);
+$last = $line[$#line];
+if ($last eq '/') {
+$dfroot = $line[$#line - 1];
+next;
+}
+if ($last eq '/usr') {
+$dfusr = $line[$#line - 1];
+next;
+}
+if ($last eq '/var') {
+$dfvar = $line[$#line - 1];
+next;
+}
+if ($last eq '/home') {
+$dfhome = $line[$#line - 1];
+next;
+}
+# Users and load. The number of tokens in the
+# uptime line depends on how long the system
+# has been up.
+if ($line =~ /load average/) {
+foreach $token (@line) {
+if (substr($token, 0, 3) eq 'day') {
+# $users is the previous token.
+$uptime = $users;
+}
+if (substr($token, 0, 4) eq 'user') {
+last;
+}
+$users = $token;
+}
+$load = $last;
+next;
+}
+} # foreach rsh
+
+# Ypwhich.
+$ypwhich = $rsh[$#rsh];
+$ypwhich =~ s/^([^\.]+).*\n$/$1/;
+
+# Fill in the status line if we got good stuff.
+if ($#rsh &gt; 1) {
+substr($status_line,  6, 4) =
+sprintf(&quot;%4.4s&quot;, $dfroot);
+substr($status_line, 11, 4) =
+sprintf(&quot;%4.4s&quot;, $dfusr);
+substr($status_line, 16, 4) =
+sprintf(&quot;%4.4s&quot;, $dfvar);
+substr($status_line, 21, 4) =
+sprintf(&quot;%4.4s&quot;, $dfhome);
+substr($status_line, 26, 5) =
+sprintf(&quot;%5.1f&quot;, $load);
+substr($status_line, 32, 3) =
+sprintf(&quot;%3.3s&quot;, $users);
+substr($status_line, 43, 3) =
+sprintf(&quot;%3.3s&quot;, $uptime);
+$status_line .= $ypwhich;
+
+# Check on the popular daemons. This is
+# different depending on OS type.
+if (&quot;$ostype&quot; eq 'SunOS-4'
+|| &quot;$ostype&quot; eq 'NeXT') {
+substr($status_line, 36, 6) = 'blmpsx';
+$cmd = &quot;ps -ax | grep '?'&quot;;
+@rsh = split(/\n/,
+`/usr/ucb/rsh -n $host $cmd 2&gt;&amp;1`);
+foreach $line (@rsh) {
+if ($line =~ /screenblank/) {
+substr($status_line, 36, 1) = 'B';
+next; }
+if ($line =~ /\/usr\/lib\/lpd/) {
+substr($status_line, 37, 1) = 'L';
+next; }
+if ($line =~ /sendmail/) {
+substr($status_line, 38, 1) = 'M';
+next; }
+if ($line =~ /yppasswdd/) {
+substr($status_line, 39, 1) = 'P';
+next; }
+if ($line =~ /ypserv/) {
+substr($status_line, 40, 1) = 'S';
+next; }
+if ($line =~ /xntpd/) {
+substr($status_line, 41, 1) = 'X';
+next; }
+} #foreach
+}
+else {
+# SVR4 (Sun Solaris 2.x, DEC OSF/1).
+substr($status_line, 36, 6) = 'blmstx';
+$cmd = &quot;ps -e | grep '?'&quot;;
+@rsh = split(/\n/,
+`/usr/ucb/rsh -n $host $cmd 2&gt;&amp;1`);
+foreach $line (@rsh) {
+# Truncated to 8 chars by ps -e
+if ($line =~ /screenbl/) {
+substr($status_line, 36, 1) = 'B';
+next; }
+if ($line =~ /lpsched/) {
+substr($status_line, 37, 1) = 'L';
+next; }
+if ($line =~ /sendmail/) {
+substr($status_line, 38, 1) = 'M';
+next; }
+if ($line =~ /ypserv/) {
+substr($status_line, 39, 1) = 'S';
+next; }
+if ($line =~ /ttymon/) {
+substr($status_line, 40, 1) = 'T';
+next; }
+if ($line =~ /xntpd/) {
+substr($status_line, 41, 1) = 'X';
+next; }
+} #foreach
+} #else not BSD
+}
+else {
+# Fill in the problem.
+if ($#rsh == -1) {
+$status_line =
+substr($status_line, 0, 7)
+. 'NO RESPONSE!';
+}
+else {
+$rsh[0] =~ tr/\n//d;
+$status_line =
+substr($status_line, 0, 7).$rsh[0];
+}
+}
+
+# Finally, display the results.
+$host =~ s/^([a-z0-9-]*).*$/$1/;
+&amp;do_print('b', sprintf(&quot;%16.16s: %s\n&quot;,
+$host, $status_line));
+}
+} # End of &quot;do_poll&quot; subroutine.
+
+#------------------------------------------------------
+# do_print | Subroutine to print to both stdout and to
+#----------- the currently open mail pipe. We are
+# sloppy with the pipe. The next open on the same
+# filehandle closes the previous pipe. Exiting from
+# the script closes the final pipe. The overall goal
+# is that a complete report goes to stdout, while a
+# copy of the output covering each lab goes to the lab
+# manager.
+#
+# Arguments:
+# 0 - &quot;s&quot; for stdout, &quot;b&quot; for both.
+# 1 - string to print.
+#
+# Global variables used:
+#   $current, $debug, $lab, $getngrp_skip*
+# Global variables modified:
+#   $current
+sub do_print {
+if ($_[0] eq 'b' &amp;&amp; (! $opt_s)) {
+# Print to both.
+# If this is the first time the routine is
+# called for this lab, open a pipe to the mail
+# command for the report to the lab manager.
+if ($current ne $lab) {
+$current = $lab;
+if ($debug eq '') {
+open(MAIL,
+&quot;|mail -s \&quot;Host Probe for&quot;
+.&quot; $lab\&quot; manager\@$lab&quot;);
+}
+else {
+open(MAIL,
+&quot;|mail -s \&quot;DEBUG Host Probe for&quot;
+.&quot; $lab\&quot; lees&quot;);
+}
+select((select(MAIL), $| = 1)[0]);
+chop($date = `date`);
+printf MAIL &quot;CPS Host Probe $ver from&quot;
+.&quot; $hostname\n$date\n\n&quot;;
+printf MAIL &quot; BSD: screenBlank Lpd    &quot;
+.&quot; sendMail ypPasswdd ypServe Xntpd\n&quot;;
+printf MAIL &quot;SVR4: screenBlank Lpsched&quot;
+.&quot; sendMail ypServe   Ttymon  Xntpd\n&quot;;
+printf MAIL
+&quot;Skipping groups:$getngrp_skipgroup\n&quot;;
+printf MAIL
+&quot;Skipping hosts:$getngrp_skiphost\n&quot;;
+}
+print MAIL $_[1];
+}
+
+# Print to stdout.
+print $_[1]
+unless $opt_m;
+} # End of &quot;do_print&quot; subroutine.
+
+#------------------------------------------------------
+# getngrp | The single argument is a netgroup entry.
+#---------- This is either a subgroup name, or a
+# parentheses enclosed tuple for a host. Normally, we
+# start things off with a call of the form:
+# do getngrp('cps').
+#
+# Our netgroup database looks like this:
+#
+# cps           lab1 lab2...
+# lab1          lab1_s lab1_c
+# lab1_s        (server1.cps.msu.edu,-,)\
+#               (server2.cps.msu.edu,-,)
+# lab1_c        lab1_next lab1_sparc
+# lab1_next     (one.cps.msu.edu,-,)\
+#               (two.cps.msu.edu,-,)
+# lab1_sparc    lab1_ss1 lab1_ss2 lab1_ss10
+# lab1_ss1      (three.cps.msu.edu,-,)\
+#               (four.cps.msu.edu,-,)
+# lab1_ss2      (five.cps.msu.edu,-,)\
+#               (six.cps.msu.edu,-,)
+# lab1_ss10     (seven.cps.msu.edu,-,)\
+#               (eight.cps.msu.edu,-,)
+# ...and so on.
+#
+# Two global arrays are used. @getngrp_stack is used
+# as a temporary stack, %getngrp_lab accumulates the
+# result. Its key is a concatenation of the netgroups,
+# e.g., &quot;cps prip prip_c&quot;, and the data is a
+# concatenation of all the hosts for the key.
+# Recursive routine.
+#
+# The global variables getngrp_skip* are checked for
+# things to skip.
+sub getngrp {
+local($arg) = $_[0];
+local($entry);
+
+# Either a host tuple or a subgroup.
+if (split(/\s+/, $arg) == 1) {
+if ($arg =~ /\(/) {
+# This is a host tuple. Skip hosts having
+# a -gw suffix, because these are additional
+# ports on the same box.
+$arg =~ s/^\(([^,]*).*$/$1/;
+$getngrp_hosts{&quot;@getngrp_stack&quot;} .= &quot;$arg &quot;
+unless ($arg =~ /-gw/
+|| $getngrp_skiphost =~ / $arg /);
+}
+else {
+# Subgroup. Check the exception list.
+if (! ($getngrp_skipgroup =~ / $arg /)) {
+push(@getngrp_stack, $arg);
+foreach $entry (split(/\s+/,
+`ypmatch $arg netgroup`)) {
+&amp;getngrp($entry);
+}
+pop(@getngrp_stack);
+}
+}
+}
+} # End of &quot;getngrp&quot; subroutine.
+# End of health_probe script.
+</pre><p>
+<p>
+
+
+<P>
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

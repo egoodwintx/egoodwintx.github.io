@@ -1,0 +1,268 @@
+<HTML>
+<META NAME="year" CONTENT="1996">
+<HEAD>
+<!-- This document was built using HyperWriter Professional by NTERGAID Inc. -->
+<TITLE>APR96: Speeding Up C-tree Plus Database Searches</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>Speeding Up C-tree Plus Database Searches<a name="0179_0077"><a name="0179_0077"><a name="0179_0075"><a name="0179_0000"></h1><P>
+
+<h2>In search of the homogenized quantum effect</h2><P>
+
+<h3>John Mudd</h3><P>
+
+<P>
+<i><a name="0179_0076"><a name="0179_0000">John, a programmer in Florida, can be contacted at
+mudd%nat@satchmo.oau.org.</i></p><hr><P>
+
+When we began evaluating database systems to develop a customer application, our needs were fairly
+straightforward: We needed fast, indexed access, portability, source code, and an inexpensive price.
+FairCom's c-tree Plus file-handling software seemed to fit the bill. C-tree is a cross-platform C function
+library for performing database I/O. Based on B+tree routines, the software has been ported to over 100
+platforms, ranging from Windows to HP 9000, and provides low-level routines and high-level, multi-key
+ISAM routines for high-speed random or sequential access. C-tree also supports variable record lengths,
+key compression, client/ server architecture, ascending/descending key segments, space reclamation, and
+variable-length key fields. The software includes transaction processing, alternate collating sequence,
+duplicate keys and/or automatic sequence numbers, dynamic space reclamation, high-speed hashed data and
+index caching, and more. <P>
+
+Still, one thing c-tree doesn't provide is a means of performing searches on partial keys, unless the key is
+a leading subset of the index. For example, a compound index such as <I>[Group_ID|Account|Amount]</I>
+can't be used to reduce search time unless the criterion includes at least a Group_ID clause. A search such
+as &quot;Amount &gt; 100&quot; would require sequentially reading all records and testing each against
+the Amount criterion since the compound index doesn't make records available in purely Account-value
+order.  In this article, I'll present an algorithm that enhances c-tree searching by treating all parts of an
+index identically. This search technique can decrease access time, no matter what parts of an index are
+specified in the criteria--even if it's in the middle or the trailing parts of a compound index.<P>
+
+<h3><a name="0179_0078">Homogenized Search Criteria <a name="0179_0078"></h3><P>
+
+In a query such as <I>Bank_ID = 1234 and Account &lt; 123456</I>, a <I>[Bank_ID|Account] </I>index can
+speed processing by limiting database reads to only records for <I>Bank 1234</I>. This would eliminate
+reading all records with Bank IDs less than 1234 or greater than 1234. <P>
+
+The query code would then sequentially filter out records that had an amount less than 123456.
+Unfortunately, my first program to process this sort of SQL-style query continued to read records until it
+hit the end of the file, turning what should be a subsecond query into one that lasts several minutes. This
+problem occurred because my program was bogged down in the countless possible permutations of fields and
+operands that could appear in the ad-hoc search criteria. There was too much custom code for each
+different type of operand and too little understanding of how different clauses in the search criteria could
+be used to limit reading data records. One solution to this problem is to transform (homogenize) the
+different operators so that each can be expressed in identical terms. Once homogenized, it becomes
+relatively easy to use the entire search criteria in controlling the direction and progress of a search.<P>
+
+It probably never would have occurred to me that any clause can be expressed in a uniform fashion if it
+hadn't been for the range operator. While range isn't standard SQL, I still had to implement it to enable a
+user interface that provides a range-type query capability to the users. Eliminating the range operator
+from my code would mean one less operator to support. While daydreaming about removing support for
+range, it occurred to me that a better approach was to instead convert all other operators to, of all things,
+ranges.<P>
+
+<a href="9604h.htm#0179_007c">Table 1</A> illustrates how SQL-style clauses can be described as one
+or two ranges. Note that the range operator is listed first. Obviously it doesn't require any sort of
+conversion to be described as a range. The = operator is also an easy conversion, since the <I>min</I> and
+<I>max</I> values in the range are both simply the target value (10) taken from the original criteria. To
+convert the rest of the operators, I had to use implied criteria. <P>
+
+The &lt;= operator example explicitly states that the amount must be less than or equal to a value of 10.
+But, since all database types have absolute minimum and maximum values, the same <I>amount &lt;=
+10</I> criterion also implies that the amount must be greater than or equal to the absolute minimum value
+associated with the <I>Amount </I>field. If the <I>Amount </I>field is a 4-byte unsigned integer field, then
+the respective absolute <I>min</I> and <I>max</I> values are 0 and 4,294,967,295. The end result is that
+<I>amount &lt;= 10</I> is equivalent to <I>amount range 0 10</I>.<P>
+
+The &lt; and &gt; operators add another twist to the conversion. The value (10) specified in the criteria
+cannot be used directly in the equivalent range. The solution is to decrement the target value for the &lt;
+operator and increment the target for the &gt; operator. Since all database fields are stored as discrete
+binary codes, they all can be adjusted one higher or lower as part of the transformation. I use a collection
+of C functions to handle the job of incrementing and decrementing database fields. There is one function for
+each basic data type that I support, including <I>char</I>, <I>short</I>, <I>int</I>, <I>long</I>, and
+<I>float</I>. The tedious production of this repetitious code is simplified by a single generic C preprocessor
+macro that is invoked once for each data type at compile time. I use another, similar macro to generate all
+of the functions necessary for comparing the different types of database field values.<P>
+
+The last two example range conversions, != and (null criteria), use variations on the techniques just
+described. The != is the same as <I>amount &lt; 10 or amount &gt; 10</I>. This compound criterion is then
+converted into two separate ranges using the same method as for the &lt; and &gt; operators. The null
+criterion is what a user implicitly specifies whenever there's no criterion for a field. No criterion implies
+that any value is acceptable, so this criterion simply converts to the absolute range corresponding to the
+field type.<P>
+
+<h3><a name="0179_0079">Quantum Effect Search Algorithm <a name="0179_0079"></h3><P>
+
+The search algorithm I eventually implemented takes advantage of this more easily expressed search
+criterion. It does so by skipping over blocks of data records that a conventional approach would stubbornly
+read one after another. Even though I developed this solution, it still was amazing to watch the program
+shift between  indexed and sequential access in order to skip over data records that couldn't satisfy the
+search criteria. Since this reminded  me of how electrons jump across quantum energy levels, I named the
+algorithm &quot;quantum effect&quot; (QE, for short).<P>
+
+The QE is achieved by checking each record as it is read to see if it is too high or low with respect to the
+current set of ranges. If too high or low, there is an opportunity to switch from sequentially reading
+records to jumping ahead by performing an indexed read. Reducing the number of reads necessary to satisfy
+a query provides a real increase in performance. I label a key value as too high if the first component to
+violate its current range is above its range. I check the components from most significant to least
+significant--in other words, from left to right. A compound key value is too low if the first component to
+violate its range is below the range. If there are no range violations, the search may proceed with
+sequential reads. <a href="9604h.htm#0179_007d">Figure 1</A> illustrates these situations.<P>
+
+At position 1, the initial read is based on a target composed of the three minimum values [10|20|40] for the
+three index components. The read searches for a record with a key value greater than or equal to this
+target. The subsequent three records are read sequentially. Each fits within the ranges until position 2.<P>
+
+At position 2, the value of &quot;c&quot; has fallen below its range of (40-40). A new target value is built
+based on the current values of fields to the left of the low field (&quot;c&quot;). The current values for
+&quot;a&quot; and &quot;b&quot; are 10 and 21. The minimum value of &quot;c,&quot; the field in
+violation, also is used to build the new target. The resulting target is [10|21|40]. Searching for a record
+with an index value greater than or equal to this target jumps over several unusable records. Sequential
+reading resumes at position 3.<P>
+
+At position 4, field &quot;c&quot; is above its maximum of 40. This record is therefore too high. A new
+target is constructed to jump ahead. Minimum values are used from all index components except just to the
+left of the field in violation. The target for &quot;b&quot; will be its current value plus one. The new target
+for this example is [10|26|40]. Again, a search is performed for a value greater than or equal to the
+target.<P>
+
+The quantum jump lands at position 5 and another block of unusable records is avoided. Sequential reading
+resumes. At position 6, the record is too high. The next target requires incrementing the field to the left of
+&quot;b,&quot; which is &quot;a.&quot; Since &quot;a&quot; is already at its maximum value there is no
+chance of finding further matching records. The search can be terminated.<P>
+
+Remember that, because of the null criterion, the algorithm doesn't depend on the search criteria to specify
+ranges for the leading portion of the index. Any missing portions are automatically filled by using the null
+criterion. The earlier example would perform roughly the same even if the a = 10 clause was not specified.
+The missing clause would simply be substituted with the default &quot;a&quot; range 0 max_integer clause.
+The only change to the previous results is that the search would have continued past the position 6 record
+since there would be no restriction on incrementing &quot;a&quot; past a value of 10.<P>
+
+An unexpected advantage of this new freedom to use any part of an index is that it is possible to merge
+similar indexes. <a href="9604h.htm#0179_007e">Figure 2(a)</A> lists three fairly redundant indexes
+that have been replaced by the single index in <a href="9604h.htm#0179_007e">Figure 2(b)</A>.
+The QE search algorithm makes the single new index perform the jobs of all three former indexes. Clearly,
+reducing the number of indexes increases performance for inserts and updates and saves disk space. Even
+without the keys beginning with the <I>Account</I> field, it is still possible for the QE search to perform a
+quick Account lookup. One indexed-read-per-unique-<I>Group ID</I> value quickly checks each group for the
+presence of a target Account value. In my particular data there may be as few as ten different <I>Group
+ID</I> codes in a database of one million records. The ten indexed reads necessary to scan such a database
+for a particular <I>Account</I> deliver approximately the same response time to the end user as directly
+reading account records using one of the original redundant indexes. Decisions regarding index selection still
+depend on the amount and distribution of the working data. The QE algorithm helps by making
+otherwise-impossible indexing options a reality.<P>
+
+The use of homogenized clauses simplified my code so that my new version is actually shorter than the first
+crude attempt that had such poor performance. It's not often I find a way to simplify my code, drop
+indexes, and speed up the queries.<P>
+
+<h3><a name="0179_007a">Future Possibilities <a name="0179_007a"></h3><P>
+
+Combinations of ranges is an important concept in this approach. <a href="9604h.htm#0179_007f">Figure
+3</A> shows how a search criterion can generate a series of combinations of ranges. This aspect of the
+approach lends itself to additional performance maneuvers. The simplest method is to process each
+search-range combination separately. Having multiple combinations really doesn't add much complexity to
+the search algorithm. It's just a matter of repeating the QE search process once for each distinct
+combination of ranges. The overall search continues until all of the combinations have been processed.<P>
+
+The combinations are listed for <a href="9604h.htm#0179_007f">Figure 3</A> in the order necessary to
+read records in the sorted order of the index. An alternative is to process multiple combinations in parallel.
+A multithreaded version can distribute the job of searching by handing out individual combinations to
+separate processes. Results can then be collected by a central controlling process to be merged, sorted if
+necessary, and returned to the calling application. The search time should be dramatically reduced.<P>
+
+A simple query such as<I> amount &gt; 100</I> doesn't generate multiple combinations of ranges needed
+for a multithreaded approach. Still, it's even possible to divide this plain search into two parts. The trick is
+to add the ability to perform a QE search in either direction. That is, either starting at the minimum values
+and reading forward (as described earlier) or starting at the maximum values and reading backwards. This
+way it would be possible to run any query in a minimum of two parallel processes. The opposing threads
+would execute until it becomes apparent that they have crossed paths.<P>
+
+<h3><a name="0179_007b">For More Information<a name="0179_007b"></h3><P>
+
+c-tree Plus <P>
+
+FairCom Corp<P>
+
+4006 W. Broadway<P>
+
+Columbia, MO 65203-0100<P>
+
+314-445-6833<P>
+
+http://www.faircom.com<P>
+
+<h4><a name="0179_007c"><B>Table 1:</B> SQL-style clauses can be described as one or two ranges.<a name="0179_007c"></h4><P>
+
+<pre>
+     Example Criteria           Equivalent Ranges
+                 
+     amount range 1 10          1          10
+     amount =  10               10         10
+     amount &lt;= 10               min        10
+     amount &gt;= 10               10         max
+     amount &lt;  10               min        (10-1)
+     amount &gt;  10               (10+1)     max
+     amount != 10               min        (10-1)
+                                       or
+                                (10+1)     max
+     (null criteria)            min        max
+</pre>
+
+<h4><a name="0179_007d"><B>Figure 1:</B> The algorithm checks each record as it is read to see if it is too high or too low with respect to the current set of ranges.<a name="0179_007d"></h4><P>
+
+<pre>
+        Index:                [a|b|c]
+        Search Criteria:       a = 10 and b range 20 30 and c = 40
+        Assumptions: All fields are integer type.  The index permits duplicate values.
+             
+             Data:
+             
+         a        b        c
+         -----    -----    -----
+         10       0        40
+         10       15       40
+    1)   10       20       40     &lt;-- Initial read starts here.
+         10       20       40     &lt;-- Read next.
+         10       20       40     &lt;-- Read next.
+    2)   10       21       0      &lt;-- Too low (c &lt; 40).
+         10       21       10
+         10       21       20
+         10       21       30
+    3)   10       21       40     &lt;-- Quantum jump to here.
+         10       25       40     &lt;-- Read next.
+         10       25       40     &lt;-- Read next.
+    4)   10       25       42     &lt;-- Too high (c &gt; 40).
+         10       25       43
+         10       25       44
+         10       25       45
+    5)   10       29       40     &lt;-- Quantum jump to here.
+         10       30       40     &lt;-- Read next.
+         10       30       40     &lt;-- Read next.
+         10       30       40     &lt;-- Read next.
+    6)   10       31       40     &lt;-- Too high (b &gt; 30).  The end.
+         10       31       40</pre>
+
+<h4><a name="0179_007e"><B>Figure 2:</B> Redundant indexes that have been replaced by a single index. (a) Before; (b) after.<a name="0179_007e"></h4><P>
+
+<pre>(a) 
+[GroupID|Account|Serial]
+[Account|Serial]
+[Account|Amount]
+
+(b)
+[GroupID|Account|Amount|Serial]</pre>
+
+<h4><a name="0179_007f"><B>Figure 3:</B> How a search criterion can generate a series of combinations of ranges.<a name="0179_007f"></h4><P>
+
+<pre>        Search Criteria:    a &lt;= 10 and b != 20 and c != 30
+        Equivalent Ranges:  a range 0 10
+                            b range 0 19 or b range 21 256
+                            c range 0 29 or b range 31 256
+        Range combinations:
+                  a        |       b        |       c      
+         -----------------+---------------+------------------
+             min  |  max  |  min  |  max  |  min  |  max
+         ---------+-------+-------+-------+-------+----------
+ Combo 1     0    |  10   |  0    |  19   |  0    |  29
+ Combo 2     0    |  10   |  0    |  19   |  31   |  256
+ Combo 3     0    |  10   |  21   |  256  |  0    |  29
+ Combo 4     0    |  10   |  21   |  256  |  31   |  256</pre>
+
+</BODY></HTML>

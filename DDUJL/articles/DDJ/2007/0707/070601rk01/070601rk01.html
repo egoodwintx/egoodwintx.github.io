@@ -1,0 +1,348 @@
+<html>
+<head>
+<title>Real-Time Enough</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> July 2007</p>
+
+<h1>Real-Time Enough</h1>
+<h2>A FreeBSD-based software Frequency Shift Keying modem for Caller ID</h2>
+
+
+<h3>By Robert Krten</h3>
+
+
+<I>Robert is an independent consultant specializing in real-time and embedded systems. He can be contacted at rk@parse.com or http://www.parse.com/.</I>
+
+<hr>
+
+
+<h3>Caller ID</h3>
+
+<p>Caller ID, which is a feature that tells you who is calling on the telephone, occurs as a Frequency Shift Keying (FSK) signal between the first and second ring. It operates at 1200 baud, using the Bell-202 Standard, which is based on 1200 Hz (a "mark," representing a 1) and 2200 Hz (a "space," representing a 0) tones. It's a serial transmission, with a start bit, 8 bits of data, no parity, and a stop bit. At the data level, it consists of packets of information with checksums.</p>
+
+<p>In this article, I discuss a real-time caller-ID implementation that is part of a voice-activated call monitoring system I built. In particular, I discuss how the caller-ID part of the solution has evolved from a hardware FSK modem in the early 1990s to the software FSK modem in use today. While my particular implementation is based on FreeBSD 5.3, there is nothing operating-system specific here.</p>
+
+<p>My hardware consists of an adapter for a phone line (Figure 1) that converts the telephone signal into something that I can feed into a sound card's input. Because I have two lines, I have two such circuits in my system. I've conveniently used the sound card's left channel for one line, and the right channel for the other.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2007/07/ -->    
+<img class="illowide" src="070601rk01_f1.gif" onclick = "popimage(this,'www.ddj.com - Real-Time Enough - Figure 1')">
+
+<div class="caption">
+Figure 1: Telephone line adapter.
+</div>
+</div>
+
+
+
+
+
+
+
+<h3>Requirements</h3>
+
+<p>My original requirement for the hardware was to use it as a simple, voice-activated recorder to record phone calls. Later, I realized that I could do the caller-ID decoding as part of the voice recorder's processing, thus freeing up two serial ports (used by the hardware caller-ID boxes). (Soon, I will be doing call-progress tone detection and DTMF decoding, but that's currently left as an exercise for the reader.)</p>
+
+<p>Figure 2 presents the big picture of the system. Both lines go into a sound card and are sampled at 8 kHz. The samples then go into the voice-activated recorder, which listens for activity. When it detects activity (as defined by the signal levels going above a certain threshold, for a certain period of time), it begins recording. While it's recording, it feeds samples into the software caller-ID FSK modem (there's no point in feeding samples through the modem if there's no signal).</p>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2007/07/ -->    
+<img class="illowide" src="070601rk01_f2.gif" style="width:485">
+
+<div class="caption" style="width:487">
+Figure 2: The big picture.
+</div>
+</div>
+
+
+<p>Each sample is run through the FSK modem, and if a zero or a one is detected, the bit is then sent into a software UART ("Universal Asynchronous Receiver Transmitter," but we're using just the receiver part). The software UART looks for the start bit, and when it gets it, accumulates eight more bits, and constructs the byte. The bytes are then accumulated in a buffer. When a sufficient number of bytes have been accumulated, the buffer is passed to the caller-ID event decoder, which analyzes the buffer for caller-ID information (date, time, phone number, caller's name, message waiting, and so on), and stores the information. A logger is waiting for information from the caller-ID event decoder, and logs the information to a text file.</p>
+
+<p>Now turn to the FSK modem part of the system, keeping in mind the constraints affecting the real-time processing of the samples.</p>
+
+<p>A sample rate of 8 kHz means that a sample arrives every 125 microseconds. In the past, before soundcards, an A/D (analog-to-digital) converter would simply present the digital value of the sample when the conversion was finished. This meant that something had to happen every 125 microseconds. The constraint here is that the system had to provide a reliable, preemptive scheduler that would allow a task to be scheduled every 125 microseconds.</p>
+
+<p>Coupled with the fact that something had to happen fairly frequently, the next issue was how much actual work had to happen. Do you perform the FSK calculations or do you simply buffer the data? If you buffered the data, meaning you've deferred the FSK calculations until later, then the only way you could perform the FSK work would be with a reliable preemptive scheduler that interrupts your FSK calculations in order to store subsequent samples.</p>
+
+<p>However, times have changed. Today's sound cards buffer the samples. This means that we don't need to worry about incurring scheduling overhead (context switches) for each and every sample. The hardware simply informs the kernel (via an interrupt) that a buffer is full and should be emptied. This means that you can access blocks of samples, rather than being forced to get the samples one at a time from the hardware. The advantage is that you invoke a single kernel call to transfer an entire block of samples, (and then process them individually), rather than invoking kernel calls for each and every sample.</p>
+
+<p>Another constraint is the actual amount of processing required to perform the FSK algorithm. If you are right on the edge in terms of CPU processing power to perform the calculations, then adding context-switching overhead is not going to help. By eliminating (or vastly reducing) one constraint, you've bought yourself more time to perform the FSK work.</p>
+
+
+
+
+<h3>The FSK Algorithm</h3>
+
+<p>How much work is it? Look at the FSK algorithm itself. Mathematically speaking, we are constructing the formula in Figure 3. The gist of this formula is that you take each sample and multiply it by the sine at the mark frequency, the cosine at the mark frequency, the sine at the space frequency, and the cosine at the space frequency. We add up all the multiplication and square each set. Whichever set turns out to be bigger indicates which tone you've decoded.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2007/07/ -->    
+<img class="illowide" src="070601rk01_f3.gif" onclick = "popimage(this,'www.ddj.com - Real-Time Enough - Figure 3')">
+
+<div class="caption">
+Figure 3: The formula.
+</div>
+</div>
+
+
+<p>To detect 1200 Hz and 2200 Hz tones, you construct a "correlation template"&#151;a table of four normalized (meaning that they are between -1 and +1) sets of values, giving the sine and cosine of a 1200 Hz and 2200 Hz waveform sampled at the sampling rate of 8 kHz. I only require enough samples to match the slowest waveform, which is 1200 Hz in this case. One complete waveform of a 1200 Hz sine wave, sampled at 8 kHz, will require 6 2/3 samples (8000/1200=6.666...), so I can get away with just six samples. The correlation tables look like Table 1. </p>
+
+
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+  <tr>
+  	<td>&nbsp;</td>
+    <td colspan="2" align="center">M A R K</td>
+    <td colspan="2" align="center">S P A C E</td>
+  </tr>
+  <tr>
+  	<td>&nbsp;</td>
+    <td>sine</td>
+    <td>cosine</td>
+    <td>sine</td>
+    <td>cosine</td>
+  </tr>
+  <tr>
+    <td>[0]</td>
+    <td>+0.0000</td>
+    <td>+1.0000</td>
+    <td>+0.0000</td>
+    <td>+1.0000</td>
+  </tr>
+  <tr>
+    <td>[1 ]</td>
+    <td>+0.8090</td>
+    <td>+0.5878</td>
+    <td>+0.9877</td>
+    <td>-0.1564</td>
+  </tr>
+  <tr>
+    <td>[2]</td>
+    <td>+0.9511</td>
+    <td>-0.3090</td>
+    <td>-0.3090</td>
+    <td>-0.9511</td>
+  </tr>
+  <tr>
+    <td>[3]</td>
+    <td>+0.3090</td>
+    <td>-0.9511</td>
+    <td>-0.8910</td>
+    <td>+0.4540</td>
+  </tr>
+  <tr>
+    <td>[4]</td>
+    <td>-0.5878</td>
+    <td>-0.8090</td>
+    <td>+0.5878</td>
+    <td>+0.8090</td>
+  </tr>
+  <tr>
+    <td>[5]</td>
+    <td>-1.0000</td>
+    <td>-0.0000</td>
+    <td>+0.7071</td>
+    <td>-0.7071</td>
+  </tr>
+</table>
+
+<div class="caption">
+Table 1: Correlation tables.
+</div>
+</div>
+
+
+<p>In Listing One, the mark waveform's sine table is at index 0 (corresponding to<i> sin(q</i><sub>m<i></sub>)</i> in Figure 3), the cosine at<i> 1(cos(q</i><sub>m<i></sub>)),</i> the space waveform's sine table at <i>2(sin(q</i><sub>s<i></sub>))</i>, and the cosine at <i>3(cos (q</i><sub>s<i></sub>)</i>. </p>
+
+
+<pre class="code">
+// clear out intermediate sums
+factors [0] = factors [1] = factors [2] = factors [3] = 0;
+
+// get to the beginning of the samples
+j = handle -&gt; ringstart;
+
+// do the multiply-accumulates
+for (i = 0; i &lt; handle -&gt; corrsize; i++) {
+    if (j &gt;= handle -&gt; corrsize) {
+        j = 0;
+    }
+    val = handle -&gt; buffer [j];
+    factors [0] += handle -&gt; correlates [0][i] * val;
+    factors [1] += handle -&gt; correlates [1][i] * val;
+    factors [2] += handle -&gt; correlates [2][i] * val;
+    factors [3] += handle -&gt; correlates [3][i] * val;
+    j++;
+}
+
+</pre>
+<div class="caption">
+   Listing One  
+</div>	
+	
+
+<p>The algorithm assumes that samples are placed into the ring buffer<i> handle -&gt; buffer</i>, with the variable <i>handle -&gt; ringstart</i> pointing to the beginning of the buffer.</p>
+
+<p>Then, each sample in the buffer is multiplied by each of the four correlates, and the values are accumulated into the <i>factors</i> array. (The logic dealing with <i>j</i> simply makes sure that <i>j</i> loops around the ring buffer correctly.) The four factors correspond to the four summations in Figure 3.</p>
+
+<p>So far, the total amount of work is 24 multiply-accumulates, which is followed by a comparison and some buffer housekeeping.</p>
+
+<p>At this point, it's fair to point out a small optimization.</p>
+
+<p>Notice that the correlates at index zero are always zero (for the sine components) and one (for the cosine components). The code could be optimized slightly to:</p>
+
+
+
+<ul>
+  <li>Assign the value zero to the <i>factors [0] </i>and <i>factors [2]</i> accumulators.</li>
+  <li>Assign the value of the sample at the ring buffer start to the <i>factors [1]</i> and <i>factors [3]</i> accumulators.</li>
+  <li>Start at the next sample position.</li>
+  <li>Start at one rather than zero for the multiply-accumulate cycle.</li>
+  </ul>
+
+<p>This would bring the code down by four multiply-accumulates (17 percent savings). (Alternatively, you could do the aforementioned optimization, but keep the same number of multiply-accumulates and just extend the table. Remember, I'm using six samples where my calculations indicated 6 and 2/3 samples, so 7 samples is okay, too.)</p>
+
+<p>Finally, once all the multiply-accumulates are done for the four factors, you square and add the respective mark and space factors, and see which one is bigger:</p>
+
+<pre class="code">
+
+handle -&gt; current_bit = factors [0] * 
+         factors [0] + factors [1] * 
+         factors [1] &gt; factors [2] * 
+         factors [2] + factors [3] * 
+         factors [3];
+
+
+</pre>
+<p>Whichever set of factors is bigger indicates which frequency was detected; therefore, if you get a true value, it means you detected a mark; otherwise, you detected a space.</p>
+
+<p>The algorithm just described is basically a pair of matched filters at the mark and space frequencies; the result is obtained by comparing the amplitude of the output of the two filters.</p>
+
+
+
+
+<h3>Bit-Cell Management</h3>
+
+<p>At a slightly higher level, you need to perform bit-cell management. What I mean by this is that we need to know where one bit ends and another bit starts. Obviously, if the bits have different values, this is easy: When the value changes, one bit has ended and another has started. However, what if there are several bits all with the same value, one after another? This is the topic of "clock recovery."</p>
+
+<p>Because the data stream is arriving at 1200 baud, you know that each bit cell is 1/1200 of a second long, or 833.333... microseconds. Next you calculate how many samples (at 8 kHz) 1/1200 of a second is. Well, this is the same number I came up with earlier when I calculated how many samples I needed to store one complete waveform at 1200 Hz. It's the value 6 and 2/3. This means that every 6 2/3 samples we have the end of one bit, and the beginning of another. However, since I am working with integral samples, it means that I have to compromise a little bit, and potentially introduce drift. (Drift is introduced not only by rounding errors, but also because your sound card will not be sampling at <i>exactly</i> 8 kHz, nor will the phone company be transmitting at <i>exactly</i> 1200 baud; there will be some variation.)</p>
+
+<p>The saving grace here, though, is that you are dealing with a serial protocol that has a start bit and a stop bit, which are different from each other. This means that you are guaranteed to have at least two bit reversals during an 8-bit data byte. Recall that a bit reversal (a change from a mark to a space or vice-versa) tells you the definitive location of a bit-cell boundary. You therefore use those for synchronization. Listing Two is the code that does that part. The value <i>celladj</i> is a floating-point value that indicates the fraction of a bitcell that elapses with each sample. (Yes, this could have been done with integers, but I got lazy.)</p>
+
+
+<pre class="code">
+// store previous bit in preparation
+handle -&gt; previous_bit = handle -&gt; current_bit;
+
+// compute current bit (as above)
+handle -&gt; current_bit = (factors [0] * factors [0] + factors [1] * 
+                       factors [1] &gt; factors [2] * factors [2] + 
+                       factors [3] * factors [3]);
+// if there's a bit reversal
+if (handle -&gt; prevbit != handle -&gt; current_bit) {
+    // adjust cell position to be in the middle
+    handle -&gt; cellpos = 0.5;
+}
+
+// walk the cell along
+handle -&gt; cellpos += handle -&gt; celladj;
+
+// gone past the end of the bitcell?
+if (handle -&gt; cellpos &gt; 1.0) {
+
+  // compensate
+  handle -&gt; cellpos -= 1.0;
+
+  // tell the higher level application that we have a new bit value
+  bit_outcall (handle -&gt; current_bit);
+}
+
+</pre>
+<div class="caption">
+   Listing Two
+</div>	
+	
+
+<p>So far, you've accumulated a sequence of bits, and called <i>bit_outcall</i> with each bit as it arrived from the software modem. You now need to construct a software UART; something that looks for a start bit, accumulates 8 bits (ignores the stop bit), and calls a function to indicate that a completed data byte has arrived; see Listing Three. This implements a trivial state machine.</p>
+
+
+
+<pre class="code">
+// if waiting for a start bit (0)
+if (!handle -&gt; have_start) {
+    if (bit) {
+        // ignore it, it's not a start bit
+        return;
+    }
+    // got a start bit, reset
+    handle -&gt; have_start = 1;
+    handle -&gt; data = 0;
+    handle -&gt; nbits = 0;
+    return;
+}
+
+// here, we have a start bit
+
+// accumulate data
+handle -&gt; data &gt;&gt;= 1;
+handle -&gt; data |= 0x80 * !!bit;
+
+handle -&gt; nbits++;
+
+// if we have enough...
+if (handle -&gt; nbits == 8) {
+    // ship it to the higher level
+    byte_outcall (handle -&gt; data);
+
+    // and reset for next time
+    handle -&gt; have_start = 0;
+}</pre>
+<div class="caption">
+   Listing Three
+</div>	
+	
+
+<p>The state machine begins the operation with <i>have_start</i> set to zero, indicating that you have not yet seen the start bit. A start bit is defined as a zero, so while you receive 1s, you simply ignore them. Once you do get a zero, you set <i>have_start</i> to a 1, clear the data byte that you'll accumulate, and reset the number of bits that you've received to zero. As new bits come in, you shift them into place (using my favorite bit of obfuscated C, the "Boolean typecast operator," or "!!"), and bump the count of received bits. When the count reaches eight, you've received all of the bits you need to declare a completed byte, and you ship the completed data off to a higher level function (<i>byte_outcall</i>) and reset the <i>have_start</i> state variable back to zero to indicate that you are once again looking for a start bit.</p>
+
+<p>If you are into such things, you could check to see that there is indeed a stop bit present. If there isn't a stop bit, you should declare a frame error in your serial transmission. I didn't bother for this application, but there is some commented-out code in the library that serves as a starting point. At this point, you have bytes coming from a sound card&#151;pure magic. </p>
+
+<p>What does this have to do with real time? Well, there's a lot of computations happening:</p>
+
+
+
+<p>8000 x (24 x (multiply + accumulate) + </p>
+
+<p>       4 x multiplies + 2 accumulates) = </p>
+
+<p>             432,000 math operations per second</p>
+
+<p>(to say nothing of the buffer management and housekeeping functions required).</p>
+
+<p>So while I'd like to believe that I could do this on a late 1960s vintage PDP-8 minicomputer, the truth is that it would probably take at least an 8086-class processor to come close to the CPU requirements.</p>
+
+<p>This ties in to the "real time enough" aspect. Just as certain tasks were completely out of the picture in terms of being done in software, so has the landscape changed in terms of "real-time" requirements. In 1993, I implemented the higher level caller-ID software, but relied on hardware FSK modems because it was inconceivable (to me, at least) that I could do this in software. The 1993 implementation relied on a real-time OS (QNX 4) to make sure that the CPU got allocated to the serial port handler when data arrived, and then got allocated to the high-level caller-ID software to ensure timely processing.</p>
+
+<p>Today, I run the full software caller-ID package as described in this article on a free OS (FreeBSD 5.3) and I didn't even bother using the real-time scheduling features of the kernel. It barely uses enough CPU to show up as more than 0.00 percent on the CPU monitor. In short, it's "fast enough."</p>
+
+
+
+
+
+</body>
+</html>

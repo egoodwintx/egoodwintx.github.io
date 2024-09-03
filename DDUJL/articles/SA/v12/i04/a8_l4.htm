@@ -1,0 +1,150 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i04: Listing 4 amufsdump
+
+
+
+</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a8.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a8_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink"><a href="a8_l2.htm">Listing 2</a></span></td>
+		<td><span class="navbarLink"><a href="a8_l3.htm">Listing 3</a></span></td>
+		<td><span class="navbarLink">Listing 4</span></td>
+		<td><a href="../../../../source/SA/2003/apr2003.tar"><b class=codeListing>apr2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b>Listing 4 </b><i>amufsdump</i></h1>
+            <p> 
+            <pre>
+#!/usr/local/bin/perl -wT
+# -*- perl -*-
+#ufsdump a filesystem snapshot for amanda
+#usage: /usr/local/etc/amufsdump 0usf 1048576 - /dev/rdsk/c1t0d0s6
+
+#JRCB 21-oct-02
+
+#1. Initialise
+#2. Secure input 
+#3. Delete old snapshot if exists
+#4. Create snapshot
+#5. ufsdump snapshot
+#6. Delete snapshot
+#No signal handling as interrupting "fssnap ... /" (or /var) hangs system
+
+### 1. Initialise
+use Sys::Hostname;
+$DF="/usr/bin/df";
+$HOST = hostname();
+$BSDIR="/share/backingstore/$HOST";
+$FSSNAP="/usr/lib/fs/ufs/fssnap";
+$LOCK_EX = 2;
+$LOCK_UN = 8;
+$LOCKFILE = "&gt;/var/run/fssnap.lock";
+$PGREP="/usr/bin/pgrep";
+$UFSDUMP="/usr/sbin/ufsdump";
+$XNTPD="PATH=/usr/bin /etc/init.d/xntpd";
+
+### 2. Secure input
+#Suid: untaint PATH
+$ENV{PATH}="";
+$ENV{IFS}=" ";
+
+$DUMPMAN = "dumpman";
+die "Must run as $DUMPMAN" unless ($&lt; == getpwnam ($DUMPMAN));
+
+#Ensure we are called with appropriate 4 arguments as called from amdump
+($OPTS, $SIZE, $TAPEDEV, $RAWDEV) = 
+    ("@ARGV" =~ m!^(\w+) (\d+) (-) (/dev/rdsk/c\d+t\d+d\d+s\d+)$!) or 
+    die "@ARGV.  Usage eg: amufsdump 0usf 1048576 - /dev/rdsk/c0t0d0s0";
+
+#Skip snapshot if just getting dump size
+#  amandad calls sendsize which calls amufsdump with RAW DEVICE
+if ($OPTS =~ /S/){
+    system($UFSDUMP, $OPTS, $SIZE, $TAPEDEV, $RAWDEV);
+    exit;
+}
+
+#Get mount point of raw device to dump, eg /var
+($BLKDEV = $RAWDEV) =~ s/rdsk/dsk/;
+$DF_T = `$DF $BLKDEV`;
+($MNTPT) = ($DF_T =~ m!^(/\S*)!) or die "df output tainted. $!";
+
+#Open lockfile (just need to open once then lock and unlock as required)
+open(LOCKFILE) or die $!;
+
+#Flock access to fssnap (and /etc/init.d/xntpd) to avoid concurrent access by 2 amufsdumps
+sub lock($)
+{
+    $CMND = shift @_;
+    flock(LOCKFILE, $LOCK_EX) or die $!;
+    $FSSNAPOUT_T = `$CMND`;
+    warn "Error with: $CMND\n" if ($?&gt;&gt;8);
+    flock(LOCKFILE, $LOCK_UN) or die $!;
+    return $FSSNAPOUT_T;
+}
+
+### 3. Delete old snapshot if exists
+#Set the (real) uid (was dumpman) to the (effective) euid (root)
+$&lt; = $&gt;; 
+$FSSNAP_I_T = lock("$FSSNAP -i -o mountpoint $MNTPT");
+lock("$FSSNAP -d $MNTPT") if ($FSSNAP_I_T =~ m!^/\S*$!);
+
+### 4. Create new snapshot
+#Stop xntpd if running because...
+#  network time protocol daemon runs in realtime mode, blocks locking filesystem)
+`$PGREP xntpd &gt; /dev/null`;
+if ($MNTPT eq "/" or $MNTPT eq "/var" and ($? &gt;&gt; 8) == 0){
+    $FSSNAPDEV_T = lock("$XNTPD stop; $FSSNAP -o unlink,bs=$BSDIR $MNTPT; $XNTPD start");
+} else {
+    $FSSNAPDEV_T = lock("$FSSNAP -o unlink,bs=$BSDIR $MNTPT");
+}
+($FSSNAPDEV) = ($FSSNAPDEV_T =~ m!^(/dev/fssnap/\d+)!) or die "fssnap output tainted. $!";
+
+### 5. Ufsdump filesytstem (N option writes raw device of front filesystem in dumpdates)
+#Eg: /usr/local/etc/amufsdump 0usf 1048576 - /dev/rdsk/c0t0d0s3 by
+#    /usr/sbin/ufsdump N0usf /dev/rdsk/c0t0d0s3 1048576 - /dev/fssnap/1
+system($UFSDUMP, "N$OPTS", $RAWDEV, $SIZE, $TAPEDEV, $FSSNAPDEV);
+
+### 6. Delete snapshot
+lock("$FSSNAP -d $MNTPT");</pre>
+            <p>&nbsp; 
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

@@ -1,0 +1,293 @@
+<HTML>
+<META NAME="year" CONTENT="1988">
+<HEAD>
+
+<TITLE>FEB88: STRUCTURED PROGRAMMING</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>STRUCTURED PROGRAMMING<a name="006e_0003"><a name="006e_0003"></h1><P>
+<h2><a name="006e_0001"><a name="006e_0000">Writing a DOS Critical Error Handler</h2><P>
+<h3>Kent Porter</h3><P>
+<a name="006e_0002"><a name="006e_0000">An application running under DOS gets ugly treatment when a hardware error occurs. The alternatives DOS provides are the infamous Ignore (at peril), Retry (and get the same error again), and Abort (losing the work done so far). To get around these nasty consequences, you can write a special kind of interrupt service routine called a critical error handler. That's what I'll do here, and in the process I'll point out some of the features that make the new Turbo Pascal, Version 4.0, a real treat for serious application developers.<P>
+The critical error handler wakes up (via interrupt 24h) when DOS encounters any of 14 problems associated with disk and character devices. These problems run the gamut from an open drive door to media failure. The default critical error handler built into DOS displays a message explaining the problem and asks users to select from the Abort/Retry/Ignore alternatives. Because the default handler sets no state switches and returns nothing, DOS applications that don't replace it can't make any provision for critical errors. The best you can hope for is that the error will go away if the user selects Retry--fat chance.<P>
+A better solution is to take over the vector for interrupt 24h, pointing it to your own handler, which records what went wrong and sets a flag, then returns. Your application can check the flag after each disk or printer I/O request and, if it finds a critical error occurred, recover or shut down gracefully; the action depends on the nature of the error.<P>
+There are two classes of critical errors--disk and nondisk. Although DOS triggers interrupt 24h for both, they require different processing. On entry, bit 7 of register AH contains a 0 for disk errors and a 1 for nondisk problems. Because interpretation of the registers differs from that point on, entry processing should test this bit and branch to the appropriate routine.<P>
+Disk errors occur more often than nondisk errors do, and there are more possibilities. Consequently, DOS passes a number of items of information, especially in register AFl. Bit 0 contains 0 if a read failed and 1 if a write failed. Bits 1 and 2 show where the error was detected, the patterns being:<P>
+<pre>00   DOS work area
+01   File allocation table
+10   Disk directory
+11   Files area</pre><P>
+Register AL indicates the drive on which the failure took place, the values being 0 for A, 1 for B, and so on. The low half of the DI register contains an error code (and the upper half garbage, so isolate the low byte before attempting to interpret the code). Finally, the BP:SI register pair points to the device driver header, although nobody cares in handling disk errors. The failure codes returned in DI are listed in <a href="8802d.htm#006e_0004">Table 1</A>, page 103.<P>
+<h4><a name="006e_0004"><a name="006e_0004"><B>Table 1:</B> Critical error failure codes returned in DI</h4><P>
+<pre>
+DI           Means
+00h          Write-protected disk
+01h          Invalid drive designator
+02h         Drive not ready: empty or open door
+03h          Unknown command: probably bad DOS call
+04h          CRC data: bad disk
+05h          Invalid request structure: program error
+06h          Seek error: hardware failure
+07h          Unknown media type: probably bad disk
+08h          Sector not found: usually unformatted disk
+0Ah        Write fault
+0Bh          Read fault
+0Ch          General failure
+
+</pre><P>
+<P>
+The nondisk error class is a catchall for two entirely unrelated kinds of problems. One occurs when a character device--nominally a printer, but it could be a serial port, too--signals a malfunction. The other occurs when DOS detects a discrepancy between the two inmemory copies of the file allocation table (FAT), which governs the management of disk space.<P>
+To determine which error is being reported, use the address in BP:SI to check the attribute word in the device driver. It's at offset 4 from BP:SI. If bit is is off, the FAT is corrupted; if it's on, you have a problem with a character device. In the latter case, you can determine which device failed by inspecting the string at offset 8 from BP:SI. It gives the logical device name (LPT1, COM1, and so on) of the guilty party.<P>
+The critical error handler built into DOS uses this information to produce a brief explanation of the problem. It then asks the user the infamous Abort/Retry/Ignore question and, based on the answer, passes one of three codes back to DOS in the AL register. A code of 0 means Ignore (that is, pretend nothing happened and restore control to the running program); 1 means Retry the operation; and 2 means Abort the program without giving it a chance to close files.<P>
+Because the purpose of writing a custom error handier is to avoid the catastrophic consequences of these choices, your handler should record information about what went wrong, set a Boolean flag (CriticalErrorOccurred) to TRUE, and always return 0 in register AL. That way DOS will restore control to your program, which can check the flag with the test:<P>
+<pre>     if CriticalErrorOccurred then ...</pre><P>
+and take appropriate action.<P>
+And what might that action be? Well, it depends. If the disk is unformatted (error code 8), you might execute FORMAT as a child process using Turbo Pascal 4.0's EXEC procedure. For drive not ready (code 2), you could tell the user to stick in a disk and close the door, then retry. Unrecoverable errors call for more drastic action, such as closing all files and terminating the program. The error handler itself only records the bad news; what you do about it is up to you.<P>
+There's a more or less ironclad rule among DOS hackers that you shouldn't attempt any I/O from inside an interrupt handler. This is because of the notorious DOS reentrancy problem. An exception is made for a critical error handler, however; it can perform console I/O functions (DOS interrupt 21h, functions 01h through 0Ch). Turbo Pascal and most other high-level languages use these very functions to communicate with the user, so you can safely carry on a console dialog from within the handler.<P>
+<h3><a name="006e_0005">Examining the Code<a name="006e_0005"></h3><P>
+Now let's look at the real live critical error handler in <a href="8802d.htm#006e_0008">Listing One</A> (see page 84). It's written as a unit, a new feature of Turbo Pascal 4.0 that provides for separately compiled, linkable modules.<P>
+The only externally visible routine in the criterr unit is the InstallCEH procedure. It's called by the using program to stuff the address of the critical error handler into the vector for interrupt 24h, thereby activating the handler. It also initializes the variables set by the handler and determines the location of the video buffer so that the handler can save and restore the display image without permanently corrupting it.<P>
+Incidentally, it's not necessary to restore the vector to the default DOS routine when the program ends. That's because DOS automatically does this as part of job terminatio  processing. For that reason, the unit lacks an uninstall procedure.<P>
+The handler itself occupies the rest of the unit and is sufficiently generalized to serve as a model. This handler sets four global variables when it gets control: a Boolean flag to indicate that an error occurred, the error code, the drive if a disk, and an action code )the initials of Abort, Retry, and Ignore).<P>
+Notice the heading for CEHandler in the Implementation section of the unit. The $F+ switch forces far calls, thus guaranteeing that the installation procedure will get a full 32-bit segment:offset pointer to set the interrupt vector. The parameters to CEHandler are the general registers. Because of the Interrupt keyword following the heading, the compiler saves the named registers on the stack at entry, making their contents available as local variables.<P>
+The body of the handler begins after the third local subroutine. It immediately sets the error flag and dissects the AX register into its  two byte-size components. Next the handler saves the cursor position  and copies the screen image onto the heap to prevent it from being corrupted. After determining the error class, it dispatches the  appropriate subhandler to report the problem to the user. lt then  determines what the user wants to do about it (Abort/Retry/Ignore) and  records it as the action code. If the user says to Ignore, it resets  the four reporting variables. After restoring the screen image and cursor position, it zeros the AX register, telling DOS to pay no  attention, and returns from the interrupt.<P>
+The DiskError and NonDiskError routines are called from the main body, depending on the error class. Both call the GiveReason procedure, which merely prints a diagnostic message on the screen based on the error code passed to it.<P>
+DiskError is straightforward, loading the error drive global and  advising the user of the location and nature of the problem. The  NonDiskError function is a little more complex because it deals with two  distinct kinds of errors. The branch is based on the high-order bit of the device attribute. Note the Repeat...Until loop that outputs the  device name; it can be up to eight characters long, but if it's  shorter, the unused bytes are ASCII 0s. Consequently, the loop halts on  a null or after the eighth character, whichever comes first.<P>
+Strung throughout the handler are instructions that set the  appropriate error indicators so that the using program can sense what  went haywire and decide what corrective action to take.<P>
+<h3><a name="006e_0006">Testing It Out<a name="006e_0006"></h3><P>
+Make sure the door to drive A is open when you run the cerrtest program in <a href="8802d.htm#006e_000a">Listing Two</A>, page 85. The program attempts to create a file on A. If it can't, the handler in the criterr unit gains control and reports the problem. The program then displays the error globals and quits. Because the error handler saves the screen before output, then restores it when it's finished, the error dialog simply vanishes.<P>
+The Uses statement at the top of <a href="8802d.htm#006e_000a">Listing Two</A> illustrates how units get linked with programs in Turbo Pascal 4.0. This program uses three units, the first two furnished with Turbo Pascal and the last the critical error handler from <a href="8802d.htm#006e_0008">Listing One</A>. Anything in the Interface section of a unit is accessible to the using program: constants, types, variables, and subroutines. Consequently, although cerrtest doesn't declare the CriticalError variables or define the InstallCEH procedure, it has access to them via the interface to criterr.<P>
+You might wish to make your own critical error handler less user dependent. In that case, remove all the I/O from criterr and simply load the reporting variables; your program can then decide what to do and how much to tell the user. By building in a custom critical error handler, you'll make your software much more bulletproof.<P>
+<h3><a name="006e_0007">Who Am I?<a name="006e_0007"></h3><P>
+Because there's a new name on this column and it's mine, perhaps I should introduce myself. I've been hanging around computer rooms since the early 1960s doing various software and management jobs, and was one of the micro pioneers when I got an IMSAI 8080 back in the Dark Ages, which was nine years ago. My first book was Computers Made Really Simple, published in 1976 and long out of print. Since then, I have written more than a dozen more, the most recent being Stretching Turbo Pascal (he mentioned with shameless commercialism). I've written another Pascal book as well, and I'm working on my second C book at the moment. I also write a lot of magazine articles, not only about programming but also about the application of small computers to business problems.<P>
+What I intend to do in this column is to present programming solutions--this installment being an example--as well as to review  structured programming products and discuss issues relevant to software development.<P>
+But this isn't just my column, it's ours. If there's something  you'd like to see here, drop me a line at DDJ. Or you can leave a note for KPORTER on MCI.  Don't call, though, please; I don't work at the editorial offices. No promises, but I'll consider any reasonable suggestion. Right now I'm one guy in a room by himself, trying to guess what The Reader (that's you) wants. I won't know until you tell me. Let's make this into a forum that's fun and instructive for us both.<P>
+
+
+
+<a name="006e_0008"><a name="006e_0008">
+<a name="006e_0009"></pre><B>[LISTING ONE]</B><pre><a name="006e_0009">
+
+unit criterr;
+
+ { Critical error handler, Turbo Pascal Release 4.0 }
+
+Interface
+Uses dos, crt;
+
+{ EXTERNALLY VISIBLE PORTION }
+
+   { The following are for saving and restoring the screen,     }
+   { which is assumed to be in text mode and display page 0     }
+
+Const bell = #7;
+
+Type scrnPtr = ^scrnBuffer;
+     scrnBuffer = array [1..4096] of byte;
+
+Var  display, saveNode  : scrnPtr;             { display buffer }
+
+   { The following are global variables available to the using  }
+   { program to find out if an error occurred and, if so, what  }
+   { it was. The program can then take appropriate action.      }
+
+     criticalErrorOccurred : boolean;
+     criticalErrorCode     : integer;
+     criticalErrorDrive    : integer;
+     criticalActionCode    : char;
+
+   { The only externally visible routine installs the critical  }
+   { error handler in Int 24h, replacing the DOS default.       }
+
+Procedure InstallCEH;
+Implementation
+{ ------------------------------------------------------------- }
+
+   { Following is a general-purpose critical error handler }
+
+{$F+}
+Procedure CEHandler (
+       Flags, CS, IP, AX, BX, CX, DX, SI, DI, DS, ES, BP : word);
+Interrupt;
+
+Var  AH, AL    : byte;
+     row, col  : integer;
+     action    : char;
+{ --------------------------- }
+  { Local functions }
+
+  { giveReason lists reason for critical error by decoding the  }
+  { low byte of the DI register. Called by procs DiskError and  }
+  { CharDeviceError. Writes to screen.                          }
+
+  Procedure GiveReason (error : byte);
+  Begin
+    Case error of
+      $00: Writeln ('Write protect');
+      $01: Writeln ('Unknown unit');
+      $02: Writeln ('Drive not ready');
+      $03: Writeln ('Unknown command');
+      $04: Writeln ('CRC data error');
+      $05: Writeln ('Bad request structure length');
+      $06: Writeln ('Seek error');
+      $07: Writeln ('Unknown media type');
+      $08: Writeln ('Sector not found');
+      $0A: Writeln ('Write fault');
+      $0B: Writeln ('Read fault');
+      $0C: Writeln ('General failure');
+      $0D: Writeln ('Bad file allocation table');
+      else Writeln ('Unknown');
+    End;
+  End;
+{ --------------------------- }
+
+  { DiskError is dispatched when H/O bit of AH is 0 }
+
+  Function DiskError : word;
+
+  Var   area, why : byte;
+
+  Begin
+    Writeln;
+    CriticalErrorDrive := AL;
+    Writeln ('Disk error on drive ', char (AL + 65));
+    Area := (AH and 6) shr 1;                 { get AH bits 1-2 }
+    Case area of
+      0: Writeln ('Error in DOS communications area');
+      2: Writeln ('Error in disk directory');
+      3: Writeln ('Error in files area');
+    End;
+    Why := lo (DI);
+    Write ('Type of error: ');
+    GiveReason (why);
+    DiskError := why;                       { error return code }
+  End;
+{ --------------------------- }
+
+  { NonDiskError is dispatched when H/O bit of AH is 1. }
+  { Usually triggered by a printer problem or bad FAT.  }
+
+  Function NonDiskError : word;
+
+  Var  why         : byte;
+       deviceAttr  : ^word;
+       deviceName  : ^char;
+       ch          : shortInt;
+
+  Begin
+    DeviceAttr := ptr (BP, SI+4);   { point to device attr word }
+    If (deviceAttr^ and $8000) &lt;&gt; 0 then    { if bit 15 is on.. }
+      Begin
+        Writeln ('Character device error');
+        Write ('Failing device is ');
+        ch := 0;
+        Repeat
+          deviceName := ptr (BP, SI + $0A + ch);
+          Write (deviceName^);
+          inc (ch);
+        Until (deviceName^ = chr (0)) or (ch &gt; 7);
+        Writeln;
+      End
+    Else                                       { assume bad FAT }
+      Begin
+        Writeln ('Disk error has occurred');
+        Write   ('Probable cause: ');
+        Why := $0D;
+        GiveReason (why);
+      End;
+    NonDiskError := why;                    { return error code }
+  End;
+{ --------------------------- }
+
+Begin   { Body of CEHandler procedure }
+  CriticalErrorOccurred := TRUE;              { set global flag }
+  AH := hi (AX);
+  AL := lo (AX);
+  Col := whereX;                  { get current cursor position }
+  Row := whereY;
+  New (saveNode);
+  SaveNode^ := display^;                { and save screen image }
+  Write (bell);                            { beep to alert user }
+  If (AH and $80) = 0 then                    { if AH bit 7 = 0 }
+    CriticalErrorCode := DiskError
+  Else
+    CriticalErrorCode := NonDiskError;
+  Repeat                { what are we gonna do about the error? }
+    Write ('Abort/Retry/Ignore? ');
+    Action := upCase (readKey);
+    Writeln (action);
+  Until action in ['A', 'I', 'R'];
+  CriticalActionCode := action;
+  If action = 'I' then begin  { pretend the error didn't happen }
+    CriticalErrorOccurred := FALSE;
+    CriticalErrorCode     := 0;
+    CriticalErrorDrive    := $FF;
+    CriticalActionCode    := ' ';
+  End;
+  Display^ := saveNode^;                 { restore screen image }
+  Dispose (saveNode);
+  Gotoxy (col, row);                  { restore cursor position }
+  AX := 0;                       { tell DOS to ignore the error }
+End;
+{$F-}
+{ ------------------------------------------------------------- }
+
+   { Externally visible: installs the error handler.            }
+   { NOTE: Program termination automatically reinstalls the     }
+   { default handler in the vector table.                       }
+
+Procedure InstallCEH;
+
+Var   videoMode : byte absolute $0040 : $0049;
+
+Begin
+  SetIntVec ($24, @CEHandler);             { install in int 24h }
+  CriticalErrorOccurred := FALSE;                 { set globals }
+  CriticalErrorCode     := 0;
+  CriticalErrorDrive    := $FF;
+  CriticalActionCode    := ' ';
+  If videoMode = 7 then
+    Display := ptr ($B000, $0000)         { set display address }
+  Else
+    Display := ptr ($B800, $0000);
+End;
+
+End.
+
+
+<a name="006e_000a"><a name="006e_000a">
+<a name="006e_000b"></pre><B>[LISTING TWO]</B><pre><a name="006e_000b">
+
+Program cerrtest;
+
+    { Test critical error handler }
+
+Uses  crt, dos, criterr;
+
+Var testFile   : text;
+    n, ignored : integer;
+
+Begin
+  {$I-}
+  ClrScr;
+  InstallCEH;
+  For n := 1 to 10 do
+    Writeln ('This is output line ', n);
+  Assign (testFile, 'A:TEST.FIL');
+
+  Repeat
+    Rewrite (testFile);
+    Ignored := IOResult;           { clear system error status }
+  Until criticalActionCode &lt;&gt; 'R';
+
+  Writeln ('After disk attempt, criticalErrorOccurred = ',
+            criticalErrorOccurred);
+  Writeln (' and criticalErrorCode = ', criticalErrorCode);
+  Writeln (' and criticalErrorDrive = ', criticalErrorDrive);
+  Writeln (' and criticalActionCode = ', criticalActionCode);
+  {$I+}
+End.
+
+
+<P>
+<P>
+</pre></BODY></HTML>

@@ -1,0 +1,352 @@
+<html>
+<head>
+<title>Lock-Free Queues</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> July 2008</p>
+
+<h1>Lock-Free Queues</h1>
+<h2>One thread can write and another read&#151; at the same time! </h2>
+
+
+<h3>By Petru Marginean</h3>
+
+
+<I>Petru is a Vice President for Morgan Stanley, where he works as a C++ senior programmer in investment banking. He can be contacted at  <a href="mailto:petru.marginean@gmail.com">petru.marginean@gmail.com</a>.</I>
+
+<hr>
+
+
+
+
+<p>Queues can be useful in a variety of systems involving data-stream processing. Typically, you have a data source producing data&#151;requests coming to a web server, market feeds, or digital telephony packets&#151;at a variable pace, and you need to process the data as fast as possible so there are no losses. To do this, you can push data into a queue using one thread and process it using a different thread&#151;a good utilization of resources on multicore processors. One thread inserts data into the queue, and the other reads/deletes elements from the queue. Your main requirement is that a high-rate data burst does not last longer than the system's ability to accumulate data while the consumer thread handles it. The queue you use has to be threadsafe to prevent race conditions when inserting/removing data from multiple threads. For obvious reasons, it is necessary that the queue mutual exclusion mechanism add as little overhead as possible. </p>
+
+<p>In this article, I present a lock-free queue (the source code for the <i>lockfreequeue</i> class is available online; see <a href="http://www.ddj.com/code/">www.ddj.com/code/</a>) in which one thread can write to the queue and another read from it&#151;at the same time without any locking. </p>
+
+<p>To do this, the code implements these requirements:</p>
+
+<ul>
+    <li>There is a single writer (<i>Producer</i>) and single reader (<i>Consumer</i>). When you have multiple producers and consumers, you can still use this queue with some external locking. You cannot have multiple producers writing at the same time (or multiple consumers consuming the data simultaneously), but you can have one producer and one consumer (2x threads) accessing the queue at the same time (<b>Responsibility: developer</b>). </li>
+  <li>When inserting/erasing to/from an <i>std::list&lt;T&gt;</i>, the iterators for the existing elements must remain valid (<b>Responsibility: library implementor</b>).</li>
+  <li>Only one thread modifies the queue; the producer thread both adds/erases elements in the queue (<b>Responsibility: library implementor</b>).</li>
+  <li>Beside the underlying <i>std::list&lt;T&gt;</i> used as the container, the lock-free queue class also holds two iterators pointing to the not-yet-consumed range of elements; each is modified by one thread and read by the other (<b>Responsibility: library implementor</b>). </li>
+  <li>Reading/writing <i>list&lt;T&gt;::iterator</i> is atomic on the machine upon which you run the application. If they are not on your implementation of STL, you should check whether the raw pointer's operations are atomic. You could easily replace the iterators to be mentioned shortly with raw pointers in the code (R<b>esponsibility: machine</b>).</li>
+  </ul>
+
+<p>Because I use Standard C++, the code is portable under the aforementioned "machine" assumption: </p>
+
+<pre class="code">
+
+template &lt;typename T&gt;
+struct LockFreeQueue
+{
+  LockFreeQueue();
+  void Produce(const T&amp; t);
+  bool Consume(T&amp; t);
+private:
+  typedef std::list&lt;T&gt; TList;
+  TList list;
+  typename TList::iterator iHead, iTail;
+};
+</pre>
+<p>Considering how simple this code is, you might wonder how can it be threadsafe. The magic is due to design, not implementation. Take a look at the implementation of the <i>Produce()</i> and <i>Consume()</i> methods. The <i>Produce()</i> method looks like this: </p>
+
+<pre class="code">
+ 
+void Produce(const T&amp; t)
+{
+  list.push_back(t);
+  iTail = list.end();
+  list.erase(list.begin(), iHead);
+}
+
+</pre>
+<p>To understand how this works, mentally separate the data from <i>LockFreeQueue&lt;T&gt;</i> into two groups: </p>
+
+<ul>
+    <li>The list and the <i>iTail</i> iterator, modified by the <i>Produce()</i> method (<i>Producer</i> thread).</li>
+  <li>The <i>iHead</i> iterator, modified by the <i>Consume()</i> method (<i>Consumer</i> thread). </li>
+  <li> </li>
+</ul>
+
+<p><i>Produce()</i> is the only method that changes the list (adding new elements and erasing the consumed elements), and it is essential that only one thread ever calls <i>Produce()</i>&#151;it's the <i>Producer</i> thread! The iterator (<i>iTail</i>) (only manipulated by the <i>Producer</i> thread) changes it only after a new element is added to the list. This way, when the <i>Consumer</i> thread is reading the <i>iTail</i> element, the new added element is ready to be used. The <i>Consume()</i> method tries to read all the elements between <i>iHead</i> and <i>iTail</i> (excluding both ends). </p>
+
+<pre class="code">
+ 
+bool Consume(T&amp; t)
+{
+  typename TList::iterator iNext = iHead;
+  ++iNext;
+  if (iNext != iTail)
+  {
+    iHead = iNext;
+    t = *iHead;
+    return true;
+  }
+  return false;
+}
+
+</pre>
+<p>This method reads the elements, but doesn't remove them from the list. Nor does it access the list directly, but through the iterators. They are guaranteed to be valid after <i>std::list&lt;T&gt;</i> is modified, so no matter what the <i>Producer</i> thread does to the list, you are safe to use them. </p>
+
+<p>The <i>std::list&lt;T&gt;</i> maintains an element (pointed to by <i>iHead</i>) that is considered already read. For this algorithm to work even when the queue was just created, I add an empty <i>T()</i> element in the constructor of the <i>LockFreeQueue&lt;T&gt;</i> (see Figure 1): </p>
+
+<pre class="code">
+ 
+
+LockFreeQueue()
+{
+  list.push_back(T());
+  iHead = list.begin();
+  iTail = list.end();
+}
+
+</pre>
+<p>
+</p>
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!--  -->    
+<img class="illowide" src="080601pm01_f1.gif" onclick = "popimage(this,'www.ddj.com - Lock-Free Queues - Figure 1')">
+
+<div class="caption">
+Figure 1: Adding an empty T() element in the constructor of the LockFreeQueue&lt;T&gt;.
+</div>
+</div>
+
+
+<p><i>Consume()</i> may fail to read an element (and return false). Unlike traditional lock-based queues, this queue works fast when the queue is not empty, but needs an external locking or polling method to wait for data. Sometimes you want to wait if there is no element available in the queue, and avoid returning false. A naive approach to waiting is: </p>
+
+<pre class="code">
+ 
+T Consume()
+{
+  T tmp;
+  while (!Consume(tmp))
+    ;
+  return tmp;
+}
+
+</pre>
+<p>This <i>Consume()</i> method will likely heat up one of your CPUs red-hot to 100-percent use if there are no elements in the queue. Nevertheless, this should have good performance when the queue is not empty. However, if you think of it, a queue that's almost never empty is a sign of systemic trouble: It means the consumer is unable to keep pace with the producer, and sooner or later, the system is doomed to die of memory exhaustion. Call this approach <i>NAIVE_POLLING</i>. </p>
+
+<p>A friendlier <i>Consume()</i> function does some pooling and calls some sort of <i>sleep()</i> or <i>yield()</i> function available on your system: </p>
+
+<pre class="code">
+
+T Consume(int wait_time = 1/*milliseconds*/)
+{
+  T tmp;
+  while (!Consume(tmp))
+  {
+    Sleep(wait_time/*milliseconds*/);
+  }
+  return tmp;
+}
+
+</pre>
+<p>The <i>DoSleep()</i> can be implemented using <i>nanosleep()</i> (POSIX) or <i>Sleep()</i> (Windows), or even better, using <i>boost::thread::sleep(),</i> which abstracts away system-dependent nomenclature. Call this approach <i>SLEEP</i>. Instead of simple polling, you can use more advanced techniques to signal the <i>Consumer</i> thread that a new element is available. I illustrate this in Listing One using a <i>boost::condition</i> variable.</p>
+
+	
+
+<pre class="code"> 
+
+#include &lt;boost/thread.hpp&gt;
+#include &lt;boost/thread/condition.hpp&gt;
+#include &lt;boost/thread/xtime.hpp&gt;
+    
+template &lt;typename T&gt;
+struct WaitFreeQueue
+{
+    void Produce(const T&amp; t)
+    {
+        queue.Produce(t);
+        cond.notify_one();
+    }
+    bool Consume(T&amp; t)
+    {
+        return queue.Consume(t);
+    }
+    T Consume(int wait_time = 1/*milliseconds*/)
+    {
+        T tmp;
+        if (Consume(tmp))
+            return tmp;
+        // the queue is empty, try again (possible waiting...)
+        boost::mutex::scoped_lock lock(mtx);
+        while (!Consume(tmp)) // line A
+        {
+            boost::xtime t;
+            boost::xtime_get(&amp;t, boost::TIME_UTC);
+            AddMilliseconds(t, wait_time);
+            cond.timed_wait(lock, t); // line B
+        }
+        return tmp;
+    }
+private:
+    LockFreeQueue&lt;T&gt; queue;
+    boost::condition cond;
+    boost::mutex mtx;
+};
+
+</pre>
+<div class="caption">
+   Listing One 
+</div>	
+	
+
+<p>I used the <i>timed_wait()</i> instead of the simpler <i>wait()</i> to solve a possible deadlock when <i>Produce()</i> is called between line <i>A</i> and line <i>B</i> in Listing One. Then <i>wait()</i> will miss the <i>notify_one()</i> call and have to wait for the next produced element to wake up. If this element never comes (no more produced elements or if the <i>Produce()</i> call actually waits for <i>Consume()</i> to return), there's a deadlock. Call this approach <i>TIME_WAIT</i>. </p>
+
+<p>The lock is still wait-free as long as there are elements in the queue. In this case, the <i>Consumer()</i> thread does no waiting and reads data as fast as possible (even with the <i>Producer()</i> that is inserting new elements). Only when the queue is exhausted does locking occur. </p>
+
+
+
+
+
+
+
+
+<h3>The Ping-Pong Test </h3>
+
+<p>To compare the three approaches (<i>NAIVE_POLLING, SLEEP,</i> and <i>TIME_WAIT</i>), I implemented a test called "Ping-Pong" that is similar to the game of table tennis (the source code is available online). In Figure 2, there are two identical queues between the threads <i>T1</i> and <i>T2</i>. You first load one of the queues with a number of "balls," then ask each thread to read from one queue and write to the other. The result is a controlled infinite loop. By limiting the game to a fixed number of reads/writes ("shots"), you get an understanding of how the queue behaves when varying the waiting/sleep time and strategy and the number of "balls." The faster the game, the better the performance. You should also check CPU usage to see how much of it is used for real work. </p>
+
+<ul>
+  <li>"No ball" means "do nothing" (like two players waiting for the other to start). This gives you an idea of how good the queues are when there is no data&#151;how nervous the players are. Ideally, CPU usage should be zero. </li>
+  <li>"One ball" is like the real ping-pong game: Each player shoots and waits for the other to shoot. </li>
+  <li>"Two (or more) balls" means both players could shoot at the same time, modulo collision and waiting issues. </li>
+  </ul>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080601pm01_f2.gif" style="width:400">
+
+<div class="caption" style="width:402">
+Figure 2: The Ping-Pong test.
+</div>
+</div>
+
+
+<p>In a wait-free system, the more balls in the game, the better the performance gain compared to the classic locking strategy. This is because wait-free is an optimistic concurrency control method (works best when there is no contention), while classical lock-based concurrency control is pessimistic (assumes contention happens and preemptively inserts locking). </p>
+
+<p>Ready to play? Here is the Ping-Pong test command line: </p>
+
+<pre class="code">
+
+$&gt; ./pingpong [strategy] [timeout] [balls] [shots]
+
+</pre>
+<p>When you run the program, the tests show the results in the table shown in Figure 3:</p>
+
+<ul>
+    <li>The best combination is the <i>timed_wait()</i> with a small wait time (1ms in the test for <i>TIMED_WAIT</i>). It has a very fast response time and almost 0 percent CPU usage when the queue is empty.</li>
+  <li>Even when the sleep time is 0 (<i>usleep(0)</i>), the worst seems to be the <i>sleep()</i> method, especially when the queue is likely to be empty. (The number of shots in this case is 100-times smaller than the other cases because of the long duration of the game.) </li>
+  <li>The <i>NO_WAIT</i> strategy is fast but behaves worst when there are no balls (100-percent CPU usage to do nothing). It has the best performance when there is a single ball. </li>
+</ul>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080601pm01_f3.gif" onclick = "popimage(this,'www.ddj.com - Lock-Free Queues - Figure 3')">
+
+<div class="caption">
+Figure 3: Ping-Pong test results.
+</div>
+</div>
+
+
+<p>Figure 4 presents a table with the results for a classic approach (see <i>SafeQueue</i>). These results show that this queue is, on average, more than four-times slower than the <i>LockFreeQueue</i>. The slowdown comes from the synchronization between threads. Both <i>Produce()</i> and <i>Consume()</i> have to wait for each other to finish. CPU usage is almost 100 percent for this test (similar to the <i>NO_WAIT</i> strategy, but not even close to its performance). </p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080601pm01_f4.gif" onclick = "popimage(this,'www.ddj.com - Lock-Free Queues - Figure 4')">
+
+<div class="caption">
+Figure 4: Classic approach results.
+</div>
+</div>
+
+
+
+
+
+
+
+
+
+<h3>Final Considerations </h3>
+
+<p>The single-threaded code below shows the value of the <i>list.size()</i> when Producing/ Consuming elements: </p>
+
+<pre class="code">
+ 
+LockFreeQueue&lt;int&gt; q;   // list.size() == 1
+q.Produce(1);    // list.size() == 2
+int i;
+q.Consume(i);  // list.size() == still 2!;
+               // Consume() doesn't modify the list
+q.Produce(i);    // list.size() == 2 again;
+
+</pre>
+<p>The size of the queue is 1 if <i>Produce()</i> was never called and greater than 1 if any element was produced. </p>
+
+<p>No matter how many times <i>Consume()</i> is called, the list's size will stay constant. It is <i>Produce()</i> that is increasing the size (by 1); and if there were consumed elements, it will also delete them from the queue. In a way, <i>Produce()</i> acts as a simple garbage collector. The whole thread safety comes from the fact that specific data is modified from single threads only. The synchronization between threads is done using iterators (or pointers, whichever has atomic <i>read/write</i> operation on your machine). Also consider this code: </p>
+
+<pre class="code">
+ 
+usleep(1000);    // sleep 1 microsecond
+
+</pre>
+<p>On the face of it, this line of code makes a thread sleep for 1 microsecond, and then continue. In reality, 1 microsecond is just a lower bound to the duration of the call. </p>
+
+<p>The man page for <i>usleep()</i> says, "The <i>usleep()</i> function suspends execution of the calling process for (at least) usec microseconds. The sleep may be lengthened slightly by any system activity or by the time spent processing the call or by the granularity of system timers," or if you use the <i>nanosleep()</i> function. "Therefore, <i>nanosleep()</i> always pauses for at least the specified time; however, it can take up to 10 ms longer than specified until the process becomes runnable again."</p>
+
+<p>So if the process is not scheduled under a real-time policy, there's no guarantee when your thread will be running again. I've done some tests and (to my surprise) there are situations when code such as: </p>
+
+<pre class="code">
+ 
+cond.timed_wait(lock, x);    // x = e.g. 1 millisecond
+
+</pre>
+<p>will actually wait for more than 1 second.</p>
+
+
+<h3>Acknowledgments</h3>
+
+<p>Many thanks to Andrei Alexandrescu who took the time to review this article. Also, thanks to Radu Duta for making useful corrections.\</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+	
+	
+
+
+
+</body>
+</html>

@@ -1,0 +1,132 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v16, i05: Monitoring MySQL Clusters with Perl and Nagios</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1"></HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a3_l1.htm">Listing 1</a></span></td>
+		<td><a href="../../../../source/SA/2007/may2007.tar"><b class=codeListing>may2007.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><img src="a3.gif" width="200" height="167" align="right">Monitoring MySQL Clusters with Perl and Nagios</h1>
+
+Brian Smith
+
+<P>Managing replication between MySQL servers can be a difficult task. One installation I managed recently had a master database on one end of the country, a failover master on the other, and several slave database servers on both sides serving primary and backup Web servers (and this is a relatively small cluster). If any one of the replication setups on those slave servers fails -- if even one write command is accidentally sent to a slave server instead of the master database -- the database will stay up, and the Web servers will continue reading without error; but, silently and randomly, one out of every few pageviews will be increasingly out of date. Fortunately, using a little Perl, you can monitor all of these systems and correct mistakes before they escalate into actual problems.
+
+<P>To use these methods, you'll need a reasonably recent version of Perl; I'm using 5.8.8, the latest stable release as of this writing, but anything recent should do. You'll also need the DBI and DBD::mysql modules, both available through CPAN. Finally, your MySQL servers should be at least version 4.1.9; some of what's used in this article doesn't exist prior to MySQL 4.1, and the behavior was changed in 4.1.9.
+
+<P>You'll also need to create a user to test replication. I recommend using a separate one just in case it's somehow compromised. This way it only has access to replication client commands (like "SHOW SLAVE STATUS") and can only be accessed from the host(s) you monitor from. The command:<p>
+
+<pre>
+GRANT REPLICATION CLIENT ON *.* TO 'username'@'hostname' \
+  IDENTIFIED BY 'password';
+</pre>
+
+<P>will create the user.
+
+<P>The script (see Listing 1) is rather simple; it checks various results from the SHOW SLAVE STATUS command. There's a wealth of information there, all easily available through DBD::mysql.
+
+<P>I've written the script to interact with the Nagios monitoring system, but it can easily be rewritten to work with whichever monitoring system you use. Nagios plugins return a status of "critical", "warning", "ok", or "unknown" by exit code: 2, 1, 0, and -1, respectively. They can also display a line of text, which is shown on the monitoring screen and in alert emails in addition to the status code.
+
+<P>Assuming the host, username, and password are in variables of those names, we can connect to the database and pull down the results:<p>
+
+<pre>
+my $dsn = "DBI:mysql:database=;host=$host;port=3306";
+my $dbh = DBI-&gt;connect($dsn, $username, $password);
+
+my $sth = $dbh-&gt;prepare("SHOW SLAVE STATUS");
+$sth-&gt;execute;
+my $results = $sth-&gt;fetchrow_hashref();
+</pre>
+
+The variable $results now contains a hash reference to the data returned by the database. We want to verify that those results actually exist:<p>
+
+<pre>
+if (!$results) {
+  print "REPL WARNING No results returned";
+  exit 1;
+}
+</pre>
+
+One of the values returned by this command is "Slave_SQL_Running", which is a simple boolean (ÔYes' or ÔNo'). We definitely want to see ÔYes'. Another value returned is "Last_Error", which shows an error message if replication fails. We can combine these to produce useful output:<p>
+
+<pre>
+if ($results-&gt;{"Slave_SQL_Running"} ne 'Yes') {
+  print "REPL CRITICAL Slave SQL thread is not running. \
+    Last error: " . $results-&gt;{"Last_Error"};
+  exit 2;
+}
+</pre>
+
+Note that some older versions of Nagios would limit the amount of data shown on the monitoring screen to about one line of text, so this error message would get truncated. However, it would go out in full in the email, and more modern versions of Nagios display the full line on the monitoring screen as well.<p>
+
+The other value I check is "Seconds_Behind_Master", which shows the difference between the thread that is processing SQL and the thread reading from the master database; in short, it states how many seconds behind the master the slave is running. The variables $warn_threshold and $crit_threshold define, in seconds, the warning and critical thresholds. At our site, we use 60 and 300, respectively, and have found those to be reasonable defaults.<p>
+
+<pre>
+if ($results-&gt;{"Seconds_Behind_Master"} &lt; $warn_threshold) {
+  print "REPL OK " . $results-&gt;{"Seconds_Behind_Master"} . \
+    " seconds behind master\n";
+  exit 0;
+} elsif ($results-&gt;{"Seconds_Behind_Master"} &lt; $crit_threshold) {
+  print "REPL WARNING " . $results-&gt;{"Seconds_Behind_Master"} . \
+    " seconds behind master\n";
+  exit 1;
+} else {
+  print "REPL CRITICAL " . $results-&gt;{"Seconds_Behind_Master"} . \
+    " seconds behind master\n";
+  exit 2;
+}
+</pre>
+
+Note that Seconds_Behind_Master is only truly reliable when the network is fast enough that the I/O thread is keeping up to date with the master. I've used this script to read from a master database across the room as well as across the United States without difficulty, but a colleague who was sending large amounts of data across the ocean reported that this wasn't a truly reliable measure. Of course, if the connection actually breaks, our check of Slave_SQL_Running will pick that up.<p>
+
+Finally, let's look at the "if all else fails" case:<p>
+
+<pre>
+printf "REPL UNKNOWN This should never happen";
+exit -1;
+</pre>
+
+Because every possible remaining condition is met by the previous if/else statement, it's not really possible to reach the unknown case. However, I like to put it in all of my Nagios commands just in case I make a logic error somewhere in development. Otherwise, it'll just trail off the end, return a status of OK (exit 0), and not give any information.<p>
+
+Using the code fragments here, you can now monitor your MySQL replication, as well as adapt it to a whole host of uses for MySQL. For information on some of the other features and methods available, consult the perldoc for DBI and DBD::mysql.<p>
+
+<i>Brian Smith is the Linux system administrator for the University of Washington's Health Sciences Libraries. He holds a B.A. in history and creative writing and is hoping to start on an MLIS degree this fall. Aside from Perl scripts and MySQL database administration, he also specializes in network architecture and software-based server clustering and load balancing.</i><p>
+
+</table></table> 
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

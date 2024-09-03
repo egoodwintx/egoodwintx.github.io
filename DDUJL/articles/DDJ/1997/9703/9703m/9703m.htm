@@ -1,0 +1,142 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal March 1997: The Secrets of System Management Mode</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>The Secrets of System Management Mode</h1>
+
+<p><i>Dr. Dobb's Journal</i> March 1997
+</p>
+<h3>By Robert R. Collins</h3>
+
+<I>Robert is an independent consultant on the x86 architecture. He can be reached at rcollins@x86.org.</I>
+
+<hr>
+
+<p>In the January 1997 "Undocumented Corner," I presented a brief prehistory and overview of System Management Mode (SMM), and made a comparison between 80386 ICE mode and Pentium's SMM. As demonstrated in that column, there are many similarities and many differences between ICE mode and SMM. Even though Intel did document SMM in its Pentium manuals, it skipped a few things -- the secrets of System Management Mode. This column will disclose some of those secrets. Specifically, I will discuss the state save map, show how the <i>AutoHALT</i> feature works, explain the I/O Restart feature (and how it is capable of restarting a string I/O operation from the beginning), and discuss interrupt servicing within SMM. Keep in mind that the information presented in this column is highly implementation dependent. Intel offers no guarantee that this behavior will exist in any future processors, or future steppings of the same processor. Therefore, it would be inappropriate to use any of these secrets in production code.</p>
+
+<h3>The Secrets of the State Save Map</h3>
+
+<p>As mentioned in my previous column, SMM's State Save Map is nearly identical to the memory image used by the undocumented LOADALL instruction (see http:// www.x86.org/articles/loadall/ for a description of the LOADALL instruction). In the <i>Pentium Processor Family Developer's Manual, Volume 3</i> (Intel part number 241430), Table 20-2 presents the SMRAM State Save Map. Many parts of this map are designated "Reserved." You are warned not to modify any of these locations lest unpredictable microprocessor behavior result. Often times, those words are Intel technobabble that means "the microprocessor behavior is fully defined -- we just don't want to tell you what it is." This case appears to be no different.</p>
+
+<p><a name="rt1"><a href="9703mt1.htm">Table 1</A> shows the entire SMM State Save Map, including all of the undocumented locations. The undocumented locations can be subdivided into four categories: undocumented registers; descriptor cache; I/O restart; and unwritten. The unwritten category is self explanatory, as these locations are never written by the Pentium processor.</p>
+
+<h3>Undocumented Registers</h3>
+
+<p>The only undocumented registers are CR4 in location 7F28, RSM Control in 7F26, and the Alternate DR6 register in location 7F24. The CR4 register contains control bits that enable many Pentium features, such as Virtual Mode Extensions, Protected Virtual Interrupts, and 4-MB Pages (See http://www.x86.org/articles/vme1/, http://www.x86.org/articles/pvi1/, and <i>DDJ</i> May 1996, or http://www.x86.org/ddj/May96/ for a description of these features.) If CR4 were not stored in the State Save Map, it would be impossible to restore the Pentium processor to all of its operating environments.</p>
+
+<p>The Alternate DR6 register is controlled by the RSM Control register. When <i>RSM_CTL[bit0]</i> = 1, the least significant word of DR6 (the lower 16 bits) is loaded from the ALT_DR6 slot, instead of the normal DR6 slot at 7FCC. It appears that the remaining 15 bits in RSM Control serve no other measurable purpose. I don't know why this alternate version of DR6 exists, and would strongly recommend that nobody rely on it existing in future versions of SMM, or even different steppings of the Pentium processor.</p>
+
+<h3>Descriptor Cache Slots</h3>
+
+<p>The descriptor caches contain the microprocessor's internal form of each segment register (DS, CS, and so on) and the system registers (GDT, IDT, LDT, and TR). The registers that we normally call segment registers (CS, DS, and so on), are merely user-visible registers that don't have any real effect on the internal operations of the microprocessor. Whether in real mode, protected mode, or virtual 8086 mode, all microprocessor operations that use segments are controlled by the values in the descriptor cache registers -- not the user-visible segment registers. Each time a segment register or system register is loaded, the microprocessor loads the appropriate descriptor cache register. Each descriptor cache is composed of three fields: a base address, a limit, and segment access rights. (<a name="re1"><a href="9703me1.htm">Example 1</A> shows the format of the descriptor cache registers.) Some of these fields are read from descriptor tables (for example, when loading a segment register in protected mode), some are calculated (for instance, the segment register base address in real mode), some are ignored (for example, the segment access rights are not changed in real mode), and others are given hard-coded values (for example, the access rights when loading GDT and IDT).</p>
+
+<p>Whenever a field in the descriptor cache register is modified, it has an immediate effect on microprocessor operations. However, there are only two ways to modify an individual field in the descriptor cache registers. The first method is to modify any of the descriptor cache slots in SMM's State Save Map. Upon execution of the RSM instruction, the new values have an immediate effect. The second method requires using an in-circuit emulator (ICE) to modify the fields. </p>
+
+<p>Beware modifying the descriptor cache contents to illegal values, such as values that would be impossible to achieve through any programmatic means. (See the article at http://www.x86.org/Productivity/DescriptorCache.html for a detailed description of the descriptor cache contents and source-code examples of changing the various fields to illegal values.) For example, you can modify the segment limit to 0xFFFEFF -- a value that can't be programmed by any other method. The CS access rights may be changed to read/writable for protected mode. On one occasion, I set the GDT access rights to Not Present. The GDT and IDT access rights don't exist, in theory. However, in the State Save Map you will discover that both descriptors have their access rights set to 0x82 -- a Present, LDT type, System Descriptor. This begs the question: What happens when you change the GDT access rights? Does the Pentium ignore these access rights, or does it actually use them? To answer this question, I wrote an SMM handler that would set the GDT access rights to Not Present before executing the RSM instruction. After executing RSM, I performed a far transfer, which would cause the GDT to be accessed. If the access rights were ignored when the GDT was accessed, the program would continue to operate normally. However, if the access rights were actually used, you would expect that the GDT access would cause a Not Present Fault, and eventually lead to a microprocessor shutdown. </p>
+
+<p>During any far control transfer, the code-segment selector would need to be authenticated as a valid code segment. The validation process requires the microprocessor to read from the GDT. If the GDT access rights had any meaning, this GDT access would cause the requisite Not Present (#NP) fault. The #NP Fault would attempt to invoke the #NP handler specified in the IDT. </p>
+
+<p>The code selector for the #NP handler would need GDT validation. The GDT is still not present, and this second condition causes the microprocessor to generate a Double Fault. The Double Fault couldn't be executed for the same reason. This third exception condition would trigger a triple fault; all triple faults generate a SHUTDOWN cycle (see <i>Pentium Processor Fam</i>ily Developer's Manual, Volume 3, section 14.9.8, or http://www.x86.org /Productivity/TripleFault.html for a description and source-code example of a Triple Fault). The SHUTDOWN cycle could be read from the logic analyzer. My test confirmed that the Pentium does enter a shutdown state as I expected, but not as the result of a #NP exception. Instead, I found that the first exception generated was a general-protection fault, followed by a double fault, and finally a SHUTDOWN cycle. <a name="rl1"><a href="9703m.htm#l1">Listing One</A> hows a logic analyzer trace of the Pentium behavior after modifying the GDT access rights. You can see from this listing the General Protection Fault, followed by the Double Fault, then the Shutdown.</p>
+
+<h3><i>AutoHALT</i></h3>
+
+<p>The AutoHALT Restart feature of SMM is intended to give the systems designer the choice of whether or not to return to a HALT state after the return from SMM. When the microprocessor is in the halt state upon entrance to SMM, a flag is set in the <i>AutoHALT</i> field of the State Save Map (offset 0x7F02). When <i>AutoHALT[bit0]=1</i>, SMM was entered from the HALT state. If this bit is cleared upon exit (<i>AutoHALT[bit0]=0</i>), the microprocessor will continue execution at the instruction following the HLT instruction. (See  <a name="rt2"><a href="9703mt2.htm">Table 2</A> for a list of possible entry and exit values for the AutoHALT Restart field.) In general, the <i>AutoHALT</i> field directs the microprocessor whether or not to restart the HLT instruction upon exit of SMM. This is accomplished by decrementing EIP and executing whatever instruction resides at that position. AutoHALT restart behavior is consistent, regardless of whether or not EIP-1 contains a HLT instruction. If the SMM handler set <i>AutoHALT[bit0]=1</i> when the interrupted instruction was not a HLT instruction (<i>AutoHALT[bit0]=0</i> upon entrance), it would run the risk of resuming execution at an undesired location. The RSM microcode doesn't know the length of the interrupted instruction. Therefore, when <i>AutoHALT[bit0]=1</i> upon exit, the RSM microcode blindly decrements the EIP register by 1 and resumes execution. This explains why Intel warns that unpredictable behavior may result from setting this field to restart a HLT instruction when the microprocessor wasn't in a HALT state upon entrance. <a name="rl2"><a href="9703m.htm#l2">Listing Two</A> presents an algorithm that describes the AutoHALT Restart feature.</p>
+
+<h3>I/O Restart</h3>
+
+<p>There are few reserved fields in the State Save Map that provide support for the I/O Restart feature. The I/O Restart feature is intended to restart an I/O operation, such as OUT and IN instructions. But this task isn't as easy as it sounds. The OUT and IN instructions are single-byte instructions. However, when the source or destination register is a 32-bit register, a size-override prefix is prepended to the normal opcode to create a two-byte opcode. Next, consider a string operation like <i>REP OUTS DX,BYTE PTR CS:[SI]</i>. In this case, there is a repeat prefix (REP) and a CS override, thus adding two bytes to the single-byte opcode. The extra opcode byte(s) substantially complicate the restart process -- the instruction pointer can't be decremented by a fixed value, as in the case of the AutoHALT Restart feature.</p>
+
+<p>To overcome problems associated with decoding variable-length opcodes, Intel added four fields to the State Save Map to aid in restarting I/O operations. Whenever an I/O instruction is executed, the Pentium stores the values of ECX, ESI, EDI, and EIP in temporary (internal) registers. These temp registers seem to retain their contents even when hundreds or even thousands of other instructions precede the entrance to SMM. Once an SMI# is triggered, the Pentium stores the contents of these temp registers to slots reserved for their use. ECX, ESI, EDI, and EIP are stored in the State Save Map slots 7F08, 7F0C, 7F04, and 7F10, respectively. After completion of the SMM handler, the RSM instruction doesn't know whether or not to restart an I/O operation without being told to do so. This is the purpose of the I/O Restart field in the State Save Map. When any bit in the <i>IORestart</i> field is set, the RSM microcode uses these undocumented fields as the restoration values for ECX, ESI, EDI, and EIP. For string operations that use the REP prefix, the operation is restarted from the very beginning using the initial values of ECX, ESI, and EDI. <a name="rl3"><a href="9703m.htm#l3">Listing Three</A> shows how the I/O Restart operation behaves.</p>
+
+<h3>NMI or INIT from Within SMM</h3>
+
+<p>Upon entrance to SMM, interrupts are disabled (<i>EFLAGS.IF=0</i>) and both NMI and INIT are disabled. The IDT register has not been changed and retains whatever value it had before SMM entrance. Before servicing any interrupts, it is necessary to load your own interrupt vectors, and most likely reload the IDT register with a new value. Once you issue the STI instruction, you're ready to begin servicing interrupt. However, two asynchronous interrupts pins remained disabled: NMI and INIT. </p>
+
+<p>On one occasion, I needed to write an SMM handler that was capable of servicing nonmaskable interrupts (NMIs). I read the appropriate Intel manuals and wrote my SMM and NMI handlers in accordance with their (ambiguous) recommendations. After writing the NMI handler, I decided to test it by generating an NMI from within SMM. Much to my surprise, the NMI handler was never called until I returned from SMM. Either the Pentium manuals were wrong, or my interpretation of them was wrong.</p>
+
+<p>The <i>Pentium Processor Family Developer's Manual, Volume 3</i> describes NMI recognition within SMM in the following manner: </p>
+
+<blockquote><p>
+Although NMI requests are blocked when the CPU enters SMM, they may be enabled through software by invoking a dummy interrupt and vectoring to an Interrupt Service Routine. NMI interrupt requests will be recognized once the Interrupt Service Routine has begun executing.</p>
+</blockquote>
+
+<p>This statement is highly ambiguous, and is open to at least three interpretations. However, the <i>Pentium Processor Specification Update</i> P54C erratum #14, (Intel part number 242480) is much more specific:</p>
+
+<blockquote><p>
+Normally the processor would ignore NMI or INIT while in SMM, except after an IRET instruction.</p>
+</blockquote>
+
+<p>This is exactly what I had done, but it didn't work. Therefore, I decided to set up some tests to determine the exact circumstances where NMI is unmasked within SMM. After collecting my results, I found that the Pentium documentation is completely wrong, as NMI isn't unmasked under any of the circumstances described therein. Therefore, I contacted Intel's technical support department for further clarification (I didn't tell them that I already knew the answer). I asked for a specific example describing how to unmask NMI from within SMM, and got the following response:</p>
+
+<blockquote><p>
+Since NMI is tied to critical events like power-down and is also unrecognized while in SMM, the SMM handler can "poll" for NMI events by performing the dummy interrupt. Just write an ISR that is empty (you might need a couple of NOPs) except for the IRET; call it by doing a soft INT; while in this "ISR" any latched NMIs will be recognized.</p>
+</blockquote>
+
+<p>The problem, as I saw it, was that everybody was wrong. The Pentium documentation was wrong; the Pentium errata (P54c erratum #14), which normally provides very accurate workarounds for specific anomalies, was wrong; and now Intel's tech support was wrong. All sources were giving consistent solutions to this problem -- but the solution didn't even remotely match the behavior I had observed. My discoveries showed that most interrupt conditions don't unmask NMI and INIT; but I found a few cases that do. <a name="rt3"><a href="9703mt3.htm">Table 3</A> is a list of conditions that do not unmask NMI and INIT during SMM. <a name="rt4"><a href="9703mt4.htm">Table 4</A> is a list of conditions that do unmask NMI and INIT.</p>
+
+<p>As you can see from these tables, unmasking NMI and INIT from within SMM doesn't behave as documented, nor appear to have any consistent methodology. For example, if BOUND (exception taken) unmasked NMI/INIT, and BOUND (exception not taken) didn't, why didn't INTO (exception taken) unmask NMI/INIT also? Most disappointingly, the most obvious examples of a "dummy interrupt routine" failed to provide the documented behavior.</p>
+
+<h3>Conclusion</h3>
+
+<p>If you're planning to write your own SMM handler, hopefully you've learned something in this column that will give you insights while writing your own code. I wouldn't rely on any Pentium-specific behavior. On the contrary, I would stay clear of any implementation-specific usage. Instead, I would learn from the undocumented behavior and apply that knowledge to debugging efforts. A good grasp of Intel processor internals can substantially increase productivity -- if nothing else. In my next column, I'll continue my SMM discussion by examining the many caveats of SMM. These caveats are things that every SMM programmer should know before beginning to code; in doing so, you might save many hours debugging code that appears to be written perfectly.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>8 Oct 1996 06:26                                       DAS 92A96SD-1 DisasmGDT Shutdown after RSM                                                Page 1
+<p></p>
+Sequence  Address   Data      Mnemonic                             Timestamp
+----------------------------------------------------------------------------
+       0  00038048  665A66EF    OUT DX,AX                 SMM(16)  
+          00038049  665A66EF    POP EDX                   SMM(16)
+          0003804B  665A66EF    POP EAX                   SMM(16)
+          0003804D  00AA0F58    RSM                       SMM(16)
+      [_] ; GDT Descriptor Cache from the SMM State Save Map
+      32  0003FF88  00015BA0    ( MEM READ )              SMM         240 ns
+      33  0003FF8C  00000002    ( MEM READ )              SMM         230 ns
+      34  0003FF84  0000001F    ( MEM READ )              SMM         230 ns
+      [_]
+      60  00016240  100135EA    JMPL 0010:0135               (16)     500 ns
+      [_]
+      64  00015C48  0010017F    ( SEGMENT OVERRUN ) (13)              720 ns
+          00015C4C  00008600    ( SEGMENT OVERRUN ) (13)
+      65  00015C20  0010017A    ( DOUBLE FAULT ) (8)                  740 ns
+          00015C24  00008600    ( DOUBLE FAULT ) (8)
+      66  00000000  ------4F    ( SHUTDOWN )                          490 ns
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>If (AutoHALT &amp; 0xFFFF) {    EIP = EIP - 1;
+    return;
+}
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three</H4>
+
+<pre>if (TR12 &amp; 0x200) &amp;&amp; (IORestart &amp; 0xFF)) {    EDI = REP_EDI;
+    ECX = REP_ECX;
+    ESI = REP_ESI;
+    EIP = IORestart_EIP;
+    return;
+}
+<p></p>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

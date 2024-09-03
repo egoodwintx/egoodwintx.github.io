@@ -1,0 +1,368 @@
+<HTML>
+<META NAME="year" CONTENT="1994">
+<HEAD>
+<TITLE>JAN94: Optimizing Pentium Code</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Optimizing Pentium Code<a name="0042_0003"></h1><P>
+<h2><a name="0042_0001"><a name="0042_0000">Writing fast code for a fast microprocessor</h2><P>
+<h3>Mike Schmit</h3><P>
+<p><i><a name="0042_0002"><a name="0042_0000">Mike is the president of an assembly- language tools publisher, Quantasm Corp., and the author of ASMFLOW and Pentium optimization tools. He can be contacted at 408-244-6826 or on CompuServe at 76347,3661.</i></p><hr><P>
+When naming its next generation 80x86 microprocessor, Intel broke the name-recognition mold by opting for &quot;Pentium&quot; instead of the predictable &quot;80586.&quot; What the processor vendor didn't break, however, was binary compatibility with previous-generation 80x86 CPUs, making it possible for you to continue running your old applications (except for those that perform strange timing-related loops and the like).<P>
+Still, there are numerous differences between the Pentium and 80486, including new instructions such as CPUID, RDMSR, RDTSC, and others; see <a href="#0042_000c">Table 1</A>. Unless you're writing systems-level code, however, you probably won't need to use many of these instructions.<P>
+Among the basic hardware differences are a 64-bit bus, 8K code and data caches, fewer clock cycles for some instructions (especially floating point), branch-prediction logic, dual-integer pipelines, higher clock speeds, and a &quot;superscalar pipelined architecture&quot; that can execute two instructions per cycle. (To be more precise, the Pentium can generate two results in a single clock cycle.) &quot;Pipelined architecture&quot; refers to a CPU that executes each portion of an instruction in different stages. When a stage is completed, another instruction begins executing in the first stage while the previous instruction moves to the second stage. Both the 80486 and Pentium have five-stage pipelines; see <a href="#0042_000d">Table 2</A>. At some point in the pipeline, some instructions may prevent others from advancing because of address or register conflicts or the number of cycles actually required by the microcode to execute an instruction.<P>
+Before discussing this dual-pipeline architecture in detail, I'll first examine some of the main differences between the Pentium and the 80486.<P>
+<h3><a name="0042_0004">Pentium vs. its Predecessors<a name="0042_0004"></h3><P>
+The Pentium's 64-bit bus doesn't change how you program, only how you optimize. Data structures and code should be aligned on 32-bit boundaries for peak performance. The CPU still has an internal architecture of 32 bits; the 64-bit bus just gives the caches greater memory bandwidth.<P>
+The Pentium cache is 8K for code and 8K for data vs. 8K total on the 486. You'll rarely write code that requires a substantial difference from any 80486 optimizations for only a single shared (code and data) 8K cache. On the 486, the cache is four-way set associative write through. There are 128 sets of four lines, each line with 16 bytes. The Pentium has two 8K caches that are two-way write-back (for data).<P>
+The Pentium offers improved floating-point performance; it also implements the integer multiply and divide instructions via hardcoding. You'll discover some code sequences that are faster on one 80x86 chip and (relatively) slower on another; see <a href="#0042_000e">Table 3</A>.<P>
+Branch prediction is also new to the 80x86 architecture. When a jump or call instruction is encountered, the address of the instruction is used to access the BTB (branch-target buffer) to predict the outcome of the instruction. There isn't much more that you can do to take advantage of the branch-prediction logic since it's automatic. Almost every jump or call in a loop will execute in one cycle if the prediction logic is correct. If you have an odd-ball procedure and are concerned about the effect of the branch-prediction logic, don't worry because the Pentium keeps track of the last 256 branches in the BTB and tries to predict the destination for each call/jump. It does this by keeping a history of whether or not a jump was taken. For example, if the prediction is correct, then a conditional jump takes only one cycle.<P>
+The Pentium supports two 32-byte-long prefetch queues. The branch prediction takes place in the D1 pipeline stage (second stage) and predicts whether a branch is or isn't taken, as well as its destination. When it predicts a branch, the other prefetch queue begins fetching instructions. If the prediction turns out to be incorrect, then both queues are flushed, and prefetching is restarted. For the 486 and previous CPUs, the best optimization in regards to conditional branching was to not do the branch; the code is fastest when a conditional jump isn't taken. The best optimization for the Pentium is to just be consistent; that is, either always take the conditional jump or always don't. Once a loop is determined to usually take the jump, then it runs at the fastest rate, and failure to jump will cause a delay.<P>
+One place you might exceed the 256-branch limit is during a hardware interrupt while in a tight loop. Another is during a task switch in a multitasking environment where each task switch will impose a restart penalty on each task while it refills the branch-target buffer. There isn't anything you can do in an application program to prevent these delays.<P>
+<a href="#0042_0010">Example 1</A> shows an instance where you might unknowingly cause the branch-table buffer to overflow. This code scans a string (of known length) for spaces. When a space is found, a function is called; otherwise, a counter is incremented. When a space character is found, if the space function is small, the next iteration of the <I>loop1</I> code will run in four cycles; otherwise, it runs in ten cycles. This is a dramatic change from earlier CPUs. However, the space function would need to be at least several hundred instructions in length to completely modify the BTB and the additional six cycles for the next iteration of <I>loop1</I> would be insignificant.<P>
+This leads to an interesting timing artifact. Suppose you're using a hardware timing device (or some other method) to time the <I>loop1</I> code, but not the space function and you modify the space function, thereby removing several jumps. Your timing will now show the <I>loop1</I> code as being faster.<P>
+<h3><a name="0042_0005">Dual-integer Pipelines<a name="0042_0005"></h3><P>
+There are two integer pipelines, the U and V pipes. The U pipe is fully capable of executing any (integer) instruction. The V pipe can only execute simple instructions. When two simple instructions are next in the prefetch queue and the conditions of several &quot;rules&quot; are met, then the CPU &quot;pairs&quot; the instructions and begins execution of both at the same time. The key to optimizing for the Pentium is knowing and following the instruction-pairing rules as best as possible.<P>
+Simple instructions include MOVs, ALU operations (such as ADD, SUB, CMP, AND, and OR), INC, DEC, PUSH, POP, LEA, NOP, shifts, CALL, JMP, and conditional jumps. <a href="#0042_000f">Table 4</A> lists the simple instructions. Instructions that you might believe to be simple but aren't--flags register operations such as STC, CLC, CMC, and so forth; the XCHG instructions; and type conversions such as CBW (NOT and NEG)--aren't included in this list. The <I>Pentium Programming Manual</I> and <I>Pentium Data Book</I> only provide four rules for pairing simple instructions. After running a series of tests to verify each rule, I've developed an extended set of the Pentium instruction-pairing rules; see <a href="#0042_0015">Figure 1</A>.<P>
+The prefix-byte rule (rule #6) is important when you use segment overrides (remember that MASM and TASM automatically insert segment overrides based on the ASSUME directive parameters) and when you're writing mixed 16- and 32-bit code. The REP, REPE, and REPNE prefixes can't be used on any simple instructions. The LOCK prefix can be used with some ALU (arithmetic logic unit) instructions.<P>
+Because of the one-byte rule (rule #7), the only instructions that will pair on the first execution are INC/DEC reg, PUSH/POP reg, and NOP. This should never be a consideration in real applications because attempting to optimize code that executes only once (per cache fill) is of little value. The only time this might be useful is when you're performing timing tests of code repeated inline. But it also means that instructions may pair differently on the first execution as compared to subsequent executions; see <a href="#0042_0011">Example 2(a)</A>.<P>
+The logic that determines read/write dependencies (rules #8, #9, and #10) is based on each register as a single 32-bit entity. Therefore, a read/write to one part of a register is the same as using the entire register. So writing to AL, AH, or AX is the same as writing to EAX. Although Intel is vague in its description of pairing instructions that change the flags, I determined that all simple ALU/INC/DEC instructions can be paired with conditional jumps. This leads to the interesting optimization that you should always use CMP or TEST to set the flags (when possible) since they only write to the flags register. <a href="#0042_0011">Example 2(b)</A> tests to see if AX is zero. The CMP instruction is three bytes long, the others two. The OR instruction writes to AX, reducing pairing opportunities; thus, the best choice is to use TEST. <a href="#0042_0011">Example 2(c)</A> shows examples of read/write dependencies.<P>
+Four other delays can occur in the Pentium that don't affect instruction pairing, but do add extra cycles and should be considered when reordering instructions. First, if two-paired instructions access the same data-cache memory bank, there's a one-cycle delay in the second instruction. A data-cache memory bank conflict occurs when bits 2--4 are the same in the two physical addresses. This is difficult to program around, especially in low-level subroutines that only receive pointers to data items. The best strategy is to not pair instructions that might access the same data-cache memory bank.<P>
+Second, an AGI (address-generation interlock) will occur when any instruction in cycle <I>n</I> writes to a register used in an effective address calculation in any instruction in cycle <I>n</I>+1. This can occur either when an instruction in one cycle changes a register that's the base or index portion of an effective address calculation for the next cycle, or when an instruction in one cycle changes SP (or ESP) and the next instruction relies on SP (or ESP). <a href="#0042_0012">Example 3(a)</A> shows AGI examples.<P>
+The third delay is the prefix-byte delay. On the 486, prefix bytes don't add cycles. On the Pentium, a prefix (such as a segment override) takes one extra cycle to process. Also, beware of rule #6, because a prefixed instruction can't be paired in the V pipe.<P>
+The fourth is a sequencing delay. Most simple instructions execute in one cycle because they're hardwired (no microcode). Some forms of ALU instructions execute in two or three cycles; for example, <I>ADD mem, reg</I> and <I>ADD reg, mem</I>. Sequencing hardware allows them to function as simple instructions. The three-cycle form (read-modify-write: <I>ALU mem, reg</I>) is pairable. However, when two read-modify-write instructions are paired together, there's a two-cycle sequencing delay; see <a href="#0042_0012">Example 3(b)</A>. The instructions in <a href="#0042_0012">Example 3(b)</A> take three cycles each. If they're paired, they take a total of five cycles because of the two-cycle sequencing delay. If you have a spare register, you could rewrite it like <a href="#0042_0013">Example 4(a)</A>.<P>
+But this still takes five cycles (the third and fourth instructions should pair). This leads you to believe that this is exactly how the CPU sequences the operation using an internal scratch register. So you need to take into account an extra register when you write your code. You could rewrite the above code as in <a href="#0042_0013">Example 4(b)</A>.<P>
+Although smaller, this still takes five cycles. The problem is that in writing the code this way you are blocking yourself from finding other pairing opportunities. Another way to write the code with two spare registers is shown in <a href="#0042_0013">Example 4(c)</A>. Again, this still takes five cycles, but it can be reordered to <a href="#0042_0013">Example 4(d)</A>, which only takes three cycles. If you need to save and restore the two registers that you used, this will take back the two cycles you saved. But if the pushes and pops are outside of a loop, then this portion of your loop has gone from five to three cycles--a 40 percent improvement. Finally, the 486 has an extra cycle delay when an effective address calculation uses a base register and an index register. The Pentium does not have this delay.<P>
+<h3><a name="0042_0006">String-instruction Optimizations<a name="0042_0006"></h3><P>
+Many of the optimizations for the Pentium are also optimizations for the 486 when compared to the 386 and previous CPUs. As I said earlier, the key factor in Pentium optimization is to use <P>as many of the simple instructions as possible to create more opportunities for pairing to occur. (The downside, of course, is that your code is larger.)<P>
+Consider the 8088 code in <a href="#0042_0014">Example 5</A>, which copies an ASCIIZ string (a string of ASCII characters terminated with a null byte). The alternative to writing the code with the string instructions is to use the combination of the corresponding MOV and INC for the LODSB and STOSB; see <a href="#0042_0016">Figure 2(b)</A>. The <a href="#0042_0016">Figure 2(b)</A> code doesn't exactly duplicate the <a href="#0042_0016">Figure 2(a)</A> function since STOSB uses the ES segment by default. Adding a segment override to the second MOV in <a href="#0042_0016">Figure 2(b)</A> would do this and change the cycle counts by 1 or 2 on some CPUs.<P>
+As Intel came out with each new CPU, I periodically reviewed code such as that in <a href="#0042_0014">Example 5</A> to see if it would benefit from being changed. Even on the 386, the string instructions tended to be better or equal in performance. But with the more RISC-like 486, the simple load and store instructions tended to perform better. Although string operations on the 486 don't continue <P>to measure up in speed, they're still more compact (in this case 6 vs. 11 bytes). With the Pentium, the speed increase is dramatic--from six cycles to three, a (theoretical) 50 percent speed-up compared to only a 43 percent increase on the 486 (fourteen to eight cycles). You'll notice in Figures 2 through 4 that I've indicated the number of cycles for each Pentium instruction assuming that no pairing occurs. In the column titled &quot;w/pair,&quot; the cycles are given assuming that pairing occurs according to the Intel pairing rules. An instruction that executes in the V pipe will show the number of cycles beyond those required for the U pipe instruction (usually 0).<P>
+So executing 80x86 string instructions is slower than just executing the individual move and increment, since these instructions can be paired and executed in a single cycle. In addition, the CMP/Jcc (or TEST/Jcc) combination can be paired so this is also executed in a single cycle. But what about the repeat-string instructions? You should use the repeat-string instruction (MOVS and STOS) when the string is any significant length. For very short strings (less than four or five bytes, words, or dwords), the REP overhead will usually overwhelm any savings. Another consideration when using REPE or REPNE with CMPS or SCAS is that executing the individual operations requires the use <P>of one or two additional registers that may need to be saved and restored; see <a href="#0042_0017">Figure 3</A>.<P>
+<a href="#0042_0018">Figure 4</A> shows an ASCIIZ string copy with a limitation on the maximum length of the string. This illustrates that the LOOPNE (also LOOPE) is much slower than the equivalent Jcc/DEC/Jcc. Again, the LODSB and STOSB are replaced with MOV/INC pairings. This reduces the Pentium cycle count from fourteen to four cycles, a 71 percent speed-up.<P>
+<h3><a name="0042_0007">Making Assumptions<a name="0042_0007"></h3><P>
+Remember that all the pairing guesses and cycle counting are just assumptions. You must check your assumptions by timing actual code. The Pentium has 8K of cache for code, so virtually every loop that will run out of the cache can be highly optimized. This is because when one instruction pairs with another, it is generally executed in 0 extra cycles. (Actually, when two instructions pair, they execute in the number of cycles required by the instruction with the largest cycle count.) If you're just reordering instructions in a tight loop, there's no prefetch time, and all other factors should be the same.<P>
+So now you can pull out Michael Abrash's Zen Timer (see <I>Zen of Assembly Language: Volume I, Knowledge</I> by Michael Abrash, Scott, Foresman, 1990) or use an in-circuit emulator to time your code before and after to see if you saved all the cycles you thought you would. Before you do, however, note that Intel gives away a free hardware timer to everyone who buys a Pentium. Actually, it's just a new instruction RDTSC (Read Time Stamp Counter). That's the good news. The bad news is that it is not fully documented. The <I>Intel Pentium Processor User's Manual, Volume 3: Architecture and Programming Manual</I> (Intel #241430-001) doesn't list it anywhere except in &quot;Appendix A&quot; (page A--7) in the opcode map. There's no other description of it in the entire 291-page chapter that describes the instruction set.<P>
+On every machine cycle, there's an internal 64-bit counter that is incremented. This means that with every Pentium there's a timer accurate to one machine cycle with a range of up to 8800 years (at 66 MHz). The instruction opcode for RDTSC is 0F 31, and it returns the 64-bit timer count in EDX:EAX.<P>
+<h3><a name="0042_0008">Pentium Timing Results<a name="0042_0008"></h3><P>
+To check the cycle counts I've discussed here, I used a slight modification of the Ztimer so that I could run the same code on a 486, the Pentium (an Intel 60-MHz Pentium system, thanks to the Center for Software Development testing lab in San Jose), and a 33-MHz ZEOS 486. All the code and data was aligned on <I>dword</I> boundaries, and the strings were small enough to be entirely in the cache. All code and data were preloaded into the cache. All the timings came within one cycle of the predicted counts. The surprise was that some timings were faster by a cycle. I suspect that happened because either the published cycle counts are incorrect, or more instructions pair on the Pentium than are published.<P>
+When I timed the code in <a href="#0042_0016">Figure 2(a)</A>, it only took six cycles per loop instead of my original prediction of seven. This lead me to believe that the OR/Jcc instruction combination is also pairable. The Intel documentation notes two exceptions to the rule about writing to a register before immediately using it in the same cycle. &quot;The first is the commonly occurring sequence of compare and branch which may be paired.&quot; The second is for pairing pushes and pops since they depend on SP or ESP. It would appear that all ALU instructions update the flags register and can be paired with conditional jump instructions.<P>
+When I changed the code in <a href="#0042_0016">Figure 2(b)</A> to include an ES-segment override prefix, the code took four cycles instead of three, because the segment-override prefix takes an extra cycle to process. It's my view that this works as follows: The prefix codes are independent, non-pairable, single-cycle instructions.When a prefix is on an instruction that you assume will be paired in the U pipe, the net effect is that you're penalized one extra cycle. When a prefix is on an instruction you assume will be paired in the V pipe, no pairing occurs (rule #6). The easy way to understand this is that there are three instructions, the middle one being a nonpairable prefix instruction.<P>
+The code in <a href="#0042_0018">Figure 4(a)</A> took one cycle less than predicted on the Pentium. The only two reasonable explanations for this are that the published cycle counts are wrong or that pairing rules allow some other pairings. The code <P>in <a href="#0042_0018">Figure 4(b)</A> also took one cycle less than I originally predicted. My guess was that the DEC/Jcc combination was pairing. To prove this, I added a CMP between the DEC and Jcc, which then required an extra cycle.<P>
+<h3><a name="0042_0009">Conclusion<a name="0042_0009"></h3><P>
+Optimizing for the Pentium also tends to optimize for the 80486 because the simple instructions pairable on the Pentium make up the RISC-like core set of instructions in both the 486 and the Pentium.<P>
+In general, issuing a sequence of simple instructions is better than issuing a complex instruction that takes the same number of cycles. These simple instruction sequences expose more chances for pairing. This load/store style of code generation does, however, require more registers and increases code size. This impacts performance and may degrade performance on older chips. However, if you are writing code for the Pentium, you can increase performance of common operations by 50 percent or more by using the pairing rules, the right instructions, and the built-in Pentium timer.<P>
+<h3><a name="0042_000a">Acknowledgments<a name="0042_000a"></h3><P>
+I'd like to thank Intel and the Center for Software Development for the use of the Pentium machine.<P>
+<pre></pre><P>
+<a name="0042_000b"><B><I>Pentium Optimization</I></B><P>
+Something Old, Something New<a name="0042_000b"><P>
+<h3>Michael Abrash</h3><P>
+<p><i>Michael, DDJ's former &quot;Graphics Programming&quot; columnist, is the author of  The Zen of Assembly Language. He can be reached on MCI mail at 313-3923.</i></p><hr><P>
+To this longtime assembly-language fan, the Pentium is an unexpected treat. The trend toward diminishing returns on hand-tuning that reached its peak with the 386 has completely reversed itself--the Pentium is stunningly rich in optimization opportunities, as Mike Schmit's article details.<P>
+You've likely read that the Pentium, like RISC processors, is too complex to program effectively in assembly language, that the key to Pentium performance is using a Pentium-aware compiler. Yes and no. First, compilers are no more able to match <I>skilled</I> humans on the Pentium than they were on the 8088. It is painstaking work to hand-tune Pentium code; you must find the places where the next instruction is guaranteed to go through the U pipe, then work with the long list of pairing rules and special cases to optimize the code forward from those points. On the other hand, the rules and special cases allow for enormous benefits from redesigning code. The payback for Pentium optimization is even greater than for 486 optimization--and I've seen the speed of an entire word-counting utility doubled on the 486 simply by rearranging three instructions. Surely, hand-tuning for the Pentium is complex enough that it should be reserved for the most critical paths, but those are the only places assembly makes sense, anyway.<P>
+Then, too, there are hazards to compiling for Pentium optimization. First, Pentium-optimized code runs well on the 486, but can slow down considerably on the 386, because Pentium optimization consists largely of breaking complex instructions into series of simple, RISC-like instructions, and then rescheduling them. On the 486 and Pentium, the cycle counts for complex instructions are the same as the cumulative cycle counts for equivalent simple instructions, but on the 386 complex instructions take fewer cycles.<P>
+Second, RISC code is notorious for being large, and RISC-like instructions share that trait. Consider incrementing two memory locations on the Pentium in 32-bit code. Two <I>INC [mem]</I> instructions take five cycles and 12 bytes; two <I>MOV reg,[mem] / INC reg / MOV [mem],reg</I> sequences interleaved together take only three cycles but explode to 26 bytes. For key loops, this is fine; the Pentium's 8K code cache is ample for almost any loop. However, Pentium performance relies heavily on instruction fetches hitting the internal cache, because cache misses are expensive and because code that hasn't already been executed out of the internal cache can't be dual-piped. Unfortunately, compilers apply Pentium optimization to all code, not just key loops, so programs become larger and suffer more cache and possibly page misses, when they are Pentium-optimized. My preference is to Pentium-optimize only time-critical code--by hand or via compiler switches and <I>#pragma</I>s--letting the compiler handle the rest of the code with 386/486 optimization. Ideally, the tuned code would also have a 386-optimized form, with the correct version selected at startup. This approach gives a compact code footprint and very good performance on all the processors, significantly better on both counts than merely compiling with Pentium optimization.<P>
+<h4><a name="0042_000c"><B>Table 1:</B>  New instructions for the Pentium.<a name="0042_000c"></h4><P>
+<pre>
+CMPXCHG8B     Compare and Exchange 8 Bytes
+CPUID         CPU Identification   (EAX is input)
+              for EAX = 0: returns vendor string in EBX, EDX, ECX
+              for EAX = 1: returns EAX[0:3]       stepping ID
+                                   EAX[4:7]       model number
+                                   EAX[8:11]      family number
+                                   EAX[12:31]     reserved
+                                   EBX            reserved (0)
+                                   ECX            reserved (0)
+                                   EDX            feature flags
+RDMSR         Read from Model Specific Register (ECX is register number)
+WRMSR         Write to Model Specific Register (ECX is register number)
+RSM           Resume from System Management Mode
+RDTSC         Read Time Stamp Counter
+MOV           Move to/from Control Registers (new registers)</pre><P>
+<h4><a name="0042_000d"><B>Table 2:</B> (a) 80486 five-stage pipeline operation; (b) Pentium dual five-stage pipeline operation. PF=prefetch, D1=instruction decode, D2=address generation, EX=execute and cache access, WB=write back, i1=instruction #1, i2=instruction #2, and so on.<a name="0042_000d"></h4><P>
+<pre>
+<b>(a)</b>
+                                    <B>Cycle</B>
+
+Stage        1        2       3       4       5       6       7       8
+PF           i1       i2      i3      i4
+D1                    i1      i2      i3      i4
+D2                            i1      i2      i3      i4
+EX                                    i1      i2      i3      i4
+WB                                            i1      i2      i3      i4
+
+<b>(b)</b>
+                                     <B>Cycle</B>
+
+Stage        Pipe     1       2       3       4       5      6       7       8
+PF            U       i1      i3      i5      i7
+              V       i2      i4      i6      i8
+D1            U               i1      i3      i5     i7
+              V               i2      i4      i6     i8
+D2            U                       i1      i3     i5      i7
+              V                       i2      i4     i6      i8
+EX            U                               i1     i3      i5      i7
+              V                               i2     i4      i6      i8
+WB            U                                      i1      i3      i5      i7
+              V                                      i2      i4      i6      i8</pre><P>
+<h4><a name="0042_000e"><B>Table 3:</B> Pentium instructions showing reduced clock cycles over the 486.<a name="0042_000e"></h4><P>
+<pre>
+
+              486      Pentium
+mul         13--42     10--11
+ret            5          2
+popa           9          5
+pusha          11         5
+lods           5          2
+rep movs       3          1
+rep stos       4          1
+repe/ne cmps   7          4
+repe/ne scas   5          4
+fadd         8--32       1--3
+fmul        11--16       1--3
+fcos fsin  257--354     16--126
+fdiv        73--89        39</pre><P>
+<h4><a name="0042_000f"><B>Table 4:</B> Simple instructions that can execute in the V pipe.<a name="0042_000f"></h4><P>
+<pre>
+MOV     reg, reg
+MOV     reg, mem
+MOV     reg, imm
+MOV     mem, reg
+MOV     mem, imm
+<I>alu</I>     reg, reg
+<I>alu</I>     reg, mem
+<I>alu</I>     reg, imm
+<I>alu</I>     mem, reg
+<I>alu</I>     mem, imm
+INC     reg
+INC     mem
+DEC     reg
+DEC     mem
+PUSH    reg
+POP     reg
+LEA     reg, mem
+JMP     near
+CALL    near
+Jcc*    near
+NOP
+<I>shift</I>      reg, 1
+<I>shift</I>      mem, 1
+<I>shift</I>      reg, imm
+<I>shift</I>      mem, imm
+*Jump on condition code.
+<I>alu</I>=Add, adc, and, or, xor, sub, sbb, cmp, test; <I>shift</I>=sal, sar, shl, shr, rcl, rcr, rol, ror. (rcl and rcr not pairable with immediate.)</pre><P>
+<h4><a name="0042_0010"><B>Example 1:</B> Unknowingly overflowing the branch-target buffer. This code scans a string (of known length) for spaces.<a name="0042_0010"></h4><P>
+<pre>
+                          ; with    without branch prediction
+                          ; (cycles are for a case of non-space character)
+   loop1:
+        mov     al, [si]   ;  1       1
+        inc     si         ;  0       0  (0 due to pairing)
+        cmp     al, ' '    ;  1       1
+        jne     foo        ;  0       3
+        call    space      ;
+        jmp     bar        ;
+   foo:
+        inc     dx         ;  1       1
+   bar:
+        dec     cx         ;  0       0
+        jnz     loop1      ;  1       3
+        ;              total  4      10
+</pre><P>
+<h4><a name="0042_0011"><B>Example 2:</B> (a) Different pairing occurs on first and subsequent executions from the cache; (b) testing to see if ax is zero; (c) read/write dependencies.<a name="0042_0011"></h4><P>
+<pre>
+<b>(a)</b>
+
+             first     subsequent
+mov  ax, 1     1           1
+inc  bx        2           1
+mov  cx, 1     2           2
+call xyz       3           2
+
+
+<b>(b)</b>
+
+cmp     ax,     0
+or      ax,     ax
+test    ax,     ax
+
+
+<b>(c)</b>
+
+<b>read-after-write (do not pair)</b>
+        mov  al, 1
+        add  bh, ah
+
+        mov  ax, 1
+        add  bx, ax
+
+<b>write-after-write (do not pair)</b>
+        mov  eax, 1
+        add  eax, ebx
+
+        mov  ax, 1
+        mov  ax, 2
+
+<b>write-after-read (pairs)</b>
+        mov  ax, bx
+        inc  bx
+
+<b>read-after-read (pairs)</b>
+        mov  eax, ebx
+        add  ecx, ebx
+</pre><P>
+<h4><a name="0042_0012"><B>Example 3:</B> (a) AGI examples; (b) two-cycle sequencing delay because the instructions take three cycles each.<a name="0042_0012"></h4><P>
+<pre>
+<b>(a)</b>
+
+inc     bx        ; two INCs pair
+inc     ax
+mov     cx, [si]  ; two MOVs pair
+mov     dx, [bx]  ; AGI delay because BX changed in previous cycle
+
+pop     bx        ; two POPs pair
+pop     ax
+ret               ; no AGI delay
+
+pop     bx        ; two POPs pair
+pop     ax
+add     sp,0
+ret               ; AGI delay
+
+
+<b>(b)</b>
+
+add  [bx], 2
+add  [si], 2
+
+</pre><P>
+<h4><a name="0042_0013"><B>Example 4:</B> (a) Rewriting Example 3(b) like this still takes five cycles; <P>(b) rewriting 4(a) by taking into account an extra register--the code is smaller, but still takes five cycles; <P>(c) rewriting the code using two spare registers; (d) this reordered sequence only takes three cycles.<a name="0042_0013"></h4><P>
+<pre>
+<b>(a)</b>
+mov  ax, [bx]
+add  ax, 2
+mov  [bx], ax
+mov  ax, [si]
+add  ax, 2
+mov  [si], ax
+
+
+<b>(b)</b>
+mov  ax, [bx]
+add  ax, 2
+mov  [bx], ax
+add  [si], 2
+
+
+<b>(c)</b>
+mov  ax, [bx]
+add  ax, 2
+mov  [bx], ax
+mov  cx, [si]
+add  cx, 2
+mov  [si], cx
+
+
+<b>(d)</b>
+mov  ax, [bx]
+mov  cx, [si]
+add  ax, 2
+add  cx, 2
+mov  [bx], ax
+mov  [si], cx
+</pre><P>
+<h4><a name="0042_0014"><B>Example 5:</B> 8088 code that copies an ASCIIZ string.<a name="0042_0014"></h4><P>
+<pre>
+loop1:  lodsb
+        stosb
+        or    al, al
+        jne   loop1
+</pre><P>
+<h4><a name="0042_0015"><B>Figure 1:</B> Enhanced list of Pentium instruction-pairing rules.<a name="0042_0015"></h4><P>
+
+<ol type="1" start="1">
+ 	<LI>Both instructions must be simple. (See <a href="#0042_000f">Table 4</A>.)
+ 	<LI>Shift/rotate can only be in U pipe.
+ 	<LI>ADC and SBB can only be in U pipe.
+ 	<LI>JMP/CALL/Jcc can only be in V pipe (Jcc=jump on condition code).
+ 	<LI>Neither instruction can contain both a displacement <I>and </I>an immediate operand.
+ 	<LI>Prefixed instructions can only be in the U pipe (except for 0F in Jcc).
+ 	<LI>The U pipe instruction must be only one byte in length or it will not pair until the second time it executes from the cache.
+ 	<LI>There can be no read-after-write or write-after-write register dependencies between the instructions except for special cases for the flags register and the stack pointer (rules #9 and #10).
+ 	<LI>The flags register exception allows a CMP or TEST instruction to be paired with a Jcc even though CMP/TEST writes the flags and Jcc reads the flags.
+	<LI>The stack pointer exception allows two PUSHes or two POPs to be paired even though they both read and write to the SP (or ESP) register.
+</ol>
+
+<P>
+<h4><a name="0042_0016"><B>Figure 2:</B> ASCIIZ string copy with maximum string length. w/pair=cycles with pairing, bytes=instruction length in bytes. You can further optimize the Figure 2(b) code from three cycles per byte to two cycles per byte. (Cycles are per repeated byte, word, or dword; assumes cache hits.)<a name="0042_0016"></h4><P>
+<pre>
+<b>(a)</b>
+
+                    ; 8088 286 386 486 Pent. w/pair  bytes
+loop1:
+lodsb               ;  16   5   5   5   2    2        1
+stosb               ;  15   3   4   5   3    3        1
+or     al, al       ;   3   2   2   1   1    1        2
+jne    loop1        ;  16   8   8   3   1    0        2
+                    ; ----------------------------   ---
+                       50  18  19  14   7    6        6
+
+
+<b>(b)</b>
+
+                    ; 8088 286 386 486 Pent. w/pair  bytes
+loop2:
+mov    al, [si]     ;  17   5   4   1   1    1        2
+inc    si           ;   3   2   2   1   1    0        1
+mov    [di], al     ;  18   4   2   1   1    1        2
+inc    di           ;   3   2   2   1   1    0        1
+cmp    al, 0        ;   4   3   2   1   1    1        2
+jne    loop2        ;  16   9   8   3   1    0        2
+                    ; -----------------------------  ---
+                       61  25  20   8   6    3       11
+
+
+
+</pre><P>
+<h4><a name="0042_0017"><B>Figure 3:</B> CPU cycles for common repeat string instructions.<a name="0042_0017"></h4><P>
+<pre>
+                                                              486      Pentium
+REP         MOVS     repeat move string                        3          1
+REP         STOS     repeat store string                       4          1
+REPE/NE     CMPS     repeat while equal (not equal) compare    7          4
+REPE/NE     SCAS     repeat while equal (not equal) scan       5          4</pre><P>
+<h4><a name="0042_0018"><B>Figure 4:</B> ASCIIZ string copy with maximum string length.<a name="0042_0018"></h4><P>
+<pre>
+<b>(a)</b>
+                         ; 8088  286 386 486 Pent. w/pair
+loop3:
+    lodsb                ;  16    5   5   5   2    2
+    stosb                ;  15    3   4   5   3    3
+    or     al, al        ;   3    2   2   1   1    1
+    loopne loop3         ;  19   10  13   9   8    8
+                         ;-----------------------------
+                            53   20  24  20  14   14
+
+<b>(b)</b>
+                         ; 8088  286 386 486 Pent. w/pair
+loop4:
+    mov    al, [si]      ;  17   12   4   1   1    1
+    inc    si            ;   3    2   2   1   1    0
+    mov    [di], al      ;  18    9   2   1   1    1
+    inc    di            ;   3    2   2   1   1    0
+    cmp    al, 0         ;   4    3   2   1   1    1
+    je     exit4         ;   4    3   3   1   1    0
+    dec    cx            ;   3    2   2   1   1    1
+    jnz    loop4         ;  16    9   8   3   1    0
+exit4:
+                        ;------------------------------
+                            68   42  25  10   8    4
+
+</pre><P>
+<h3><a name="0042_0019"><I><B>The Center for Software Development<a name="0042_0019"></B></I></h3><P>
+The Center for Software Development is a nonprofit organization with a mission to enable software companies to bring higher-quality products to market more rapidly and promote the growth of software companies. The Center was created through a partnership between The Software Entrepreneurs' Forum, the City of San Jose, and Novell. Many companies are supporting the Center, including Novell, Adobe, AT&amp;T, GO, IBM, Intel, Microsoft, Oracle, and others.<P>
+The Center has independent multivendor labs with PCs, Macs, UNIX workstations, and other resources useful for software testing. Developers can utilize the Center's industry- and technology-specific labs, such as the Network Software Test Lab, PostScript Lab, Mobile Computing Lab, and the International Lab. The Center's labs are set up in two types of space: a Walk-in Lab, where developers rent preconfigured machines by the hour, and a set of secure Custom Labs.<P>
+The Software Industry Resource Center includes a library of commonly needed information, including market-research data, brochures, and reference information from local service firms, as well as an extensive collection of technical materials. The Center also provides software developers with access to service providers such as legal firms, accounting firms, venture-capital funds, marketing consultants, and the like. Platform vendors and service providers use the Center's meeting facilities to put on seminars and clinics. Software developers use the meeting facilities for presentations to potential publishers, venture capitalists, and major end users.<P>
+The Center is an exciting, useful, one-of-a-kind resource. For more information, you can contact the Center at 408-289-8378.<P>
+--M.S.<P>
+
+<HR><P>Copyright &copy; 1994, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

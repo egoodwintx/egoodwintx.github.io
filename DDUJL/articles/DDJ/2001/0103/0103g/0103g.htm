@@ -1,0 +1,457 @@
+<html>
+<head>
+<title>Mar01: Cross-Platform Coroutines in C++</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Cross-Platform Coroutines in C++</h1>
+<p><i>Dr. Dobb's Journal</i> March 2001</p>
+<h2>A natural solution to parsing problems</h2>
+
+<h3>By George F. Frazier</h3>
+
+<I>
+George is a programmer in the System Level Design Group at Cadence Design Systems. He occasionally also lectures in the Department of Electrical Engineering and Computer Science at the University of Kansas. He can be reached at georgef@ cadence.com.</I>
+
+<hr>
+
+<p>Coroutines have long been a tool of assembly language and system-level programmers or anyone needing to implement their own scheduling schemes between thread-like "pseudoprocesses." The classic illustration of coroutines is in the cooperation between the lexical analyzer and parser in a compiler (<A NAME="rf1"><A HREF="0103gf1.htm">Figure 1</A>). Some compilers separate lexical analysis and parsing into two consecutive steps. However, it is usually more efficient for the parser to interact with the lexical analyzer in a producer/consumer relationship where the parser consumes tokens produced for it by the lexical analyzer. In this common scenario the parser subroutine is suspended when it is necessary to call the lexical analyzer for more tokens. When the lexical analyzer returns, the parser picks up where it left off. In a similar manner, the lexical analyzer also needs to store its state information (particularly the position in the file being processed and historical information about past tokens) between subsequent invocations by the parser. Coroutines are mutual subroutines that are designed to facilitate such an interaction.</p>
+<p>Beyond historic uses, coroutines today are routinely used in electronic design automation (EDA) tools, genetic algorithms, embedded systems, computer games (particularly in games where players take turns), and scheduling applications in artificial intelligence. In this article I describe a platform-independent interface for a class that represents coroutines in C++. I show extensions of the interface for Solaris and Microsoft Windows NT. The Solaris implementation is based on POSIX threads and the NT code uses "fibers" (user threads that are not preempted by the scheduler). Finally, I present an example use of the interface to solve the classic Odd Word problem. The complete code accompanying this article is available electronically; see "Resource Center" (see page 5).</p>
+<DDJADVERTISEMENT INLINE>
+
+
+
+<h3>Coroutine Specifics</h3>
+
+
+<p>Coroutines are mutual subroutines with the following three properties:</p>
+
+
+<p></p>
+
+<ul>
+  <li>Local data to a coroutine persists between successive calls. 
+  <li>Execution is suspended at the point where control leaves a coroutine (perhaps to allow another coroutine to produce something for it). When control reenters the coroutine, execution is resumed at the point where it previously left off.
+
+  <li>Control can be passed from one coroutine to another, causing the current coroutine to suspend its execution and transfer control to the new coroutine. 
+
+</ul>
+
+
+<p>In a traditional subroutine program structure there is an asymmetric master/slave relationship between a calling program and a subroutine. When a subroutine gets control via its single port of entry, all nonparameter variables that are not global are undefined (or perhaps set to some "zero" value). Coroutines are subroutines that may call each other but do not have the master/slave relationship. On exit from a coroutine, its state is saved and the next time the coroutine is called it resumes execution at exactly the point where it left off. In addition, its variables are maintained in the same state as at the end of the previous suspension (via a private stack).</p>
+
+<p>Since the location of the subroutine in the aforementioned definition is not tied to any specific operating-system resource, coroutines can be modeled as completely separate processes (possibly on different machines), different threads in a single process, or as special subroutines in a single thread of computation. In this article, coroutines will be presented as the latter, although the code could be used as a basis for generalization into a multithreaded/multiprocessor environment. </p>
+
+
+
+<h3>The Coroutine Interface</h3>
+
+
+<p>To illustrate the basic requirements of a coroutine interface, I'll use the Odd Word problem described by E.W. Dijkstra (see "Notes on Structured Programming," <i>Structured Programming,</i> Academic Press of London, 1972). Consider a character set consisting of letters, a space, and a point. Words consist of one or more, but at most 20 letters. An input text consists of one or more words separated from each other by one or more spaces and terminated by 0 or more spaces followed by a point. Input should be read from and, including the first letter of the first word, up to and including the terminating point. The output text is to be produced such that successive words are separated by a single space with the last word being terminated by a single point. Odd words 1, 3, 5, ... are copied in reverse order while even words 0, 2, 4, ... are merely echoed. For example, the input string:</p>
+
+
+<blockquote><p>
+"whats the matter with Kansas"</p>
+
+</blockquote><p>becomes:</p>
+
+
+<blockquote><p>
+"whats eht matter htiw Kansas."</p>
+
+</blockquote>
+
+<p>The problem is further restricted in that the characters must be read and printed one at a time. </p>
+
+<p>Although somewhat contrived, this problem lends itself well to a solution using coroutines because you can interleave the reading of words and the printing of either the word itself or its reverse. One of the coroutines in the solution described at the end of the article (<i>PrintRoutine</i>) has a main routine that alternately reads a word, "pretties" it by removing spaces, and then prints it. It then does the same thing but this time prints the word in reverse order.<i> PrintRoutine'</i>s requirements are straightforward. As a coroutine it must be created and initially started. It must also have the ability to suspend itself and then transfer control to another coroutine (in this case the coroutine that strips spaces). </p>
+
+<p>Class <i>CCoroutine</i> provides the capability to do this. It contains a constructor, destructor, and an initialize routine that returns a pointer to a <i>CCoroutine</i> that has just been created. The <i>initialize</i> method is used to possibly preinitialize any variables needed by the coroutine after it is created but before it starts execution. The pure virtual method <i>go</i> is the point of entry for the coroutine. It must be overridden and will either contain code or a call to another function. Finally, the method <i>resume</i> transfers control out of the coroutine (suspending it at the point where <i>resume</i> is invoked) to the <i>CCoroutine</i> object stored in the argument to resume. <A NAME="re1"><A HREF="0103ge1.htm">Example 1</A> presents the class (excluding some of the bookkeeping details). This interface is suitable for solving the illustrative example in this article and also for more sophisticated applications. From this simple interface the platform-specific versions are constructed. I'll start with the Microsoft Windows NT implementation.</p>
+
+
+
+<h3>Coroutines for Microsoft Windows NT</h3>
+
+
+<p><A NAME="rl1"><A HREF="#l1">Listing One</A> is the code for the Microsoft Windows NT implementation of coroutines. The NT class <i>CTargetPlatformCoroutine</i> is based on the Windows fiber library. A fiber is a thread-like pseudoprocess that is manually scheduled by the application. Fibers run in the context of the threads that schedule them (but have their own fiber-specific stacks). A thread is allowed to schedule multiple fibers. The only state information maintained for a fiber is its stack, the state of its registers that are typically preserved across a function call, and the fiber data provided during fiber creation.</p>
+
+
+<p>The <i>ConvertToFiber</i> API routine creates an area in which to save fiber state information. Subsequently, you can start the new fiber or convert to a new one by calling <i>CreateFiber</i>. A fiber is preempted by the application when another fiber or thread calls <i>SwitchToFiber</i>. However, when the thread that scheduled the fiber is preempted by the system, the fibers of the thread are also suspended. If a fiber calls <i>ExitThread</i>, execution terminates for the thread that created it.</p>
+
+<p>The class <i>CCoroutineState</i> is used as a helper class to wrap, in this case, the main fiber of the coroutine. At construction, a new <i>CCoroutineState</i> object <i>state_</i> is created, given a default stack (whose size can be customized by the user with the constructor argument), and its fiber is created. The initialize method of the <i>CCoroutine</i> class is used in the NT implementation to create fiber-specific state information using <i>ConvertToFiber</i>. <i>Initialize</i> serves as a coroutine factory. Once a <i>CTargetPlatformCoroutine</i> has been initialized it is ready to "go" and can be used in a call to <i>resume</i>. In <A NAME="re2"><A HREF="0103ge2.htm">Example 2</A>, you switch to the new coroutine if necessary (<i>other != this</i>); otherwise, the actual coroutine context switch is accomplished with the fiber API call <i>SwitchToFiber</i>.</p>
+
+
+
+<h3>Coroutines for Solaris</h3>
+
+
+<p><A NAME="rl2"><A HREF="#l2">Listing Two</A> is the Solaris code that implements the <i>CCoroutine</i> interface. POSIX threads are the building blocks of the coroutine class for Solaris. Although pthreads implementations exist for Win32, they don't match the coroutine functionality as naturally as do fibers, thus the variance between the two platforms. There are ports of the fiber library on UNIX &#151; namely via the Mainwin toolset from Mainsoft (http://www.mainsoft.com/); also see my article "Porting C++ Code from NT to UNIX Using the Mainwin XDE Toolkit" (<i>DDJ,</i> April 1999) &#151; but these implementations invariably sit on the POSIX thread library, which leads to our direct use of it here. Since there are several excellent descriptions of pthreads (<i>Programming with POSIX Threads,</i> by D. Butenhof, Addison-Wesley, 1997, for example), I will proceed directly to the description of the Solaris extension of <i>CCoroutine</i>, also called class "<i>CTargetPlatformCoroutine.</i>"</p>
+
+
+<p>In this class, all of the work needed to construct the coroutine and get it ready to go is in the constructor. I start by creating and initializing a <i>pthread_attr_t</i> object <i>attr</i> (which is the type of thread attribute object). The stack size for the coroutine is then negotiated and assigned with <i>pthread_attr_setstacksize</i>. The final three statements of the constructor (<A NAME="re3"><A HREF="0103ge3.htm">Example 3</A>) set the state of the <i>pthread</i> to PTHREAD_CREATE_DETACHED, allowing resources to be freed when the thread terminates, create the thread, and then destroy the <i>pthread_attr_t</i> object.</p>
+
+<p>Helper class <i>CCoroutineState</i> is more involved in the Solaris case since we have to explicitly control access to the <i>pthread</i>. The two important methods are <i>waitToGo</i> and <i>signalToGo</i>. They make use of a condition variable synchronization primitive <i>go_cond_</i> and a mutex <i>go_mutex_</i>. <i>waitToGo</i> grabs the <i>go_mutex_</i> and loops while <i>go_</i> is False (someone else has the mutex). Finally, when <i>go_</i> is True, the mutex is released and the caller knows it is safe to execute. <i>signalToGo </i>is called when it is time to broadcast that the caller is ready to yield (this is where <i>go_</i> is set to True). Notice that this will block if <i>pthread_mutex_lock </i>can't initially get the mutex. The third argument to <i>pthread_create</i> in the constructor passes the static method <i>crstart</i> to the thread. This uses <i>waitToGo</i> to signal the start criterion for the coroutine. <i>pthread_create</i> passes <i>this-&gt;state</i> to <i>crstart</i> and after calling <i>waitToGo</i>, the coroutine's <i>go</i> method is called; see <A NAME="re4"><A HREF="0103ge4.htm">Example 4</A>. <i>resume</i> is similar to its counterpart in the Windows NT implementation. After making sure that the caller isn't trying to switch to the present coroutine, <i>resume</i> calls <i>signalToGo</i> and waits until the next coroutine (<i>other</i>) is ready to begin execution. After this, <i>blocking</i> call returns, <i>resume</i> calls <i>waitToGo,</i> and control is transferred to the <i>CCoroutine</i> object <i>other</i>; see <A NAME="re5"><A HREF="0103ge5.htm">Example 5</A>.</p>
+
+<p>In both extensions of the coroutine interface, the method <i>go</i> just asserts if called. This points to the usage model for the class. A coroutine should extend the appropriate class and then override the virtual <i>go</i> method. The actual code of the coroutine is called from <i>go</i> (or possibly resides in that method depending on the complexity). <i>go</i> will likely contain one or more calls to <i>resume</i>. This is demonstrated in the solution to the Odd Word problem that uses coroutines.</p>
+
+
+
+<h3>Solution to the Odd Word Problem</h3>
+
+
+<p>Although the solution to the Odd Word problem is simple, it is an apt example of the use of coroutines and can be generalized to more complex tasks (see <A NAME="rl3"><A HREF="#l3">Listing Three</A>). Three coroutine classes are used: <i>ReadWord</i>, <i>ReadSpace</i>, and <i>PrintRoutine</i>. Each is an extension of class <i>CTargetPlatformCoroutine</i>. Because the amount of code used in the problem solution is relatively small for each coroutine instance, the bodies of the coroutines have been left in the public method <i>go.</i></p>
+
+
+<p>The program takes a single argument, a string of characters that is interpreted as a sequence of words separated by spaces. If no argument is given, the default string in the main function is used as an example. The input is stored in the variable <i>InputString</i>. After the input is read in, the three coroutine objects are created: <i>rwrd</i>, <i>rspc,</i> and <i>prtn</i>. I begin by <i>calling rspc-&gt;go(),</i> which transfers control to the first coroutine, a <i>ReadSpace</i> object. <i>ReadSpace</i> looks at the characters of <i>InputString</i> one at a time starting at the beginning and skips spaces. If a period is encountered, it is echoed to standard output and processing ceases. Spaces are skipped and if one was encountered, a single space is echoed to standard out in its place.</p>
+
+<p>Once the first character of a word is examined, the <i>ReadSpace</i> object suspends itself and transfers control to the <i>ReadWord</i> object with the call <i>resume(rwrd)</i>. The code in this coroutine copies characters of the current word into a character buffer <i>Word1</i> that is globally accessible to all the coroutines. When the word has been completely parsed, the <i>ReadWord</i> coroutine suspends itself and transfers control to the <i>PrintRoutine</i>. <A NAME="re6"><A HREF="0103ge6.htm">Example 6</A>, the body of <i>PrintRoutine::go</i>, consists of an infinite loop that does two things: The first time through the loop it echoes the current word to standard output in order and then resumes execution in <i>ReadSpace</i>. Once control is transferred back, the <i>PrintRoutine</i> object echoes the current word to standard output in reverse order (and again transfers control to <i>ReadSpace</i>). The consecutive nature of the print loops keeps track of whether the word is odd or even and prints the correct order of the characters. Again, processing ends in <i>ReadSpace::go</i> when a period is encountered.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>Coroutines are a natural solution to parsing problems and have been used widely by assembly language programmers. Because they closely mimic the interactions between certain hardware devices and electronic components, coroutines are also a natural programming tool for architects of electronics design tools. Since languages such as Lisp have language-level coroutines, they are also known to the AI community and have been employed in solutions to intelligent scheduling problems. </p>
+
+
+<p>Although coroutines do not provide an advantage over a well-designed multithreaded application for typical GUI scenarios, they are very useful when the design calls for careful control over scheduling and can certainly make such a design easier to understand by exploiting any inherently mutual subroutines in a solution.</p>
+
+
+
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>#ifndef _CWinNTCoroutine_h_
+#define _CWinNTCoroutine_h_
+//////////////////////////////////////////
+// CWinNTCoroutine.h
+#ifdef _WIN32
+#ifdef _COROUTINE_DLL
+#define ExportStatus _declspec(dllexport)
+#else
+#define ExportStatus _declspec(dllimport)
+#endif
+#else
+#define ExportStatus
+#endif
+#include &lt;assert.h&gt;
+/////////////////////////////////////////////////////////
+class ExportStatus CTargetPlatformCoroutine : public CCoroutine {
+public:
+    CTargetPlatformCoroutine(unsigned stackSizeInBytes = DEFSTACKSIZE);
+    virtual ~CTargetPlatformCoroutine();
+    virtual void go(){assert(0);}
+    virtual void resume(CCoroutine *next);
+};
+#endif
+/////////////////////////////////////////////////////
+// CWinNTCoroutine.cpp
+/////////////////////////////////////////////////////
+// CCoroutineNT.cpp
+// NT implementation of Coroutine interface.
+#if (!defined(_WINNT) || !defined(_WIN32_WINNT))
+#error "This module is only for Windows NT."
+#endif
+
+#define WIN32_LEAN_AND_MEAN
+#include &lt;windows.h&gt;
+#include &lt;assert.h&gt;
+
+#include "CCoroutine.h"
+#include "CWinNTCoroutine.h"
+
+///////////////////////////////////////////////////////////
+class CCoroutineState
+{
+public:
+    CCoroutineState() : fiber_(0) {}
+    LPVOID fiber_;
+};
+static void WINAPI startCoroutine(PVOID lpParameter)
+{
+    CCoroutine *c = (CCoroutine *) lpParameter;
+    c-&gt;go();
+    assert(0);
+}
+///////////////////////////////////////////////////////////
+CTargetPlatformCoroutine::CTargetPlatformCoroutine(unsigned 
+                            stackSizeInBytes) : CCoroutine(INITCOROUTINE)
+{
+    state_ = new CCoroutineState();
+    if (stackSizeInBytes == INITCOROUTINE)
+        return;
+    state_-&gt;fiber_ = CreateFiber(0, startCoroutine, this);
+    assert(state_-&gt;fiber_);
+}
+CTargetPlatformCoroutine::~CTargetPlatformCoroutine()
+{
+    assert(state_-&gt;fiber_);
+    DeleteFiber(state_-&gt;fiber_);
+    state_-&gt;fiber_ = 0;
+    delete state_;
+}
+void CTargetPlatformCoroutine::resume(CCoroutine *other)
+{
+    if (other == this) return;
+
+    assert(other-&gt;state_-&gt;fiber_);
+    SwitchToFiber(other-&gt;state_-&gt;fiber_);
+}
+/////////////////////////////////////////////////////////
+// This can't be pure virtual because it is static
+CCoroutine *CCoroutine::initialize()
+{
+    CCoroutine *thisCoroutine = new CTargetPlatformCoroutine();
+    LPVOID thisFiber = ConvertThreadToFiber(thisCoroutine);
+    assert(thisFiber != 0);
+    thisCoroutine-&gt;state_-&gt;fiber_ = thisFiber;
+    return thisCoroutine;
+}
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two</H4>
+
+
+<pre>////////////////////////////////////////////
+// CSolarisCoroutine.h
+////////////////////////////////////////////
+
+#ifndef _CSolarisCoroutine_h_#define _CSolarisCoroutine_h_#include 
+          &lt;assert.h&gt;class CTargetPlatformCoroutine : public CCoroutine {
+public:
+    CTargetPlatformCoroutine(unsigned stackSizeInBytes = DEFSTACKSIZE);
+    virtual ~CTargetPlatformCoroutine();
+    virtual void go() {assert(0);}
+    virtual void resume(CCoroutine *next);
+};
+#endif
+
+////////////////////////////////////////////
+// CSolarisCoroutine.cpp
+////////////////////////////////////////////
+#include "CCoroutine.h"
+#include "CSolarisCoroutine.h"
+
+#include &lt;pthread.h&gt;
+#include &lt;assert.h&gt;
+
+////////////////////////////////////////////////
+class CCoroutineState
+{
+public:
+  CCoroutineState(CCoroutine *parent)
+  : parent_(parent), go_(false)
+  {
+      pthread_mutex_init(&amp;go_mutex_, 0);
+      pthread_cond_init(&amp;go_cond_, 0);
+  }
+  CCoroutine *parent_;
+  pthread_t thread_;
+  int go_;
+  pthread_mutex_t go_mutex_;
+  pthread_cond_t go_cond_;
+
+  inline void waitToGo() {
+    pthread_mutex_lock(&amp;go_mutex_);
+    while (!go_)
+      pthread_cond_wait(&amp;go_cond_, &amp;go_mutex_);
+    go_ = false;
+    pthread_mutex_unlock(&amp;go_mutex_);
+  }
+  inline void signalToGo() {
+    // Tell the other guy to go.
+    pthread_mutex_lock(&amp;go_mutex_);
+    go_ = true;
+    pthread_cond_signal(&amp;go_cond_);
+    pthread_mutex_unlock(&amp;go_mutex_);
+  }
+};
+static void *crstart(void *thunk) {
+  CCoroutineState *s = (CCoroutineState *) thunk;
+  s-&gt;waitToGo();
+  s-&gt;parent_-&gt;go();
+  assert(0);
+  return 0;
+}
+/////////////////////////////////////////////////////////////
+CTargetPlatformCoroutine::CTargetPlatformCoroutine(unsigned 
+                 requestedStackSizeInBytes) : CCoroutine(INITCOROUTINE)
+{
+  state_ = new CCoroutineState(this); 
+  if (requestedStackSizeInBytes == INITCOROUTINE)
+    return;
+    pthread_attr_t attr;
+    pthread_attr_init(&amp;attr);
+#ifdef _POSIX_THREAD_ATTR_STACKSIZE
+    size_t stackSize = 8192;
+    if (requestedStackSizeInBytes != DEFSTACKSIZE)
+      stackSize = requestedStackSizeInBytes;
+#ifdef PTHREAD_STACK_MIN                    // Solaris is missing this.
+    if (stackSize &lt; PTHREAD_STACK_MIN)
+      stackSize = PTHREAD_STACK_MIN;
+#endif
+    pthread_attr_setstacksize(&amp;attr, stackSize);
+#endif
+    pthread_attr_setdetachstate(&amp;attr, PTHREAD_CREATE_DETACHED);
+    pthread_create(&amp;state_-&gt;thread_, &amp;attr, crstart, this-&gt;state_);
+    pthread_attr_destroy(&amp;attr);
+}
+CTargetPlatformCoroutine::~CTargetPlatformCoroutine()
+{
+  state_ = 0;
+}
+void CTargetPlatformCoroutine::resume(CCoroutine *other)
+{
+  if (other == this) return;
+
+  // Tell the other guy to go.
+  assert(other-&gt;state_);
+  other-&gt;state_-&gt;signalToGo();
+
+  // Wait until someone tells us to go.
+  assert(state_);
+  state_-&gt;waitToGo();
+}
+///////////////////////////////////////////////////////////
+CCoroutine *CCoroutine::initialize()
+{
+  return new CTargetPlatformCoroutine();
+}
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+<H4><A NAME="l3">Listing Three</H4>
+
+
+<pre>// oddword.cpp : Defines the entry point for the console application. 
+#include &lt;iostream.h&gt;
+#include &lt;string&gt;
+#include "CCoroutine.h"
+#ifdef _WIN32
+#include "CWinNTCoroutine.h"
+#else
+#include "CSolarisCoroutine.h"
+#endif
+
+CTargetPlatformCoroutine *rwrd;
+CTargetPlatformCoroutine *rspc;
+
+CTargetPlatformCoroutine *prtn;
+std::string InputString;
+int InputPointer = 0;
+int k;
+char Word1[20];
+
+class ReadWord : public CTargetPlatformCoroutine
+{
+public:
+    ReadWord() : CTargetPlatformCoroutine() {this-&gt;initialize();}
+    virtual void go();
+};
+class ReadSpace : public CTargetPlatformCoroutine
+{
+public:
+    ReadSpace() : CTargetPlatformCoroutine() {this-&gt;initialize();}
+    virtual void go();
+};
+class PrintRoutine : public CTargetPlatformCoroutine
+{
+public:
+    PrintRoutine() : CTargetPlatformCoroutine() {this-&gt;initialize();}
+    virtual void go();
+};
+void ReadWord::go()
+{
+    char ch;
+    while (true)
+    {
+        k = 0;
+        memset(Word1, 0, 20);
+        ch = InputString[InputPointer];
+        while (ch != ' ' &amp;&amp; ch != '.' &amp;&amp; k &lt; 20)
+        {
+            Word1[k] = ch;
+            k++;
+            InputPointer++;
+            ch = InputString[InputPointer];
+        }
+        resume(prtn);
+
+    }
+}
+void ReadSpace::go()
+{
+    while (true)
+    {
+         bool bSawSpace = false;
+         if (InputPointer &gt;= InputString.length())
+             return;
+         // assume that this thing ends with '.'
+         while (InputString[InputPointer] == ' ')
+         {
+             InputPointer++;
+             bSawSpace = true;
+
+        }
+         if (InputString[InputPointer] == '.')
+         {
+             cout &lt;&lt; "." &lt;&lt; endl;
+             exit(0);
+         }
+         else
+         {
+             if (bSawSpace)
+                 cout &lt;&lt; " ";
+             resume(rwrd);
+         }
+    }
+}
+void PrintRoutine::go()
+{
+    int j;
+    while (true)
+    {
+        for (j = 0; j &lt; k; j++)
+            cout &lt;&lt; Word1[j];
+        resume(rspc);
+        for (j = k - 1; j &gt;= 0; j--)
+            cout &lt;&lt; Word1[j];
+        resume(rspc);
+    }
+}
+// Let the user enter a string on the command line. Store it in memory in 
+// the variable InputString then read characters one at a time from 
+// InputString to solve the odd word problem. Make sure to enclose your 
+// command-line argument in double quotes
+int main(int argc, char* argv[])
+{
+    if (argc != 2)
+    {
+        InputString = "whats      the     matter with Kansas.";
+    }
+    else
+    {
+        InputString = argv[1];
+    }
+    rwrd = new ReadWord();
+    rspc = new ReadSpace();
+    prtn = new PrintRoutine();
+
+    rspc-&gt;go();
+    return 0;
+}
+
+</pre>
+<P>
+<A HREF="#rl3">Back to Article</A>
+</P>
+
+
+</body>
+</html>

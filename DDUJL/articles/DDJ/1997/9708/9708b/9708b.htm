@@ -1,0 +1,193 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal August 1997: The Empty Member C++ Optimization</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>The Empty Member C++ Optimization</h1>
+
+<p><i>Dr. Dobb's Journal</i> August 1997
+</p>
+<h2>Avoiding code bloat</h2>
+
+<h3>By Nathan Myers</h3>
+
+<I>Nathan has worked on the ISO/ANSI C++ Standard since 1993, designing most of what is in Chapter 22 of the Draft Standard. He can be contacted at http://www.cantrip.org/.</I>
+
+<hr>
+
+<p>The (Draft) Standard C++ Library is filled with useful templates, including extended versions of those found in the Standard Template Library (STL). These templates offer great flexibility, yet they are optimized for best performance in the common case. Not only can you use these templates directly, but they can stand as examples of effective design, and as a source of inspiration for ways to make your own components efficient and flexible.</p>
+
+<p>Some of the ways that they offer flexibility involve "empty" classes -- classes with no data members. Ideally, these empty classes should consume no space at all. They typically declare <i>typedef</i>s or member functions, and you can replace them with your own classes (which might not be empty) to handle special needs. The default empty class is by far the most commonly used, however, so this case must be optimal.</p>
+
+<p>Due to an unfortunate detail of the language definition, instances of empty classes usually occupy storage. In members of other classes, this overhead can make otherwise small objects large enough to be unusable in some applications. If this overhead couldn't be avoided in the construction of the Standard Library, the cost of the library's flexibility would drive away many of its intended users. But the optimization techniques used in the Standard library limit this overhead, and can be equally useful in your own code.</p>
+
+<h3>Empty Member Bloat</h3>
+
+<p>In the Standard C++ Library, each STL Container constructor takes as a parameter, and copies, an allocator object. Whenever the container needs storage, it asks its allocator member. In this way, a user with some special memory to allocate (such as a shared memory region) can define an allocator for it, and pass that to a container constructor, so that container elements will be placed there. In the common case, however, the standard default allocator is used, which just delegates to the global operator <i>new</i>. It is an empty object.</p>
+
+<p>The listings resent simplified code for a possible implementation of these components. In <a name="rl1"><a href="9708b.htm#l1">Listing One</A>, the standard default allocator <i>allocator&lt;&gt;</i> has only function members. In <a name="rl2"><a href="9708b.htm#l2">Listing Two</A>, the generic <i>list&lt;&gt;</i> container template keeps a private <i>alloc_</i> member, copied from its constructor argument. The <i>list&lt;&gt;</i> constructor is declared "explicit" so that the compiler will not use it as an automatic conversion (this is a recent language feature). </p>
+
+<p>The member <i>list&lt;&gt;::alloc_</i> usually occupies four bytes in the object, even in the default case where <i>Alloc</i> is the empty class <i>allocator&lt;T&gt;</i>.</p>
+
+<p>A few extra bytes for the list object doesn't seem so bad until you imagine a big vector of these lists, as in a hash table. Any extra junk in each list is multiplied, and reduces the number of list headers that fit in a virtual memory page. Wasted space makes slower programs.</p>
+
+<h3>Empty Objects</h3>
+
+<p>How can this overhead be avoided? First, you need to know why the overhead is there. The Standard C++ language definition says:</p>
+
+<blockquote><p>
+A class with an empty sequence of [data] members and base class objects is an empty class. Complete objects and member subobjects of an empty class type shall have nonzero size.</p>
+</blockquote>
+
+<p></p>
+
+<p>Why must objects with no member data occupy storage? Consider <a name="rl3"><a href="9708b.htm#l3">Listing Three</A>. If <i>sizeof(Bar)</i> were zero, <i>f.b</i> and the elements of <i>f.a[]</i> might all have the same address. If you were keeping track of separate objects by their addresses, <i>f.b</i> and <i>f.a[0]</i> would appear to be the same object. The C++ standards committee chose to finesse these issues by forbidding zero-sized addressable objects.</p>
+
+<p>Still, why does an empty member take up so much space (four bytes, in our example)? On all the compilers I know of, <i>sizeof(Bar)</i> is 1. However, on most architectures, objects must be aligned according to their type. For example, if you declare</p>
+
+<PRE>struct Baz {
+   Bar b;
+   int* p;
+};
+</PRE>
+<p>on most architectures today, <i>sizeof(Baz)</i> is 8. This is because the compiler adds "padding" so that member <i>Baz::p</i> doesn't cross a memory word boundary; see <a name="rf1"><a href="9708bf1.htm">Figure 1</A>(a).</p>
+
+<p>How can you avoid this overhead? The Draft says (in a footnote) that "a base class subobject of an empty class type may have zero size." In other words, if you declared <i>Baz2</i> like this,</p>
+
+<PRE>struct Baz2 : Bar {
+   int* p;
+};
+</PRE>
+<p>then a compiler is allowed to reserve zero bytes for the empty base class <i>Bar</i>. Hence, <i>sizeof(Baz2)</i> can be just 4 on most architectures; see <a href="9708bf1.htm">Figure 1</A>(b).</p>
+
+<p>Compiler implementers are not required to do this optimization, and many don't -- yet. However, you can expect that most standard-conforming compilers will, because the efficiency of so many components of the Standard Library (not only the containers) depends on it. </p>
+
+<h3>Eliminating Bloat </h3>
+
+<p>This principle eliminates the space overhead. How do you apply it? Let's consider how to fix the implementation of our example template <i>list&lt;&gt;</i>. You could just derive from <i>Alloc</i>, as in <a name="rl4"><a href="9708b.htm#l4">Listing Four</A>, and it would work, mostly. Code in the <i>list&lt;&gt;</i> member functions would get storage by calling <i>this-&gt;allocate()</i> instead of <i>alloc_.allocate()</i>. However, the <i>Alloc</i> type supplied by the user is allowed to have virtual members, and these could conflict with a <i>list&lt;&gt;</i> member. (Imagine a private member <i>void list&lt;&gt;::init()</i>, and a virtual member <i>bool Alloc::init()</i>.)</p>
+
+<p>A better approach is to package the allocator with a <i>list&lt;&gt;</i> data member, such as the pointer to the first list node (as in <a name="rl5"><a href="9708b.htm#l5">Listing Five</A>), so that the allocator's interface cannot leak out. </p>
+
+<p>Now, <i>list&lt;&gt;</i> members get storage by calling <i>head_.allocate()</i>, and mention the first list element by calling <i>head_.p</i>. This works perfectly, there's no unnecessary overhead of any kind, and users of <i>list&lt;&gt;</i> can't tell the difference. Like most good optimizations, it makes the implementation a bit messier, but doesn't affect the interface.</p>
+
+<h3>A Packaged Solution</h3>
+
+<p>There is still room for improvement and, as usual, the improvement involves a template. In <a name="rl6"><a href="9708b.htm#l6">Listing Six</A>, I've packaged the technique so that it is clean and easy o use.</p>
+
+<p>The declaration of <i>list&lt;&gt;</i> in <a name="rl7"><a href="9708b.htm#l7">Listing Seven</A> is no bigger or messier than the unoptimized version I started with. Any other library component (Standard or otherwise) can use <i>BaseOpt&lt;&gt;</i> just as easily. The member code is only slightly messier; while it's not immediately obvious what's going on, the declaration of <i>BaseOpt&lt;&gt;</i> provides a natural place to document the technique and the reasons for it.</p>
+
+<p>It is tempting to add members to <i>BaseOpt&lt;&gt;</i>, but that would not improve it: They could conflict with members inherited from the <i>Base</i> parameter, just as in <a href="9708b.htm#l4">Listing Four</A>.</p>
+
+<h3>Finally</h3>
+
+<p>This technique can be used with any compiler that has sturdy template support. Not all C++ compilers support the empty-base optimization yet (the Sun, HP, IBM, and Microsoft compilers do), but the technique costs nothing extra even on those that don't. When you get a standard-conforming compiler, it probably will do the optimization, and if your code uses this technique, it will automatically become more efficient.</p>
+
+<h3>Acknowledgment</h3>
+
+<p>Fergus Henderson contributed an essential refinement to this technique.</p>
+<HR>
+<H4><a name="l1">Listing One</H4>
+
+<pre>template &lt;class T&gt;class allocator {   // an empty class
+  static T* allocate(size_t n)
+    { return (T*) ::operator new(n * sizeof T); }
+  . . .
+};
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>template &lt;class T, class Alloc = allocator&lt;T&gt; &gt;class list {
+  Alloc alloc_; 
+  struct Node { . . . };
+  Node* head_;      
+ public:
+  explicit list(Alloc const&amp; a = Alloc())
+    : alloc_(a) { . . . }
+  . . .
+};
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three </H4>
+
+<pre>struct Bar { };struct Foo {
+  struct Bar a[2];
+  struct Bar b;
+};
+Foo f;
+</pre>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+<H4><a name="l4">Listing Four</H4>
+
+<pre>template &lt;class T, class Alloc = allocator&lt;T&gt; &gt;class list : private Alloc {
+  struct Node { . . . };
+  Node* head_;      
+ public:
+  explicit list(Alloc const&amp; a = Alloc())
+    : Alloc(a) { . . . }
+  . . .
+};
+</pre>
+<P>
+<a href="#rl4">Back to Article</A>
+</P>
+<H4><a name="l5">Listing Five</H4>
+
+<pre>template &lt;class T, class Alloc = allocator&lt;T&gt; &gt;class list {
+  struct Node { . . . };
+  struct P : public Alloc {
+    P(Alloc const&amp; a) : Alloc(a), p(0) { }
+    Node* p;
+  };
+  P head_;
+ public:
+  explicit list(Alloc const&amp; a = Alloc())
+      : head_(a) { . . . }
+  . . .
+};
+</pre>
+<P>
+<a href="#rl5">Back to Article</A>
+</P>
+<H4><a name="l6">Listing Six</H4>
+
+<pre>template &lt;class Base, class Member&gt;struct BaseOpt : Base {
+  Member m;
+  BaseOpt(Base const&amp; b, Member const&amp; mem) 
+   : Base(b), m(mem) { }
+};
+</pre>
+<P>
+<a href="#rl6">Back to Article</A>
+</P>
+<H4><a name="l7">Listing Seven</H4>
+
+<pre>template &lt;class T, class Alloc = allocator&lt;T&gt; &gt;class list {
+  struct Node { . . . };
+  BaseOpt&lt;Alloc,Node*&gt; head_;
+ public:
+  explicit list(Alloc const&amp; a = Alloc())
+    : head_(a,0) { . . . }
+  . . .
+};
+<p></p>
+</pre>
+<P>
+<a href="#rl7">Back to Article</A>
+</P>
+
+<p><b>DDJ</b></p>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

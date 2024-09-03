@@ -1,0 +1,368 @@
+<HTML>   
+     <HEAD>
+<TITLE>February 2001/Exception Handling in Embedded C Programs</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocfeb.htm"></A><FONT COLOR="#FF0000">   Embedded Systems</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Exception Handling in Embedded C Programs</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Yonatan Lehman</FONT></H3>
+
+<BLOCKQUOTE>
+<p>The most common way to emulate exceptions in C is through its setjmp/longjmp facility. The approach presented here is less complicated, but with some surprisingly useful features, including a simple form of stack unwinding.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>Exception handling is a mechanism that is used to handle failures within a system in a graceful and modular manner. A full discussion of exception handling is beyond the scope of this article; however, to help readers appreciate the method I summarize the main features an exception handling mechanism should provide:</p>
+
+<UL><LI>   Separation of detection code from recovery code. A low level function that detects a failure of some sort should be able to say, &quot;hang on &#151; we have a problem; let&#146;s abort the current sequence&quot; without knowing how and where the problem will be handled. This is especially important when a function may be called from several places, and in different situations &#151; each of which potentially needs different handling. The function must be able to <I>raise</I> an exception (signal that an error has occurred) from anywhere within the program, regardless of how deep it is in the call stack.</LI>
+<LI>   &quot;Unwrapping&quot; of the calling stack. If an exception occurs within a sequence of nested functions (<B>A</B> calls <B>B</B>, which calls <B>C</B>, which calls <B>D</B> etc.), execution should stop immediately in each of these functions; the deepest function should return immediately to its caller, which should return to its caller, and so on &#151; until execution has propagated to a function that is high enough in the call tree to handle the exception.</LI>
+<LI>   Local cleanup. Each of the intermediate functions may need to do some cleanup, release resources, reset its state, and so on. This is necessary since each function has stopped in the middle of execution. The process of raising an exception must leave all parts of the system in a state that will allow recovery, by ensuring that no part of the system remains in an inconsistent state.</LI>
+<LI>   A way to identify which error occurred. In other words, functions that detect exceptions need to say &quot;hey we&#146;ve got exception <B>A</B>,&quot; and functions that do error cleanup and recovery need to say &quot;if we&#146;ve got exception <B>A</B> do this if we&#146;ve got exception <B>B</B> then do that.&quot;</LI></UL>
+
+<p>Newer languages such as C++ and Java include exception handling as part of the language. In older languages such as C this mechanism must be emulated using more basic features.</p>
+<p>The purpose of this article is to show a simple, systematic, unobtrusive, and efficient method for implementing exception handling in C. The relevence to embedded systems is due to the fact that 1) embedded systems don&#146;t &quot;blue screen&quot; &#151; they try to recover and keep going. 2) Embedded systems are typically both time and memory critical, so the implementation must be both time and memory efficient.</p>
+
+<H4><FONT COLOR="#000080">An Added Bonus</FONT></H4>
+
+<p>In addition to the exception handling features listed above, this method provides a feature not normally found when exception handling is part of the language &#151; it can trace the unwrapping of the stack. In other words, upon return from each of the functions <B>D</B>, <B>C</B>, <B>B</B>, and <B>A</B>, the mechanism can write information to a log. This log shows the calling sequence up to the time the exception occurred. Typical output is as follows:</p>
+
+<pre>
+boo.c[128] RAISE 100
+foo.c[64] return 100
+moo.c[345] return 100
+nu.c[1234] RECOVER 100
+</pre>
+
+<p>This shows that the error was raised in file <B>boo.c</B> line 128. The function where the error was raised was called from line 64 in file <B>foo.c</B>. That function was called from file <B>moo.c</B> line 345. The exception was finally handled in file <B>nu.c</B> line 1234.</p>
+<p>This sort of &quot;postmortum&quot; dump shows the full context of the exception, and is often useful, since it eliminates the need to reconstruct the situation that led to the failure. In embedded systems this is particularly important because failures may be timing dependent. It may take hours of running to reconstruct a problem, and simply using a debugger or adding <B>printf</B> statements can change the timing enough to make the problem disappear.</p>
+<p>In the code that follows I refer to an abstract <B>LOG</B> operation. This operation can be simply a <B>printf</B> to standard output or to a file, or it can be a write to a memory resident buffer. What is important is that ASCII trace information can be written and it can be viewed at some point.</p>
+
+<H3><FONT COLOR="#000080">Using the Method</FONT></H3>
+
+<p>The best way to understand this exception mechanism is to see how it is actually used. The following is an example of a call tree: function <B>A</B> calls function <B>B</B>, which calls function <B>C</B>, which calls function D:</p>
+
+<pre>
+void A(...) {
+   ...
+   B(...);
+   ...
+}
+
+void B(...) {
+   ...
+   C(...);
+   ...
+}
+
+void C(...) {
+   ...
+   D(...);
+   ...
+}
+</pre>
+
+<p>Function <B>D</B> checks and discovers some sort of exceptional condition that it can&#146;t handle by itself. Since <B>D</B> can&#146;t recover, it signals its caller (function <B>C</B>) that it has had to abort execution. Similarly, <B>C</B> can&#146;t handle the problem; it needs to &quot;bounce&quot; the problem up to function <B>B</B>. Function <B>B</B> hasn&#146;t got the political clout to solve the problem either, so it too signals its caller, <B>A</B>. The buck stops in function <B>A</B>. It takes some recovery action and the system carries on execution.</p>
+<p>A walk through a few code excerpts will show how this works in practice.</p>
+<p>The first requirement of the method is that every function take an extra parameter called a status parameter. For readability, I give this status a special type, using a typedef as follows:</p>
+
+<pre>
+typedef unsigned long ER_status_t;
+</pre>
+
+<p>At the top level (the <B>main</B> function, or the top level of each task in a multi-threaded system) the program defines a status and initializes it to an <B>OK</B> value (usually zero).</p>
+
+<pre>
+main (...) {
+   ER_status_t st = ER_OK;
+   ...
+}
+</pre>
+
+<p>Every function takes an extra parameter of type <B>ER_status_t *</B>. By convention, this is the last parameter. The parameter is passed from function to function. So the previous example actually looks as follows:</p>
+
+<pre>
+void A(..., ER_status_t *st_p){
+   ...
+   B(..., st_p); ER_CHK(st_p);
+   ...
+EXIT :;
+}
+
+void B(..., ER_status_t  *st_p) {
+   ...
+   C(..., st_p); ER_CHK(st_p);
+   ...
+EXIT :;
+}
+
+void C(..., ER_status_t *st_p) {
+   ...
+   D(..., st_p); ER_CHK(st_p);
+   ...
+EXIT :;
+}
+</pre>
+
+<p>You will have noticed that in addition to the status pointer parameter passed to each function, I have added two additional elements. After invoking each function the code calls a macro <B>ER_CHK</B>, passing it the <B>st_p</B> parameter. In addition, every function has an <B>EXIT</B> label at the end of the function. I&#146;ll get to the <B>EXIT</B> label in a moment.</p>
+<p>First, observe what happens in function <B>D</B>, where the error is detected:</p>
+
+<pre>
+void D (..., ER_status_t *st_p)
+{
+   ...
+   if (some condition) {
+      ER_RAISE(st_p, error1);
+   }
+
+   EXIT : ;
+}
+</pre>
+
+<p><B>ER_RAISE</B> does the following (simplified for the moment):</p>
+
+<pre>
+#define ER_RAISE(ST_P, ST) \
+/*1*/ {*ST_P = ST; \
+/*2*/   ER_LOG("%s(%d) RAISE %x\n", \
+             __FILE__,__LINE__, *ST_P);\
+/*3*/   goto EXIT;}
+</pre>
+
+<p>This macro has three parts:</p>
+
+<OL><LI>It sets the status pointer to a given error value.</LI>
+<LI>It writes a trace with the file and line to the log. (In C99  it could also include the function name, since C99 provides a <B>__FUNC__</B> macro.)</LI>
+<LI>Execution jumps &#151; yes, via a <B>goto</B> &#151; to the <B>EXIT</B> label at the end of the function.</LI></OL>
+
+<p>So function D returns, in effect, from the point where it invoked the macro <B>ER_RAISE</B>.</p>
+<p>This brings us to the <B>ER_CHK</B> macro. This macro is placed after every function that takes a status parameter. It is defined (again, slightly simplified) as:</p>
+
+<pre>
+#define ER_CHK(ST_P) \
+/*1*/{if (*ST_P != ER_OK) {\
+/*2*/  ER_LOG("%s(%d) return %x\n",\
+         __FILE__,__LINE__, *ST_P);\
+/*3*/   goto EXIT;}
+</pre>
+
+<p>Line 1 checks the status for a non-<B>ER_OK</B> value. If this happens then lines 2 and 3 write to the log and <B>goto EXIT</B>, as in <B>ER_RAISE</B>.</p>
+<p>This process continues at each level, until it reaches the brave function <B>A</B>, which wants to handle the error. Typically, what the handler does is something like:</p>
+
+<pre>
+void A(..., ER_status_t *st_p) {
+   ...
+   B(...,st_p);
+   if (*st_p == error1) {
+      handle error1;
+      ER_RECOVER(st_p);
+   } else if (*st_p != ER_OK) {
+      default action for other errors;
+      ER_CHK(st_p);
+   }
+   ...
+}
+</pre>
+
+<p>Here, instead of calling <B>ER_CHK</B>, function <B>A</B> explicitly checks <B>*st_p</B> for all values that it knows how to handle. (Only <B>error1</B> is shown in the example but it could &#147;<B>else if</B>&#148; any number of errors.) Assuming that it can recover from this error, function <B>A</B> calls the macro <B>ER_RECOVER</B>. This macro does something like:</p>
+
+<pre>
+#define ER_RECOVER(ST_P) \
+  { ER_LOG("%s(%d) RECOVER %x \n",\
+           __FILE__,__LINE__, *ST_P);\
+    *ST_P = ER_OK;}
+</pre>
+
+<p><B>ER_RECOVER</B> writes a special log trace to mark the end of the trace sequence. It then resets the status to <B>ER_OK</B> so that execution can continue normally.</p>
+<p>Back to function <B>A</B>: in cases where it can&#146;t handle the error, it can call <B>ER_CHK</B> to defer the exception handling to an even higher level (similar to &quot;rethrowing&quot; an exception in C++).</p>
+
+<H3><FONT COLOR="#000080">Time for a Quick Review</FONT></H3>
+
+<p>1)  At the top level of the program (the &#147;main&#148; function), or the top of each task or interrupt handler in a real-time system, the program defines and initializes the status parameter.</p>
+<p>2)  The pointer to the status is passed to each function.</p>
+<p>3)  After each function returns, the <B>ER_CHK</B> macro is used to check the status, and if it is not <B>ER_OK</B>, to log the file and line and do a <B>goto EXIT</B>.</p>
+<p>4)  <B>ER_RAISE</B> is used to raise (start) an exception.</p>
+<p>5)  <B>ER_RECOVER</B> is used to &quot;close&quot; and reset an exception.</p>
+<p>6)  Note that the status is initialized only once. Functions that raise no exceptions need not explicitly set the status value to <B>ER_OK</B>; they can just leave the status value alone.</p>
+
+<H3><FONT COLOR="#000080">Why goto and Not return?</FONT></H3>
+
+<p>The problem with the <B>return</B> statement is that it forces multiple exits from the function. If the function needs to do some cleanup before it exits &#151; for example, to release a resource it is holding &#151; in the best case it will contain duplicated code; in the worst case, the programmer will forget to do it and the function will contain a bug!</p>
+<p>The <B>EXIT</B> label provides a single point of exit from the function. It also acts as the exception handler for the function (the equivalent to the <B>catch</B> in C++). For example, consider a function to be used in a real-time system, in which a resource must be locked while it is being used:</p>
+
+<pre>
+void X(..., ER_status_t *st_p)
+{
+   lock();
+   ...
+   B1(st_p); ER_CHK(st_p);
+   ...
+   B2(st_p); ER_CHK(st_p);
+   ...
+EXIT :;
+   unlock();
+}
+</pre>
+
+<p>In this example <B>X</B> calls functions <B>B1</B> and <B>B2</B>, within some sort of locking mechanism. Such locking is often needed in real-time systems to ensure that tasks or interrupts don&#146;t interfere with each other. The mechanism could be a semaphore lock, or an interrupt disable, depending on the situation; for this example what matters is that the <B>lock</B> must be matched by an <B>unlock</B>, otherwise the system could become deadlocked.</p>
+<p>Putting the <B>unlock</B> after the <B>EXIT</B> statement ensures that even when calling <B>ER_CHK</B> from <B>B1</B> or <B>B2</B> (or from any other function called) that the unlock will be done, since <B>ER_CHK</B> always exits via the <B>EXIT</B> label.</p>
+<p>The <B>EXIT</B> label thus marks a &quot;cleanup&quot; handle that can do any kind of cleanup, such as releasing a lock, releasing allocated memory, or closing a file, before propagating the error to the calling function. Each function in the call stack has an opportunity to do any cleanup necessary.</p>
+
+<H3><FONT COLOR="#000080">A More Complete Example</FONT></H3>
+
+<p>In the example below, four functions are invoked: <B>A</B>, <B>B1</B>, <B>B2</B>, and <B>C</B>. However, only functions <B>B1</B> and <B>B2</B> are in the locked region.</p>
+
+<pre>
+void X(..., ER_status_t *st_p) {
+   A(st_p); ER_CHK(st_p);
+   lock();
+   B1(st_p); ER_CHK(st_p);
+   B2(st_p); ER_CHK(st_p);
+   unlock();
+   C(st_p); ER_CHK(st_p);
+EXIT :;
+  ???
+}
+</pre>
+
+<p>The problem here is that if <B>B1</B> or <B>B2</B> raise an exception, then <B>X</B> must perform the <B>unlock</B>, but if <B>A</B> or <B>C</B> raise an exception it must not. The solution is to use a local <B>is_locked</B> flag, and test it within the cleanup handler:</p>
+
+<pre>
+void X(..., ER_status_t *st_p) {
+/*2*/ int is_locked = 0;
+      A(st_p); ER_CHK(st_p);
+/*4*/ lock(); is_locked = 1;
+      B1(st_p); ER_CHK(st_p);
+      B2(st_p); ER_CHK(st_p);
+/*7*/ unlock(); is_locked = 0;
+      C(st_p); ER_CHK(st_p);
+EXIT :;
+/*10*/ if (is_locked)
+          unlock();
+}
+</pre>
+
+<p>The flag is initialized to <B>0</B> in line 2, indicating that <B>X</B> has not yet performed the lock. Once <B>X</B> performs the lock, <B>is_locked</B> is set to <B>1</B> in line 4. <B>X</B> then calls functions <B>B1</B> and <B>B2</B>. When <B>X</B> performs the unlock in line 7 it once again clears <B>is_locked</B>. Finally, after the <B>EXIT</B> <B>X</B> tests <B>is_locked</B> in line 10 and unlocks it only if it is set. This guarantees that if <B>ER_CHK</B> is called immediately after <B>A</B> or <B>C</B> &#151; or it isn&#146;t called at all &#151; the <B>EXIT</B> section does nothing; if <B>EXIT</B> is reached from <B>B1</B> or <B>B2</B>, then the <B>EXIT</B> section does the necessary cleanup.</p>
+
+<H3><FONT COLOR="#000080">Usage Guideline</FONT></H3>
+
+<p>1)  <I>Never</I> put an <B>ER_CHK</B> after the <B>EXIT</B> label. This causes an infinite loop (think about it...) &#151; you will probably fall in this trap at least once, especially if you cut and paste a function call (along with its <B>ER_CHK</B>) after the <B>EXIT</B>. See the source code provided with this article (<B>www.cuj.com/code</B>) for a way out of this problem.</p>
+<p>2)  Be careful when doing loops or <B>if</B>s on a single statement. The following code:</p>
+
+<pre>
+while (something)
+   some_function(st_p); ER_CHK(st_p);
+</pre>
+
+<p>is wrong. (The <B>ER_CHK</B> is not in the loop.) This is correct:</p>
+
+<pre>
+while (something)
+{
+   some_function(st_p); ER_CHK(st_p);
+}
+</pre>
+
+<p>3)  I always puts the <B>ER_CHK</B> at the end of the line, where it is unobtrusive; otherwise it can double the number of lines of code, making it harder to read.</p>
+<p>4)  Don&#146;t forget to initialize the top level status to <B>ER_OK</B>, and to reset it to <B>ER_OK</B> when you recover (unless you use <B>ER_RECOVER</B>).</p>
+<p>5)  Don&#146;t cheat on the <B>ER_CHK</B>; put one after every function you call. If you don&#146;t you will get a trace which shows not where the function was called but where the <B>ER_CHK</B> was done. This trace will be misleading and you may spend hours trying to figure out how you got a trace in function <B>X</B> from function <B>Y</B> when it never calls that function.</p>
+<p>6)  If a function raises no exceptions, and calls no functions that affect the exception status, then you can eliminate the status parameter if you really must &#151; but it is better to include it in all functions, since:</p>
+<p>a)  It saves you remembering when you need a status and when not.</p>
+<p>b)  When you eventually <I>do</I> call another function that <I>does</I> take a status, it saves you having to add status to a long chain of functions. (What usually happens is that a local status is declared, and exceptions don&#146;t get propogated all the way up.)</p>
+
+<H3><FONT COLOR="#000080">Exceptions for Embedded Systems</FONT></H3>
+
+<p>The implementation shown above is fine for systems where memory is plentiful, and the memory overhead of doing <B>ER_CHK</B> after each function is not significant. In embedded systems, more careful coding is necessary. The following snippets show how to use three new macros, <B>ER_DEF_FILE</B>, <B>ER_ENTER</B>, and <B>ER_EXIT</B>, to achieve a more memory efficient implementation.</p>
+
+<pre>
+ER_DEF_FILE("my_file.c");
+
+void A(...,ER_status_t *st_p)
+{
+   int      i;
+   ER_ENTER();
+   ...
+       B(st_p); ER_CHK(st_p);
+   ...
+EXIT :;
+  ER_EXIT(st_p);
+}
+</pre>
+
+<p>The <B>ER_DEF_FILE</B> macro is added once to each file. The <B>ER_ENTER</B>, <B>ER_EXIT</B> macros are the very first and last calls in each function respectively.</p>
+<p>To understand what these macros do, look again at the first implementation of <B>ER_CHK</B>:</p>
+
+<pre>
+#define ER_CHK(ST_P) \
+ { if (*ST_P != ER_OK) {\
+    ER_LOG("%s(%d) return %x\n", \
+    __FILE__,__LINE__, ST);\
+    goto EXIT;}
+</pre>
+
+<p>This code generates memory overhead in a number of places:</p>
+<p>1)  In some compilers, <B>__FILE__</B> generates a (long) full path name. This can waste memory, and also makes the log entries unreadable.</p>
+<p>2)  <I>Every</I> <B>ER_CHK</B> generates and stores a new copy of the file name (<B>__FILE__</B>).</p>
+<p>3)  The <B>ER_LOG</B>, taking three parameters, is called by every <B>ER_CHK</B>. (Although this could conceivably slow things down when an exception occurs, that is not the primary concern. The primary concern is that every appearance of <B>ER_LOG</B> generates code to store the parameters, which represents a memory overhead whether the function is called or not.)</p>
+<p>4)  A copy of the format string is stored for each <B>ER_CHK</B>.</p>
+<p>The new macros solve these problems as follows. <B>ER_DEF_FILE</B> is defined as:</p>
+
+<pre>
+#define ER_DEF_FILE(F) \
+static char _er_filename[] = F;\
+static void _er_log_error(\
+   ER_status_t  status,\
+   int          line) \
+{\
+   ER_LOG("%s(%d) error %x\n",\
+      _er_filename, line, status);\
+}
+</pre>
+
+<p>This macro does two things. First, it defines a global, static string of <B>char</B>, initialized with the name given as a parameter <B>F</B>. This provides a string that can be used anywhere where <B>__FILE__</B> would be used, but the string is allocated only once. Second, the macro defines a static function <B>_er_log_error</B>, which takes the line number and and status as parameters, and generates the <B>ER_LOG</B> trace just as <B>ER_CHK</B> did.</p>
+<p>Now <B>ER_CHK</B> can be redefined as follows:</p>
+
+<pre>
+#define ER_CHK(ST_P) \
+   { if (*ST_P != ER_OK) {\
+      _er_log_error(__LINE__, ST);\
+      goto EXIT;}
+</pre>
+
+<p>This eliminates overheads 1, 2, and 4 above and reduces overhead 3, by passing only two parameters instead of three. However, we can do better than that, by using the macros <B>ER_ENTER</B>, <B>ER_EXIT</B>, and by redefining <B>ER_RAISE</B> and <B>ER_CHK</B>.</p>
+<p><B>ER_ENTER</B> opens a block and defines a local variable <B>_er_line</B>:</p>
+
+<pre>
+#define ER_ENTER() {int _er_line;
+
+ER_RAISE and ER_CHK do
+   ....\
+   _er_line == LINE; goto EXIT;...
+</pre>
+
+<p><B>ER_ENTER</B> does this <I>instead</I> of calling the log function, thus it uses an assignment of a constant to a local variable (which is often stored in a register) instead of a function call.</p>
+<p>Finally, <B>ER_EXIT</B> is defined as follows:</p>
+
+<pre>
+#define ER_EXIT(ST_P) \
+    {if (*st_p != ER_OK) \
+    _er_log_error(_er_line, ST);}}
+</pre>
+
+<p>Note the extra curly brace at the end. This closes the brackets opened by the <B>ER_ENTER</B>.</p>
+<p><B>ER_EXIT</B> tests the status, and if it is non-zero it writes to the log using the static function generated by the <B>ER_DEF_FILE</B> macro, passing it the line number that was saved by <B>ER_CHK</B> or <B>ER_RAISE</B>. This reduces the overhead to a function call per function instead of a function call per <B>ER_CHK</B>.</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+<p>The macros defined here are useful both for implementing exception handling and recovery, and as a diagnostic tool. They are a great help <I>if</I> they are used consistently, which is easy to do if you include them from the beginning and as coding proceeds. Adding these macros afterward, or when you have a specific problem, can be a pain in the neck.</p>
+<p>Along with this article I have provided a file <B>er.h</B>, which implements these macros. (See <B>www.cuj.com/code</B>.) The file defines several versions of <B>ER_CHK</B> that trade off different levels of memory compactness with programing conveniance. I also include a file <B>er_example.c</B> which demonstrates use of the exception macros.</p>
+
+<p><i><B>Yonatan Lehman</B> has worked as a programmer, software, and system architect for 18 years. He holds a BSc from Imperial College, London. He is currently working for Zen Research, Israel and can be reached at <B>ylehman@ieee.org</B>.</i></p>
+
+<h4><a href="../../../source/2001/feb01/lehman.zip"></a></h4>
+
+</blockquote></body></html>

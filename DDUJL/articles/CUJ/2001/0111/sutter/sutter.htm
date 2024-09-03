@@ -1,0 +1,427 @@
+<HTML>   
+     <HEAD>
+<TITLE>November 2001/Sutter&#146;s Mill</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocnov.htm"></A><FONT COLOR="#FF0000">   C/C++ Contributing Editors</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Sutter&#146;s Mill: The String Formatters of Manor Farm</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Herb Sutter</FONT></H3>
+
+<BLOCKQUOTE>
+<p>There is more than one way to "string" an integer. Find your favorite here.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+
+<p><I>&#147;All animals are equal, but some animals are more equal than others.&#148;</I><br>
+&#151;George Orwell, <I>Animal Farm</I> <a href="#1">[1]</a></p>
+
+<p>Consider the following C code that uses <B>sprintf</B> to convert an integer value to a human-readable string representation, perhaps for output on a report or in a GUI window:</p>
+
+<pre>
+  // Example 1:
+  // Stringizing some data in C,
+  // using sprintf().
+
+  // PrettyFormat() takes an integer,
+  // and formats it into the provided
+  // output buffer. For formatting
+  // purposes, the result must be at
+  // least 4 characters wide.
+  //
+  void PrettyFormat( int i, char* buf )
+  {
+    // Here&#146;s the code, neat and simple:
+    sprintf( buf, "%4d", i );
+  }
+</pre>
+
+<p>The $64,000 question <a href="#2">[2]</a> is: How would you do this kind of thing in C++? Well, all right, that&#146;s not quite the question because, after all, Example 1 <I>is</I> valid C++. The true $64,000 question is: Throwing off the shackles of the C90 Standard <a href="#3">[3]</a> on which the C++98 Standard <a href="#4">[4]</a> is based, if indeed they are shackles, isn&#146;t there a superior way to do this in C++ with its classes and templates and so forth?</p>
+<p>That&#146;s where the question gets interesting, because Example 1 is the first of no fewer than <I>four</I> direct, distinct, and standard ways to accomplish this task. Each of the four ways offers a different tradeoff among clarity, type safety, run-time safety, and efficiency. Moreover, to paraphrase George Orwell&#146;s revisionist pigs, &#147;All four choices are standard, but some are more standard than others&#148; &#151; and, to add insult to injury, not all of them are from the same standard. They are, in the order I&#146;ll discuss them:</p>
+
+<UL><LI>   <B>sprintf</B> <a href="#3">[3]</a>, <a href="#4">[4]</a>, <a href="#5">[5]</a></LI>
+<LI>   <B>snprintf</B> <a href="#5">[5]</a></LI>
+<LI>   <B>std::stringstream</B> <a href="#4">[4]</a></LI>
+<LI>   <B>std::strstream</B> <a href="#4">[4]</a></LI></UL>
+
+<p>Finally, as though that&#146;s not enough, there&#146;s a fifth not-yet-standard-but-liable-to-become-standard alternative for simple conversions that don&#146;t require special formatting:</p>
+
+<UL><LI>   <B>boost::lexical_cast</B> <a href="#6">[6]</a></LI></UL>
+
+<p>Enough chat; let&#146;s dig in.</p>
+
+<H3><FONT COLOR="#000080">Option #1: The Joys and Sorrows of sprintf</FONT></H3>
+
+<p>The code in Example 1 is just one example of how we might use <B>sprintf</B>. I&#146;m going to use Example 1 as a motivating case for discussion, but don&#146;t get too tied to this simple <B>PrettyFormat</B> one-liner. Keep in mind the larger picture: we&#146;re interested in looking at how we would normally choose to format non-string values as strings in the general case, perhaps in code that&#146;s more likely to change and grow over time than the simple case in Example 1.</p>
+<p>I&#146;m going to list the major issues involved by analyzing <B>sprintf</B> in more detail. <B>sprintf</B> has two major advantages and three distinct disadvantages. The two advantages are as follows:</p>
+<p><I>Issue #1: Ease of use and clarity.</I> Once you&#146;ve learned the commonly used formatting flags and their combinations, using <B>sprintf</B> is succinct and obvious, not convoluted. It says directly and concisely what needs to be said. For this, the <B>printf</B> family is hard to beat in most text formatting work. (True, most of us still have to look up the more rarely used formatting flags, but they are after all used rarely.)</p>
+<p><I>Issue #2: Maximum efficiency (ability to directly use existing buffers).</I> By using <B>sprintf</B> to put the result directly into an already-provided buffer, <B>PrettyFormat</B> gets the job done without needing to perform any dynamic memory allocations or other extra off-to-the-side work. It&#146;s given an already-allocated place to put the output and puts the result directly there.</p>
+<p>Caveat lector: of course, don&#146;t put too much weight on efficiency just yet; your application may well not notice the difference. Never optimize prematurely, but optimize only when timings show that you really need to do so. Write for clarity first, and for speed later if necessary. In this case, never forget that the efficiency comes at the price of memory management encapsulation &#151; Issue #2 is phrased here as &#147;you get to do your own memory management,&#148; but the flip side is &#147;you <I>have</I> to do your own memory management&#148;!</p>
+<p>Alas, as most <B>sprintf</B> users know, the story doesn&#146;t end quite there. <B>sprintf</B> also has these significant drawbacks:</p>
+<p><I>Issue #3: Length safety.</I> Using <B>sprintf</B> is a common source of buffer overrun errors if the destination buffer isn&#146;t big enough for the whole output <a href="#7">[7]</a>. For example, consider this calling code:</p>
+
+<pre>
+  char smallBuf[5];
+  int value = 42;
+  // er, well, sort of okay
+  PrettyFormat( value, buf );
+  assert( value == 42 );
+</pre>
+
+<p>In the above case, the value <B>42</B> happens to be small enough so that the five-byte result <B>" 42\0"</B> happens to fit into <B>smallBuf</B>. But the day the code changes to:</p>
+
+<pre>
+  char smallBuf[5];
+  int value = 12108642;
+  PrettyFormat( value, buf ); // oops
+  // likely to fail
+  assert( value == 12108642 );
+</pre>
+
+<p>we&#146;ll start scribbling past the end of <B>smallBuf</B>, which may be into the bytes of <B>value</B> itself if the compiler chose a memory layout that put <B>value</B> immediately after <B>smallBuf</B> in memory.</p>
+<p>We can&#146;t easily make Example 1 much safer, though. True, we could change Example 1 to take the length of the buffer and then check <B>sprintf</B>&#146;s return value, which will tell after the fact how many bytes <B>sprintf</B> ended up writing. This gives us something like:</p>
+
+<pre>
+  // BAD: A not-at-all-improved PrettyFormat().
+  //
+  void PrettyFormat( int i, char* buf, int buflen )
+  {
+    // This is no better:
+    if( buflen &lt;= sprintf( buf, "%4d", i ) )
+    {
+      // uh, what to do? by the time it&#146;s
+      // detected, we&#146;ve already corrupted
+      // whatever we were going to corrupt
+    }
+  }
+</pre>
+
+<p>That&#146;s no solution at all. By the time the error is detected, the overrun has already occurred, we&#146;ll already have scribbled on someone else&#146;s bytes, and in bad cases our execution may never even get to the error-reporting code <a href="#8">[8]</a>.</p>
+<p><I>Issue #4: Type safety.</I> For <B>sprintf</B>, type errors are run-time errors, not compile-time errors, and they may not even manifest right away. The <B>printf</B> family uses C&#146;s variable argument lists, and C compilers generally don&#146;t check the parameter types for such lists <a href="#9">[9]</a>. Nearly every C programmer has had the joy of finding out in subtle and not-so-subtle ways that they got the format specifier wrong, and all too often such errors are found only after a pressure-filled late-night debugging session spent trying to duplicate a mysterious crash reported by a key customer.</p>
+<p>Granted, the code in Example 1 is so trivial that it&#146;s likely easy enough to maintain now when we know we&#146;re just throwing a single <B>int</B> at <B>sprintf</B>, but even so, it&#146;s not difficult to go wrong if your finger happens to hit something other than &#147;d&#148; by mistake. For example, &#147;c&#148; happens to be right next to &#147;d&#148; on most keyboards; if we&#146;d simply mistyped the <B>sprintf</B> call as:</p>
+
+<pre>
+  sprintf( buf, "%4c", i ); // oops
+</pre>
+
+<p>then we&#146;d probably see the mistake quite quickly when the output is some character instead of a number, because <B>sprintf</B> will silently reinterpret the first byte of <B>i</B> as a <B>char</B> value. Alternatively, &#147;s&#148; is also right next to &#147;d&#148;, and if we&#146;d mistyped it as:</p>
+
+<pre>
+  sprintf( buf, "%4s", i ); // oops again
+</pre>
+
+<p>then we&#146;d probably also catch the error quite quickly because the program is likely to crash immediately or at least intermittently. In this case, <B>sprintf</B> will silently reinterpret the integer as a pointer to <B>char</B> and then happily attempt to follow that pointer into some random region of memory.</p>
+<p>But here&#146;s a more subtle one: What if we&#146;d instead mistyped &#147;d&#148; as &#147;ld&#148;?</p>
+
+<pre>
+  sprintf( buf, "%4ld", i ); // a subtler error
+</pre>
+
+<p>In this case, the format string is telling <B>sprintf</B> to expect a long <B>int</B>, not just an <B>int</B>, as the first piece of data to be formatted. This too is bad C code; the trouble is that not only won&#146;t this be a compile-time error, but it might not even be a run-time error right away. On many popular platforms, the result will still be the same as before. Why? Because on many popular platforms <B>int</B>s happen to have the same size and layout as <B>long</B>s. You may not notice this error until you port the above code to a platform where <B>int</B> isn&#146;t the same size as <B>long</B>, and even then it might not always produce incorrect output or immediate crashes.</p>
+<p>Finally, consider a related issue.</p>
+<p><I>Issue #5: Templatability.</I> It&#146;s very hard to use <B>sprintf</B> in a template. Consider:</p>
+
+<pre>
+  template&lt;typename T&gt;
+  void PrettyFormat( T value, char* buf )
+  {
+    sprintf( buf, "%/*what goes here?*/", value );
+  }
+</pre>
+
+<p>The best (worst?) you could do is declare the base template and then provide specializations for all the types that are compatible with <B>sprintf</B>:</p>
+
+<pre>
+  // BAD: A kludgy templated PrettyFormat().
+  //
+  template&lt;typename T&gt;
+  void PrettyFormat( T value, char* buf );
+    // note: base template is not defined
+
+  template&lt;&gt;
+  void PrettyFormat&lt;int&gt;( int value, char* buf );
+  {
+    sprintf( buf, "%d", value );
+  }
+
+  template&lt;&gt;
+  void PrettyFormat&lt;char&gt;( char value, char* buf );
+  {
+    sprintf( buf, "%c", value );
+  }
+
+  // ... etc., ugh ...
+</pre>
+
+<p>In summary, here&#146;s <B>sprintf</B>:</p>
+
+<table>
+<tr><td colspan=2>Standard?</td><td>Yes</td></tr>
+<tr><td></td><td>C90</td><td>Yes</td></tr>
+<tr><td></td><td>C++98</td><td>Yes</td></tr>
+<tr><td></td><td>C99</td><td>Yes</td></tr>
+<tr><td colspan=2>Ease of use and clarity?</td><td>Yes</td></tr>
+<tr><td colspan=2>Efficient?</td><td>Yes</td></tr>
+<tr><td colspan=2>Length safe?</td><td>No</td></tr>
+<tr><td colspan=2>Type safe?</td><td>No</td></tr>
+<tr><td colspan=2>Usable in template?</td><td>No</td></tr>
+</table>
+
+<p>The other solutions we&#146;ll consider next choose different tradeoffs among these considerations.</p>
+
+<H3><FONT COLOR="#000080">Option #2: snprintf</FONT></H3>
+
+<p>Of the other choices, <B>sprintf</B>&#146;s closest relative is of course <B>snprintf</B>. <B>snprintf</B> only adds one new facility to <B>sprintf</B>, but it&#146;s an important one: the ability to specify the maximum length of the output buffer, thereby eliminating buffer overruns. Of course, if the buffer is too small, then the output will be truncated.</p>
+<p><B>snprintf</B> has long been a widely available nonstandard extension present on most major C implementations. With the advent of the C99 Standard <a href="#5">[5]</a>, <B>snprintf</B> has &#147;come out&#148; and gone legit, now officially sanctioned as a standard facility. Until your own compiler is C99-compliant, though, you may have to use this under a vendor-specific extension name such as <B>_snprintf</B>.</p>
+<p>Frankly, you should already have been using <B>snprintf</B> over <B>sprintf</B> anyway, even before <B>snprintf</B> was standard. Calls to length-unchecked functions like <B>sprintf</B> are banned in most good coding standards, and for good reason. The use of unchecked <B>sprintf</B> calls has long been a notoriously common problem causing program crashes in general, and security weaknesses in particular <a href="#10">[10]</a>.</p>
+<p>With <B>snprintf</B>, we can correctly write the length-checked version we were trying to create earlier:</p>
+
+<pre>
+  // Example 2:
+  // Stringizing some data in C,
+  // using snprintf().
+  //
+  void PrettyFormat( int i, char* buf, int buflen )
+  {
+    // Here&#146;s the code, neat and simple
+    // and now a lot safer:
+    snprintf( buf, buflen, "%4d", i );
+  }
+</pre>
+
+<p>Note that it&#146;s still possible for the caller to get the buffer length wrong. That means <B>snprintf</B> still isn&#146;t as 100-percent bulletproof for overflow-safety as the later alternatives that encapsulate their own resource management, but it&#146;s certainly lots safer and deserves a &#147;Yes&#148; under the &#147;Length safe?&#148; question. With <B>sprintf</B>, we have no good way to avoid for certain the possibility of buffer overflow; with <B>snprintf</B> we can ensure it doesn&#146;t happen.</p>
+<p>In every other way, <B>sprintf</B> and <B>snprintf</B> are the same. In summary, here&#146;s how <B>snprintf</B> compares to <B>sprintf</B>:</p>
+
+<table>
+<tr><td></td><td></td><td><B>snprintf</B></td><td><B>sprintf</B></td></tr>
+<tr><td colspan=2>Standard?</td><td></td><td></td></tr>
+<tr><td></td><td>C90</td><td>No (only a common extension)</td><td>Yes</td></tr>
+<tr><td></td><td>C++98</td><td>No (only a common extension)</td><td>Yes</td></tr>
+<tr><td></td><td>C99</td><td>Yes</td><td>Yes</td></tr>
+<tr><td></td><td>C++0x (speculation)</td><td>Likely</td><td>Yes</td></tr>
+<tr><td colspan=2>Ease of use and clarity?</td><td>Yes</td><td>Yes</td></tr>
+<tr><td colspan=2>Efficient?</td><td>Yes</td><td>Yes</td></tr>
+<tr><td colspan=2>Length safe?</td><td>Yes</td><td>No</td></tr>
+<tr><td colspan=2>Type safe?</td><td>No</td><td>No</td></tr>
+<tr><td colspan=2>Usable in template?</td><td>No</td><td>No</td></tr>
+</table>
+
+<p><I>Guideline: Never use </I><B>sprintf</B>. If you decide to use C <B>stdio</B> facilities, always use length-checked calls like <B>snprintf</B> even if they&#146;re only available as a nonstandard extension on your current compiler. There&#146;s no drawback, and there&#146;s real benefit, to using <B>snprintf</B> instead.</p>
+<p>When I presented this material as part of a talk at Software Development East in Boston this summer, I was shocked to discover that only about 10 percent of the class had heard of <B>snprintf</B>. However, one of those who had immediately put up his hand described how, on his current project, they&#146;d recently discovered a few buffer-overrun bugs. They globally replaced <B>sprintf</B> with <B>snprintf</B> throughout the project and found during testing that not only were those bugs gone, but suddenly several other mysterious bugs had also disappeared &#151; bugs that had been reported for years, but that the team hadn&#146;t been able to diagnose. As I was saying: never use <B>sprintf</B>.</p>
+
+<H3><FONT COLOR="#000080">Option #3: std::stringstream</FONT></H3>
+
+<p>The most common facility in C++ for stringizing data is the <B>stringstream</B> family. Here&#146;s what Example 1 would look like using an <B>ostringstream</B> instead of <B>sprintf</B>:</p>
+
+<pre>
+  // Example 3:
+  // Stringizing some data in C++,
+  // using ostringstream.
+  //
+  void PrettyFormat( int i, string&amp; s )
+  {
+    // Not quite as neat and simple:
+    ostringstream temp;
+    temp &lt;&lt; setw(4) &lt;&lt; i;
+    s = temp.str();
+  }
+</pre>
+
+<p>Using <B>stringstream</B> exchanges the advantages and disadvantages of <B>sprintf</B>. Where <B>sprintf</B> shines, <B>stringstream</B> does less well:</p>
+<p><I>Issue #1: Ease of use and clarity.</I> Not only has one line of code turned into three, but we&#146;ve needed to introduce a temporary variable. This version of the code is superior in several ways, but code clarity isn&#146;t one of them. It&#146;s not that the manipulators are hard to learn &#151; they&#146;re as easy to learn as the <B>sprintf</B> formatting flags &#151; but that they&#146;re generally more clumsy and verbose. I find that code littered with long names like <B>&lt;&lt; setprecision(9)</B> and <B>&lt;&lt; setw(14)</B> is a bear to read (compared to, say, <B>%14.9</B>), even when all of the manipulators are arranged reasonably well in columns.</p>
+<p><I>Issue #2: Efficiency (ability to directly use existing buffers).</I> A <B>stringstream</B> does its work in an additional buffer off to the side, so it will usually have to perform extra allocations for that working buffer and for any other helper objects it uses. I tried the Example 3 code on two popular current compilers and instrumented <B>::operator new</B> to count the allocations being performed. One platform performed two dynamic memory allocations, and the other performed three.</p>
+<p>Where <B>sprintf</B> breaks down, however, <B>stringstream</B> glitters:</p>
+<p><I>Issue #3: Length safety.</I> The <B>stringstream</B>&#146;s internal <B>basic_stringbuf</B> buffer automatically grows as needed to fit the value being stored.</p>
+<p><I>Issue #4: Type safety.</I> Using <B>operator&lt;&lt;</B> and overload resolution always gets the types right, even for user-defined types that provide their own stream insertion operators. No more obscure run-time errors because of type mismatches.</p>
+<p><I>Issue #5: Templatability.</I> Now that the right <B>operator&lt;&lt;</B> is automatically called, it&#146;s trivial to generalize <B>PrettyFormat</B> to operate on arbitrary data types:</p>
+
+<pre>
+  template&lt;typename T&gt;
+  void PrettyFormat( T value, string&amp; s )
+  {
+    ostringstream temp;
+    temp &lt;&lt; setw(4) &lt;&lt; value;
+    s = temp.str();
+  }
+</pre>
+
+<p>In summary, here&#146;s how <B>stringstream</B> compares to <B>sprintf</B>:</p>
+
+<table>
+<tr><td></td><td></td><td><B>stringstream</td><td><B>sprintf</B></td></tr>
+<tr><td colspan=2>Standard?</td><td></td><td></td></tr>
+<tr><td></td><td>C90</td><td>&#151;</td><td>Yes</td></tr>
+<tr><td></td><td>C++98</td><td>Yes</td><td>Yes</td></tr>
+<tr><td></td><td>C99</td><td>&#151;</td><td>Yes</td></tr>
+<tr><td></td><td>C++0x (speculation)</td><td>Yes</td><td>Yes</td></tr>
+<tr><td colspan=2>Ease of use and clarity?</td><td>No</td><td>Yes</td></tr>
+<tr><td colspan=2>Efficient?</td><td>No</td><td>Yes</td></tr>
+<tr><td colspan=2>Length safe?</td><td>Yes</td><td>No</td></tr>
+<tr><td colspan=2>Type safe?</td><td>Yes</td><td>No</td></tr>
+<tr><td colspan=2>Usable in template?</td><td>Yes</td><td>No</td></tr>
+</table>
+
+<H3><FONT COLOR="#000080">Option #4: std::strstream</FONT></H3>
+
+<p>Fairly or not, <B>strstream</B> is something of a persecuted pariah. Because it has been deprecated in the C++98 Standard, the top C++ books at best cover it briefly <a href="#11">[11]</a>, mostly ignore it <a href="#12">[12]</a>, or even explicitly state they won&#146;t cover it because of its official second-string status <a href="#13">[13]</a>. Although deprecated because the standards committee felt it was superseded by <B>stringstream</B>, which better encapsulates memory management, <B>strstream</B> is still an official part of the standard that conforming C++ implementers must provide <a href="#14">[14]</a>.</p>
+<p>Because <B>strstream</B> is still standard, it deserves mention here for completeness. It also happens to provide a useful mix of strengths. Here&#146;s what Example 1 might look like using <B>strstream</B>:</p>
+
+<pre>
+  // Example 4:
+  // Stringizing some data in C++,
+  // using ostrstream.
+  //
+  void PrettyFormat( int i, char* buf, int buflen )
+  {
+    // Not too bad, just don&#146;t forget ends:
+    ostrstream temp( buf, buflen );
+    temp &lt;&lt; setw(4) &lt;&lt; i &lt;&lt; ends;
+  }
+</pre>
+
+<p><I>Issue #1: Ease of use and clarity</I>. <B>strstream</B> comes in slightly behind <B>stringstream</B> when it comes to ease of use and code clarity. Both require a temporary object to be constructed. With <B>strstream</B>, you have to remember to tack on an <B>ends</B> to terminate the string, which I dislike. If you forget to do this, then you are in danger of overrunning the end of the buffer when reading it afterwards if you&#146;re relying on its being terminated by a null character; even <B>sprintf</B> isn&#146;t this fragile and always tacks on the null. But at least using <B>strstream</B> in the manner shown in Example 4 doesn&#146;t require calling a <B>str</B> function to extract the result at the end. (Of course, alternatively, if you let <B>strstream</B> create its own buffer, the memory is only partly encapsulated; you will need not only a <B>str</B> call at the end to get the result out, but also a <B>.freeze(false)</B> else the <B>strstreambuf</B> won&#146;t free the memory.)</p>
+<p><I>Issue #2: Efficiency (ability to directly use existing buffers).</I> By constructing the <B>ostrstream</B> object with a pointer to an existing buffer, no extra allocations at all need be performed; the <B>ostrstream</B> will store its result directly in the output buffer. This is an important divergence from <B>stringstream</B>, which offers no comparable facility for placing the result directly in an existing destination buffer and thereby avoid extra allocation <a href="#15">[15]</a>. Of course, <B>ostrstream</B> can alternatively use its own dynamically allocated buffer if you don&#146;t have one handy already; just use <B>ostrstream</B>&#146;s default constructor instead <a href="#16">[16]</a>. Indeed, <B>strstream</B> is the only option covered here that gives you this choice.</p>
+<p><I>Issue #3: Length safety.</I> As used in Example 4, the <B>ostrstream</B>&#146;s internal <B>strstreambuf</B> buffer automatically checks its length to make sure it doesn&#146;t write beyond the end of the supplied buffer. If instead we had used a default-constructed <B>ostrstream</B>, its internal <B>strstreambuf</B> buffer would automatically grow as needed to fit the value being stored.</p>
+<p><I>Issue #4:</I> <I>Type safety.</I> Fully type-safe, just like <B>stringstream</B>.</p>
+<p><I>Issue #5: Templatability.</I> Fully templatable, just like <B>stringstream</B>. For example:</p>
+
+<pre>
+  template&lt;typename T&gt;
+  void PrettyFormat( T value, char* buf, int buflen )
+  {
+    ostrstream temp( buf, buflen );
+    temp &lt;&lt; setw(4) &lt;&lt; value &lt;&lt; ends;
+  }
+</pre>
+
+<p>In summary, here&#146;s how <B>strstream</B> compares to <B>sprintf</B>:</p>
+
+<table>
+<tr><td></td><td></td><td><B>strstream</B></td><td><B>sprintf</B></td></tr>
+<tr><td colspan=2>Standard?</td><td></td><td></td></tr>
+<tr><td></td><td>C90</td><td>&#151;</td><td>Yes</td></tr>
+<tr><td></td><td>C++98</td><td>Yes, but deprecated</td><td>Yes</td></tr>
+<tr><td></td><td>C99</td><td>&#151;</td><td>Yes</td></tr>
+<tr><td></td><td>C++0x (speculation)</td><td>Possible, probably still deprecated</td><td>Yes</td></tr>
+<tr><td colspan=2>Ease of use and clarity?</td><td>No</td><td>Yes</td></tr>
+<tr><td colspan=2>Efficient?</td><td>Yes</td><td>Yes</td></tr>
+<tr><td colspan=2>Length safe?</td><td>Yes</td><td>No</td></tr>
+<tr><td colspan=2>Type safe?</td><td>Yes</td><td>No</td></tr>
+<tr><td colspan=2>Usable in template?</td><td>Yes</td><td>No</td></tr>
+</table>
+
+<p>It&#146;s, um, slightly embarrassing that the deprecated facility shows so strongly in this side-by-side comparison, but that&#146;s life.</p>
+
+<H3><FONT COLOR="#000080">Option #5: boost::lexical_cast</FONT></H3>
+
+<p>If you haven&#146;t yet discovered Boost at &lt;www.boost.org&gt;, my advice is to discover it. It&#146;s a public library of C++ facilities that&#146;s written principally by C++ standards committee members. Not only is it good peer-reviewed code written by experts and in the style of the C++ Standard library, these facilities are explicitly intended as candidates for inclusion in the next C++ Standard and are therefore worth getting to know. Besides, you can freely use them today.</p>
+<p>One of the facilities provided in the Boost libraries is <B>boost::lexical_cast</B>, which is a handy wrapper around <B>stringstream</B>. Indeed, Kevlin Henney&#146;s code is so concise and elegant that I can present it here in its entirety (minus workarounds for older compilers):</p>
+
+<pre>
+  template&lt;typename Target, typename Source&gt;
+  Target lexical_cast(Source arg)
+  {
+    std::stringstream interpreter;
+    Target result;
+
+    if(!(interpreter &lt;&lt; arg) ||
+       !(interpreter &gt;&gt; result) ||
+       !(interpreter &gt;&gt; std::ws).eof())
+      throw bad_lexical_cast();
+
+    return result;
+  }
+</pre>
+
+<p>Note that <B>lexical_cast</B> is not intended to be a direct competitor for the more general string formatter <B>sprintf</B>. Instead, <B>lexical_cast</B> is for converting data from one streamable type to another, and it competes more directly with C&#146;s <B>atoi</B> et al. conversion functions as well as with the nonstandard but commonly available <B>itoa</B> et al. functions. It&#146;s close enough, however, that it definitely would be an omission not to mention it here.</p>
+<p>Here&#146;s what Example 1 would look like using <B>lexical_cast</B>, minus the at-least-four-character requirement:</p>
+
+<pre>
+  // Example 5:
+  // Stringizing some data in C++,
+  // using boost::lexical_cast.
+  //
+  void PrettyFormat( int i, string&amp; s )
+  {
+    // Perhaps the neatest and simplest 
+    // yet, if it&#146;s all you need:
+    s = lexical_cast&lt;string&gt;( i );
+  }
+</pre>
+
+<p><I>Issue #1: Ease of use and clarity.</I> This code embodies the most direct expression of intent of any of these examples.</p>
+<p><I>Issue #2: Efficiency (ability to directly use existing buffers).</I> Since <B>lexical_cast</B> uses <B>stringstream</B>, it&#146;s no surprise that it needs at least as many allocations as <B>stringstream</B>. On one of the platforms I tried, Example 5 performed one more allocation than the plain <B>stringstream</B> version presented in Example 3; on the other platform, it performed no additional allocations over the plain <B>stringstream</B> version.</p>
+<p>Like <B>stringstream</B>, in terms of length safety, type safety, and templatability, <B>lexical_cast</B> shows very strongly.</p>
+<p>In summary, here&#146;s how <B>lexical_cast</B> compares to <B>sprintf</B>:</p>
+
+<table>
+<tr><td></td><td></td><td><B>lexical_cast</B></td><td><B>sprintf</B></td></tr>
+<tr><td colspan=2>Standard?</td><td></td><td></td></tr>
+<tr><td></td><td>C90</td><td>&#151;</td><td>Yes</td></tr>
+<tr><td></td><td>C++98</td><td>No</td><td>Yes</td></tr>
+<tr><td></td><td>C99</td><td>&#151;</td><td>Yes</td></tr>
+<tr><td></td><td>C++0x (speculation)</td><td>Possible</td><td>Yes</td></tr>
+<tr><td colspan=2>Ease of use and clarity?</td><td>Yes</td><td>Yes</td></tr>
+<tr><td colspan=2>Efficient?</td><td>No</td><td>Yes</td></tr>
+<tr><td colspan=2>Length safe?</td><td>Yes</td><td>No</td></tr>
+<tr><td colspan=2>Type safe?</td><td>Yes</td><td>No</td></tr>
+<tr><td colspan=2>Usable in template?</td><td>Yes</td><td>No</td></tr>
+</table>
+
+<H3><FONT COLOR="#000080">Summary</FONT></H3>
+
+<p>There are issues we&#146;ve not considered in detail. For example, all the string formatting herein has been to normal narrow <B>char</B>-based strings, not wide strings. We&#146;ve also focused on the ability to gain efficiency by using existing buffers directly in the case of <B>sprintf</B>, <B>snprintf</B>, and <B>strstream</B>. However, the flip side to &#147;you get to do your own memory management&#148; is &#147;you have to do your own memory management,&#148; and the better encapsulation of memory management offered by <B>stringstream</B>, <B>strstream</B>, and <B>lexical_cast</B> may matter to you. (No typo, <B>strstream</B> is in both lists; it depends how you want to use it.)</p>
+<p>Putting it all together, we get the side-by-side comparison summarized in <a href="tab1.htm">Table 1</a>. Given the considerations we&#146;re using to judge the relative merits of each solution, there is no clear unique one-size-fits-all winner for all situations.</p>
+<p>From <a href="tab1.htm">Table 1</a>, I&#146;ll extract the following guidelines, also summarized in <a href="tab2.htm">Table 2</a>:</p>
+
+<UL><LI>   <I>If all you&#146;re doing is converting a value to a string (or, for that matter, to anything else!):</I> prefer using <B>boost::lexical_cast</B> by default.</LI>
+<LI>   <I>For simple formatting, or where you need wide string support or templatability:</I> prefer using <B>stringstream</B> or <B>strstream</B>; the code will be more verbose and harder to grasp than it would be with <B>snprintf</B>, but for simple formatting it won&#146;t be too bad.</LI>
+<LI>   <I>For more complex formatting, and where you don&#146;t need wide string support or templatability:</I> prefer using <B>snprintf</B>. Just because it&#146;s C doesn&#146;t mean it&#146;s off limits to C++ programmers!</LI>
+<LI>   <I>Only if actual performance measurements show that any of the above is really a bottleneck at a specific point in your code:</I> in those isolated cases only, instead of the above consider using whichever one of the faster alternatives <B>strstream</B> or <B>snprintf</B> makes sense.</LI>
+<LI>   Never use <B>sprintf</B>.</LI></UL>
+
+<p>Finally, a last word about the pariah <B>strstream</B>: it offers an interesting combination of features, not the least of which being that it&#146;s the only option that allows you to choose whether to do your own memory management or to let the object encapsulate it. Its lone technical drawback is that it is somewhat fragile to use because of the <B>ends</B> issue and the memory management approach; its only other drawback is social stigma because it&#146;s been shunted aside and doesn&#146;t get invited to parties much any more. You should be aware that there&#146;s a slight possibility that both the standards committee and your compiler/library vendor may really take it away from you at some time in the future.</p>
+<p>It&#146;s a bit strange to see a deprecated feature showing so well. Although a particular animal may have distinct merits, even in the standard some animals are more equal than others...</p>
+
+<H3><FONT COLOR="#000080">Acknowledgments</FONT></H3>
+
+<p>Thanks to Jim Hyslop and the participants in the ACCU discussion thread about <B>sprintf</B> that got me thinking about this topic, to Martin Sebor at Rogue Wave Software for the non-Windows timing results, and to Bjarne Stroustrup, Scott Meyers, Kevlin Henney, and Chuck Allison for their comments on drafts of this article.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1]  George Orwell. <I>Animal Farm</I> (Signet Classic, 1996).</p>
+<p><a name="2"></a>[2]  Remember that, when the phrase was coined, $64,000 was enough to buy several houses and/or retire.</p>
+<p><a name="3"></a>[3]  ISO/IEC 9899:1990(E), <I>Programming Languages - C</I> (ISO C90 and ANSI C89 Standard).</p>
+<p><a name="4"></a>[4]  ISO/IEC 14882:1998(E), <I>Programming Languages - C++</I> (ISO and ANSI C++ Standard).</p>
+<p><a name="5"></a>[5]  ISO/IEC 9899:1999(E), <I>Programming Languages - C</I> (ISO and ANSI C99 Standard).</p>
+<p><a name="6"></a>[6]  Kevlin Henney. C++ <I>BOOST lexical_cast</I>, &lt;www.boost.org/libs/conversion/lexical_cast.htm&gt;.</p>
+<p><a name="7"></a>[7]  A common beginner&#146;s error is to rely on the width specifier, here &#147;4&#148;, which doesn&#146;t work because the width specifier dictates a minimum width, not a maximum width.</p>
+<p><a name="8"></a>[8]  Note that in some cases you can mitigate the buffer length problem by creating your own formats at run time. As Bjarne Stroustrup puts it in [17], speaking of a similar case:</p>
+<p>The expert-level alternative is not one I&#146;d care to explain to novices:</p>
+
+<pre>
+char fmt[10];
+// create a format string: plain %s can overflow
+sprintf(fmt,"%%%ds",max-1);
+// read at most max-1 characters into name
+scanf(fmt,name);
+</pre>
+
+<p><a name="9"></a>[9]  Using lint-like tools will help to catch this kind of error.</p>
+<p><a name="10"></a>[10]  For example, for years it was fashionable for malicious web servers to crash web browsers by sending them very long URLs that were likely to be longer than the web browser&#146;s internal URL string buffer. Browsers that didn&#146;t check the length before copying into the fixed-length buffer ended up writing past the end of the buffer, usually overwriting data, but in some cases overwriting code areas with malicious code that could then be executed. It&#146;s surprising just how much software out there was, and is, using unchecked calls.</p>
+<p><a name="1"></a>[11]  Nicolai Josuttis. <I>The C++ Standard Library</I> (Addison-Wesley, 1999), page 649.</p>
+<p>[Later note: timing sure is weird sometimes, and everything old is new again. I wrote the above in mid-August, when the Code Red II worm was all over the press, but only later did I notice Microsoft&#146;s description of the security vulnerability Code Red II exploited: A security vulnerability results because <B>idq.dll</B> contains an unchecked buffer in a section of code that handles input URLs. An attacker who could establish a web session with a server on which <B>idq.dll</B> is installed could conduct a buffer overrun attack and execute code on the web server.? Haven&#146;t we learned this lesson yet? (&lt;www.microsoft.com/technet/treeview/default.asp?url=/technet/security/bulletin/MS01-033.asp&gt;)] </p>
+<p><a name="12"></a>[12]  Bjarne Stroustrup. <I>The C++ Programming Language, Special Edition</I> (Addison-Wesley, 2000), page 656.</p>
+<p><a name="13"></a>[13]  Angelika Langer and Klaus Kreft. <I>Standard C++ IOStreams and Locales</I> (Addison-Wesley, 2000), page 587.</p>
+<p><a name="14"></a>[14]  What does &#147;deprecated&#148; mean, in theory and in practice? When it comes to standards, &#147;deprecated&#148; denotes a feature that the committee warns you may disappear anytime in the future, possibly as soon as the next revision of the Standard. To deprecate a feature amounts to &#147;normative discouragement&#148; &#151; it&#146;s the strongest thing the committee can do to discourage you from using a feature without actually taking the feature away from you immediately. In practice, it&#146;s hard to remove even the worst deprecated features because, once the feature appears in a standard, people write code that depends on the feature &#151; and every standards body is loath to break backward compatibility. Even when a feature is removed, implementers often continue to supply it because they, too, are loath to break backward compatibility. Oftentimes, deprecated features never do disappear from the Standard. Standard Fortran, for example, still has features that have been deprecated for decades.</p>
+<p><a name="15"></a>[15]  <B>stringstream</B> does offer a constructor that takes a <B>string&amp;</B>, but it simply takes a copy of the <B>string</B>&#146;s contents instead of directly using the supplied <B>string</B> as its work area.</p>
+<p><a name="16"></a>[16]  In <a href="tab1.htm">Table 1</a>&#146;s performance measurements, <B>strstream</B> shows unexpectedly poorly on two platforms, BC++ 5.5.1 and VC7 beta. The reason appears to be that on those implementations for some reason some allocations are always performed on each call to Example 4&#146;s <B>PrettyFormat</B> (although both implementations still actually do perform fewer allocations when given an existing buffer to work with as is done in Example 4, than when the <B>strstream</B> has to make its own buffer). The other environments, as expected, perform no allocations. </p>
+<p><a name="17"></a>[17]  Bjarne Stroustrup. &#147;Learning Standard C++ as a New Language,&#148; <I>C/C++ Users Journal</I>, May 1999.</p>
+
+<p><i><B>Herb Sutter</B> (&lt;www.gotw.ca&gt;) is secretary of the ISO/ANSI C++ standards committee and author of the acclaimed books </I>Exceptional C++<I> and <I>More Exceptional C++</I> (available summer 2001). Herb is also one of the featured instructors of The C++ Seminar (&lt;www.gotw.ca/cpp_seminar&gt;).</i></p>
+
+</blockquote></body></html>

@@ -1,0 +1,467 @@
+<html>
+<head>
+<title>Aug00: Optimizing 3DNow! Real-Time Graphics</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Optimizing 3DNow! Real-Time Graphics</h1>
+
+<p><i>Dr. Dobb's Journal</i> August 2000</p>
+<h2>Floating-point SIMD extensions make  the difference</h2>
+
+<h3>By Max I. Fomitchev</h3>
+
+<I>
+Max is a computer consultant and senior research associate with Ultrason image processing. He can be contacted at maxf@ webzone.net.</I>
+
+<hr>
+
+<p>Because computationally expensive applications (engineering CAD systems, scientific and statistics applications, 3D graphics, 3D modeling, 3D games, and the like) rely on floating-point operations, most modern processors are designed to support high floating-point performance, while still providing support for the familiar x87 instruction set. However, the increasing demand for real-time 3D graphics and image processing is driving CPU design toward highly optimized, fully pipelined floating point. It takes the AMD Athlon and Pentium III, for instance, only one cycle to add two floating-point numbers, and one and two cycles, respectively, to multiply them. Not bad -- but still not good enough for real-time 3D graphical applications. </p>
+<p>One approach to pumping up real-time 3D graphics performance is AMD's 3DNow! technology, which adds floating-point SIMD extensions to the original x86 instruction set. This approach addresses the need for high-performance floating point by exploiting the natural parallelism of floating-point calculations and allowing execution of up to four single-precision (32-bit) floating-point operations per clock cycle. This means that 3DNow! technology makes it possible to crunch numbers 2-4 times faster than with ordinary x87 instructions. In this article, I'll examine 3DNow! technology, then provide guidelines for optimizing its performance even more.</p>
+<DDJADVERTISEMENT INLINE>
+
+<p>AMD is one of a number of vendors supporting the 3DNow! instruction set. IDT WinChip provides full support for 3DNow! technology, Cyrix plans to implement the 3DNow! instruction set in its future Gobi and Mojave CPUs, and 3DNow!-optimized display drivers are available from graphics card vendors such as 3dfx Interactive, ATI Technologies, Matrox, nVidia, Creative Labs, Diamond Multimedia, and more. Microsoft supports 3DNow! in DirectX 6, while SGI provides support for it in OpenGL. </p>
+
+
+
+<h3>Instruction Set Overview</h3>
+
+
+<p><A NAME="rt1"><A HREF="0008ct1.htm">Table 1</A> lists the 3DNow! instructions, all of which operate on MMX registers MM0-MM7. Most 3DNow! instructions operate on pairs of 32-bit single-precision, floating-point numbers packed in a 64-bit quadword; see <A NAME="rf1"><A HREF="0008cf1.htm">Figure 1</A>. The exceptions are PAVGUSB and PMULHRW, which operate on packed 8- and 16-bit integers, respectively. (These instructions actually extend the original MMX instruction set and are not discussed in this article.) Data is loaded to/stored from MMX registers using MOVD and MOVQ. MOVD can be used to load a single 32-bit floating-point value to an MMX register, while MOVQ loads a pair of such values. With MOVD operations, it is possible to use the 3DNow! instructions in place of the x87 instructions to operate on single-precision numbers in a nonSIMD way.</p>
+
+
+<p>The PI2FD and PF2ID instructions provide a useful interface for converting to/from 32-bit integer data. These instructions are similar to FILD/FIST x87 operations. PSWAPD, an extension to the original 3DNow! instruction set, lets you avoid reverse vector processing by swapping upper and lower double words of the source operand.</p>
+
+<p>PI2FW and PF2IW were introduced in the Athlon CPU and simplify interface between MMX integer math and 3DNow!. These instructions provide conversion to/from 16-bit integers. </p>
+
+<p>PFCMPEQ, PFCMPGE, and PFCMPGT are similar to the PCMPEQD and PCMPGTD MMX instructions, except they operate on packed floating-point operands. The destination operand is set to all 0s or all 1s, depending on the result of comparison.</p>
+
+<p>PFMAX and PFMIN select maximum/ minimum values from two pairs of packed floating-point numbers.</p>
+
+<p>PFRCP, PFRCPIT1, and PFRCPIT2 calculate the reciprocal of the scalar operand. At a glance, it is a surprise to see three instructions that calculate the reciprocal. However, each instruction calculates the reciprocal with different precision. The reciprocal calculation is initiated by PFRCP. It takes one cycle to complete and the result is 14-bit accurate. Successive execution of PFRCPIT1 and PFRCPIT2 makes the result 24-bit accurate (but not fully accurate). </p>
+
+<p>The main purpose of PFRCPxx (see <A NAME="rl1"><A HREF="#l1">Listing One</A>) is division facilitation. Each iteration step takes only one clock cycle to complete. This makes three cycles for pipelined full-precision reciprocal calculation. Moreover, it is possible to improve the performance when lower 14-bit precision is sufficient. Also, having three reciprocal calculation instructions provides more control over instruction scheduling.</p>
+
+<p>However, even after three iteration steps the reciprocal results are not absolutely accurate. The estimate contains the correct round-to-nearest value for approximately 99 percent of all arguments. The remaining arguments differ from the correct round-to-nearest value for the reciprocal by 1 unit-in-the-last-place (error in the last digit). Thus, when porting x87 code to 3DNow!, the computational results may be slightly different. Whether the error is negligible depends on the application precision requirements and selected numerical method.</p>
+
+<p>In some cases, it is possible to avoid floating-point division completely by computing reciprocals beforehand and using floating-point multiplication with precalculated, fully accurate reciprocals.</p>
+
+<p>PFRSQRT and PFRSQIT1 calculate the square root reciprocal of the scalar operand. These instructions are similar to the PFRCPxx operations. The last iteration is affected through the PFRCPIT2 instruction. After all three iterations, the square root reciprocal of the operand is 24-bit accurate. For example, <A NAME="rl2"><A HREF="#l2">Listing Two</A> calculates square root. The square root/square root reciprocal estimate contains the correct round-to-nearest value for approximately 87 percent of all arguments.</p>
+
+<p>The reciprocal and the square root reciprocal calculation procedures are somewhat awkward and must be followed precisely. The results of PFRSQIT1, PFRCPIT1, and PFRCPIT2 iteration are not defined for arguments other than those produced by PFRCP and PFSQRT.</p>
+
+<p>PFACC, PFADD, PFMUL, PFSUB, and PFSUBR are used most frequently and are fairly self explanatory. PFACC accumulates the two double words of the destination operand and the source operand and stores the results in the low and high double words of the destination operand, respectively; see <A NAME="rf2"><A HREF="0008cf2.htm">Figure 2</A>.</p>
+
+<p>PFNACC and PFPNACC are Athlon specific and similar to PFACC. PFNACC subtracts the two double words of the destination operand and the source operand and stores the results in the low and high double words of the destination operand. PFPNACC subtracts the two lower double words of the destination operand and the source operand but accumulates the two upper double words of the operands and stores the results in the low and high double words of the destination operand.</p>
+
+<p>PREFETCH and PREFETCHW load a cache line from L2 cache or main memory to L1 cache. PREFETCHW also marks the cache line as "modified" in anticipation of subsequent data writes to the line. When used properly, these instructions can significantly improve performance by eliminating data cache miss penalties.</p>
+
+<p>The complete 3DNow! instruction set reference is available from AMD; see <i>3DNow! Technology Manual</i> (Publication #21928, November 1998).</p>
+
+
+
+<h3>Instruction Scheduling</h3>
+
+
+<p>3DNow! instructions can be arranged in two groups:</p>
+
+
+<p></p>
+
+<ul>
+  <li>PFADD, PFSUB, PFSUBR, PFACC, PFNACC, PFPNACC, PFCMPx, PFMIN, PFMAX, PI2FD, PF2ID, PI2FW, PF2IW, PFRCP, and PFRSQRT.
+  <li>PFMUL, PFRCPIT1, PFRSQIT1, and PFRCPIT2.
+
+</ul>
+
+
+<p>The arrangement reflects the internal architecture of AMD 3DNow!-capable CPUs, such as K6-2, K6-III, and Athlon (<A NAME="rf3"><A HREF="0008cf3.htm">Figure 3</A>). The instructions from different groups utilize different shared execution units. Thus, two 3DNow! instructions can be paired and will execute simultaneously if they belong to different groups. For instance, PFMUL will pair with PFADD, giving the maximum throughput of four floating-point operations per cycle. Of course, general dependency and resource contention rules apply and limit the instructions' pairing and simultaneous execution; see <A NAME="rl3"><A HREF="#l3">Listing Three</A>. The 3DNow! instructions will pair well with integer or MMX instructions provided that there are no register dependencies and other resource conflicts.</p>
+
+<p>3DNow! instructions are fully pipelined, take one cycle to execute, and have two-cycle latency (four-cycle latency on Athlon). Thus for optimal performance, the results of an instruction being executed should not be referenced in the next cycle; see <A NAME="rl4"><A HREF="#l4">Listing Four</A>. <A NAME="rl5"><A HREF="#l5">Listing Five</A> is the properly scheduled code.</p>
+
+
+
+<h3>Code Optimization</h3>
+
+
+<p>The first step in code optimization is the original high-level code optimization. Porting to 3DNow! might require original algorithm modifications for better exploitation of instruction parallelism.</p>
+
+
+<p>Floating-point arithmetic is computationally expensive, and should be used only when integer math does not provide the desired precision. If integer precision is satisfactory, the code should be ported to MMX, and MMX code optimization techniques must be used (see my article "MMX Code Optimization," <i>DDJ</i>, September 1999).</p>
+
+<p>The floating-point precision itself is an important limiting factor. 3DNow! technology is applicable only when single-precision floating-point arithmetic suffice. For double (64-bit) or extended precision (80-bit) operands, there is no other way but to use x87 instructions.</p>
+
+<p>Typically, floating-point algorithms exhibit inherent parallelism and operate on fairly large data arrays or vectors. Such algorithms normally contain loops encompassing patterns of arithmetic operations that represent some operations on vectors. Therefore, it is possible to process numbers in pairs. For better instruction, scheduling loop unrolling and aggressive instruction rearrangement may be necessary. </p>
+
+<p>In short, the process of code optimization/porting to 3DNow! is as follows:</p>
+
+
+<p>1. Determine the precision requirements of the algorithm.</p>
+
+<p>2. Write and optimize the code using high-level language.</p>
+
+<p>3. Identify the most performance consuming code sections/loops. </p>
+
+<p>4. When targeting for K6-2/K6-III, straighten all reverse vector operations.</p>
+
+<p>5. Unroll or split the selected loops on odd/even parts.</p>
+
+<p>6. Write straightforward 3DNow! code.</p>
+
+<p>7. Schedule and pair 3DNow!, MMX, and integer instructions to avoid pipeline stalls, register dependencies, and resource contention.</p>
+
+<p>8. Strategically place PREFETCH instructions to eliminate cache miss penalties.</p>
+
+
+
+<h3>Reverse Vector  Operation Straightening</h3>
+
+
+<p>Many numerical algorithms involve vector or data array processing in forward and reverse direction. For example, <A NAME="rl6"><A HREF="#l6">Listing Six</A>(a) presents quite a challenge when being ported to 3DNow!. The problem is that vector <i>r</i> has to be processed in reverse order, and reversing the index is not enough since MOVD instruction loads data in straight order; see <A NAME="rl6"><A HREF="#l6">Listing Six</A>(b).</p>
+
+
+<p>The challenge is obvious because <i>a[j]*r[n-j-</i>1<i>]</i> and <i>a[j+</i>1<i>]*r[n-j]</i> expressions are calculated instead of <i>a[j]*r[n-j]</i> and <i>a[j+</i>1<i>]*r[n-j-</i>1<i>]</i>. Unfortunately, the original MMX instruction set does not contain a PSHUFW instruction that allows rearranging words in an MMX register. Also, the original 3DNow! instruction set lacks a useful PSWAPD instruction, which swaps upper and lower double words of the source operand.</p>
+
+<p>Thus, when targeting for K6-2 or K6-III, you must either process the original array <i>r</i> in reverse order or insert additional MMX PUNPCK instructions for double word swapping. This requires the original algorithm modification in <A NAME="rl7"><A HREF="#l7">Listing Seven</A>(a). Needless to say, such algorithm modification can be cumbersome. Also, the algorithm performance can be impaired when the <i>r</i>-array components have to be swapped before or in the loop; see <A NAME="rl7"><A HREF="#l7">Listing Seven</A>(b). However, the problem goes away with Athlon, and the code can be rewritten as in <A NAME="rl7"><A HREF="#l7">Listing Seven</A>(c). The final value for beta is calculated after the loop using the PFACC instruction in <A NAME="rl7"><A HREF="#l7">Listing Seven</A>(d). </p>
+
+
+
+<h3>Odd/Even Loop Split</h3>
+
+
+<p>Another challenge comes from the fact that all 3DNow! instructions operate on pairs of floating-point numbers. Thus special handling is needed for cases when the number of array elements or loop iterations is not even.</p>
+
+
+<p>For instance, in the beta calculation loop the problem arises when <i>n</i> is odd. The last pair of MOVQ instructions will grab an extra 32 bits of data from <i>a</i>- and <i>r</i>-arrays; see <A NAME="rl8"><A HREF="#l8">Listing Eight</A>(a). Therefore, it makes sense to allocate and initialize with zeros an additional 4 bytes for each array to avoid memory access violation and an extra component in the sum.</p>
+
+<p>But this is not the end of troubles. In many cases, both arrays contain <i>m</i> elements, <i>m&gt;n</i>. And it is in the nature of the algorithm to process a different number of elements in each iteration, as in <A NAME="rl8"><A HREF="#l8">Listing Eight</A>(b). In this case, the beta calculation loop has to be split on odd and even part processing; see <A NAME="rl8"><A HREF="#l8">Listing Eight</A>(c). The iteration counter ECX is initialized with <i>n</i>-1. If <i>n</i> is even, then the program branches to SKIPODD label after the last iteration; otherwise, the odd part is processed.</p>
+
+<p>This example won't work correctly for <i>n</i>=1, thus the main loop must be unrolled for <i>n</i>=1 and processed in an iterative manner for <i>n=</i>2,3<i>,...m</i>; see <A NAME="rl8"><A HREF="#l8">Listing Eight</A>(d).</p>
+
+
+
+<h3>PREFETCH Scheduling</h3>
+
+
+<p>The last step in 3DNow! code optimization is PREFETCH instruction scheduling. Strategical placement of the PREFETCH instructions can improve the algorithm's performance dramatically.</p>
+
+
+<p>The PREFETCH instruction is vector decodable and takes two cycles. The number of cycles required to fill 32-byte cache line depends on the cache and system-memory configuration.</p>
+
+<p>PREFETCHW instruction is identical to the PREFETCH instruction on K6-2/K6-III systems but is fully implemented on Athlon.</p>
+
+<p>There are two major guidelines for the PREFETCH instructions scheduling:</p>
+
+
+<ul>
+  <li>The PREFETCH instruction should not be used in small loops.
+  <li>Data loads should be scheduled away from the PREFETCH instruction.
+
+</ul>
+
+
+<p>Small loops cannot take advantage of the PREFETCH instruction since data loads will occur soon after the PREFETCH instruction. This results in pipeline stall because the load operation has to wait until the data is available in L1 cache. Also, two additional decode cycles can contribute considerable overhead to a short loop.</p>
+
+<p>Normally, the PREFETCH instruction is used as:</p>
+
+<blockquote><p>
+PREFETCH   [&lt;index register&gt;+32<i>*</i>&lt;const&gt;]</p>
+
+</blockquote><p>The value of the <i>&lt;const&gt;</i> is determined by the number of cache lines processed in the loop.</p>
+
+
+
+
+<h3>A 3DNow! Code Porting  and Optimization Example</h3>
+
+
+<p>The reverse vector operation straightening, loop unrolling, and 3DNow! instruction scheduling techniques are illustrated in a least-squares digital filter calculation routine available electronically; see "Resource Center," page 5.</p>
+
+
+<p>The routine solves a special system of linear equations using Toeplitz recursion (see <i>Geophysical Signal Analysis</i>, by E. Robinson and S. Treitel, Prentice-Hall, 1980). This routine is also part of the digital image processing software I wrote for a PC-based ultrasound imager (see http://www.webzone.net/maxf/ultrason). It calculates FIR coefficients for ultrasound pulse-shaping and image reconstruction. In general, this least-squares filter calculation routine can be used in any image-processing application. The filter coefficients are computed based on the input signal <i>d</i>, the desired filter length <i>m,</i> and the desired output signal shape <i>w</i>.</p>
+
+<p>The file contains three routines:</p>
+
+
+<ul>
+  <li><i>Toeplitz()</i>, the original nonoptimized routine representing a direct translation of math formulas.
+  <li><i>Toeplitz2()</i>, the modified routine with straightened reverse vector operations and two times unrolled main loop.
+
+  <li><i>Toeplitz3()</i>, the 3DNow!-optimized version of <i>Toeplitz2()</i>, employing aggressive instruction scheduling and other MMX code optimization techniques.
+
+</ul>
+
+
+<p>The filter coefficients produced by the original <i>Toeplitz()</i> routine are slightly more accurate than those produced by <i>Toeplitz3()</i> due to the lack of precision in 3DNow! reciprocal calculation.</p>
+
+<p>The 3DNow! optimized routine cannot take advantage of PREFETCH instruction because of the small size of the loops.</p>
+
+<p>At one point in time, <i>Toeplitz3()</i> used odd/even loop splits, which were later replaced by array zero-initialization. The affected arrays are fairly small (128*4= 512 bytes) and it takes less clock cycle to zero them than account for odd/even branching.</p>
+
+<p>In this FIR coefficient calculation example, the 3DNow!-optimized code runs 4.5 times faster than the original C code (as measured on K6-2). This makes the porting to 3DNow! worth the trouble in this case.</p>
+
+
+
+<h3>Performance Measurement</h3>
+
+
+<p>It is possible to measure the 3DNow! code performance by measuring the time it takes to execute the code in a loop for a specified number of times. The Standard C <i>clock()</i> function is used.</p>
+
+
+<p>However, a more accurate performance data can be obtained when using the RDTSC instruction, which returns in EDX:EAX the number of cycles executed by the CPU since the processor reset. Thus to measure the code performance, you only have to write <A NAME="rl9"><A HREF="#l9">Listing Nine</A>(a). CPUID is needed for serialization. It makes the CPU wait until all previous instructions have been executed.</p>
+
+<p><A NAME="rl9"><A HREF="#l9">Listing Nine</A> is neglecting RDTSC latency and is less sensitive to task switching. If the task switch occurs, the number of counted cycles will be significantly larger. Thus it makes sense to run the performance measuring code several times and select the smallest <i>EndTicks-StartTicks</i> value. It will be the most accurate performance estimate since the instruction cache will be filled with the code instructions, and task-switching artifacts are filtered; see <A NAME="rl9"><A HREF="#l9">Listing Nine</A>(b).</p>
+
+<p>If it is necessary to flush the data cache for the performance measurement, it is sufficient to use the <i>memset()</i> function to fill some array the size of the data cache (32 KB for K6-2). There is no need for WBINVD privileged instruction.</p>
+
+<p>For more demanding uses, there is a fancy performance-measuring sample called "OpTimer" packaged with AMD SDK (http://www.amd.com/swdev/swdev.html). It provides nice GUI interface and continuos performance-measuring capability.</p>
+
+<p>Lastly, when optimizing code it is recommended to do one change at a time and run the performance measuring. When several changes are made to the code, they might compensate each other, making it harder to find winning combination.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>3DNow! technology is a powerful tool for fast floating-point number crunching, and it can be advantageous for a wide variety of applications ranging from 3D games to medical imaging. </p>
+
+
+<p>The potential 300-400 percent performance gain makes the idea of porting existing x87 applications to 3DNow! attractive. At the same time, 3DNow! code porting and optimization can be a tedious and time-consuming process. Luckily, compilers are starting to provide support for 3DNow! technology. For instance, Metrowerks CodeWarrior C++ compiler utilizes vectorization techniques to generate 3DNow! instructions in place of x87 commands.</p>
+
+<p>The 3DNow! SDK (http://www.amd .com/swdev/swdev.html) is freely available if you want to jumpstart in 3DNow! technology and bring applications to a new level of performance.</p>
+
+
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>; compute y/w and x/w
+MOVD        MM0,mem ;   0 | w
+PFRCP       MM1,MM0 ; 1/w | 1/w (14-bit approximation)
+PUNPCKLDQ   MM0,MM0 ;   w | w
+PFRCPIT1    MM0,MM1 ; 1/w | 1/w (intermediate)
+MOVQ        MM2,mem ;   y | x
+PFRCPIT2    MM0,MM1 ; 1/w | 1/w (24-bit precision)
+PFMUL       MM2,MM0 ; y/w | x/w
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two</H4>
+
+
+<pre>MOVD        MM0,mem ;         0 | w
+PFRSQRT     MM1,MM0 ; 1/sqrt(w) | 1/sqrt(w)   (15-bit approximation)
+MOVQ        MM2,MM1
+PUNPCKLDQ   MM0,MM0 ;         w | w
+PFMUL       MM1,MM1 ; sqrt(w)^2 | sqrt(w)^2 (15-bit approximation)
+PFRSQIT1    MM1,MM0 ; 1/sqrt(w) | 1/sqrt(w)   (intermediate)
+PFRCPIT2    MM1,MM2 ; 1/sqrt(w) | 1/sqrt(w)   (24-bit precision)
+PFMUL       MM0,MM1 ;   sqrt(w) | sqrt(w)
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+<H4><A NAME="l3">Listing Three</H4>
+
+
+<pre>PFSUB       MM1,MM3 ; this instruction pair will execute
+PFMUL       MM2,mem ; in the same clock cycle
+PFADD       MM1,MM2 ; this instruction pair won't execute
+PFMUL       MM1,MM3 ; simultaneously due to register dependency
+</pre>
+<P>
+<A HREF="#rl3">Back to Article</A>
+</P>
+<H4><A NAME="l4">Listing Four</H4>
+
+
+<pre>PFMIN       MM1,MM2
+PFSUB       MM3,a
+MOVQ        mem,MM1 ; 1-cycle stall occurs here because the result
+PFMIN       MM2,MM3 ; in MM1 will be ready in the next cycle
+</pre>
+<P>
+<A HREF="#rl4">Back to Article</A>
+</P>
+<H4><A NAME="l5">Listing Five</H4>
+
+
+<pre>PFMIN       MM1,MM2
+PFSUB       MM3,a
+PFMIN       MM2,MM3 ; 1-cycle stall occurs here 
+PFSUB       MM4,b
+MOVQ        mem,MM1 ; no stall, the result in MM1 is ready
+PFSUB       MM3,a
+</pre>
+<P>
+<A HREF="#rl5">Back to Article</A>
+</P>
+<H4><A NAME="l6">Listing Six</H4>
+
+<pre>
+(a)
+for ( j = 0; j &lt; n; j++ )
+   beta += a[j]*r[n - j];
+
+(b)
+; eax = j, ebx = n-j-1
+MOVQ        MM0,a[EAX*4]    ;          a[j] | a[j+1]
+MOVQ        MM1,r[EBX*4]    ;      r[n-j-1] | r[n-j]
+PFMUL       MM0,MM1         ; a[j]*r[n-j-1] | a[j+1]*r[n-j]
+</pre>
+<P>
+<A HREF="#rl6">Back to Article</A>
+</P>
+<H4><A NAME="l7">Listing Seven</H4>
+
+<pre>
+(a)
+// Calculate r in reverse order (if possible) or swap the array elements
+ ...
+for ( j = 0; j &lt; n; j++ )       // beta calculation loop
+      beta += a[j]*r[c + j];    // c is some constant
+
+(b) 
+for ( j = 0; j &lt; n; j++ )
+{
+    float c = r[n - j]; // swap(r[j], r[n-j];
+    r[n - j] = r[j];
+    r[j] = c;
+}
+
+(c)
+MOVQ        MM0,a[EAX*4]    ;        a[j] | a[j+1]
+PSWAPD      MM1,r[EBX*4]    ;      r[n-j] | r[n-j-1]
+PFMUL       MM0,MM1         ; a[j]*r[n-j] | a[j+1]*r[n-j-1]
+
+(d)
+PFACC       MM0,MM0         ; a[j]*r[n-j] + a[j+1]*r[n-j-1]
+MOVD        beta,MM0
+</pre>
+<P>
+<A HREF="#rl7">Back to Article</A>
+</P>
+<H4><A NAME="l8">Listing Eight</H4>
+
+<pre>
+(a)
+; n-th iteration
+MOVQ        MM0,a[EAX*4]    ;        a[n] | a[n+1]
+MOVQ        MM1,r[EBX*4]    ;      r[c+n] | r[c+n+1]
+PFMUL       MM0,MM1         ; a[n]*r[c+n] | a[n+1]*r[c+n+1]
+ ...
+; after the loop
+PFACC       MM0,MM0         ; a[n]*r[c+n] + a[n+1]*r[c+n+1]
+MOVD        beta,MM0        ; Oops! Extra a[n+1]*r[c+n+1]
+
+(b)
+float a[m], r[m];           // m is some constant
+// Initialize arrays a and r
+ ...
+for ( n = 1; n &lt; m; n++ )   // main loop
+{
+    beta = 0;
+    for ( j = 0; j &lt; n; j++ )
+    beta += a[j]*r[c + j];    // c is some constant
+    // Do something else
+    ...
+}
+
+(c)
+    ; Compute beta
+    MOV     ECX,n
+    DEC     ECX
+    MOV     EAX,0           ; j = 0
+    PXOR    MM2,MM2         ; beta = 0
+M:
+    MOVQ        MM0,a[EAX]  ;        a[j] | a[j+1]
+    MOVQ        MM1,r[EAX]  ;      r[c+j] | r[c+j+1]
+    PFMUL       MM0,MM1     ; a[n]*r[c+j] | a[j+1]*r[c+j+1]
+    PFADD       MM2,MM0     ;       beta0 | beta1
+    ADD     EAX,8
+    SUB     ECX,2
+    JG      M               ; end of even part
+    JNE     SKIPODD
+    ; odd part processing
+    MOVD        MM0,a[EAX]  ;          a[n-1] | 0
+    MOVD        MM1,r[EAX]  ;        r[c+n-1] | 0
+    PFMUL       MM0,MM1     ; a[n-1]*r[c+n-1] | 0
+    PFADD       MM2,MM0     ;           beta0 | beta1
+SKIPODD:
+    PFACC       MM2,MM2     ; beta = beta0 + beta1
+    MOVD        beta,MM2
+
+(d)
+// Unroll for n = 1
+beta = a[0]*r[c];
+// Do something else for n = 1
+  ...
+// Process for n = 2, 3,...m
+for ( n = 2; n &lt; m; n++ )       // main loop
+{
+    // 3DNow! optimized loop for beta calculation
+    __asm {
+    }
+    // Do something else
+    ...
+}
+</pre>
+<P>
+<A HREF="#rl8">Back to Article</A>
+</P>
+<H4><A NAME="l9">Listing Nine</H4>
+
+<pre>
+(a)
+__int64 StartTicks, EndTicks;
+_asm {
+    CPUID
+    RDTSC
+    MOV     DWORD PTR StartTicks,EAX
+    MOV     DWORD PTR StartTicks[4],EDX
+    // Code which performance is measured
+   ...
+   CPUID
+   RDTSC
+   MOV     DWORD PTR EndTicks,EAX
+   MOV     DWORD PTR EndTicks[4],EDX
+   // EndTicks - StartTicks = Running Time in CPU cycles
+}
+
+(b)
+__int64 StartTicks, EndTicks, Ticks = 0x7FFFFFFFFFFFFFFF;
+for ( int i = 0; i &lt; 10; i++ )
+{
+    // Flush the data cache if necessary
+    // memset(data, 0, sizeof_data_cache);
+    _asm {
+         CPUID
+         RDTSC
+         MOV     DWORD PTR StartTicks,EAX
+         MOV     DWORD PTR StartTicks[4],EDX
+         // Code which performance is measured
+        ...
+        CPUID
+        RDTSC
+        MOV     DWORD PTR EndTicks,EAX
+        MOV     DWORD PTR EndTicks[4],EDX
+   }
+   if ( EndTicks - StartTicks &lt; Ticks )
+        Ticks = EndTicks - StartTicks;
+}
+
+
+
+
+</pre>
+<P>
+<A HREF="#rl9">Back to Article</A>
+</P>
+
+
+</body>
+</html>

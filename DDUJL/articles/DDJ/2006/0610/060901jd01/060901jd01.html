@@ -1,0 +1,186 @@
+<html>
+<head>
+<title>Application Responsiveness</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> October 2006</p>
+
+<h1>Application Responsiveness</h1>
+<h2>Using concurrency can enhance user experiences</h2>
+
+<h3>by Joe Duffy</h3>
+
+<I>Joe works at Microsoft on concurrency programming models in the Common Language Runtime (CLR) team. He blogs regularly at www.bluebytesoftware.com/blog.</I>
+
+<hr>
+
+
+
+
+<p>Thanks to innovation in both hardware graphics processors and client-side development frameworks, GUIs for Windows applications have become more and more visually stunning over time. But throughout the evolution of such frameworks, one problem hasn't gone away&#151;poor responsiveness. Studies show that positive user experiences are linked to application responsiveness. Conversely, frustrating experiences are often caused by poor responsiveness. More often than not, the lack of responsiveness is due to a series of subtle (and sometimes accidental) design choices made during development. In this article, I examine the root of responsiveness problems, and then suggest best practices for improving applications. </p>
+<h3>Responsiveness: What Is It?</h3>
+
+<p>A responsive UI is snappy, responds to input promptly, and doesn't leave users hanging. You can think of response time as the delay between the time at which an event is generated and the time at which some acknowledgment is made. This principle applies as much to UI events as, say, server-side events. While I focus on GUIs here, many of the lessons learned are transferable to other event-based environments.</p>
+
+<p>Throughput is typically defined as the amount of work performed in a given period of time, and is directly related to responsiveness. The maximum (best) responsiveness applications can reasonably exhibit is bounded by the maximum throughput for UI event processing. The more work that must be done to respond to any individual event, the higher the response latencies are apt to be. The lower the overall event-processing throughput, the worse the perceived responsiveness of an application. Responding to events in this context does not necessarily mean completely processing them, but rather simply giving the sender some acknowledgment of receipt. In cases where full processing takes time, it might also mean giving users an estimated completion time and ongoing progress using, say, progress bars. </p>
+
+<p>But averages aren't sufficient. You must also consider worst-case scenarios. An application's degree of responsiveness must be predictable to maintain the perception of a responsive application. In other words, the maximum processing time for any event that might occur could severely impact the user's happiness with your UI. This is true even for events whose processing time is, on average, very short. Simply put, variable response times are problematic and can be almost as frustrating as applications that are all around sluggish. Understanding this is instrumental to building responsiveness into programs.</p>
+
+
+<h3>How GUI Events  Are Processed</h3>
+
+<p>To understand these points, it helps to understand how Windows GUI frameworks work. While there are subtle differences in the details, User32, Windows Forms, and WPF use the same general architecture (see Figure 1). Each window has a message queue and a single UI thread whose job it is to process messages from that queue. UI events, including user-initiated (clicks, window close requests, scrollbar dragging, and so on), system-initiated (paint requests), and application-initiated events are communicated via queuing a message, and are processed on this UI thread. </p>
+
+<div>
+ <!--  -->
+   
+<img class="illowide" src="060901jd01_f1.gif" style="width:486px">
+
+<div class="caption" style="width:488px">
+Figure 1: Windows GUI event architecture.
+</div>
+</div>
+
+
+
+<p>Code that manipulates UI elements must execute on the UI thread. This eliminates the overhead and pervasiveness that explicit synchronization in the programming model would impose (such as acquiring locks before updating elements) at the sacrifice of possible concurrency (see blogs.msdn.com/nickkramer). This means that:</p>
+
+
+
+<ul>
+  <li>Only the UI thread can run the message loop, which processes incoming events.</li>
+  <li>Code that must update a UI element must execute on the UI thread.</li>
+</ul>
+
+<p>Because of the first point, anything the UI thread does&#151;in addition to just dequeueing messages&#151;impacts its ability to keep up with incoming messages. The most intuitive thing to do is simply write code that responds to an event in the UI element's event handlers. But because this work executes on the sole UI thread, it is often prudent to offload processing to a separate thread and, due to the second point, transition back to the UI thread to update visuals at specific intervals.</p>
+
+<p>In WPF, similar to Windows Forms, modifications to <i>System.Windows.Threading.DispatcherObject</i>-derived objects must occur on the UI thread to execute. All visual types in WPF derive indirectly from this class. Each such object has a <i>Dispatcher</i> property of type <i>Dispatcher</i>, which an application can use to call <i>Invoke</i> or <i>BeginInvoke</i> to execute code synchronously or asynchronously, respectively, on the UI thread. These methods take a delegate and know how to schedule that work by queuing messages into the GUI's message queue. These are then picked up by the message loop and dispatched. </p>
+
+<p>Example 1 is a typical Windows GUI message loop. An equivalent loop is carried out by WPF's <i>Dispatcher.Run</i> method, which gets called automatically when you call <i>Application.Run</i> to start up your application.</p>
+
+<div>
+
+<pre class="code">
+MSG msg;
+while (GetMessage(&amp;msg, NULL, 0, 0)) {
+   TranslateMessage(&amp;msg);
+   DispatchMessage(&amp;msg);
+}
+</pre>
+
+<div class="caption">
+Example 1: A typical Windows GUI message loop in Win32 (the "message pump").
+</div>
+</div>
+
+
+<p>This message loop is responsible for invoking event-processing code. In WPF, for example, this involves routing events to the framework elements listening for it, and invoking the registered user-defined code. (WPF's event subsystem is feature-rich and uses multiple models for event delivery. Regardless, all event delegates are invoked from  the UI thread.)</p>
+
+<p>If the UI thread is busy, incoming events back up in the queue until the thread finds time to check and respond to new messages. Figure 2 presents an example application timeline of event processing, where the x-axis is time and the y-axis is the size of the message queue. When a user or system initiates an event, that event is placed in the queue. Each event is assigned a number, so you can track it through the execution, and has a processing time label (in seconds).</p>
+
+
+<div>
+<!--  -->
+   
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<img class="illowide" src="060901jd01_f2.gif" onclick = "popimage(this,'www.ddj.com - Application Responsiveness - Figure 2')">
+
+<div class="caption">
+Figure 2: Example timeline of UI event processing.
+</div>
+</div>
+
+
+
+
+<p>Notice that at time 6 in Figure 2, event #9 arrives in the queue. Imagine that this were a crucial event, such as a user trying to close the window. The message loop is busy processing event #5, whose processing time is six seconds, and thus can't respond immediately. Unbeknownst to the user, it won't be done until time 10. Unfortunately, even when it finishes processing event #5, it still has to deal with the three messages (#6-#8) that arrived before #9; thus the close event isn't even processed until time 12. The user had to wait for 6 seconds before his close request was even seen by the program! Events #11 and #12 could have well been additional attempts to close the window out of frustration. Events #6-#8 might have been requests to repaint the screen because it was moved, which were entirely ignored.</p>
+
+<p>Windows responds to these situations in a number of ways. If a message sits in the queue for five or more seconds, the next message changes the title bar from "App Title" to "App Title (Not Responding)." This status is reflected in tools like Task Manager. Failure to paint the screen can cause all types of visual artifacts, but most commonly this manifests as a blank window and the window's icon changing to a generic-looking window. Users usually respond by killing the process.</p>
+
+
+<h3>Common Sources Of Problems</h3>
+
+<p>The general cause of event-processing bottlenecks is executing unbounded or high-latency operations on the GUI thread. More often than not, this code lives in user-authored code to respond to UI events. Such code might perform a simple CPU-intensive activity whose algorithmic complexity depends on some variable, say the size of the input data. When testing your program in-house, it might function okay with small sample data sizes. However, when users decide to operate on more data than you anticipated, it might consume more compute time, leading to precisely the situation just described.</p>
+
+<p>That said, most programs aren't CPU-bound. The total amount of work your code performs is a complex equation, depending on variables such as the CPU, memory, peripherals (such as disk), and the network. Clearly CPU clock speed plays a major role, but often isn't the dominant factor. The CPU's internal parallelism and the degree to which it can achieve superscalar execution on a particular piece of code depend heavily on the number of branch prediction misses and instruction stream fences. These are generally of more interest to compiler writers than application developers, but use of locks, volatile reads/writes, interlocked operations, and memory barriers can also impact this. Memory-intensive operations can also lead to variable delays, especially on multiprocessor machines in which some portions of the cache hierarchy are more expensive to access than others. High cache miss rates can be crippling on applications, bloating the cost of memory-intensive work by an order of magnitude. Too much thread-level parallelism in your application&#151;or among all the machine's running processes&#151;can place a higher burden on the OS thread scheduler, leading to context-switching overhead. Many of these factors are never dealt with directly in your code, but should be part of a rigorous stress-testing process to catch problems before software is released. If you encounter issues like this during testing, a good profiler can measure and track down the source.</p>
+
+<p>Device I/O clearly incurs a higher cost than most CPU- and memory-based activities, usually by several orders of magnitude. Most programs today are more and more connected, and as a result must send and receive larger quantities of data via the disk and network. Doing this type of work on the UI thread is almost always a mistake. Network I/O consists of many steps, and the cost of each varies greatly depending on the state of the network peripheral, the network, the destination node, and hops in between. Your program generally has no control over these factors, so doing such things on the UI thread is a disaster waiting to happen.</p>
+
+<p>GUIs often perform dramatically worse under system-wide memory pressure. This is because ordinary memory operations can suddenly turn into disk I/O due to page faulting. This dramatically changes the performance characteristics of simple memory accesses once your program has to compete with others for scarce machine resources. If simple memory accesses can be seen as "variable latency operations," you're probably wondering if there's anything you should do on the GUI thread. Generally speaking, any data- or compute-intensive tasks should be done on a separate thread, even if that incurs overhead for worker synchronization.</p>
+
+<p>Finally, synchronization resulting from access to shared data structures is another variable latency operation. If a lock is contended, the thread attempting acquisition typically ends up blocking. It is only awoken again when the thread that owned the lock finishes its work and relinquishes the lock (and any that are given access to the lock first). Although the thread that owns that lock might not be a GUI thread, it might be performing I/O or waiting for an event. This essentially looks as if the GUI thread itself were performing such operations because it has to wait the same amount of time. Deadlocks are the worst type of lock contention, especially on the GUI thread.</p>
+
+
+<h3>Platform Mitigations</h3>
+
+<p>The CLR, WPF framework, and Windows all mitigate these general problems to some degree. First, the CLR is responsible for ensuring that any time a GUI thread blocks, it does so in a GUI-friendly manner. It uses existing Win32 primitives under the covers&#151;<i>MsgWaitForMultipleHandles, CoWaitForMultipleTasks,</i> and so forth&#151;which are special functions that unblock either when the condition the thread has blocked for occurs, or when one of a few special UI events arrives at the message queue. In the latter case, the message loop runs to process a message. This ensures that, although a thread may have blocked, it wakes up just long enough to process a new GUI message. In the previous example, if any of event #6's time was wasted blocking (highly likely, unless it is entirely CPU bound), this would permit a dispatch of additional messages. While this might have resulted in repainting the screen, the shutdown request would still have to wait. It might be processed but first attempts an orderly shutdown, which requires that it wait for the current message to finish processing.</p>
+
+<p>Also, WPF doesn't maintain a simple FIFO ordering for messages in the queue. Instead, it offers a prioritization mechanism to guarantee that urgent messages&#151;a keystroke or attempt to close the window&#151;are processed before other less urgent messages, such as a general-purpose application event, helping to maintain responsiveness. The system controls priorities in most cases, but when queuing work manually (via <i>Dispatcher.Invoke</i> and <i>BeginInvoke</i>), you pass in a <i>DispatcherPriority</i> value specifying the priority of the work. This feature would have helped slightly in the example we saw earlier, in Figure 2. Assuming events #6-#8 were not urgent priority, the window close event would have been processed at time 10 instead of 12, saving the user two-seconds-worth of frustration.</p>
+
+<p>Finally, the foreground UI thread on Windows enjoys something called a "priority boost." This ensures that the UI gets more of the overall system time-slices, and that when a new event occurs at the message queue, the UI thread is given preferential treatment by the scheduler for the next time-slice. The result is that a more responsive system is maintained. This helps in situations where multiple applications are fighting for a processor, but unfortunately, if the code performs an explicit I/O operation or encounters page faulting, it can cause the UI thread to relinquish its time-slice voluntarily. Windows offers other innovations, like Superfetch in Windows Vista, that help eliminate page faulting of frequently utilized code and data.</p>
+
+
+<h3>Solutions</h3>
+
+<p>The first step to addressing this problem is to understand how UI events occur, and the general category of operations that wreak havoc. Next, understanding the performance characteristics of any code called from the UI thread is key. This not only requires an understanding of what methods can block, the data-intensiveness, and the range in execution time, but also what code paths lead to code executing on the UI thread. Determining this can be tricky. There is no standard mechanism in the documentation that tells you the performance characteristics of a method, whether it blocks, and if so, whether it does so in a GUI-friendly manner. Measurement is important.</p>
+
+<p>Rather than issuing variable latency operations on the GUI thread, your application should delegate that work to occur on a separate thread, rendezvousing back with the UI thread at some later point; for instance, to update a window element with progress, or to initialize a control tree with data loaded from the network. This is as simple as using the CLR's <i>ThreadPool</i>, and manually invoking the <i>Dispatcher</i>'s <i>Invoke</i> or <i>BeginInvoke</i> method to rendezvous, as in Example 2.</p>
+
+
+<div>
+
+<pre class="code">
+class MyWindow : Window {
+  Button myButton = /*...*/;
+  void myButton_Click(object sender, RoutedEventArgs e) {
+    ThreadPool.QueueUserWorkItem(delegate {
+       // Perform intensive operation
+       myButton.Dispatcher.BeginInvoke(delegate {
+          // Update UI element based on outcome of
+          // the previous operation.
+        });
+    });
+  }
+}
+</pre>
+
+<div class="caption">
+Example 2: Using the ThreadPool to avoid blocking the UI thread.
+</div>
+</div>
+
+<p>While orchestrating this manually works fine, the <i>System.ComponentModel.BackgroundWorker</i> component encapsulates the code required to perform these transitions. Thanks to the <i>AsyncOperationManager</i> infrastructure used for many <i>Component-derived</i> types, this class works just as well with WPF as it does Windows Forms, firing events on the appropriate thread automatically. It has a <i>DoWork</i> event, responsible for executing the heavy work, which is automatically scheduled on the <i>ThreadPool</i>. It also offers <i>ProgressChanged</i> and <i>RunWorkerCompleted</i> events, letting you hook progress change and completion events, both of which occur on the UI thread, so that you may easily update visuals to notify the user of status.</p>
+
+<p>It is also often important to support cancellation. It's nice to tell users what's going on, but if they still have to sit there watching a progress bar for 30 seconds while some network operation times out, they will likely become frustrated and kill the program. A responsive application should provide a way to cancel the operation if they decide they do not wish to wait for it.</p>
+
+<p>The <i>Dispatcher.BeginInvoke</i> method returns a <i>DispatcherOperation</i> object with which you may cancel the operation via the <i>Abort</i> method. Provided that it hasn't been dispatched yet, this just deletes the target message from the UI thread's message queue. This does nothing about the fact that runaway operations continue to execute, however. To solve that, many component model .NET types provide a <i>CancelAsync</i> method. The <i>BackgroundWorker</i> class is one such type. <i>System.Net.WebClient is another type, offering a </i> <i>DownloadXxxAsync</i> method that performs the heavy network work&#151; DNS resolution and data transfer&#151;on a separate thread, firing back interesting events on the UI thread, supporting cancellation, and so on. Using it requires writing code to handle the various events, but is worth the effort for costly operations (say, more than three seconds in maximum duration).</p>
+
+<p>Windows Vista also provides a general-purpose I/O cancellation feature, which can be used to cancel in-progress file I/O operations (see msdn.microsoft.com/library/en-us/dnlong/html/win32iocancellationapisv2.asp), but unfortunately, has no managed code support and does not yet work for network operations. It's worth keeping an eye on future releases. In the absence of a platform-wide feature like this, you must take care to write I/O code carefully, even when it's executing on a nonUI thread, taking note of options for timeouts and selecting reasonable values, and performing data operations incrementally. For example, instead of using the <i>File.ReadAllLines</i> API, consider using a <i>FileStream</i>, reading a line at a time, and checking for cancellation every so often. This also lets you indicate progress using some form of progress bar.</p>
+
+
+<h3>Conclusion</h3>
+
+<p>The types of problems I've described here are only becoming more prevalent in GUI applications. The increasing address space on 64-bit, memory sizes, and disk capacities on today's average desktop machine and focus on rich multimedia experiences mean that programs are operating on larger quantities of data than ever before. Users demand that of programs. Further, no application is an island&#151;those variable latency network activities are becoming more and more common for all types of applications, not just those that were traditionally viewed as "network applications." Consider that Office 12 has deep integration with SharePoint Server, and that even Windows Vista is becoming more connected, with integration of RSS into core OS features. This trend will continue.</p>
+
+<p>At the same time, the availability of multicore processors means we should take advantage of concurrency wherever possible. As it turns out, the requirements to do so are closely related to the requirements for maintaining responsive applications. But along with more parallelism comes the requirement to properly synchronize and coordinate activities across a process, involving the use of mutual-exclusion locks and events. This leads to additional blocking points and the possibility of deadlock, and must be managed carefully.  </p>
+
+<p>
+DDJ
+</p>
+
+
+
+
+
+
+
+
+
+</body>
+</html>

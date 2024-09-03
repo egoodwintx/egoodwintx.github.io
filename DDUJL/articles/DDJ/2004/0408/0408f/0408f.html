@@ -1,0 +1,105 @@
+
+<html>
+<head>
+<title>August, 2004: Optimizing Pixomatic for  x86 Processors:  Part I</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Optimizing Pixomatic for  x86 Processors:  Part I</h1>
+<p><i>Dr. Dobb's Journal</i> August, 2004</p>
+<h2>Challenging  assumptions about  optimization</h2>
+
+
+<h3>By Michael Abrash</h3>
+
+
+<I>Michael is a developer at RAD Games Tools and author of several legendary programming books, including Graphics Programming Black Book. He can be contacted at michael_abrashhotmail.com.</I>
+
+<hr>
+
+
+
+
+
+<p>For the first time in a while, I recently happened to leaf through my <i>Graphics Programming Black Book</i> (http://www.ddj.com/downloads/premium/abrash/), where one of the first things I noticed was the phrase "Assume Nothing." And that made me think that maybe I should follow my own programming advice more often...</p>
+
+<p>You see, a couple of months ago, Jeff Roberts (my boss at RAD Game Tools) asked me to take a look at the low-level MP3 filter code in the Miles Sound System, an SDK that handles all aspects of sound&#151;3D audio, digital audio, digital decompression, interactive MIDI, and the like. This code was performance critical, so much so that it was written entirely in assembly language. Nonetheless, Jeff wanted me to see if I could find a way to speed it up further. In particular, he thought perhaps the code would benefit from Streaming SIMD Extension (SSE), the instruction set Intel introduced with the Pentium III.</p>
+
+<p>It had been a while since I had had a crack at pedal-to-the-metal x86 optimization (I've been working on PlayStation2) and I happily dove into the code. It is complex and intricate, and not obviously amenable to the four-way parallelism of SSE, but eventually I figured out a way to bring SSE to bear. With a day of coding, I managed to speed up the entire MP3 test application by about 10 percent.</p>
+
+<p>As it turned out, that 10 percent speedup was more impressive than it seems. When I finally got around to profiling, the low-level filter code turned out to have taken only about one-third of the total time before my optimizations, meaning that I had succeeded in speeding the low-level filter up by about 1.5 times. Not bad.</p>
+
+<p>However, profiling also revealed that an unrelated C routine was taking 40 percent of the time, considerably more than the filter code. Obviously, my assumption that the code in assembly was the most performance critical had caused me to start optimizing in the wrong place. Worse yet, most of the time in the C routine was taken by a tiny block of code, which did nothing more than call the library <i>pow() </i>function with integer exponents between 0 and 15. Worst of all, though, it turned out that the exponent was on most of the time. It didn't take a whole lot of research or deep thinking to figure out a faster way to raise a number to the first power than calling <i>pow()</i>!</p>
+
+<p>I converted this bit of code over to using a <i>switch()</i> statement to handle the various cases directly with multiplication (and to handle an exponent of one by doing nothing), all of which took about five minutes. In return, I got an overall speedup in the MP3 test of about 1.4&times;&#151;four times what I had gotten from my heroic assembly language optimizations.</p>
+
+<p>"Assume Nothing" is probably the oldest, simplest, and least-specific optimization principle I've ever come up with. Every so often, however, I am reminded yet again that I ignore it at my peril. So as I examine a variety of optimization techniques in this article, remember that any technique is only as good as the assumptions&#151;or, preferably, knowledge&#151;that you base it on.</p>
+<h3>Pixomatic</h3>
+
+<p>In this three-part article, I discuss the process of optimizing Pixomatic, an x86 3D software rasterizer for Windows and Linux written by Mike Sartain and myself for RAD Game Tools (http://www .radgametools.com/). Pixomatic was perhaps the greatest performance challenge I've ever encountered, certainly right up there with <i>Quake</i>. When we started on Pixomatic, we weren't even sure we'd be able to get DirectX 6 (DX6) features and performance, the minimum for a viable rasterizer. (DirectX is a set of low-level Windows multimedia APIs that provide access to graphics and audio cards.) I'm pleased to report that we succeeded. On a 3-GHz Pentium 4, Pixomatic can run <i>Unreal Tournament 2004</i> at 640&times;480, with bilinear filtering enabled. On slower processors, performance is of course lower, but by rendering at 320&times;240 and stretching up to 640&times;480, then drawing the heads-up display (HUD) at full resolution, <i>Unreal Tournament 2004</i> runs adequately well, even on a 733-MHz Pentium III.</p>
+
+<p>In the end, we exceeded our design goals. With Version 2.0, Pixomatic has a high-end DX7-class feature set (except it doesn't support cubemaps) and low-end DX7-class performance, with peak 3-GHz Pentium 4 performance of more than 100 megapixels and nearly 5 million triangles a second. In this three-part article, I describe how we've managed to push Pixomatic as far as we have.</p>
+
+<p>While I won't be talking about Pixomatic as a product, there is one product issue that I'd like to address. People keep  asking: "Why would anyone want to use a software rasterizer nowadays?" (Actually, I believe the exact words they often use are: "Are you nuts?" But I'll just go with the first version of the question.) It's a good question, with a simple answer: Because Pixomatic is utterly reliable. There are no dependencies on APIs, drivers, or chips, so you can be absolutely certain that Pixomatic will work on any Windows or Linux machine with Intel's Multimedia Extensions (MMX). The potential market is bigger, tech support is simpler, and returns are reduced.</p>
+<h3>Ad Astra Per Aspera</h3>
+
+<p>A good place to start is the story of how Pixomatic came to be a DX7-class rasterizer, and a good place to start with that is to digress a bit to discuss Norton Juster's wonderful children's book <i>The Phantom Tollbooth</i>. In it, Milo travels through the Kingdom of Wisdom, having many adventures and surviving many dangers to rescue the princesses Rhyme and Reason. As he does so, people keep telling him, "There's just one thing about your quest," but they won't tell him what that thing is. Finally, after he has succeeded, a parade is held in his honor, and while riding in it, he asks the Kings exactly what that thing no one would discuss with him was. They inform him of the truth: His quest was impossible.</p>
+
+<p>The Kings add: "But if we'd told you then, you might not have gone&#151;and, as you've discovered, so many things are possible just as long as you don't know they're impossible."</p>
+
+<p>If only we'd had the Kings to guide us when we started to design Pixomatic! We weren't sure whether we'd be able to get adequate performance, and after back-of-the-envelope calculations, we figured we'd have to cut features to the bone to keep performance up. In addition, once we'd determined that we'd have to compile code on the fly, we were convinced that the overhead and complexity of supporting a lot of features would be too much. Consequently, we aimed for a DX6-class pipeline, with little more than two textures and Gouraud shading, and with modulation as the only operation. That was Pixomatic 1.0, and if its features were a little limited and didn't map ideally to most current games, its performance was certainly good enough.</p>
+
+<p>Then customers started asking for DX7-class features and we started patching new capabilities into Pixomatic. Naturally, because there wasn't any overall design to these additions, they started to get messy and complicated. And then, one day, I realized that the problem was that I had assumed that a DX7-class feature set was impossible, and I hadn't even taken a shot at it to find out if that was really true. It turned out that it was actually easier to refactor the code to a full, orthogonal DX7-class feature set than to patch in random features. Moreover, the performance was just as good as in Pixomatic 1.0. Everything worked great for Pixomatic 2.0; the only way it could have been better would have been if we had designed for DX7-class features from the start. (Clearly, for Pixomatic 3.0, all I have to tell myself is that a DX9-class software rasterizer isn't impossible!) In short, everything worked out fine, and Pixomatic wound up with a nice, big, clean feature set.</p>
+
+<p>In 1995-97, I wrote a series of <i>Dr. Dobb's Sourcebook</i> articles describing all the revelations and false starts we went through in designing and implementing <i>Quake</i> at Id Software. I'd love to do the same for Pixomatic, but the truth is it wasn't that kind of project. This was at least the fourth 3D rasterizer I'd written, so there wasn't a whole lot of aha! in the process; it was more a matter of matching our knowledge of the 3D pipeline to Pentium III and Pentium 4 hardware as efficiently as possible. Of course, that's not to say it was easy, or that there weren't any mistakes or learning experiences. There were plenty of both, as you'll see, which isn't surprising in a product with well over 10<sup>30</sup> valid pixel-processing configurations. Still, it was a relatively linear development process, at least compared to <i>Quake</i>.</p>
+
+<p>By the way, a number like 10<sup>30</sup> may make you wonder how we managed to test Pixomatic. We constructed a testbed that implemented the pixel pipeline in C, along with a very-long-period random-number generator and the ability to run random configurations through both the C and Pixomatic pipelines and compare the results. Then we started it up and left it running for days at a time, churning through tens of billions of configurations a day. But obviously, it's impossible to test every single possible configuration.</p>
+<h3>C, Assembly, and More</h3>
+
+<p>Pixomatic is implemented in several ways, as appropriate for the performance needs of various parts of the rasterizer. Most of the code outside the pixel pipeline is in pure C, with inline assembly used in key places. For example, backface culling is done with inline assembly, among other reasons because, in C, there is no way to prevent gradient values from getting stored to memory before the backface test is performed, even though they only need to be stored if the backface test passes.</p>
+
+<p>The span generator emits perspective-correct horizontal spans 1 to 16 pixels long to the pixel pipeline and exists in three versions. The first is an all-C x87 version. The second is a part C, part inline assembly version that uses MMX and 3DNow (a set of MMX-like multimedia extensions that AMD has added to its processors). The third and fastest is an all-inline assembly version that uses SSE and MMX.</p>
+
+<p>The use of inline assembly improved performance by 20-45 percent in various scenarios&#151;and that's overall performance, including time spent in the pixel pipeline, which I will discuss shortly.</p>
+
+<p>In addition to C and inline assembly, Pixomatic contains a fair amount of code that's neither C nor inline assembly. The reason for this is the tremendous number of configurations Pixomatic has to support.</p>
+
+<p>For example, Pixomatic has to handle a huge number of possible pixel pipelines, as mentioned earlier; consider the number of available stage operations, sources, and scalings for both alpha and RGB, and then multiply by three stages. Or consider the number of possible vertex formats. Moreover, it's not enough to process all these configurations correctly; they also have to be handled efficiently, which rules out using lots of tests and branches. When we started to design Pixomatic, it wasn't obvious how best to get both complete feature coverage and high performance.</p>
+
+<p>One approach we used was to write a custom preprocessor to simply expand out all the permutations; for example, this is how the various 2D blts Pixomatic supports are implemented. Our overall experience with this approach was mixed; the preprocessor made it easy to generate permutations, but that code was then hard to debug because we had to work with the preprocessor output in the debugger. Worse, though, was that the preprocessor made it easy to generate a huge amount of code. Since the pixel pipeline involves a vast number of possible configurations, it was clear early on that the preprocessor wasn't going to do the trick there. When we tried using the preprocessor to implement the relatively limited pipeline of Pixomatic 1.0, it generated several megabytes of code (that's executable code&#151;the source was even larger), way over our design target. (For comparison, the entire Pixomatic 2.0 DLL is about 250 KB in size.)</p>
+
+<p>A technique I had used back in the x486 and Pentium days was to thread together span processors that each performed one pixel processing operation; for example, one span processor to load the texels for a span into a temporary buffer, another to Gouraud shade them in the buffer, yet another to handle specular shading, and so on. However, my experience was that the loop overhead for each pass was fairly expensive even then; given how costly mispredicted branches are now and that at least one branch per pass is likely to mispredict, this did not seem like the right direction.</p>
+
+<p>The obvious next thought was to compile an optimized pixel pipeline on the fly, one that contained no extraneous instructions or overhead at all. There were two concerns with this.</p>
+
+<p>The first concern was whether the code would run slowly as a result of the CPU synchronizing its caches for the modifications. After all, code compiled on the fly is close to self-modifying code, which Intel specifically warns against as a performance hazard. However, tests showed that the time between the drawing primitive call (when compilation happens) and the pixel pipeline (when the modified code starts to execute) is more than long enough for the new code to propagate to the code cache, what with transformation, projection, clipping, culling, gradient calculation, and span construction all happening in that interval.</p>
+
+<p>The second concern was whether the overhead of compiling the code would be so large as to offset the benefits. Certainly, it would take some time to do the compiling, and that cost would be multiplied by the number of times rendering state changes forced a recompilation of the pixel pipeline. Initially, we assumed we would have to implement some kind of cache for compiled pixel pipelines, and we even exposed APIs to enable applications to do so if they wanted, but all this proved to be unnecessary for three reasons.</p>
+
+
+
+<ul>
+  <li>State changes are expensive with 3D hardware as well as with Pixomatic, so 3D apps are already written to minimize state changes.</li>
+  <li>We designed Pixomatic to batch up state changes until a triangle actually needed to be drawn, so we recompiled only when it was actually needed, rather than whenever a state changed.</li>
+  <li>We designed Pixomatic's pixel pipeline so that the selection of a new texture doesn't require recompilation. </li>
+</ul>
+
+
+
+<p>This last point is critical because while textures change frequently (often every few triangles with mipmaps), the remainder of the rendering state tends to remain in effect for dozens or even hundreds of triangles. </p>
+
+<p>Of course, none of this would have mattered unless the code could be compiled very quickly, so full-blown traditional compilers were out of the question. Instead, we wrote a streamlined compiler custom designed for the task, which we call the "welder."</p>
+<h3>Next Month</h3>
+
+<p>In the next installment of this article, I'll delve into welder and, among other topics, introduce an optimization tool dubbed "Speedboy."</p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+
+</body>
+</html>

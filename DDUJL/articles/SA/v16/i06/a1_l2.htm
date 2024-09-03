@@ -1,0 +1,184 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v16, i06: Listing 2  getipsstatus</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a1.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a1_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink"><a href="a1_f2.htm">Figure 2</a></span></td>
+		<td><span class="navbarLink"><a href="a1_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink">Listing 2</span></td>
+		<td><a href="../../../../source/SA/2007/jun2007.tar"><b class=codeListing>jun2007.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h2>Listing 2  <b>getipsstatus</b></h2>
+<pre>
+#!/usr/local/bin/perl
+#########################################################################
+#
+# Name:    getipsstatus
+# Usage:   getipsstatus ipslist.txt
+# Author:  Lisa Hamet Bernard, LHB Consulting
+#
+# This script checks the signature update status for the Cisco Advanced 
+# Inspection and Prevention Security Service Module (AIP SSM) installed in 
+# each ASA 5510.  The list of AIP SSM's to check is stored in ipslist.txt,
+# which is the argument specified on the command line when the script is 
+# executed.  The format of each line in ipslist.txt is
+# ipsname ipsIPaddr
+# This script reads each line, one at a time.  It uses ipsIPaddr as the target
+# device and ipsname as the prompt to expect on that device. On ipsIPaddr,
+# a "show events past 00:30:00 | begin softwareUpgradeCompleted" command
+# is executed to grab the Event Store from the last 30 minutes, starting with
+# an event whose record includes the string "softwareUpgradeCompleted".
+# If this event is found in the Event Store, it is emailed to an admin account
+# with ipsname to notify the admin that a signature update has been installed.
+# (Details of the update are included in the event text.)
+# 
+# Note that all communication to each IPS is handled via SSH using pre-shared
+# keys, so no passwords are stored in this script.
+#
+#########################################################################
+use Net::Telnet;
+use Proc::Spawn;
+
+$notify = "netadmin\@company.com";
+$user = "sigupdate";
+$blanklines = '/\015\015\012\015\015/';  # ^M^M^J^M^M = CR-CR-LF-CR-CR
+
+# Read each line in ipslist.txt, which consists of IPS name and IP address
+# (space separated), and split into corresponding variables. Add delimiters
+# to IPS name to create the prompt string on that IPS. (Prompt must be 
+# defined for Net::Telnet cmd method to complete correctly.)
+
+while (&lt;&gt;)  {
+    chomp;
+    ($ipsname,$ipsIP) = split(' ',$_);
+    $prompt = "/" . $ipsname . "# /" ;
+
+# Start SSH program as user $user -- must force version 1 for pre-shared key 
+# exchange to work correctly.  (Key is RSA1 format.)
+
+my ($pid, $pty_fh) = spawn_pty("ssh -1l $user $ipsIP");
+
+# Create a Net::Telnet object to perform I/O on ssh's tty. Use file handle
+# from SSH process.  Disable Telnetmode, since this is an SSH session. Set
+# Cmd_remove_mode so sent command is not echoed back.  Then call waitfor
+# method to look for IPS prompt to signify connection is established.
+
+$ssh = new Net::Telnet (Fhopen =&gt; $pty_fh,
+                        Prompt =&gt; $prompt,
+                        Telnetmode =&gt; 0,
+                        Cmd_remove_mode =&gt; 1,
+                        Output_record_separator =&gt; "\r");
+
+$ssh-&gt;waitfor(Match =&gt; $ssh-&gt;prompt, Errmode =&gt; "return") 
+   or &fail_exit("$notify","$ipsname", "login failed: ", $ssh-&gt;lastline);
+
+# Disable paging for SSH login session
+
+$ssh-&gt;cmd("terminal length 0");
+
+# Send a "show events past 00:30:00" to grab events from the last 30 minutes,
+# beginning with the event including "softwareUpgradeCompleted".  Call
+# waitfor method to capture this event in @eventmsg.  Specify the blank lines
+# sequence as the expression to match, because events are separated this way 
+# in "show events" output.  Then send CTRL-C to cancel this command output. 
+# If "softwareUpgradeCompleted" isn't found, call noupgrade subroutine 
+# and continue. (Use @Notfound to specify subroutine reference and arguments.)
+
+$Notfound[0] = \&noupgrade;
+$Notfound[1] = "$ipsname";
+$Notfound[2] = "$notify";
+$Notfound[3] = "$pid";
+$ssh-&gt;print("show events past 00:30:00 | begin softwareUpgradeCompleted");
+(@eventmsg, $myevent) = $ssh-&gt;waitfor(Match =&gt; $blanklines,
+                      Errmode =&gt; \@Notfound);
+
+# Send a CTRL-C to exit this command
+$ssh-&gt;print("\x03");
+
+# Close this SSH session.  Need to kill the process also, because close
+# does not.
+
+$ssh-&gt;close;
+`kill $pid`;
+
+# Email this event message to admin account.
+&sendevent("$notify","$ipsname", "\n\nEvent store output:\n",\@eventmsg);
+
+}
+
+sub fail_exit {
+
+# Email address at $notify that login failure has occurred on AIP SSM $IPS
+# with message $summary and $message.
+
+    local ($notify, $IPS, $summary, $message) = @_;
+    `/bin/echo "AIP SSM $IPS failed during signature status check 
+      attempt. $summary $message" | /bin/mailx -s "AIP SSM signature 
+      status check failure" $notify`;
+    next;
+}
+
+sub sendevent {
+
+# Email address $notify with IPS signature update installation event details
+# ($message) from AIP SSM $IPS. 
+
+    local ($notify, $IPS, $summary, $message) = @_;
+    `/bin/echo "AIP SSM $IPS completed signature update. $summary @$message" 
+       | /bin/mailx -s "AIP SSM signature update completed" $notify`;
+}
+
+sub noupgrade {
+
+# Custom subroutine that Errmode calls (when specified string in waitfor method
+# is not found).  Set up to kill SSH process and force while loop to iterate 
+# to next line in ipslist.txt, but can optionally send email.  
+
+   local ($ips, $notify,$pid) = @_;
+   `kill $pid`;
+#   `/bin/echo "AIP SSM $ips did not record an upgrade event." | 
+      /bin/mailx -s "AIP SSM signature update status" $notify`;
+   next;
+}
+</pre>
+            </table></table> 
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

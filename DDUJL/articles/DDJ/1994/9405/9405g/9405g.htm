@@ -1,0 +1,586 @@
+<HTML>
+<META NAME="year" CONTENT="1994">
+<HEAD>
+<TITLE>MAY94: OS/2 and UnixWare Interprocess Communication</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>OS/2 and UnixWare Interprocess Communication<a name="0171_0003"></h1><P>
+<h2><a name="0171_0001"><a name="0171_0000">Searching for common IPC ground</h2><P>
+<h3>John Rodley</h3><P>
+<p><i><a name="0171_0002"><a name="0171_0000">John is an independent consultant in Cambridge, MA. He can be contacted on CompuServe at 72607,3142.</i></p><hr><P>
+Multitasking operating systems such as UNIX and OS/2 bring interprocess communication (IPC) explicitly into the realm of applications programming. As a UNIX or OS/2 developer, you can design a single system with dozens of independent processes (or threads) if that's what you want. However, to make a coherent system, these processes usually have to pass information back and forth, and that's where IPC comes in.<P>
+An applications programmer looking at the APIs of the two systems would be hard-pressed to see similarities. However, the IPC models <I>are </I>similar, despite greatly differing implementations. In this article, I'll look at IPC under IBM's OS/2 2.1 and Novell's UnixWare 1.1 and see what common ground exists.<P>
+In designing a multiprocessing (or multithreaded) system, there are a number of IPC issues you need to think about. The first one is, how are the processes going to identify the shared resource? Since related processes (child processes and threads) share a common set of open file handles with their parent, they don't have to worry about resource naming. The parent can create any number of anonymous resources (pipes, shared memory, and so on) and both parent and child can refer to them simply by handle.<P>
+Unrelated processes don't enjoy the luxury of sharing open handles and need to have another way to identify shared resources. Under OS/2, resources must have unique, fully qualified filenames. Each resource type uses a common base filename; for semaphores, this is \SEM32; for queues, \QUEUES; for shared memory, \SHAREMEM; and for  pipes, \PIPE.<P>
+Under UNIX, queues, semaphores, and shared memory share a single naming scheme. These resources have an integer id that is typically created by a call to <I>ftok</I>, which uses an agreed-upon filename and a char seed to create a consistent integer id. <a href="#0171_0014">Listing One</A> (page 107) is a typical use of <I>ftok</I> to create a resource ID.<P>
+With the resource named, the processes must then agree on who owns the resource--who's responsible for creating and destroying it. System-wide resources (those that unrelated processes can access) generally have to be explicitly destroyed. That means that if your process disappears without destroying the resource, the resource will still exist the next time the process comes up, and the create call will fail. Take it from me, processes disappear mysteriously a lot more often than anyone is willing to admit. Local resources, like anonymous pipes, live and die with the process that create them. In general, you have to put some thought into what is needed if a process fails to properly dispose of an unwanted resource.<P>
+Another important issue in any IPC situation is &quot;atomicity.&quot; (I write atomic code all the time--it blows up spectacularly.) In this case, atomicity refers to whether or not a call can be task switched. For our purposes, a call is said to be atomic if it is guaranteed not to be task switched while it is being performed. Consider the case of a bunch of OS/2 processes trying to gain ownership of a resource protected by a single, mutual-exclusion semaphore. Each process makes a call to <I>DosRequestMutexSem</I> and blocks waiting for the semaphore to clear. The current owner clears the semaphore. Only one of the waiting processes can now become the new owner. If <I>DosRequestMutexSem</I> were not atomic, you could get two or more processes waking up thinking they owned the semaphore.<P>
+The last and perhaps most-important consideration is what mode you're going to run the IPC channel in--blocking or nonblocking. In blocking mode, your process sleeps until the call (read or write) can be satisfied. In nonblocking mode, the call returns an error if it can't be satisfied. If, like the window procedure in a Windows program, a process is solely concerned with processing the message coming in over the IPC channel, it's simple, safe, and very effective to use blocking I/O. Most real-world programs, though, can't afford to block waiting for I/O. Usually, you'll have to split a program into multiple related processes to use blocking I/O. A common OS/2 technique is to spawn a thread for each blocking I/O channel and have each thread use nonblocking I/O to get the information back to the main thread.<P>
+<h3><a name="0171_0004">Shared Memory and Semaphores<a name="0171_0004"></h3><P>
+There are roughly four types of IPC: shared memory, semaphores, pipes, and queues. Shared memory is the simplest, most intuitive type of IPC. With shared memory, multiple processes have access to a single block of memory. Shared memory is particularly effective where the size of the data being communicated is small and fixed. The difference between shared memory and the message-style IPC APIs (pipes and queues) is the difference between a whiteboard and a pad of post-it notes:<P>
+<UL>
+<li>You can only fit so much on the whiteboard, but post-its go on forever.</li>
+<li>The information on the whiteboard has no particular order, while the post-its are always stuck to your terminal in either chronological or priority order.</li>
+</UL>
+Consider an example of an uninterruptible power supply (UPS). A typical smart UPS keeps track of a couple of dozen variables (line voltage, load, and the like), which it transmits to the system every couple of seconds over the serial port. The UPS control program might consist of two processes: a daemon that reads the serial port and updates the variables in the shared-memory block and a user interface (UI) that displays the variables it reads in the shared-memory block. The user is only interested in the current value of any variable, so the UI doesn't need to try to display every change of value and thus has no need to synchronize with the daemon. In this case, the shared-memory block is used like the outfield scoreboard at a baseball game, simply transmitting the scores to anyone who wants to read them.<P>
+This is a simple example, but it presents two potentially nasty atomicity problems. The first is in initialization. The daemon process creates the shared-memory block, and the UI process attaches to it. There is a small window of time after the daemon makes the block when the values in the block will be uninitialized. In that time window, the daemon could be task-switched, and the UI could attach to the block and read the bogus values. <a href="#0171_000a">Figure 1</A> illustrates the problem. The second situation occurs whenever the UI reads or the daemon writes the block. Assume that one of our UPS values is a string. The daemon could be <I>strcpy</I>ing our string to the shared-memory block when the OS task switches to the UI, which then tries to use the half-completed string. Not a good situation. The same thing can be said in reverse; if the UI is halfway through <I>strcpy</I>ing the string to video memory and the daemon overwrites the string, you also get inconsistent data.<P>
+This is where semaphores come in. With the UPS example, a single semaphore could guard the block. On startup, the daemon would create the semaphore and set it. Then it would create and initialize the shared-memory block. Only after initialization would the daemon clear the semaphore. The UI would attach to the semaphore and always block, waiting for it to clear before reading the shared-memory block. Since the daemon would always set the sema-phore before beginning to write the block, the UI is guaranteed to never read a half-complete value. <a href="#0171_000b">Figure 2</A> shows how semaphore protection might work in this case.<P>
+<a href="#0171_000e">Table 1</A> and <a href="#0171_000f">Table 2</A> show the OS/2 and UnixWare shared-memory and semaphore APIs. As usual, under OS/2 there's a separate call for every step, while UNIX lumps a bunch of functionality into a catchall, <I>ioctl</I>-style <I>shmctl</I> call. OS/2 goes even further, by dividing semaphores into two types: mutual exclusion (such as the one in the previous example) and event (such as one that indicates that a print job has finished). UNIX also operates by default on a set of semaphores, making you jump through hoops to implement a single semaphore, while OS/2 assumes a single semaphore and makes you use different calls to operate on sets. I tend to agree with R.W. Stevens: In his book, <I>Advanced Programming in the UNIX Environment</I> (Addison-Wesley, 1992) he calls the SVR4 semaphore implementation &quot;unnecessarily complicated.&quot; Stevens goes so far as to suggest using file-record locking for simple semaphores. Listings Two and Three (page 107) show OS/2 and UnixWare implementations of a semaphore-protected, shared-memory initialization sequence.<P>
+<h3><a name="0171_0005">Anonymous Pipes<a name="0171_0005"></h3><P>
+Everyone knows that real comm programmers send messages, and if it's messages you're after, you have only two choices--pipes and queues. A pipe is a FIFO, and it comes in two flavors, named and anonymous, with two sizes, full and half duplex. The original pipe was a UNIX invention, and it came in only one flavor and size: anonymous, half-duplex. If you wanted full-duplex, you had to buy two half-duplexes. A call to <I>pipe</I> yielded one read and one write handle. The reading process used the read handle; the writing process, the write handle. If Process A wrote a message using the write handle, then read a message using the read handle, it would get back the message it just wrote. <a href="#0171_000c">Figure 3</A> is an example of a half-duplex pipe.<P>
+OS/2 anonymous pipes are always half-duplex. For Process A to talk to Process B via an anonymous pipe, Process A creates a pipe, getting a read and a write handle, then spawns Process (or thread) B, which inherits both of those handles. Process A then closes the read handle, while Process B closes the write handle. This leaves A with a valid write handle and B with a valid read handle. Closing the useless handle ensures that a process gets notified when the process on the other end of the pipe goes away. If B wants to talk to A, they have to open another pipe.<P>
+A full-duplex pipe is a two-way channel that makes the name &quot;pipe&quot; a bit of a misnomer because the content of a real-world pipe (like water) is always pumped in one direction at a time: half-duplex. In the UNIX world, half-duplex pipes were judged to be less than completely elegant, so as of SVR3.2, all pipes are full duplex (also known as &quot;anonymous-stream pipes&quot;). A call to <I>pipe</I> gives a handle to each end of a full-duplex pipe. Process A reads from and writes to the first handle, while Process B reads from and writes to the second handle. So a pipe shared by Processes A and B is more properly thought of as two pipes, one from A to B and one from B to A. <a href="#0171_000d">Figure 4</A> is an example of a full-duplex pipe.<P>
+In service, a pipe is sort of a cross between a serial port and a file. Like a file, you can generally choose how you want to read the data, binary or translated, whether you want a byte at a time or CR-LF delimited lines. Like a serial port, you can never read what you write (unless you're abusing a half-duplex pipe), and read data always comes at you in FIFO order. You can open it as a byte-stream (raw mode) or as a message stream (cooked mode). You can also end up blocking on the open if there's no process on the other end, on the read if there's no data available, on the write if the pipe's full, and on the close if there's still data flowing.<P>
+<h3><a name="0171_0006">Named Pipes<a name="0171_0006"></h3><P>
+Named pipes are exactly that: IPC channels that are referred to by name and can thus have unrelated processes on either end. OS/2 has a single, fairly simple named-pipe API that provides full-duplex IPC channels.<P>
+On the other hand, if you plow into the UnixWare doc looking for named pipes, you will be disappointed. UnixWare actually has two forms of named pipe: FIFOs and named-stream pipes. With FIFOs, data always gets read in the order in which it was written. But FIFOs are also files in that they actually exist within the file system and can be seen with a simple directory listing. The file I/O functions (open, close, read, write, and so on) work on them. You create a FIFO by calling <I>mkfifo</I> or using the <I>creat </I>system call with the FIFO_MODE bit set. FIFOs have one big drawback--they are only half-duplex.<P>
+If you want full-duplex named pipes, you need to use named-stream pipes. Named-stream pipes are even more difficult to find in the doc than FIFOs (try <I>streams(7), </I>or just read Stevens). This is mostly because they're implemented by combining two other facilities: FIFOs and anonymous-stream pipes. On the server end, you create a FIFO and an anonymous-stream pipe, push the streams module connld onto the stream, then use <I>fattach </I>to attach the FIFO name to the anonymous-stream pipe. Voil! The anonymous-stream pipe now has a name. The tricky part is that the file descriptor the server uses for reading and writing is neither the original anonymous-stream pipe descriptor nor one gotten from opening the FIFO, but one received via the <I>ioctl </I>call I_RECVFD. The client end is easy: Simply open the FIFO and read and write it as if it were an anonymous-stream pipe. If it all sounds a little convoluted, well, it's not that bad. Nmpipe.c is a named-pipes demo program (available electronically) for a client and server exchanging messages over a named-stream pipe. <a href="#0171_0010">Table 3</A> and <a href="#0171_0011">Table 4</A> list the calls in the OS/2 and UnixWare pipe APIs.<P>
+If you need to send a byte stream, named or anonymous pipes are the only IPC choices you have. This is why the classic pipe examples always involve <I>dup</I>ing standard input and output. In fact, a good application for named pipes is in a multiuser game, where the users all sit there bashing the arrow keys to move their game pieces around and shoot at each other. There's a single, global game process and a UI process for each user. Each UI opens a pipe to the game process. The UI sends the user's keystrokes to the game process over the pipe and receives all the other user's moves from the game process over the same pipe. (Someone at Microsoft wrote a great, multiuser tank game for LAN Manager that used networked named pipes in this fashion.)<P>
+<h3><a name="0171_0007">The Other End<a name="0171_0007"></h3><P>
+Unlike all the other forms of IPC, pipes are true process-to-process connections, so they pay close attention to the status of the processes on both ends of the conversation. Depending on what the processes are doing, something happening on one end of the pipe can result in a signal (SIG_PIPE), an error return, or blocking on the other end.<P>
+<h3><a name="0171_0008">Queues, Multiplexing, and More<a name="0171_0008"></h3><P>
+Now that Windows has conquered the world, message queues are a painfully familiar topic, but the Windows message queue is actually a good example of when to use a queue:<P>
+<UL>
+<li>All the events have to be received (forget about mouse moves for now). It wouldn't do to miss any mouse clicks. In the UPS example, all the data-value changes didn't have to be processed by the UI.</li>
+<li>The order of events must be maintained. When you double click on an icon, the double-click message has to come after the mouse move that took the mouse to the icon. In the UPS example, the user doesn't care if the value for line voltage was received before the value for load.</li>
+<li>The event can be described with a small amount of data of fixed size. Most Windows messages try to put the event data into the fixed-size message. When the data won't fit, Windows uses a pointer.</li>
+</UL>
+There is an important difference between OS/2 and UNIX queues. UNIX queues can hold a configurable maximum total number of bytes in the queue, so you can copy variably sized messages directly into the queue, while OS/2 queues operate strictly on 32-bit data values. Big deal, you say; just use pointers. Pointers to what, though? Say Processes A and B are unrelated and trying to communicate 10-byte messages via a queue. A passes B a pointer to a 10-byte section of memory. Unless that pointer points to shared memory, B will GP fault trying to read it. QSHMEM.C (available electronically) is an OS/2 program that uses queues and shared memory to pass greater than 32-bit messages.<P>
+OS/2 queues allow you to choose either FIFO, LIFO, or priority ordering of elements. You set the read order when you create the queue, and it can't be changed. UNIX approaches read ordering a little differently. You create the queue without specifying a read order. You specify (and can change) the read order with each call to read. You can read either the first message or the first message that has a particular integer id attached to it. By using the target process's pid as the integer id, you can then use the queue as a two-way, full-duplex FIFO channel. <a href="#0171_0012">Table 5</A> and <a href="#0171_0013">Table 6</A> show the UNIX and OS/2 queue APIs.<P>
+In many cases, you'll want to set up a single process that serves a number of blocking IPC channels. UnixWare includes the ability to operate on multiple I/O handles (not just pipes) via the <I>poll</I> and <I>select </I>calls. Under OS/2, you have to attach a semaphore to each pipe or queue, then create a multiplexed semaphore containing all the individual semaphores. QSHNMEM.C uses OS/2 multiplexed semaphores to implement a single process servicing multiple queues.<P>
+UNIX strives to preserve a consistent approach to all system resources, whether they be files, devices, or IPC channels. Thus, with all four forms of UnixWare IPC, you have to pay careful attention to the read/write permissions (execute mostly doesn't apply) for owner, group, and public the same way you do for files. Along with permissions you also have to be aware of the effective user id of the processes. In OS/2, permissions are generally binary: Other processes either can access the resource or they can't, with no gray areas.<P>
+I've ignored signals to this point. Under UnixWare, they provide a significantly different IPC model whereby you can register a function to be called when an event occurs, then &quot;send&quot; that event from within an unrelated process. They suffer from serious restrictions, however. No information is passed with the signal, and the number of user-defined signals is severely limited. Also, if a process is in a blocking system call when a signal arrives, the system call will generally return an error that must be explicitly ignored. OS/2 uses the signaling model for handling exceptions like Ctrl-C, but does not provide for user-defined signals.<P>
+Under UnixWare and OS/2, several other forms of IPC are also available. These include OLE, DDE (which is built on shared memory, anyway), and the messaging APIs of the Motif and Presentation Manager GUIs. Both also support network-socket APIs; UnixWare, of course, comes bundled with the NetWare networking APIs.<P>
+<h3><a name="0171_0009">Conclusion<a name="0171_0009"></h3><P>
+Like almost everything else, IPC is not portable between OS/2 and UnixWare. However, though the implementation details differ greatly, the two systems do share certain ways of thinking about IPC. They try to cover the same functionality, and almost any style of IPC you implement in one can usually be replicated in the other.<P>
+<h4><a name="0171_000a"><B>Figure 1:</B> Unprotected shared-memory initialization.<a name="0171_000a"></h4><P>
+<pre>
+Time slice     Daemon process             User-interface process
+------------------------------------------------------------------------
+1              --                         Loop waiting for shared memory
+                                            to appear.
+2              Create uninitialized       --
+                 shared memory.
+3              --                         Read shared memory.
+4              Initialize shared memory.  --
+5              --                         Display bogus values from
+                                            uninitialized shared memory.
+</pre><P>
+<h4><a name="0171_000b"><B>Figure 2:</B> Shared-memory initialization protected by a semaphore.<a name="0171_000b"></h4><P>
+<pre>
+Time      Daemon process             User-interface process
+slice
+--------------------------------------------------------------------------
+1         --                         Loop waiting for semaphore to appear.
+2         Create and set semaphore.  --
+3         --                         Block waiting for semaphore to clear.
+4         Create uninitialized       --
+            shared memory.     
+5         --                         Block...
+6         Initialize shared memory.  --
+7         --                         Block...
+8         Clear semaphore.           --
+9         --                         Unblock now that semaphore is
+                                      clear; read shared-memory block
+                                      and display initialized values.
+
+</pre><P>
+<h4><a name="0171_000c"><B>Figure 3:</B> A half-duplex pipe.<a name="0171_000c"></h4><P>
+<pre>
+After call:
+     <I>pipe(fd);</I>
+fd(1)=                      fd(0)=
+write handle                read handle
+
+write handle    ----&gt;    read handle
+
+</pre><P>
+<h4><a name="0171_000d"><B>Figure 4:</B> A full-duplex pipe.<a name="0171_000d"></h4><P>
+<pre>
+After call:
+     <I>pipe(fd);</I>
+
+fd(0)=server read/write handle
+fd(1)=client read/write handle
+
+     Server                    Client
+   write/write     -----&gt;    read/write
+     handle        &lt;-----      handle
+</pre><P>
+<h4><a name="0171_000e"><B>Table 1: </B>(a) OS/2 shared-memory API; (b) OS/2 semaphore API.<a name="0171_000e"></h4><P>
+<pre>
+Function               Description
+-------------------------------------------------------------
+<b>(a)</b>
+<I>DosAllocSharedMem</I>      Create shared memory.
+<I>DosFreeMem</I>             Destroy shared memory.
+<I>DosGetNamedSharedMem</I>   Attach to named shared memory.
+<I>DosGetSharedMem     </I>   Attach to unnamed shared memory.
+<I>DosGiveSharedMem     </I>  Give access to unnamed shared memory.
+
+<b>(b)</b>
+<I>DosCloseEventSem</I>       Destroy event semaphore.
+<I>DosCreateEventSem</I>      Create event semaphore.
+<I>DosOpenEventSem</I>        Attach to event semaphore.
+<I>DosPostEventSem</I>        Trigger an event.
+<I>DosQueryEventSem</I>       Query event sem status.
+<I>DosResetEventSem</I>       Clear an event from semaphore.
+<I>DosWaitEventSem</I>        Block waiting for event trigger.
+<I>DosCloseMutexSem</I>       Destroy a mutual exclusion semaphore.
+<I>DosCreateMutexSem</I>      Create mutex semaphore.
+<I>DosOpenMutexSem</I>        Attach to mutex semaphore.
+<I>DosQueryMutexSem</I>       Check status of mutex semaphore.
+<I>DosReleaseMutexSem</I>     Clear mutex semaphore.
+<I>DosRequestMutexSem</I>     Wait for semaphore to clear, then set it.
+<I>DosAddMuxWaitSem</I>       Add a semaphore to semaphore set on the fly.
+<I>DosCloseMuxWaitSem</I>     Destroy the semaphore set.
+<I>DosCreateMuxWaitSem</I>    Create semaphore set.
+<I>DosDeleteMuxWaitSem</I>    Delete a semaphore from semaphore set on the fly.
+<I>DosOpenMuxWaitSem</I>      Attach to existing semaphore set.
+<I>DosQueryMuxWaitSem</I>     Check semaphore's status.
+</pre><P>
+<h4><a name="0171_000f"><B>Table 2:</B> (a) UnixWare shared-memory API; (b) UnixWare semaphore API.<a name="0171_000f"></h4><P>
+<pre>
+Function     Description
+-------------------------------------------
+<b>(a)</b>
+<I>shmget</I>       Create shared memory.
+<I>shmctl</I>       Destroy shared memory.
+<I>shmat</I>        Attach to existing shared memory.
+<I>shmdt</I>        Detach from shared memory.
+
+<b>(b)</b>
+<I>semget</I>       Create a semaphore set.
+<I>semctl</I>       Destroy a semaphore set, get and set semaphore values.
+</pre><P>
+<h4><a name="0171_0010"><B>Table 3:</B> OS/2 pipe API.<a name="0171_0010"></h4><P>
+<pre>
+Function                  Description
+--------------------------------------------------------------------------------------
+<I>DosCallNPipe</I>              Does a transact and a close. See <I>DosTransact</I> and
+                             <I>DosClose</I>.
+<I>DosConnectNPipe</I>           Put server end of pipe into listen mode. Blocks until client
+                             end calls <I>DosOpen</I>.
+<I>DosCreateNPipe</I>            Make a named pipe.
+<I>DosDisConnectNPipe</I>        Server acknowledges client calling <I>DosClose</I>.
+<I>DosPeekNPipe</I>              See if anything's in the pipe.
+<I>DosQueryNPipeHState</I>       See if pipe's listening, connected, closed.
+<I>DosQueryNPipeInfo</I>         Check pipe parameters.
+<I>DosQueryNPipeSemState</I>     Check on the semaphore attached to this pipe.
+<I>DosSetNPHState</I>            Change blocking and read modes.
+<I>DosSetNPipeSem</I>            Attach a semaphore to a pipe.
+<I>DosTransactNPipe</I>          Write a message and read a response.
+<I>DosWaitNPipe</I>              Wait for named pipe to be created.
+<I>DosClose</I>                  Close the pipe.
+<I>DosCreatePipe</I>             Create anonymous pipe.
+<I>DosOpen</I>                   Open a pipe.
+<I>DosRead</I>                   Read a pipe.
+<I>DosWrite</I>                  Write a pipe.
+
+</pre><P>
+<h4><a name="0171_0011"><B>Table 4: </B>UnixWare pipe API.<a name="0171_0011"></h4><P>
+<pre>
+Function     Description
+---------------------------------------------------------------------------------
+<I>pipe</I>         Create anonymous stream pipe.
+<I>popen</I>        <I>Exec</I> a process and create a new anonymous stream pipe and attach it
+              to process's <I>stdin</I> and <I>stdout</I>.
+<I>pclose</I>       Close a pipe.
+<I>ioctl</I>        Used to push <I>connld</I> onto named pipe stream and to receive named pipe
+              file descriptor. See I_PUSH and I_RCVFD.
+<I>fattach</I>      Attach file system name to stream.
+<I>creat</I>        Create a FIFO (set FIFO_MODE).
+<I>mkfifo</I>       Create a FIFO.
+
+</pre><P>
+<h4><a name="0171_0012"><B>Table 5:</B> OS/2 queue API.<a name="0171_0012"></h4><P>
+<pre>
+Function            Description
+------------------------------------------------
+<I>DosCloseQueue</I>       Destroy a queue.
+<I>DosCreateQueue</I>      Create a queue.
+<I>DosOpenQueue</I>        Attach to an existing queue.
+<I>DosPeekQueue</I>        See what's in the queue.
+<I>DosPurgeQueue</I>       Clean out the queue.
+<I>DosReadQueue</I>        Take a message off the queue.
+<I>DosWriteQueue</I>       Put a message into the queue.
+
+</pre><P>
+<h4><a name="0171_0013"><B>Table 6: </B>UnixWare queue API.<a name="0171_0013"></h4><P>
+<pre>
+Function     Description
+---------------------------------------------------------------
+<I>msgget</I>       Create a new queue or attach to an existing queue.
+<I>msgctl</I>       Destroy the queue.
+<I>msgsnd</I>       Send a message.
+<I>msgrcv</I>       Take a message off the queue.
+
+</pre><P>
+
+<h4><a name="0171_0014"><a name="0171_0015"><B>[LISTING ONE]</B></H4>
+
+<PRE>
+
+
+main( int argc, char *argv[] )
+{
+    /* The Unix integer id for a message queue. */
+    int msgqid;
+    /* Since argv[0] is the name of this executable file
+       it is guaranteed to be a valid filename. */
+    msgkey = ftok( argv[0], 'A' );
+    ....
+
+
+</PRE>
+
+<h4><a name="0171_0016"><a name="0171_0017"><B>[LISTING TWO]</B></H4>
+
+<PRE>
+
+
+// SEMSHMEM.C - An OS/2 demonstration of a semaphore protected shared
+//   memory initialization sequence.
+//   Startup two command line windows. Run: SEMSHMEM -c to start the
+//   client and SEMSHMEM -s to start the server. You can see what each is
+//   doing by the printouts. The server will change the value at the base
+//   of shared memory 20 times and then exit.
+
+#define INCL_BASE
+#define INCL_DOSPROCESS
+#include &lt;os2.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;stdlib.h&gt;
+
+#define SHAREMEM_SIZE 100       // Size of shared memory
+PSZ szShareMem = &quot;\\SHAREMEM\\QSRV&quot;;    // Name of shared memory
+char *pShareMem;            // Pointer to base of shared memory
+INT *pint;      // Another pointer to base of shared mem.
+
+PSZ szSem = &quot;\\SEM32\\QSRV&quot;;        // Name of our mutex semaphore
+HMTX hMutexSem;             // Handle to our mutex semaphore
+
+PID srvPid, mypid;
+int i, j;
+APIRET rc;
+PTIB ptib;  // Thread info block
+PPIB ppib;  // Process info block
+
+int DoClient( void );
+int DoServer( void );
+
+// main - decide which process we are by the command line, then run
+//  either the client or server function.
+int main( int argc, char *argv[] )
+{
+DosGetInfoBlocks( &amp;ptib, &amp;ppib );
+mypid = ppib-&gt;pib_ulpid;
+if( strcmp( argv[1], &quot;-c&quot; ) == 0 )
+    DoClient();
+else
+    DoServer();
+return( 0 );
+}
+// DoClient - Attach to the shared memory block, then to the mutex
+//  semaphore guarding the block.  Block waiting on the semaphore
+//  until the server has initialized the shared memory.
+int DoClient()
+{
+    printf( &quot;Started client process %lu.\n&quot;, mypid );
+    for( i = 0; i &lt;= 30; i++ )
+        {
+        if( i == 30 )
+            {
+            printf( &quot;Client attach error %d\n&quot;, rc );
+            goto AttachError;
+            }
+        if(( rc = DosGetNamedSharedMem( (PVOID *)&amp;pShareMem,
+                                       szShareMem, PAG_READ|PAG_WRITE )) == 0 )
+            break;
+        else
+            DosSleep( 1000L );
+        }
+    printf( &quot;Opened shared memory %p!\n&quot;, pShareMem );
+    if(( rc = DosOpenMutexSem( szSem, &amp;hMutexSem )) != 0 )
+        {
+        printf( &quot;Client couldn't open semaphore\n&quot; );
+        goto OpenError;
+        }
+    printf( &quot;Opened semaphore: waiting for clear\n&quot; );
+    // Wait 90 seconds for the semaphore to clear
+    if(( rc = DosRequestMutexSem( hMutexSem, 90000L )) != 0 )
+        {
+        printf( &quot;Client sem request failed!\n&quot; );
+        goto RequestError;
+        }
+
+    printf( &quot;Semaphore cleared!\n&quot; );
+
+    pint = (INT *)pShareMem;
+    for( i = 0; i &lt; 20; i++ )
+        {
+        printf( &quot;Client read value %d\n&quot;, *pint );
+        DosSleep( 1000L );
+        }
+RequestError:
+    DosCloseMutexSem( hMutexSem );
+OpenError:
+    DosFreeMem( pShareMem );
+AttachError:
+return( 1 );
+}
+// DoServer - Create a semaphore to guard the block while it's being
+//  initialized, then create the shared memory block. Client waits to see the
+//  shared memory block, so create and set the semaphore first. Then sit
+//  twiddling the value at the base of shared memory for awhile.
+int DoServer()
+{
+    printf( &quot;Server alloced share mem at %p\n&quot;, pShareMem );
+    if(( rc = DosCreateMutexSem( szSem, &amp;hMutexSem, 0, TRUE )) != 0 )
+        {
+        printf( &quot;Server create semaphore error %d\n&quot;, rc );
+        goto CreateError;
+        }
+    printf( &quot;Started server process %lu.\n&quot;, mypid );
+    if(( rc = DosAllocSharedMem( (PVOID *)&amp;pShareMem, szShareMem, SHAREMEM_SIZE, PAG_READ|PAG_WRITE|PAG_COMMIT )) != 0 )
+        {
+        printf( &quot;Server alloc failed %d\n&quot;, rc );
+        goto AllocError;
+        }
+    memset( pShareMem, '\0', SHAREMEM_SIZE );
+    printf( &quot;Server initializing shared memory ...\n&quot; );
+    DosSleep( 10000L );
+    DosReleaseMutexSem( hMutexSem );
+    pint = (INT *)pShareMem;
+    for( i = 0; i &lt; 20; i++ )
+        {
+        (*pint)++;
+        printf( &quot;Server changed value to %d\n&quot;, *pint );
+        DosSleep( 1000L );
+        }
+    DosCloseMutexSem( hMutexSem );
+AllocError:
+    DosFreeMem( pShareMem );
+CreateError:
+    return( rc );
+}
+
+</PRE>
+
+<h4><a name="0171_0018"><a name="0171_0019"><B>[LISTING THREE]</B></H4>
+
+<PRE>
+
+
+/* semshmem.c - A UnixWare demonstration of a semaphore guarding a shared
+     memory block initialization sequence. Run: semshmem -c for the client
+     process and semshmem -s for the server. Run them in separate shell
+     windows and you can see from the printouts how client waits on semaphore.
+*/
+
+#include &lt;errno.h&gt;
+#include &lt;ctype.h&gt;
+#include &lt;time.h&gt;
+#include &lt;memory.h&gt;
+#include &lt;sys/types.h&gt;
+#include &lt;sys/ipc.h&gt;
+#include &lt;sys/shm.h&gt;
+#include &lt;sys/sem.h&gt;
+
+int shmkey; /* Shared memory integer id. */
+int shmid;  /* Shared memory's instance id. */
+char *shmptr;   /* Base of shared mem. */
+int *pint;  /* Both processes use this as integer at base of shared mem. */
+
+int semkey; /* Semaphore integer id. */
+int semid;  /* Semaphore's instance id. */
+struct sembuf semoparray[1];    /* Used for semaphore operations */
+
+#define SHAREMEM_SIZE 100
+#define MAXREPS 20
+#define SEM_INDEX 0 /* This is our index in the semaphore array */
+union semun {
+    int val;
+    struct semid_ds *buf;
+    ushort *array;
+    };
+union semun us; /* Used for semaphore semop() calls */
+
+/* main - Construct semaphore and shared memory keys and call the client or
+        server process based on command line argv[1] */
+void main( int argc, char *argv[] )
+{
+    /* Create the shared memory id */
+    if(( shmkey = ftok( argv[0], 'A' )) &lt; 0 )
+        {
+        printf( &quot;ftok error\n&quot; );
+        goto error;
+        }
+    /* Create the shared memory id */
+    if(( semkey = ftok( argv[0], 'S' )) &lt; 0 )
+        {
+        printf( &quot;ftok error\n&quot; );
+        goto error;
+        }
+    if( strcmp( argv[1], &quot;-c&quot; ) == 0 )
+        DoClient();
+    else
+        DoServer();
+error:
+exit( 0 );
+}
+/* DoClient - Attach to the existing shared memory segment, then sit in a loop
+    incrementing the integer at the base of the shared memory.  */
+int DoClient()
+{
+int rc = 0;
+int i;
+    printf( &quot;Waiting for semaphore create ...\n&quot; );
+    for( i = 0; i &lt;= 30; i++ )
+        {
+        if( i == 30 )
+            {
+            printf( &quot;timed out waiting for semaphore create\n&quot; );
+            goto error;
+            }
+        /* Create the semaphore */
+        if(( semid = semget( semkey, 0, 0 )) &lt; 0 )
+            {
+            printf( &quot;waiting for semaphore create ...\n&quot; );
+            sleep( 5 );
+            }
+        else
+            {
+            printf( &quot;got semid = %d\n&quot;, semid );
+            sleep( 5 );
+            break;
+            }
+        }
+    printf( &quot;Waiting for semaphore to clear ...\n&quot; );
+    us.val = 1;
+    printf( &quot;Setting semaphore\n&quot; );
+    semoparray[SEM_INDEX].sem_num = SEM_INDEX;
+    semoparray[SEM_INDEX].sem_op = -1;
+    semoparray[SEM_INDEX].sem_flg = SEM_UNDO;
+    if( semop( semid, semoparray, 1 ) &lt; 0 )
+        {
+        printf( &quot;Can't set semaphore!\n&quot; );
+        goto error;
+        }
+    printf( &quot;Semaphore cleared!\n&quot; );
+    /* Find the shared memory segment. */
+    if(( shmid = shmget( shmkey, SHAREMEM_SIZE, IPC_ALLOC )) &lt; 0 )
+        {
+        printf( &quot;shmget error\n&quot; );
+        goto error;
+        }
+    /* Get a pointer to the shared memory block */
+    if(( shmptr = shmat( shmid, 0, 0 )) == (void *)-1)
+        {
+        printf( &quot;shmat error\n&quot; );
+        goto error;
+        }
+    pint = (int *)shmptr;
+    /* Sit in a loop changing the string */
+    for( i = 0; i &lt; MAXREPS; i++ )
+        {
+        printf( &quot;Int is now %d.\n&quot;, *pint );
+        sleep( 1 );
+        }
+    shmdt( shmptr );
+error:
+    return( rc );
+}
+/* DoServer - Create a shared memory block, then sit in a loop changing the
+     integer value at base of shared memory block. Presumably, client process
+     is reading this value. Compare the printfs the two processes do.  */
+int DoServer()
+{
+int rc = 0;
+int i;
+struct shmid_ds dummy;
+    printf( &quot;Creating semaphore\n&quot; );
+    /* Create the semaphore */
+    if(( semid = semget( semkey, 1, IPC_ALLOC )) &gt;= 0 )
+        {
+        printf( &quot;Already existed, removing!\n&quot; );
+        semctl( semid, IPC_RMID, 0 );
+        }
+    /* Create the semaphore */
+    if(( semid = semget( semkey, 1, IPC_CREAT|0666 )) &lt; 0 )
+        {
+        printf( &quot;semget error\n&quot; );
+        goto error;
+        }
+    /* Set the semaphore to available. */
+    printf( &quot;Setting semaphore\n&quot; );
+    us.val = 1;
+    if( semctl( semid, SEM_INDEX, SETVAL, us ) &lt; 0 )
+        {
+        printf( &quot;semctl setval error %d\n&quot;, errno );
+        goto error;
+        }
+    /* Now claim the semaphore by setting it to 0 through semop. */
+    semoparray[SEM_INDEX].sem_num = SEM_INDEX;
+    semoparray[SEM_INDEX].sem_op = -1;
+    semoparray[SEM_INDEX].sem_flg = SEM_UNDO;
+    if( semop( semid, semoparray, 1 ) &lt; 0 )
+        {
+        printf( &quot;Can't set semaphore!\n&quot; );
+        goto error;
+        }
+    printf( &quot;Semaphore is now set.\n&quot; );
+    /* Create the shared memory segment. */
+    if(( shmid = shmget( shmkey, SHAREMEM_SIZE, IPC_ALLOC )) &gt;= 0 )
+        {
+        shmctl( shmid, IPC_RMID, &amp;dummy );
+        printf( &quot;Already existed!\n&quot; );
+        }
+    /* Create the shared memory segment, and give everyone access to it. */
+    if(( shmid = shmget( shmkey, SHAREMEM_SIZE, IPC_CREAT|0666 )) &lt; 0 )
+        {
+        printf( &quot;shmget error\n&quot; );
+        goto error;
+        }
+    /* Get a pointer to the shared memory block */
+    if(( shmptr = shmat( shmid, 0, 0 )) == (void *)-1)
+        {
+        printf( &quot;shmat error\n&quot; );
+        goto error;
+        }
+    pint = (int *)shmptr;
+    /* Fill the block with a non-zero value */
+    memset( shmptr, 6, SHAREMEM_SIZE );
+    /* Sleep for 20 seconds so we can visually see client blocking waiting
+           on the semaphore, and both waking up when sem is cleared. */
+    sleep( 20 );
+    /* Clear the semaphore so the client can start reading the block */
+    semoparray[SEM_INDEX].sem_num = SEM_INDEX;
+    semoparray[SEM_INDEX].sem_op = 1;
+    semoparray[SEM_INDEX].sem_flg = SEM_UNDO;
+    if( semop( semid, semoparray, 1 ) &lt; 0 )
+        {
+        printf( &quot;Can't set semaphore!\n&quot; );
+        goto error;
+        }
+    printf( &quot;Semaphore is now clear.\n&quot; );
+    /* Sit in a loop sleeping, then incrementing the integer at the
+       base of the shared memory block */
+    for( i = 0; i &lt; MAXREPS; i++ )
+        {
+        (*pint)++;
+        printf( &quot;Int changed to %d\n&quot;, *pint );
+        sleep( 1 );
+        }
+    sleep( 5 );
+    shmdt( shmptr );
+    /* Destroy the shared memory block */
+    if( shmctl( shmid, IPC_RMID, 0 ) &lt; 0 )
+        printf( &quot;shmctl(RMID) error\n&quot; );
+    semctl( semid, IPC_RMID, 0 );
+error:
+    return( rc );
+}
+
+</pre><HR><P>Copyright &copy; 1994, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

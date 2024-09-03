@@ -1,0 +1,699 @@
+<html>
+<head>
+<title>Threading and .NET</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> July 2006</p>
+
+<h1>Threading and .NET</h1>
+<h2>Better support for basic threading operations</h2>
+
+
+<h3>by Michael Taylor</h3>
+
+<I>Michael is a senior software developer working with .NET. Michael can be reached at  taylormichaell@yahoo.com.</I>
+
+<hr>
+
+
+
+
+<p>Even though threading has been around a long time, many developers still struggle with writing multithreaded code. A quick scan of the Microsoft forums, for instance, reveals that developers are constantly struggling with multithreading issues, even with the advances in .NET. There are already many articles written about writing thread-safe code, including how to use the Thread and ThreadPool classes, how to pass data between threads, and how and why to synchronize access to shared data.  </p>
+
+<p>In this article, I focus on areas that are lacking&#151;pausing/resuming threads, communicating with UI components, and canceling threads. These operations are usually required by apps, but aren't always easy to write. Granted, there are already methods in the <i>Thread</i> class to support these operations, but they should be avoided.  </p>
+
+<p>The code I present here includes a framework that you can use to provide additional threading capabilities as they are described in this article. The complete source code for the framework, which was written for the .NET Framework 2.0 but can be modified to work with 1.x, is available at <a href="http://www.ddj.com/code/" target="_blank">http://www.ddj.com/code/</a>. I also include a test application to test the threading capabilities. Finally, the framework can be extended to include new functionality if needed. </p>
+
+
+<h3>Work Items</h3>
+
+<p>A "work item" is the logic that runs in a separate thread. A work item may or may not support canceling and pausing. Pausing and canceling work items require careful handshaking between the thread running the work item and any shared resources used by the work item. Therefore, by default, a work item supports neither. In the framework I present here, the <i>WorkItem</i> class (Listing One) represents a work item. To support canceling or pausing, a class deriving from <i>WorkItem</i> must be created.</p>
+
+<pre class="code" style="height:250px"> 
+namespace DDJ.Threading
+{	
+	// Represents work that is done in a secondary thread.
+	public class WorkItem
+	{
+		//Constructors
+		protected WorkItem ( )
+		{ /* Do nothing */ }
+
+		public WorkItem ( ThreadStart workDelegate )
+		{
+			m_WorkDelegate = workDelegate;
+		}
+
+		//Public Members
+
+		// The default is false.
+		public virtual bool CanCancel
+		{
+			get { return false; }
+		}
+
+		// The default is false.
+		public virtual bool CanPause
+		{
+			get { return false; }
+		}
+
+		//Protected Members
+		protected internal WorkItemThread InnerThread
+		{
+			get { return m_Thread; }
+		}
+
+		// If the thread is paused then this method will block.
+		protected bool CheckState ( )
+		{
+			return (InnerThread != null) ? InnerThread.CheckState() 
+					: false;
+		}
+
+		// The base class calls the method specified by the work
+		// delegate passed to the constructor.		
+		protected virtual void DoWorkBase ( )
+		{
+			if (m_WorkDelegate != null)
+				m_WorkDelegate();			
+		}
+
+		//Internal Members
+		internal void DoWork ( )
+		{			
+			DoWorkBase();
+		}
+
+		internal void SetThread ( WorkItemThread thread )
+		{
+			m_Thread = thread;
+		}
+		
+		//Private Data
+		private ThreadStart m_WorkDelegate;
+		private WorkItemThread m_Thread;
+	}
+}
+</pre>
+<div class="caption">
+  Listing One
+</div>	
+
+<p>Work items do not manage the state of the thread upon which they are currently running. Other than checking the state of the thread periodically, a work item is only interested in completing its work. The <i>WorkItemThread</i> (Listing Two) manages the state of the work item's thread and is responsible for handling state change requests. <i>WorkItemThread</i> uses the associated work item to determine whether a request is supported. In return, <i>WorkItem</i> uses the associated work item thread to determine if it is okay to execute.</p>
+
+<pre class="code" style="height:250px"> 
+namespace DDJ.Threading
+{
+	//Represents a logical thread executing a WorkItem object.
+	public sealed class WorkItemThread
+	{
+		// Constructors
+				
+		static WorkItemThread ( )
+		{
+			//Initializes the state machine used to control state
+		}
+
+		internal WorkItemThread ( WorkItem item )
+		{
+			m_Item = item;
+		}
+
+		// Public Members
+
+		// Occurs after the state of the thread changes.
+		public event EventHandler StateChanged;
+
+		public bool CanCancel
+		{
+			get { return m_Item.CanCancel; }
+		}
+
+		public bool CanPause
+		{
+			get { return m_Item.CanPause; }
+		}
+
+		public WorkItem Item
+		{
+			get { return m_Item; }
+		}
+
+		public WorkItemThreadState State
+		{
+			get { return m_State; }
+		}
+
+		// The method does not wait for the work item to be cancelled.
+		public void Cancel ( )
+		{
+			//Check
+			if (!CanCancel)
+				throw new NotSupportedException("Cancel is not supported.");
+
+			//Move to the appropriate state
+			SetState(WorkItemThreadState.Cancelling);
+		}
+
+		// If the work item is already paused then nothing happens.
+		// The method does not wait for the work item to pause.
+		public void Pause ( )
+		{
+			//Check
+			if (!CanPause)
+				throw new NotSupportedException("Pause is not supported.");
+
+			SetState(WorkItemThreadState.Pausing);
+		}
+
+		// If the work item is not paused then nothing happens.
+		// The method does not wait for the work item to resume.
+		public void Resume ( )
+		{
+			SetState(WorkItemThreadState.Resuming);
+		}
+
+		// Terminating a work item may cause a resource leak or deadlock
+		// depending on what the work item was doing when the thread was
+		// terminated.  Use this method only in extreme circumstances.
+		// The method does not wait for the work item to be terminated.
+		public void Terminate ( )
+		{
+			SetState(WorkItemThreadState.Terminating);
+		}
+
+		// Internal Members
+
+		// This is a blocking call if the thread is paused.
+		internal bool CheckState ( )
+		{
+			//State machine so we may transition between states			
+			while (true)
+			{
+				switch (m_State)
+				{
+					case WorkItemThreadState.Cancelling: 
+						SetState(WorkItemThreadState.Cancelled); break;
+
+					case WorkItemThreadState.Resuming: 
+						SetState(WorkItemThreadState.Running); break;
+
+					case WorkItemThreadState.Running: return true;
+
+					case WorkItemThreadState.Paused:
+					{
+						//Block until we aren't paused anymore
+						m_evtStateChanged.WaitOne();
+						break;
+					};
+					case WorkItemThreadState.Pausing: 
+						SetState(WorkItemThreadState.Paused); break;
+
+					case WorkItemThreadState.Cancelled:
+					case WorkItemThreadState.Finished:
+					case WorkItemThreadState.Terminated: return false;
+						
+					case WorkItemThreadState.Terminating: 
+						SetState(WorkItemThreadState.Terminated); break;					
+				};
+			};
+		}
+
+		// Thread routine
+		internal void DoWork ( )
+		{
+			//Check the state of the thread first
+			if (!CheckState())
+				return;
+
+			try
+			{
+				m_Item.DoWork();
+			} catch (ThreadAbortException)
+			{
+				SetState(WorkItemThreadState.Terminated);
+			};
+
+			//Done
+			if (CheckState())
+				SetState(WorkItemThreadState.Finished);
+
+			//Clear the work item's thread so it can be reused
+			m_Item.SetThread(null);
+		}
+
+		// Private Members
+
+		#region Methods
+
+		//State must be locked already
+		private bool MoveToState ( WorkItemThreadState newState )
+		{
+			//Is the transition valid?
+			switch (m_StateMachine[(int)m_State, (int)newState])
+			{
+				case StateChangeAction.Error: 
+					throw new InvalidOperationException(
+						String.Concat("Unable to move from ", 
+							m_State.ToString(), " to ", 
+							newState.ToString()));					
+				case StateChangeAction.Ignore: return false;
+				case StateChangeAction.Success: 
+					m_State = newState; return true;				
+			};
+
+			return false;
+		}
+
+		private void OnStateChanged ( )
+		{
+			EventHandler hdlr = StateChanged;
+			if (hdlr != null)
+				hdlr(this, EventArgs.Empty);
+		}
+
+		private void SetState ( WorkItemThreadState newState )
+		{
+			//Quick check, if the states are equal then forget it
+			if (m_State == newState)
+				return;
+
+			//Lock the state flag temporarily
+			bool bChanged = false;
+			lock(m_lckState)
+			{
+				//Check again as the state may have changed
+				if (m_State == newState)
+					return;
+
+				//Move to the new state
+				bChanged = MoveToState(newState);
+			};
+
+			//If the state changed then notify anybody who cares
+			if (bChanged)
+			{
+				OnStateChanged();
+				m_evtStateChanged.Set();
+			};
+		}
+		#region Data
+
+		private WorkItem m_Item;
+
+		//State management
+		private WorkItemThreadState m_State;
+		private AutoResetEvent m_evtStateChanged = new AutoResetEvent(false);
+
+		//Simple state machine
+		private static StateChangeAction[,] m_StateMachine;
+		#endregion
+	}
+}
+</pre>
+<div class="caption">
+  Listing Two
+</div>	
+
+
+
+
+
+
+
+<h3>Work Item States</h3>
+
+<p>The <i>CheckState()</i> method on <i>WorkItemThread</i> determines the current state of the thread. Table 1 lists the supported states of a work item thread. <i>CheckState()</i> is called by a work item periodically during execution to check the state. For now, assume that the method looks at the current state of the thread and handles any state change requests by transitioning into the appropriate state. <i>CheckState()</i> returns a <i>true</i> value if the work item should continue, or a <i>false</i> value if it should terminate. Only <i>Canceled</i>, <i>Terminated,</i> and <i>Finished</i> states cause a <i>false</i> return value.</p>
+
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+  <tr>
+    <td>Value</td>
+    <td>Meaning</td>
+  </tr>
+  <tr>
+    <td>Running</td>
+    <td>Thread is currently running.</td>
+  </tr>
+  <tr>
+    <td>Finished</td>
+    <td>Thread has completed execution. This value does not indicate whether the thread completed successfully or not.</td>
+  </tr>
+  <tr>
+    <td>Pausing</td>
+    <td>Request to pause the thread has been received but the thread has not yet paused.</td>
+  </tr>
+  <tr>
+    <td>Paused</td>
+    <td>Thread is currently paused.</td>
+  </tr>
+  <tr>
+    <td>Resuming</td>
+    <td>Request to resume the thread has been received but the thread has not yet resumed.</td>
+  </tr>
+  <tr>
+    <td>Canceling</td>
+    <td>Request to cancel the thread has been received but the thread has not yet cancelled.</td>
+  </tr>
+  <tr>
+    <td>Canceled</td>
+    <td>Thread has been cancelled.</td>
+  </tr>
+  <tr>
+    <td>Terminating</td>
+    <td>Request to terminate the thread has been received but the thread has not yet terminated.</td>
+  </tr>
+  <tr>
+    <td>Terminated</td>
+    <td>Thread has been terminated.</td>
+  </tr>
+</table>
+
+<div class="caption">
+Table 1: WorkItemThreadState enumeration values.
+</div>
+</div>
+
+
+<p>A typical work item might perform work this way:</p>
+
+<pre class="code">
+
+While some condition
+   If CheckState()
+     Do work...
+     Else
+     Terminate
+   End If
+End While
+
+</pre>
+<p>This model is the same model used by cooperative multitasking systems. The net effect is that the more often <i>CheckState()</i> is called, the more responsive the work item is to user requests at a cost of slowing down the work item.</p>
+
+<p>Each time the work item thread changes state, the <i>StateChanged</i> event is raised. Since a work item may be shared between several threads, it is possible that state change requests will not necessarily take effect. For example, if thread <i>A</i> sends a pause request to a work item thread, then the thread transitions to the <i>Pausing</i> state. If thread <i>B</i> sends a cancel request to the same work item thread, then the thread transitions to the <i>Canceling</i> state, even though it never entered the <i>Paused</i> state. This is important to remember when working with work items across multiple threads.</p>
+
+
+
+
+
+
+
+
+
+<h3>Pausing/Resuming</h3>
+
+<p>.NET already supports suspending and resuming threads through the <i>Thread.Suspend()</i> and <i>Thread.Resume()</i> methods. However, the existing implementation only works well for threads that use no shared resources. Because the built-in methods are insufficient for most work items, a cooperative model must be used instead.  </p>
+
+<p>Again, the <i>CheckState()</i> method is used by a work item to determine the state of the work item thread. When the thread is in the <i>Pausing</i> state and <i>CheckState()</i> is called, the thread moves to the <i>Paused</i> state. The method then calls <i>WaitOne()</i> on the <i>StateChanged</i> event that is internal to the work item thread. This blocks the method until the state of the thread changes again. When the thread state changes, the block is released and <i>CheckState()</i> reevaluates the state of the thread. When the thread enters the <i>Resuming</i> state, it will be automatically transitioned back to the <i>Running</i> state prior to <i>CheckState()</i> returning. The net effect is that the thread is paused while in the <i>Paused</i> state.  </p>
+
+<p>By isolating the thread state management inside <i>CheckState()</i>, the work item is free from dealing with thread state requests. The simple algorithm previously described continues to work even with pause and resume requests. The only issue that a work item needs to handle when supporting pause requests is how to deal with shared resources. </p>
+
+
+<h3>Terminating Work Items</h3>
+
+<p>.NET already supports terminating a thread through the <i>Thread.Abort()</i> method. It should only be used when absolutely necessary to avoid leaving locks held or causing resource leaks.</p>
+
+<p>Terminating and canceling a work item has the same effect. The difference lies in how it is done and the final state of the work item thread. When a work item is canceled, if it is supported, the work item's thread moves to the <i>Canceling</i> state. The next time <i>CheckState()</i> is called, the thread moves to the <i>Canceled</i> state and the method returns a <i>false</i> value terminating the work item.  </p>
+
+<p>For termination requests, the same thing occurs except the <i>Terminating</i> and <i>Terminated</i> states are used. However, the thread also enters the <i>Terminated</i> state if a <i>ThreadAbortException</i> is raised. Additionally, a work item can be terminated even if it does not support cancelation. Therefore, it is important that a work item always checks the return value from <i>CheckState()</i>.</p>
+
+<p>One enhancement that could be made to termination requests for work items is a timeout.  If a work item fails to terminate (not cancel) in a specified period of time, then <i>Thread.Abort()</i> should be called to forcefully terminate the work item thread and work item.</p>
+
+
+
+
+
+
+
+
+
+<h3>Thread Manager</h3>
+
+<p>In the framework, the <i>ThreadManager</i> static class provides support for starting work items. The <i>Start()</i> method takes a <i>WorkItem</i> as a parameter and returns a <i>WorkItemThread</i> representing the thread running the work item. A <i>WorkItem</i> instance can only be associated with one thread at a time. Furthermore, a <i>WorkItemThread</i> can only be used once.  </p>
+
+<p>There are additional methods in <i>ThreadManager</i> to cancel or terminate work item threads. These methods can be used to clean up running work items prior to the application closing. Additional methods can be added as needed. Listing Three provides a simplified view of the class.</p>
+
+
+<pre class="code" style="height:250px"> 
+namespace DDJ.Threading
+{
+	// Actual implementation of ThreadManager static class
+	public class ThreadManagerBase
+	{
+		//Public Members
+
+		#region Methods
+
+		// Cancels all running work items.
+		// This method does not wait for the work items to cancel.
+		// Work items that can not be cancelled are not affected.
+		public void CancelAll ( )
+		{
+			StopBase(false);
+		}
+
+		// Starts a work item on a separate thread.
+		// The work item will be scheduled for execution.  
+		public WorkItemThread Start ( WorkItem work )
+		{
+			//Validate
+			if (work == null)
+				throw new ArgumentNullException("work");
+			if (work.InnerThread != null)
+				throw new ArgumentException(
+					"Work item already associated with another thread.", 
+					"work");
+
+			//Schedule it for execution
+			WorkItemThread thread = new WorkItemThread(work);
+			work.SetThread(thread);
+
+			ExecuteWorkItem(thread);
+			return thread;
+		}
+
+		// Terminates all running work items.
+		// This method does not wait for the work items to terminate.  
+		// All work items are terminated even if they don't support
+		// cancellation.
+		public void TerminateAll ( )
+		{
+			StopBase(true);
+		}
+
+		// Private Members
+
+		#region Methods
+
+		private void ExecuteWorkItem ( WorkItemThread thread )
+		{
+			//Create a real thread to back it
+			Thread realThread = new Thread(
+					new ThreadStart(thread.DoWork));
+			
+			thread.StateChanged += OnThreadStateChanged;
+
+			lock (m_Threads)
+			{
+				m_Threads.Add(thread);
+			};
+
+			//Go...
+			realThread.Start();
+		}
+
+		private void OnThreadStateChanged ( object sender, EventArgs e )
+		{
+			//If the thread is finished
+			switch (((WorkItemThread)sender).State)
+			{
+				case WorkItemThreadState.Cancelled:
+				case WorkItemThreadState.Finished:
+				case WorkItemThreadState.Terminated:
+				{
+					//Lock the list
+					lock (m_Threads)
+					{
+						//Remove from the list
+						m_Threads.Remove((WorkItemThread)sender);
+					};
+					break;
+				};
+			};
+		}
+
+		private void StopBase ( bool force )
+		{
+			Collection&lt;WorkItemThread&gt; threads = 
+				new Collection&lt;WorkItemThread&gt;();
+
+			//Lock the list
+			lock (m_Threads)
+			{
+				//Enumerate the list
+				for (int nIdx = 0;
+					 nIdx &lt; m_Threads.Count;
+					 ++nIdx)
+				{
+					if (force || m_Threads[nIdx].CanCancel)
+					{
+						threads.Add(m_Threads[nIdx]);
+						m_Threads.RemoveAt(nIdx);
+						--nIdx;
+					};						
+				};
+			};
+
+			//Stop each one
+			foreach (WorkItemThread thread in threads)
+			{
+				if (force)
+					thread.Terminate();
+				else
+					thread.Cancel();
+			};
+		}
+
+		private Collection&lt;WorkItemThread&gt; m_Threads = 
+			new Collection&lt;WorkItemThread&gt;();
+	}
+}
+</pre>
+<div class="caption">
+  Listing Three
+</div>	
+
+<p>Each <i>WorkItemThread</i> gets its own .NET thread to run on. This is good when dealing with a small number of work items, but as more work items are added, the performance will decline. A better solution would be to create a threading pool. Similar to the <i>ThreadPool</i> in .NET, the manager would allocate (either initially or on-demand) a fixed number of threads. Whenever a new <i>WorkItemThread</i> is created, it is assigned to one of the existing threads. When the work item thread is finished, the associated thread is returned to the thread pool. If a new <i>WorkItemThread</i> is created but there are no threads available, then the work item thread is implicitly paused until a thread becomes available. <i>Control</i> can still return to the caller (perhaps with some sort of indicator). This enhancement is left to the reader to implement. One word of caution about this enhancement: Pausing all work items could effectively prevent new work items from running. If a thread pool is used, then some thought should be given to releasing the underlying thread whenever a work item thread is paused such that waiting work items can be run.</p>
+
+
+
+
+
+
+
+
+<h3>Updating the UI</h3>
+
+<p>Throughout its history, a fundamental rule of Windows UI programming has been: "Only access a UI element on the thread that created it." This is the result of how Windows sends messages to UI elements. When dealing with multiple threads, it is important to remember this rule. Table 2 lists the members of <i>Control</i>-derived classes that can be accessed on any thread. All other members must be accessed on the thread that created the UI element.</p>
+
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+  <tr>
+    <td>Members</td>
+  </tr>
+  <tr>
+    <td>BeginInvoke()</td>
+  </tr>
+  <tr>
+    <td>CreateGraphics()</td>
+  </tr>
+  <tr>
+    <td>EndInvoke()</td>
+  </tr>
+  <tr>
+    <td>Invoke()</td>
+  </tr>
+  <tr>
+    <td>InvokeRequired()</td>
+  </tr>
+</table>
+
+<div class="caption">
+Table 2: Control members callable on any thread.
+</div>
+</div>
+
+
+
+<p>Events are often used to notify users about important changes in the system. When an event is raised on a secondary thread, it is not possible to update the UI directly. Instead, any UI changes must be marshaled to the thread that created the UI element. In .NET, the <i>InvokeRequired</i> property on any <i>Control</i>-derived class determines whether the UI element can be directly updated. When this property is <i>false</i>, all UI access must be marshaled to the appropriate thread. There is a special case when the control has not yet been created (see <a href="http://forums.microsoft.com/MSDN/ShowPost.aspx?PostID=170601&amp;SiteID=1" target="_blank">forums.microsoft.com/MSDN/ShowPost.aspx?PostID=170601&amp;SiteID=1</a>). However, it is generally reliable.</p>
+
+<p>To marshal a property or method call to the appropriate thread, use the <i>Invoke()</i> method on the <i>Control</i>-derived class. This method requires the name of the delegate to invoke and the parameters to pass to the delegate. When called, the method marshals the invocation to the associated UI thread and waits for it to return. An asynchronous version is also available if needed. Listing Four provides sample code on how to use <i>Invoke()</i>. By changing the delegate, parameters, and member names, this template can be used for any method or property call. Furthermore, the same method is called whether an invocation is required or not.</p>
+
+<pre class="code"> 
+//Create a delegate that matches the signature of the method to invoke
+void MyDelegate ( object parm1, string parm2 );
+
+//The method that is invoked by clients on any thread
+//"control" is the UI element
+void MyMethod ( object parm1, parm2 )
+{
+	//If called on a thread other than the UI thread
+	if (control.InvokeRequired)
+	{
+		//Marshal the request to the UI thread, could use BeginInvoke too
+		//Notice the delegate is the same method
+		control.Invoke(new MyDelegate(MyMethod), parm1, parm2);
+	} else
+	{
+		//On the UI thread so do any work here...
+	};
+}
+</pre>
+<div class="caption">
+  Listing Four
+</div>	
+
+
+<p>The invocation code is normally placed inside an event handler. For example, if a work item raises an event, any handler that wants to update the UI needs to use the invocation code. It is recommended that a control not try to deal with the threading issue automatically (by using the invocation code inside its property and method blocks) as this needlessly complicates the control and may mislead a caller. Any caller that interacts with a control is responsible for dealing with the threading issue.</p>
+
+<p>Introduced in .NET 2.0, the <i>BackgroundWorker</i> class (<a href="http://msdn2.microsoft.com/en-us/library/4852et58.aspx" target="_blank">msdn2.microsoft.com/en-us/library/4852et58.aspx</a>) was specifically designed to permit applications to perform some work on a secondary thread and still be able to update UI elements without the need for the invocation code. This class is an ideal solution in most cases and should be used instead. However, the created thread can only be canceled. Therefore, only use this class if pause/resume support is not needed.  DDJ</p>
+
+
+
+
+
+
+
+
+
+
+
+<table height="0" border="0" cellpadding="10" cellspacing="5" vspace="15">
+  <tr> 
+    <td valign="top" bgcolor="CCCC99">
+    <p><b>Multitasking in the .NET Framework</b></p> 
+
+<p>The <i>Thread</i> class in the .NET Framework provides support for running threads in applications. The class contains methods that seem to answer the need for pausing, resuming, and terminating threads. These methods should be used sparingly as they can have unforeseen consequences. To understand why, it is important to understand the two types of multitasking:</p>
+
+
+<ul>
+  <li>&#8226;	Cooperative multitasking requires that each thread periodically check its state to determine whether execution should continue or not. It is "cooperative" because each thread must cooperate by checking its state; otherwise, the multitasking will start to degrade. Early versions of Microsoft Windows used this form of multitasking. </li>
+  <li>&#8226;	Preemptive multitasking does not give a thread any choice in determining how to execute. The thread subsystem is responsible for determining when and how long to execute a thread. Preemptive multitasking, used in all current versions of Windows, is more reliable, but requires that you deal with multitasking issues like accessing shared resources.</li>
+</ul>
+
+
+<p><i>Thread.Suspend</i> follows the preemptive model. This method simply suspends the thread regardless of what it is doing at the time. Because the thread is not notified of the pause, it may be in an unstable state. <i>Thread.Suspend </i>should not be used to pause threads. Instead, a cooperative model should be used. <i>Thread.Suspend </i>has been deprecated in .NET 2.0.</p>
+
+
+<p><i>Thread.Resume</i> is the complement of <i>Thread.Suspend</i>. Since it has no effect without <i>Thread.Suspend</i>, it should not be called. It has been deprecated in .NET 2.0.</p>
+
+
+<p>Finally, <i>Thread.Abort</i> terminates a thread using the preemptive model. Like <i>Thread.Suspend</i>, this can cause problems. The <i>ThreadAbortException</i> is raised on the thread when Thread.Abort is called. Provided the thread handles this exception, it can ensure that it cleans up any resources. However, this is like hitting the power switch to turn off your computer. It is harsh and can be avoided through proper cooperative multitasking.</p>
+	</td>
+  </tr>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

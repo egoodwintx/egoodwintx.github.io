@@ -1,0 +1,457 @@
+
+<html>
+<head>
+<title>May, 2005: Battle of the Code Generators</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Battle of the Code Generators</h1>
+<p><i>Dr. Dobb's Journal</i> May, 2005</p>
+<h2>Template-based versus CodeDOM</h2>
+
+
+<h3>By Gigi Sayfan</h3>
+
+
+<I>Gigi is a software developer specializing in object-oriented and component-oriented programming using C++. He can be contacted at gigi_sayfan@playstation .sony.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Most nontrivial programs are event based. The events can be UI events, incoming network packets, or hardware interrupts. These events are usually translated to software events in the form of Windows messages, callback functions, delegates, and the like. The Observer design pattern suggests one way of doing event-driven programming. The Model-View-Controller (MVC) is a GUI-specific architecture for updating multiple views of a data model and handling UI events. Many large-scale programs are heavily event based and employ some kind of event propagation system. In this article, I examine one of my favorite event propagation designs&#151;Interface-based publish-subscribe event propagation. Note that native .NET delegates and events are a different implementation of a publish-subscribe with different semantics.</p>
+
+<p>The idea behind interface-based publish-subscribe event propagation is this: </p>
+
+
+
+<ul>
+  <li>There is a globally accessible <i>Switchboard</i> object that every event goes through.</li>
+  <li>Event producers send events to the <i>Switchboard</i> (publishing).</li>
+  <li>Event consumers subscribe for specific event interfaces. </li>
+  <li>Whenever the <i>Switchboard</i> receives an event, it propagates it to all the subscribers.</li>
+  <li><i>Event</i> consumers may unsubscribe at any time.</li>
+</ul>
+
+
+
+<p>The upside of this approach include:</p>
+
+
+
+<ul>
+  <li>Complete decoupling of event producers and event consumers.</li>
+  <li>Allows passing any type of data with the event.</li>
+  <li>Explicit event names.</li>
+  <li>Type safety; no casting whatsoever.</li>
+  <li>Missing/misspelled/wrong signature events/event handlers are detected at build time.</li>
+  <li>Allows grouping of related events.</li>
+  <li>Allows subscription/unsubscription of an entire interface in one call.</li>
+  <li>Easy debugging even when events are chained (meaningful call stack).</li>
+</ul>
+
+
+
+<p>On the other hand, the downside is:</p>
+
+
+
+<ul>
+  <li>The <i>Switchboard</i> object is a maintenance nightmare.</li>
+  <li>Event consumers must implement a handler for every event on an interface they subscribe to.</li>
+  <li>Sometimes, it isn't easy to decide how to group events to interfaces.</li>
+  <li>It isn't easy to queue events, persist events, or otherwise handle events as objects.</li>
+</ul>
+<h3>The EventDemo Program</h3>
+
+<p>Listings One through Four present an app that demonstrates the publish-subscribe mechanism. (The complete listings and related files are available electronically; see "Resource Center," page 5.) <a name="rl1"></a><a href="#l1">Listing One</a> contains the definition of the event interfaces. There are two interfaces: <i>ISomeInterface</i>, which has methods with different signatures; and <i>IAnotherInterface</i>, which has methods with no arguments (just to show that the code works with multiple interfaces). The <i>[EventInterface]</i> custom attribute that decorates each interface is the key for detecting the event interfaces during code generation. I'll get back to it shortly. The return value of all the event methods is void. This isn't mandatory and <i>EventSwitchboard</i> can handle arbitrary return values just like it handles arbitrary lists of arguments. The reason is that the essence of event propagation is that senders have no idea who (if anyone) is listening and handling its events; hence, they can't take any meaningful action by intercepting a return value. There is also the issue of getting multiple return values from multiple handlers. If the sender needs some information from a receiver of an event, then these two objects actually exchange messages according to some protocol and it is not event propagation.</p>
+
+<p><a name="rl2"></a><a href="#l2">Listing Two</a> is the <i>Switchboard</i> class, which is derived from all the event interfaces (C#/CLR allows single implementation inheritance but multiple interface inheritance). It has a pair of <i>Subscribe</i>/<i>Unsubscribe</i> methods for each interface, an <i>ArrayList</i> field per interface that holds all the subscribers to this interface, and implementation of each interface method that simply forwards the event to every subscriber. Granted, this is less than exciting, especially when you consider real-life production systems that might have tens/hundreds of event interfaces with hundreds/thousands of events. This class is bad&#151;real bad. The only good thing about it is that it is a Singleton, so you don't have to deal with more than one (unless you want to, and sometimes you do). </p>
+
+<p><a name="rl3"></a><a href="#l3">Listing Three</a> contains three <i>EventHandlers</i> that implement various event interfaces. All they do is write to the console some text that identifies them and the event they received. <i>EventHandler_1</i> and <i>EventHandler_2</i> implement one interface each and <i>EventHandler_3</i> implements two interfaces. Trivial so far.</p>
+
+<p>The <i>MainClass</i> in <a name="rl4"></a><a href="#l4">Listing Four</a> gets the show on the road. It gets a reference to the <i>Switchboard</i>. It creates instances of all the handlers and starts sending events to the <i>Switchboard</i>, which diligently forwards each event to its subscribers&#151;which promptly blurb to the console (see <a name="rf1"></a><a href="0505jf1.html">Figure 1</a>). Finally, <i>Main</i> unsubscribes all the event handlers. This is not necessary in this example, but in real systems where subscribers are created and destroyed and events fly back and forth, you'd better unsubscribe every object that needs to be destroyed; otherwise, it continues to live forever due to the reference the <i>Switchboard</i> holds. In nonmanaged C++ systems, it is easy to destroy an object without unsubscribing, and the next event that <i>Switchboard</i> tries to deliver crashes the system. </p>
+
+<p>The problem is that the <i>Switchboard</i> class is a world-class abomination. It must be modified every time someone, somewhere adds a new event or modifies an existing event. It is completely inadequate if third-party developers need to create new events and use your <i>Switchboard</i>. If that's not enough, <i>Switchboard</i>'s code is boring and error-prone due to copy-and-paste reuse tactics. It is easy for the <i>Switchboard</i> to receive event A and propagate event B. This kind of error can be difficult to track in a dynamic system, especially if it's multithreaded.</p>
+
+<p>The solution is tied up with the capability of the <i>Switchboard</i> class to be generated automatically without human intervention. Here is the general idea: Every event interface will be annotated with a custom <i>[EventInterface]</i> attribute. A special switchboard generator program traverses all the candidate assemblies that may contain interfaces. The generator reads the metadata information of every type in the candidate assemblies, detects the event interfaces, and for each event interface, it magically conjures the appropriate code in the <i>Switchboard</i> class (it will create). The <i>SwitchboardGenerator</i> can be run at development time against a known set of assemblies as a prebuild step or it can be run at runtime to generate the <i>Switchboard</i> class on-the-fly to address third-party assemblies that send/listen to events. In the latter case, a more sophisticated approach is necessary because the third-party assemblies must be programmed against some existing object that implements the event interfaces they use. This requires a dummy object that is replaced with the <i>Switchboard</i> after it is generated.</p>
+<h3>What Is Code Generation?</h3>
+
+<p>Code generation has different meanings to different people (or different programs). For purposes here, I define it as generating source code in some target programming language from some simpler input (domain-specific languages, for instance) via a code-generator program plus some optional templates plus some optional configuration files. This is the most interesting type of code generation for programmers. The generated code should not be modified manually by humans (it is okay to provide it as input to yet another code generator or some postprocessing program) and it should not be checked into the source-control repository; it should be treated as an intermediate product of the build process. Finally, you probably want to keep the generated code around for debugging purposes.</p>
+
+<p>Creating and using code generators is fun, especially compared to performing the same boring task manually again and again. It definitely raises the level of abstraction with which you understand the problem you try to solve. It also lets you generate efficient code targeted for a specific situation.</p>
+<h3>Code Generation versus Data-Driven Programming</h3>
+
+<p>With data-driven programming, the flow of the program is controlled by external data and is not hard coded. Code generation and data-driven programming are similar but have some important differences.</p>
+
+<p>Data-driven programming is:</p>
+
+
+
+<ul>
+  <li>More flexible (decisions can be made according to real-time data).</li>
+  <li>Incurs performance overhead.</li>
+  <li>Much more difficult to debug.</li>
+</ul>
+
+
+
+<p>Code generation is:</p>
+
+
+
+<ul>
+  <li>Less flexible in general (all decisions must be made at code-generation time).</li>
+  <li>Excellent performance (just like hand-coded in general).</li>
+  <li>Potentially excellent debugging (depends on your attention to detail when generating code).</li>
+</ul>
+
+
+
+<p>The boundaries are not clear. Code generation can generate data-driven code. Data-driven code can decide to compile some code before execution, and so on. For example, the CLR's JIT compiler generates code at load time (on a function-by-function basis) and can perform all kinds of interesting optimizations according to runtime conditions.</p>
+
+<p>Every program that parses command-line arguments or reads an external configuration file or registry entry is probably data-driven to a degree.</p>
+<h3>CLR Metadata,  Custom Attributes, and Reflection</h3>
+
+<p>The .NET platform elevates the programming model, tries to solve pervasive problems, and provides countless services, including: modern verifiable type system; versioning (side-by-side installation); deployment (XCOPY installs); code access security; streamlined interlanguage interoperability (including inheritance); streamlined intraprocess, interprocess, and cross-machine communication (AppDomains and remoting); and a huge and consistent class library. Many of these facilities&#151;and especially the almost transparent way by which they are exposed to you&#151;are based on the rich metadata embedded in every assembly and is available to the (JIT) compiler and your code at runtime. The metadata is stored in a binary format in the CLR Portable Executable (PE) file when you compile code. The key observation here is that assemblies are self-describing. When an assembly is loaded into memory, the CLR loader (and JIT compiler) has all the information it needs right there in the assembly PE file. The assembly's metadata is also loaded into memory and is available for runtime inspection by the CLR and your code. This is a huge jump from the COM world where you had to mess around with registry entries, IDL files, and type libraries.</p>
+
+<p>The CLR lets you annotate elements of code with attributes&#151;declarative tags that contain additional information and are available at runtime through reflection. The compiler emits attributes into the assembly's metadata. There are predefined attributes and custom attributes you can define. Take another look at <a name="rl1"></a><a href="#l1">Listing One</a>. The <i>[EventInterface]</i> attribute is a custom attribute. <a name="rf2"></a><a href="0505jf2.html">Figure 2</a> shows how the attribute is stored as part of the metadata of the <i>ISomeInterface</i> interface. The CLR uses many predefined attributes such as <i>[Serialized]</i> and <i>[WebMethod]</i>. Attributes are actually instances of classes that derive from the <i>System.Attribute</i> base class. <a name="rl5"></a><a href="#l5">Listing Five</a> contains the definition of <i>[EventInterface]</i>. Attribute classes may be named arbitrarily but, by convention, they always have an <i>Attribute</i> suffix. You can omit the <i>Attribute</i> suffix when using the attribute (hence, <i>[EventInterface]</i> and not <i>[EventInterfaceAttribute]</i>). When defining an attribute, you have to use yet another attribute&#151;<i>AttributeUsage,</i> which describes how the attribute is supposed to be used. You can specify what type of element your attribute may annotate, whether multiple instances of your attribute are allowed per code element, and if the attribute may be inherited by subclasses (applies only to class attributes). The <i>[EventInterface]</i> attribute applies only to interfaces (<i>AttributeTargets.Interface</i>) and doesn't allow multiple instances (<i>AllowMultiple = false</i>).</p>
+
+<p>The reflection API lets you drill down the loaded assemblies and discover the types they contain. For each type, you can discover constructors, methods, interfaces, and events. For each method you can discover its return value, name, and parameters. In addition, you can access all the attributes, predefined and custom, which annotate every element. <a name="rl6"></a><a href="#l6">Listing Six</a> demonstrates how to dump an entire assembly to the console. The API is straightforward: You call <i>GetXXX</i> methods to get collections of objects, such as <i>Type</i>, <i>MethodInfo</i>, and <i>ParameterInfo</i>, then you iterate through the collection and can access properties such as <i>MethodInfo.Name</i>, <i>MethodInfo.ReturnType</i>, and <i>ParameterInfo.DefaultValue</i>. The reflection API also allows invoking methods on types and instances using information discovered at runtime using the <i>Type.InvokeMember</i> method.</p>
+<h3>The SwitchboardGenerator MainClass</h3>
+
+<p>SwitchboardGenerator is a program (available electronically; see "Resource Center," page 5) that generates a <i>Switchboard</i> class implementation that supports arbitrary event interfaces. It accepts various arguments on the command line, so much of its operation can be configured without actually modifying the code. How does it work? The input consists of the full path of the generated <i>Switchboard</i> class, the namespace of the generated <i>Switchboard</i> class, the custom attribute type name that identifies event interfaces, and a list of paths of assemblies that need to be scanned for event interfaces. SwitchboardGenerator iterates over the types in every assembly; for each interface it finds, it checks to see that it is annotated with the custom attribute (passed on the command line) and adds the matching interfaces to a list. After compiling the interface list, it launches the selected code generator dynamically and invokes its <i>Generate</i> method. The naming convention I use is that all code generators are called "SwitchboardGenerator" (and support a static <i>'Generate'</i> method, but they belong to a different namespace). The namespace is passed on the command and the full name of the selected code generator is <i>{namespace}.SwitchboardGenerator</i> (see <a name="rl6"></a><a href="#l6">Listing Six</a>). The code generators use the interface list to create the corresponding <i>Switchboard</i> class. SwitchboardGenerator expects five arguments on the command line in this order: qualified filename of the generated <i>Switchboard</i> class, the namespace that contains it, the custom attribute (including namespace) that identifies event interfaces, which code generator to use (CodeDOM or TextTemplate), and the assembly that contains the event interfaces. <a name="rf3"></a><a href="0505jf3.html">Figure 3</a> illustrates a short session with the SwitchboardGenerator.</p>
+<h3>Template-Based Code Generator</h3>
+
+<p>The core of the template-based code generator is simple and doesn't rely on any CLR- or Windows-specific feature. I have used similar generators on UNIX-based systems and embedded systems (such as PlayStation). Usually, I use Python to implement it since that language's string manipulation capabilities are excellent. However, since I wanted to contrast it against the CodeDOM generator, I implemented it in C#. The goal is to simply generate some code. Most of it is just boilerplate code but requires embedding some dynamic parameters. The solution is to have a text template that contains the boilerplate code, have special place holders for the dynamic parameters (&agrave; la <i>sprintf</i> masks), and replace them at generation time. Listings Eight, Nine, and Ten (available electronically) contain the templates I used to generate the <i>Switchboard</i> class in <a name="rl2"></a><a href="#l2">Listing Two</a>. The <i>$$$-something-$$$</i> is my notation for place holders that should be replaced when generating the code. This is pretty much a glorified <i>sprintf</i>, but generating the text for the place holders is not trivial. <a name="rl8"></a><a href="#l8">Listing Eight</a> contains the <i>Switchboard</i> class skeleton. The <i>$$$-subscribe_unsubscribe_methods-$$$</i> and <i>$$$-event_methods-$$$</i> are created using multiple instances of the templates in <a name="rl9"></a><a href="#l9">Listing Nine</a> and <a name="rl10"></a><a href="#l10">Listing Ten</a>, correspondingly. All the information necessary to replace the place holders with real data is available through the reflection API from the interface list provided to the generator. Note that if I wanted to decouple the code generation completely from the CLR, I could extract this information and provide it to a generic generator through a dictionary of <i>key=value</i> pairs, but preparing it would be a lot of unnecessary work, when the reflection API provides a nice object model. As you recall, the <i>MainClass</i> (<a name="rl6"></a><a href="#l6">Listing Six</a>) iterated over all the interfaces and if they had the custom <i>[EventInterface]</i> attribute, it added them to the list. The generator (<a name="rl11"></a><a href="#l11">Listing Eleven</a>, available electronically) walks through this list and for each interface, it updates the base interfaces (the <i>Switchboard</i> must derive from every event interface to forward them) and creates subscribe and unsubscribe methods; for each event of the interface, it creates a corresponding event handler and finally creates a subscriber list for this interface. The most interesting part is creating the event methods because the signature of each event is arbitrary. The <i>CreateEvent</i> method has to gather the following information: return type, event name, parameter types (list of all parameter types), parameter names (list of all parameter names), the interface name itself, and the name of the subscriber list. The <i>CreateEvent</i> method traverses the <i>MethodInfo</i> object to extract most of this information (requires access to properties and iterating over the <i>ParameterInfo</i> collection) and uses the <i>GetListName</i> helper method.</p>
+<h3>CodeDOM Code Generator</h3>
+
+<p>The <i>System.CodeDOM</i> namespace contains myriad classes that lets you generate a code abstract object model that represents some code, and generate source files from it. There is also a <i>System.CodeDOM.Compiler</i> namespace that lets you compile code at runtime, but I don't deal with this namespace in this article. Here are the steps to generate code using the CodeDOM:</p>
+
+
+
+<ol>
+  <li>Create a root CodeNamespace.</li>
+  <li>Add types to the namespace.</li>
+  <li>Add members to the types (methods, properties, events, and fields). </li>
+  <li>Add code statements to the methods.</li>
+  <li>Request a specific provider and a code generator from that provider (<i>CSharpCodeProvider</i>, for instance).</li>
+  <li>Generate the code and write it to a file.</li>
+</ol>
+
+
+
+<p>The promise of the CodeDOM is enormous. You may generate code from the same CodeDOM graph to multiple languages. As long as a language provider exists, you may generate code for this language. Internally, the web services infrastructure uses CodeDOM to generate client-side proxies for you. However, the reality is less then perfect. The CodeDOM doesn't cover every CLR feature (unary operators, for example), it doesn't give you complete control on the format of the generated code, and some (many?) language constructs are missing. For example, there is no way to generate C# <i>foreach</i> or <i>while</i> statements using the CodeDOM. The only iteration statement is <i>'for'</i>. The worst drawback of the CodeDOM is its extreme verbosity. This may be okay for automatically generated code you never see and debug (like web services proxies), but if you want to integrate code generation into your software-development arsenal, it just doesn't cut it. You should be able to debug easily through the generated code and you should be able to easily modify the code generator itself. </p>
+
+<p>The CodeDOM needs a serious facelift to become useful for custom code generation. <a name="rl12"></a><a href="#l12">Listing Twelve</a> (available electronically) contains the CodeDOM switchboard generator. The basic structure is similar to the template-based code generator&#151;it gets the information it needs through the reflection API from the interface list, it creates a skeleton <i>Switchboard</i> class, subscribe/unsubscribe methods, and event methods. However, the code generation itself is done by creating <i>CodeDOM</i> classes and painstakingly composing them together. The end result is not on par with the complete control and ease of modification that the template-based code generator affords. For example, I like to put the private fields at the bottom of the class definition, but the CodeDOM code generator insists on putting them at the top; and the whitespace is not exactly the way I like but there is nothing I can do about it. See <a name="rl13"></a><a href="#l13">Listing Thirteen</a> (available electronically) for the results of the CodeDOM code generator. Note, in particular, how ugly the <i>'for'</i> construct with the explicit <i>GetEnumerator()</i> and <i>MoveNext()</i> looks. Another problem that undermines the multilanguage capability of the CodeDOM is the snippet classes (<i>CodeSnippetStatement</i>, <i>CodeSnippetExpression</i>, <i>CodeSnippetTypeMember</i>). These classes represent literal text that is pasted in the middle of the generated code as is. Of course, you can't write a cross-language snippet because every language has a different syntax. This means that using snippets destroy cross-language code generation. Since some language constructs are not implemented yet, you must sometimes use snippets. Moreover, because creating a proper CodeDOM tree is so complicated, sometimes the easy way is just to use snippets (I shamelessly admit I did it).</p>
+<h3>Using a Code Generator </h3>
+
+<p>The code generators I present here reflect a successfully built assembly. If I would have modified an event interface and tried to regenerate the <i>Switchboard</i>, the process would fail. The reason is that the previously generated <i>Switchboard</i> is part of the same assembly (<i>EventDemo</i>) and it doesn't work with the modified event interface. To regenerate it, I have to fix it manually first. What? That's right, it doesn't make much sense. The solution is to separate the event interfaces (or in general, all the input to the code generator) from the <i>Switchboard</i> class (or in general, all the output of the code generator). This can be done by putting either the event interfaces or the <i>Switchboard</i> class in a different assembly. I recommend putting the interfaces in a separate assembly and putting the <i>Switchboard</i> class in the same assembly as the rest of the application (<i>EventDemo</i>). Now, you don't have the chicken-and-egg problem. The assembly that contains the <i>Switchboard</i> class should reference and depend (build-wise) on the assembly that contains the interfaces. The SwitchboardGenerator program itself should be invoked as a build step of the main assembly that contains the <i>Switchboard</i> class. This way, an up-to-date <i>Switchboard</i> class is generated before starting to build its assembly.</p>
+<h3>Conclusion</h3>
+
+<p>Reflection plus code generation are a dynamic duo. They can be used for many purposes and not just to write various stubs and proxies. Use them wisely and forget about CodeDOM until Longhorn ships (at least). Maybe by then, some genius will find a way to make it simpler.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>using System;
+namespace EventDemo
+{
+   [EventInterface]
+    public interface ISomeInterface
+    {
+        void OnThis(int x);
+        void OnThat(string s);
+        void OnTheOther(bool b, string s);
+    };
+    [EventInterface]
+    public interface IAnotherInterface
+    {
+        void OnBim();
+        void OnBam();
+        void OnBom();
+    };
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>// Auto-generated Switchboard class
+using System.Collections;
+using System.Diagnostics;
+namespace EventDemo
+{
+    class Switchboard :
+        EventDemo.ISomeInterface,
+        EventDemo.IAnotherInterface
+    {
+        public static Switchboard Instance
+        {
+            get { return m_instance; }
+        }
+        public bool Subscribe(EventDemo.ISomeInterface sink)
+        {
+            if (m_someInterfaceList.Contains(sink))
+            {
+                Debug.Assert(false);
+                return false;
+            }
+            m_someInterfaceList.Add(sink);
+            return true;
+        }
+        public bool Unsubscribe(EventDemo.ISomeInterface sink)
+        {
+            if (!m_someInterfaceList.Contains(sink))
+            {
+                Debug.Assert(false);
+                return false;
+            }
+            m_someInterfaceList.Remove(sink);
+            return true;
+        }
+        public bool Subscribe(EventDemo.IAnotherInterface sink)
+        {
+            if (m_anotherInterfaceList.Contains(sink))
+           {
+                Debug.Assert(false);
+                return false;
+            }
+            m_anotherInterfaceList.Add(sink);
+            return true;
+        }
+        public bool Unsubscribe(EventDemo.IAnotherInterface sink)
+        {
+            if (!m_anotherInterfaceList.Contains(sink))
+            {
+                Debug.Assert(false);
+                return false;
+            }
+            m_anotherInterfaceList.Remove(sink);
+            return true;
+        }
+        public void OnThis(System.Int32 x)
+        {
+          foreach (EventDemo.ISomeInterface subscriber in m_someInterfaceList)
+              subscriber.OnThis(x);
+        }
+        public void OnThat(System.String s)
+        {
+          foreach (EventDemo.ISomeInterface subscriber in m_someInterfaceList)
+                subscriber.OnThat(s);
+        }
+        public void OnTheOther(System.Boolean b,System.String s)
+        {
+          foreach (EventDemo.ISomeInterface subscriber in m_someInterfaceList)
+                subscriber.OnTheOther(b,s);
+        }
+        public void OnBim()
+        {
+          foreach (EventDemo.IAnotherInterface subscriber in 
+                       m_anotherInterfaceList) subscriber.OnBim();
+        }
+        public void OnBam()
+        {
+          foreach (EventDemo.IAnotherInterface subscriber in 
+                       m_anotherInterfaceList) subscriber.OnBam();
+        }
+        public void OnBom()
+        {
+            foreach (EventDemo.IAnotherInterface subscriber in 
+                       m_anotherInterfaceList) subscriber.OnBom();
+        }
+        ArrayList m_someInterfaceList = new ArrayList();
+        ArrayList m_anotherInterfaceList = new ArrayList();
+        static Switchboard m_instance = new Switchboard();
+    }
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>namespace EventDemo
+using System;
+
+{
+    class EventHandler_1 : ISomeInterface
+    {
+        public void OnThis(int x)
+        {
+            Console.WriteLine("{0} received OnThis({1})", GetType().Name, x);
+        }
+        public void OnThat(string s)
+        {
+            Console.WriteLine("{0} received OnThat({1})", GetType().Name, s);
+        }
+        public void OnTheOther(bool b, string s)
+        {
+            Console.WriteLine("{0} received OnTheOther({1}, {2})", 
+                                                       GetType().Name, b, s);
+        }
+    }
+    class EventHandler_2 : IAnotherInterface
+    {
+        public void OnBim()
+        {
+            Console.WriteLine("{0} received OnBim()", GetType().Name);
+        }
+        public void OnBam()
+        {
+            Console.WriteLine("{0} received OnBam()", GetType().Name);
+        }
+        public void OnBom()
+        {
+            Console.WriteLine("{0} received OnBom()", GetType().Name);
+        }
+    }
+    class EventHandler_3 : ISomeInterface, IAnotherInterface
+    {
+        public void OnThis(int x)
+        {
+            Console.WriteLine("{0} received OnThis({1})", GetType().Name, x);
+        }
+        public void OnThat(string s)
+        {
+            Console.WriteLine("{0} received OnThat({1})", GetType().Name, s);
+        }
+        public void OnTheOther(bool b, string s)
+        {
+            Console.WriteLine("{0} received OnTheOther({1}, {2})", 
+                                                      GetType().Name, b, s);
+        }
+        public void OnBim()
+        {
+            Console.WriteLine("{0} received OnBim()", GetType().Name);
+        }
+        public void OnBam()
+        {
+           Console.WriteLine("{0} received OnBam()", GetType().Name);
+        }
+        public void OnBom()
+        {
+            Console.WriteLine("{0} received OnBom()", GetType().Name);
+        }
+    }
+}</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l4"></a>Listing Four</b><br>
+<pre>using System;
+namespace EventDemo
+{
+    class MainClass
+    {
+        /// &lt;summary&gt;
+        /// The main entry point for the application.
+        /// &lt;/summary&gt;
+        [STAThread]
+        static void Main(string[] args)
+        {
+            Switchboard s = Switchboard.Instance;
+            EventHandler_1 eh_1 = new EventHandler_1();
+            EventHandler_2 eh_2 = new EventHandler_2();
+            EventHandler_3 eh_3 = new EventHandler_3();
+            s.Subscribe(eh_1 as ISomeInterface);
+            s.Subscribe(eh_2 as IAnotherInterface);
+            s.Subscribe(eh_3 as ISomeInterface);
+            s.Subscribe(eh_3 as IAnotherInterface);
+            s.OnThis(5);
+            s.OnThat("Yeahh, it works!!!");
+            s.OnTheOther(true, "Yeahh, it works!!!");
+            s.OnBim();
+            s.OnBam();
+            s.OnBom();
+            s.Unsubscribe(eh_1 as ISomeInterface);
+            s.Unsubscribe(eh_2 as IAnotherInterface);
+            s.Unsubscribe(eh_3 as ISomeInterface);
+            s.Unsubscribe(eh_3 as IAnotherInterface);
+        }
+    }
+}</pre>
+<a href="#rl4">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l5"></a>Listing Five</b><br>
+<pre>using System;
+namespace EventDemo
+{
+    [AttributeUsage( AttributeTargets.Interface, AllowMultiple = false)]
+    public class EventInterfaceAttribute : System.Attribute
+    {
+   }
+}</pre>
+<a href="#rl5">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l6"></a>Listing Six</b><br>
+<pre>using System;
+using System.Reflection;
+namespace ReflectionDemo
+{
+    class AssemblyDumper
+    {
+        static public void Dump(Assembly a)
+        {
+            Type[] types = a.GetTypes();
+            foreach (Type type in types)
+                DumpType(type);
+        }
+        static private void DumpType(Type type)
+        {
+            Console.WriteLine(" ---- {0} ----", type.FullName); 
+            MethodInfo[] methods = type.GetMethods();
+            foreach (MethodInfo method in methods)
+            {
+                Console.Write("{0} {1}(", method.ReturnType, method.Name);
+                ParameterInfo[] parameters = method.GetParameters();
+                foreach (ParameterInfo parameter in parameters)
+                {
+                    string typeName = parameter.ParameterType.Name;
+                    string parameterName =  parameter.Name;
+                    Console.Write("{0} {1}", 
+                           parameter.ParameterType.Name, parameter.Name);
+                    if (parameter.IsOptional)
+                        Console.Write(" = {0}", 
+                                      parameter.DefaultValue.ToString());
+                    if (parameter.Position &lt; parameters.Length-1)
+                        Console.Write(", ");
+                }
+                Console.WriteLine(")");
+            }
+        }
+    }
+}</pre>
+<a href="#rl6">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

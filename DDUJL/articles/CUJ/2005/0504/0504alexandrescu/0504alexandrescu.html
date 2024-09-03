@@ -1,0 +1,287 @@
+
+
+
+<html>
+<head>
+<title>April, 2005: Prying Eyes:  A Policy-Based Observer (I)</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>Prying Eyes:  A Policy-Based Observer (I)</h1>
+<p><i>C/C++ Users Journal</i> April, 2005</p>
+<h2>There are hidden challenges in defining good Observer designs</h2>
+
+
+<h3>By Andrei Alexandrescu</h3>
+
+
+<I>Andrei Alexandrescu is a graduate student in Computer Science at the University of Washington and author of Modern C++ Design. He can be contacted at andrei@ metalanguage.com.</I>
+
+<hr>
+
+
+
+
+
+<p>This column discusses implementations of the Observer pattern (as described by the Gang of Four [3]). The approach I take is similar to that of <i>Modern C++ Design</i> [1]: First discuss the pattern itself, identifying its key points of customization&#151;the places in which there is a design decision to be made. Then, I abstract the thusly discovered points of customization into policies, and assemble a generic Observer framework from those policies.</p>
+<h3>Mailcontainer</h3>
+
+<p>The three mIdeas in "Generic &lt;Programming&gt;'s" February installment [2] have gotten a lot of attention and good feedback. As the Hula Hoop inventers might have said, you never know what people are gonna like. First, Dan Nuffer pointed out:</p>
+
+<blockquote>
+I just finished reading your column in the February issue of <i>CUJ</i>, and thought I'd mention a way to detect unchecked return codes at compile time using a gcc extension:<br>
+
+<pre>
+__attribute__((warn_unused_result))
+<br>
+Compiling this code:
+int FallibleFunction()
+   __attribute__((warn_unused_result));
+int foo() {<br>
+   FallibleFunction();<br>
+}
+outputs this warning:<br>
+warning: ignoring return value of int 
+FallibleFunction(), declared with attribute 
+warn_unused_result
+The warning could be changed to an error by specifying the -Werror command-line option.<br>
+
+</pre>
+
+</blockquote>
+
+<p>That's pretty useful for GCC users, and those aiming for portability, Dan points out, could use <b>#define</b> to use the <b>warn_unused_ result</b> attribute under GCC, and fall back to runtime errors on other platforms. David Brownell sent me his <b>ErrorChecker</b> code that my mIdea #1 unwittingly plagiarizes, and Michael Borghardt nicely points out a couple of typos (redundant braces) that I'm sure you also noticed if you ever tried to copy the code in a file. Moreover, Michael points out that this code has a problem:</p>
+
+<pre>
+IgnoreError(FallibleFunction());
+
+</pre>
+
+<p>(where <b>IgnoreError</b> is a type and <b>FallibleFunction</b> is the name of a function returning <b>ErrorCode&lt;int&gt;</b>). The intent was to construct an anonymous temporary of type <b>IgnoreError</b> from the expression <b>FallibleFunction()</b>. But the compiler yields the impenetrable error message: "<b>IgnoreError FallibleFunction()</b>: overloaded function differs only by return type from <b>ErrorCode&lt;T&gt; FallibleFunction()</b>". Whoa, whoa. What is going on over there?</p>
+
+<p>Whenever there's trouble, the French say, <i>cherchez la femme</i>. To paraphrase that for C++, whenever there's trouble, <i>cherchez la fastidieuse analyse du C++</i>, which is my attempt at rendering in French Scott Meyers' famous "beware of C++'s most vexing parse" [4]. Indeed, <b>IgnoreError(FallibleFunction()</b>); is parsed as <b>IgnoreError</b> <b>FallibleFunction()</b>; which is nothing but the declaration of a function. </p>
+
+<p>A nice solution would be to define <b>IgnoreError</b> as a function and not as a type:</p>
+
+<pre>
+template &lt;class T&gt;
+void IgnoreError(const ErrorCode&lt;T&gt;&amp; code) {
+   // silently shut off the error, if any
+   code.read_ = true;
+}
+
+</pre>
+
+<p>which requires making <b>IgnoreError&lt;T&gt;</b> a friend of <b>ErrorCode&lt;T&gt;</b>.</p>
+
+<p>Finally, Attila Feher points out that <b>ErrorCode&lt;T&gt;::operator T()</b> should be made <b>const</b>, to obey the "least mutability" principle. He also suggests making <b>ErrorCode</b>'s constructor explicit, something that I chose to disagree with for ease-of-use reasons.</p>
+
+<p>Today's discussion was motivated by an e-mail from David Blume, who has written a very nice study (see http://observer.dlma.com/) on generic implementations of Observer, that opens with a bold question:</p>
+
+<blockquote>
+What would happen if Andrei Alexandrescu, the author of <i>Modern C++ Design</i>, and Martin Fowler, the author of <i>Refactoring</i>, were required to refactor and generalize the Observer pattern sample code from the book <i>Design Patterns</i>? I imagine we'd end up with a policy-based observer pattern.<br>
+
+</blockquote>
+
+<p>The study is interesting and touches on a number of interesting issues, which we're likely to get in to in a future installment. The focus of the column you are now reading is to recap the Observer pattern and to discuss a few important trade-offs and caveats in implementing the pattern that are often understated or even forgotten.</p>
+<h3>Observer: Generalities</h3>
+
+<p>Honest, Observer was on the tentative table of contents for <i>Modern C++ Design</i>. The pattern is beautiful, immensely useful, and fits the policy-based design methodology like a glove. It's also a glove with many fingers so to say, because, as you'll see, there are many useful ways to "cut" the pattern, with various degrees of orthogonality. </p>
+
+<p>Let's recap the basics of Observer, as summarized by the GoF:</p>
+
+<blockquote>
+Define a one-to-many dependency between objects so that when one object changes state, all its dependents are notified and updated automatically. <br>
+
+</blockquote>
+
+<p>Central to Observer is the long-distance dispatch from a concrete "subject" and an unbounded number of concrete "observers" via the abstraction provided by their respective base classes <b>Subject</b> and <b>Observer</b>. A barebones incarnation of the <b>Observer</b> pattern is:</p>
+
+<pre>
+class Observer {
+public:
+   virtual void Update() = 0;
+};
+
+class Subject {
+public:
+   virtual bool Attach(Observer*);
+   virtual bool Detach(Observer*);
+   virtual void NotifyAll();
+};
+
+class BareboneSubject : public Subject {
+public:
+   virtual bool Attach(Observer* pObs) {
+      if (find(data_.begin(),
+         data_.end(), pObs) 
+         != data_.end()) {
+      return false;
+   }
+   
+   data_.push_back(pObs);
+   return true;
+}
+virtual bool Detach(Observer* pObs) {
+   const Container::iterator i =
+      find(data_.begin(),
+         data_.end(), pObs);
+   if (i == data_.end()) return false;
+      data_.erase(i);
+      return true;
+   }
+   virtual void NotifyAll() {
+      for (Container::iterator 
+      i = data_.begin();
+         i != data_.end(); ++i) {
+        (*i)-&gt;Update();
+      }
+   }
+private:
+   typedef vector&lt;Observer*&gt; Container;
+   Container data_;
+};
+
+</pre>
+
+<p>The <b>Subject</b> offers the <b>Attach</b> and <b>Detach</b> services. Concrete observers (derived from <b>Observer</b>) can use these services to register themselves as listeners for whatever events <b>Subject</b> would later signal. Whenever it feels like it, the <b>Subject</b> can invoke <b>NotifyAll</b> and send a burst of calls to all of the registered <b>Observers</b>.</p>
+<h3>Attaching and Detaching</h3>
+
+<p>"Generic&lt;Programming&gt;" readers have an eye that's highly trained to identify sources of variability and potential customization. Thus, definitely the linear operations in <b>Subject::Attach</b> and <b>Subject::Detach</b> must have appeared as obvious as the plot of a Hollywood flick after five minutes.</p>
+
+<p>In a system where there are few observers and/or there aren't many attachments and detachments, a linear search will do great. If, on the contrary, there are many observers that frequently attach to and detach from subjects, then <b>Subject::Attach</b> and <b>Subject::Detach</b> can become a bottleneck. In the latter case, choosing an associative container (tree or hashtable) keyed on <b>Observer*</b> would be a better choice.</p>
+
+<p>The metadesign solution is simple: Encapsulate the <b>Container</b>, the obvious setter of the performance of the subscription process, and put <b>Subject::Attach</b> and <b>Subject::Detach</b> into a separate policy. This is a textbook application of separating concerns in a design, and we sure won't have any problem encapsulating the subscription API into a little policy.</p>
+<h3>"If It Looks Too Simple and Elegant To Be True... "</h3>
+
+<p>It all looks so nice and clean, it's almost a pity to spoil the pleasure by asking the following simple question: What if <b>Attach</b> or <b>Detach</b> are called from within <b>Update</b>?</p>
+
+<p>The GoF description of the pattern doesn't discuss this aspect, and I believe that's an important omission. The problem of interleaved registrations and notifications is a very legitimate one because it is backed up by a number of real-world situations:</p>
+
+
+
+<ul>
+  <li>Say the <b>Subject</b> is a stock-market stream, initially wired to a ticker-tape <b>Observer</b>. When some stock varies by a large percentage, the ticker-tape opens a window that tracks that stock's price. The window itself would be an <b>Observer</b>. Hence, a new <b>Observer</b> is being <b>Attach</b>ed to its <b>Subject</b> while the <b>Subject</b> notifies another <b>Observer</b>.</li>
+  <li>The said windows should close when the market closes. And guess what, the "market close" comes as a notification from the <b>Subject</b>&#151;so we're in the situation of calling <b>Detach</b> from within <b>Update</b>. </li>
+</ul>
+
+
+
+<p>The implementation just described uses a vector for storage and a straight iteration for broadcasting events via calls to <b>Observer::Update</b>. So the loop in <b>Subject::NotifyAll</b> calls <b>Observer::Update</b>, which calls <b>Subject::Attach</b>, which changes the vector in the middle of the iteration!</p>
+
+<p>To further emphasize the subtlety of the problem, let's switch from an <b>std::vector</b> to an <b>std::list</b>. Let's pull <b>Subject::NotifyAll</b>'s code again: </p>
+
+<pre>
+void Subject::NotifyAll() {
+   for (Container::iterator 
+   i = data_.begin();
+       i != data_.end(); ++i) {
+     (*i)-&gt;Update();
+   }
+}
+
+</pre>
+
+<p>The <b>std::list</b> is more stable to changes during iteration: When removing an element from the list, only the iterators referring to that element are invalidated. The aforementioned code remains buggy: After <b>(*i)-&gt;Update()</b> returns, the next iteration calls <b>++i</b> on an invalid iterator. So a better version would increment the iterator before calling <b>Update</b>:</p>
+
+<pre>
+void Subject::NotifyAll() {
+   for (Container::iterator i = data_.begin();
+      i != data_.end(); ) {
+    (*i++)-&gt;Update();
+   }
+}
+
+</pre>
+
+<p>This version would increment <b>i</b> and return a copy of the old <b>i</b>, which will be dereferenced and used to call <b>Update</b>. Of course, the code must be properly documented because otherwise the maintainer will think, "Hey, the original author didn't know that postincrement is actually slower than preincrement...heh, let me fix this real quick."</p>
+
+<p>But, of course, the code is not fixed yet: What if some <b>Observer</b>'s <b>Update</b> function ends up detaching another <b>Observer</b>, which happens to be next in the list? We're back to square one, and the worst part is that such restrictions are very hard to enforce effectively. A much more solid version is to make a copy of the container before updating anything:</p>
+
+<pre>
+void Subject::NotifyAll() {
+   Container d(data_); // make a copy
+   for (Container::iterator i = d.begin();
+       i != d.end(); ++i) {
+     (*i)-&gt;Update();
+   }
+}
+
+</pre>
+
+<p>That's rock-solid, but has juuust a little wrinkle. You could actually label it as "not a bug, but a feature"&#151;if you detach an <b>Observer</b> object from within another <b>Observer</b>'s <b>Update</b>, then the detached <b>Observer</b> might still receive a last event even after having been detached. That's because the detached <b>Observer</b> is still present in the snapshot of the container. Ouch. That makes seemingly innocuous code such as:</p>
+
+<pre>
+void TickerTape::Update() {
+   Subject * pS = GetSubject();
+   Observer * p = GetCurrentGraph();
+   // Untie p from the world
+   pS-&gt;Detach(p);
+   // p is unlinked, we can delete it
+   // or... can we?
+   delete p; // KA-BOOM!!!
+}
+
+</pre>
+
+<p>crash in flames. Again, this is the sort of problem that is hardest to protect against: The constraints are hard to document and hard to enforce efficiently. </p>
+
+<p>A solution that is solid as well as efficient is to store the iterator as a member in the <b>BareboneSubject</b> class, then make sure that the <b>Attach</b> and <b>Detach</b> functions update it properly.</p>
+
+<p>There are even more dimensions on which <b>Subject::NotifyAll</b> could be customized. To enumerate a few:</p>
+
+
+
+<ul>
+  <li>Threading. What level of thread safety does the <b>Subject</b>/<b>Observer</b> duo offer? Things are not as simple as locking the <b>Subject</b> inside each public function; indeed, with nonrecursive locks, the system could easily deadlock by asking for the same lock twice due to recursive mutual calls among <b>Update</b>, <b>Attach</b>, and <b>Detach</b>. All of a sudden, the solution that copies the entire container and then serves notifications from the snapshot becomes much more attractive.</li>
+  <li>Exceptions. The specification should clarify whether or not functions overriding <b>Observer::Update</b> can throw exception, and what the behavior of <b>Subject::NotifyAll</b> should be (just let the exception go through? Ignore and finish the burst? Finish the burst but throw something later?...).</li>
+  <li>Iteration order. A priority system could be very useful, especially as an attempt to control active observation, which is discussed momentarily. </li>
+</ul>
+
+
+
+<p>The takeaway of this section is that you better make the process of subscription and notification a separate, configurable part of the planned <b>Observer</b> design so that different implementations featuring different designs can plug into the larger architecture. </p>
+<h3>The Sins of Active Observation</h3>
+
+<p>The aforementioned example glossed over how an <b>Observer</b> could get a hold of the <b>Subject</b> that notified it, hiding the details under the magic function <b>GetSubject</b>; it is the time now to discuss how information is passed from the <b>Subject</b> to its <b>Observers</b>. This is an actual necessity stemming from the observation (no pun intended) that one <b>Observer</b> might be listening to several subjects, all of which will call the same <b>Update</b> function. It would be necessary, then, for the <b>Observer</b> to figure out who the caller was. </p>
+
+<p>On the face of it, the solution is simple and obvious: Just change <b>Observer::Update()</b> to <b>Observer::Update(Subject*)</b>. But a more general question arises: How much information ought to be passed from the <b>Subject</b> to its <b>Observers</b> upon each burst of notifications? The <i>Design Patterns</i> book discusses the push and the pull model: Under the push model, the <b>Subject</b> gives its <b>Observers</b> comprehensive information about exactly what event happened (in the form of additional arguments to <b>Observer::Update</b>). On the contrary, in the pull model, the <b>Observers</b> only receive minimal information. It is up to them, the <b>Observers</b>, to go back to the corresponding <b>Subject</b> and "interrogate" it about what happened. If your typical <b>Observer</b>s closely track events that have a uniform representation (keystrokes, mouse events, stock name, and price...), then a push model is most appropriate. If, on the contrary, each of the <b>Observers</b> is focused on a specific aspect of a <b>Subject</b> with complex events that are hard to represent uniformly, then the pull model is the design of choice. </p>
+
+<p>Of course, as often in life, the right path is someplace in between these two extremes. As an example, imagine <b>Subject</b> is a complex image to which we attach <b>Observers</b> such as a drawing canvas, image statistics, a lens... In that case, the push model would advocate passing a lot of information about what kind of update happened, while the pull model would just have the drawing say "something happened" and let the clients ask about the details. A hybrid approach would have the image notify the clients that a specific rectangle (push information) has been updated, and the clients would have to get back to the image and pull the bits of that rectangle (pull information).</p>
+
+<p>So far so good. But as soon as the idea of passing information from the <b>Subject</b> to its <b>Observers</b> takes shape, a strange feeling creeps in: How much of that information is actually handles to mutable data that would allow a reverse information flow&#151;from the <b>Observers</b> to the <b>Subject</b>? To coin two terms, we distinguish between <i>passive</i> observation (the observer just inspects its subject during a notification cycle) and <i>active</i> observation (the observer might change its subject during a notification cycle). </p>
+
+<p>Active observation introduces severe long-distance coupling among various observers connected to the same subject: The notification order becomes a veritable food chain in which the first registered observer sees a "fresh," or better said, freshly changed subject, and the last observer sees a tarnished subject, the integral of whatever changes each of the previous observers have found fit to apply; thus, the behavior of the system becomes dependent on which observers are actually connected, and on the order in which they are notified. Now only try to imagine what happens when, during an update, some observer changes the subject by invoking some method, and the subject notifies again via a burst of <b>Subject::Update</b> calls, while the current updating cycle hasn't finished yet! This kind of inverted flow of control, in which the observers actually determine what the subject is doing, is worse than the proverbial tail wagging the dog: Due to the long-distance coupling among observers, it's like the neighbor cat's tail is wagging the dog! </p>
+
+<p>A good start toward a solution is to pass the subject as a pointer to <b>const</b>:</p>
+
+<pre>
+void Observer::Update(const Subject* p) {
+   ... cannot change *p ...
+}
+
+</pre>
+
+<p>Unfortunately, a good door lock doesn't help if the window's open: In a real program, the <b>Observers</b> might store, or have access to, nonconst aliases of the subjects. Such aliasing is not statically tractable (not in C++, at least) and hard to track even dynamically. So program correctness is left to two of the least reliable teammates: attention and discipline.</p>
+<h3>Conclusion</h3>
+
+<p>This column discusses some of the hidden challenges in defining good Observer designs. So far, we've identified together some valuable points of customization: the subscription mechanism (attaching and detaching) and the distribution means (notifying all observers about a change in the subject). We've also discussed some dangers that are hard to protect against: mutual recursion between attachment/detachment and notification, as well as active observation.</p>
+
+<p>The next installment of this column discusses brokered observation, events and event filtering, event-centric versus subject-centric observation, and proceeds with a policy-based implementation.</p>
+<h3>References</h3>
+
+<ol>
+  <li>[1]	Alexandrescu, Andrei. <i>Modern C++ Design: Generic Programming and Design Patterns Applied</i>, Addison-Wesley Longman Publishing, 2001. </li>
+  <li>[2]	Alexandrescu, Andrei. "Generic &lt;Programming&gt;: Three mIdeas." <i>C/C++ Users Journal</i>, February 2005.</li>
+  <li>[3]	Gamma, Erich, Richard Helm, Ralph Johnson, and John Vlissides. <i>Design Patterns: Elements of Reusable Object-Oriented Software</i>, Addison-Wesley Longman Publishing, 1995. </li>
+  <li>[4]	Scott Meyers. <i>Effective STL</i>, Addison-Wesley Longman Publishing, 2004. </li></ol>
+
+
+
+
+
+
+</body>
+</html>

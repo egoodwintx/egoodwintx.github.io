@@ -1,0 +1,304 @@
+<HTML>   
+     <HEAD>
+<TITLE>November 2002/Class Template, Member Template &#151; or Both?</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocnov.htm"></A><FONT COLOR="#FF0000">   Features</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Class Template, Member Template &#151; or Both?</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Scott Meyers</FONT></H3>
+
+<BLOCKQUOTE>
+<p>A novel combination of member templates and full specialization raises the stakes on effective generic programming.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>Sometimes what you templatize makes all the difference.</p>
+<p>The STL is wonderful, but in places it demands gratuitous redundancy. For example, consider this code:</p>
+
+<pre>
+vector&lt;int&gt; v;
+deque&lt;int&gt; d;
+...
+// do d[i] *= v[i] for all i
+transform(
+  v.begin(), v.end(),  
+  d.begin(),
+  d.begin(),
+  multiplies&lt;int&gt;());
+</pre>
+
+<p>Even though I&#146;m multiplying two <B>int</B>s together, I have to explicitly specify that I want to perform integer multiplication. This is more than annoying because if I later change <B>v</B> and <B>d</B> to hold a different data type (e.g., <B>double</B>), I must also remember to update all the places where I&#146;ve used <B>multiplies</B> (or <B>plus</B>, etc.) to specify the new data type. If I don&#146;t, I end up with code like this, which almost certainly doesn&#146;t do what I want:</p>
+
+<pre>
+vector&lt;double&gt; v;
+deque&lt;double&gt; d;
+...
+// do d[i] *= v[i] for all i,
+// but use integer
+// multiplication!
+transform(
+  v.begin(), v.end(),
+  d.begin(),
+  d.begin(),
+  multiplies&lt;int&gt;());
+</pre>
+
+<p>The reason I must specify a type for <B>multiplies</B> is that it is a class template:</p>
+
+<pre>
+template&lt;typename T&gt;
+struct multiplies:
+  binary_function&lt;T, T, T&gt; {
+  T operator()(
+    const T&amp; x,
+    const T&amp; y) const
+  { return x*y; }
+};
+</pre>
+
+<p>Unlike class templates, function templates offer implicit type deduction, so the usual approach to eliminating the need to specify types for class templates is to write a helper function template that deduces the type(s) and returns the appropriate type of object as the return value. For <B>multiplies</B>, such a helper function template might look like this:</p>
+
+<pre>
+template&lt;typename T&gt;
+inline
+multiplies&lt;T&gt;
+  make_multiplies(
+    const T&amp;, const T&amp;)
+{ return multiplies&lt;T&gt;(); }
+</pre>
+
+<p>In many cases, this works fine, and the general approach is enshrined in the Standard in the form of the helper template <B>make_pair</B> (which generates pair objects). The approach has its limitations, however. In the case of <B>make_multiplies</B>, notice how callers must pass two objects of type <B>T</B>, even though neither object is used; only the type is. Furthermore, it&#146;s hard to see how to use <B>make_multiplies</B> with the earlier <B>transform</B> call, because the arguments are available only <I>inside</I> <B>transform</B>:</p>
+
+<pre>
+transform(
+  v.begin(), v.end(),
+  d.begin(),
+  d.begin(),
+  make_multiplies(???, ???));
+</pre>
+
+<p>When running up against difficulties like this, I have found the following transformation useful: instead of creating a class (or <B>struct</B>) template with non-template member functions, consider creating a non-template class with a member template instead. That is, consider moving the templatization from the class to the class&#146;s member function(s).</p>
+<p>If we apply this idea to <B>multiplies</B>, we come up with this:</p>
+
+<pre>
+struct NewMultiplies {  // no longer a template
+template&lt;typename T&gt;  // now a template
+  T operator()(
+    const T&amp; x,
+    const T&amp; y) const
+  { return x*y; }
+};
+</pre>
+
+<p>Callers would use it like this:</p>
+
+<pre>
+vector&lt;int&gt; v;
+deque&lt;int&gt; d;
+...
+// do d[i] *= v[i] for all i
+transform(
+  v.begin(), v.end(),  
+  d.begin(),
+  d.begin(),
+  NewMultiplies()); // deduce that integer multiplication is appropriate
+</pre>
+
+<p>Not only is this more robust if the types stored in <B>v</B> and <B>d</B> change, it&#146;s also less to type.</p>
+<p>This idea &#151; putting a templatized member function (often <B>operator()</B>) inside a non-template class &#151; is the basis of my favorite little trick in <I>Effective STL</I> <a href="#1">[1]</a>, namely, a generic pointer-deleting functor:</p>
+
+<pre>
+struct DeleteObject {
+  template&lt;typename T&gt;
+  void operator()(
+    const T* ptr) const
+  { delete ptr; }
+};
+Container&lt;T*&gt; c;
+...
+for_each(
+  c.begin(), c.end(),  // delete pointers in c
+  DeleteObject());     // regardless of type
+</pre>
+
+<p>Useful as this technique is, sometimes you <I>want</I> to specify the type explicitly. For example, suppose <B>v</B> and <B>d</B> hold <B>double</B>s, but for some reason you want to perform integer multiplication. In that case, you want to say this:</p>
+
+<pre>
+vector&lt;double&gt; v;
+deque&lt;double&gt; d;
+...
+transform(
+  v.begin(), v.end(),  // do d[i] *= v[i] for all i,
+  d.begin(),           // but use integer
+  d.begin(),           // multiplication!
+  multiplies&lt;int&gt;());
+</pre>
+
+<p>With <B>NewMultiplies</B>, you don&#146;t have that option. Furthermore, because <B>NewMultiplies</B> fails to inherit from <B>binary_function</B>, <B>NewMultiplies</B> objects aren&#146;t adaptable, and that means that while you can use adapters like <B>bind2nd</B> with <B>multiplies</B>, you can&#146;t use them with <B>NewMultiplies</B>:</p>
+
+<pre>
+vector&lt;int&gt; v;
+...
+transform(
+  v.begin(), v.end(),
+  v.begin(),                       // fine, multiplies v's
+  bind2nd(multiplies&lt;int&gt;(), 2));  // elements by 2
+transform(
+  v.begin(), v.end(),
+  v.begin(),                       // error! Can&#146;t apply
+  bind2nd(NewMultiplies(), 2));    // a binder to a
+                                   // NewMultiplies object
+</pre>
+
+<p>These limitations make <B>NewMultiples</B> less attractive than it initially seemed.</p>
+<p>What we really want, of course, is the best of both worlds:</p>
+
+<UL><LI>   Implicit type deduction when it does the right thing.</LI>
+<LI>   Explicit type specification when we need it (e.g., when we deliberately want to use the &#147;wrong&#148; type or when we need to employ a binder).</LI></UL>
+
+<p>Fortunately, it is easy to achieve this blissful state. To get implicit type deduction, we use the <B>NewMultiplies</B> approach: a non-template <B>struct</B> with a templatized <B>operator()</B> member function. To allow explicit type specification, we use the <B>multiplies</B> approach: a templatized <B>struct</B> with a non-template <B>operator()</B>. The only twist is that we combine them: we make the non-template <B>NewMultiplies</B>-like <B>struct</B> a total specialization of the <B>multiplies</B>-like <B>struct</B>. It looks like this:</p>
+
+<pre>
+template&lt;typename T = void&gt;
+struct NewMultiplies:
+  std::binary_function&lt;T, T, T&gt; {
+    T operator()(
+      const T&amp; x,
+      const T&amp; y) const
+      { return x*y; }
+};
+template&lt;&gt;
+struct NewMultiplies&lt;void&gt; {
+  template&lt;typename T&gt;
+  T operator()(
+    const T&amp; x,
+    const T&amp; y) const
+  { return x*y; }
+};
+</pre>
+
+<p>Notice that the general <B>NewMultiplies</B> template takes a single type argument, just like <B>multiplies</B> does, and <B>NewMultiplies</B> is implemented exactly like <B>multiplies</B> is. Unlike <B>multiplies</B>, however, <B>NewMultiplies</B>&#146; type argument is optional. When that argument is omitted, the type defaults to <B>void</B>. We&#146;ve explicitly specialized <B>NewMultiplies&lt;void&gt;</B>, however, and that class contains a member function template for <B>operator()</B>. Result? When we pass <B>NewMultiplies</B> a type argument, it behaves exactly like <B>multiplies</B>. When we use <B>NewMultiplies</B> without a type argument, it uses implicit type deduction to figure out the type of multiplication to perform. Here are some examples:</p>
+
+<pre>
+vector&lt;double&gt; v;
+deque&lt;double&gt; d;
+...
+transform(
+  v.begin(), v.end(),
+  d.begin(),
+  d.begin(),
+  NewMultiplies&lt;&gt;());           // deduce that T is double
+transform(  
+  v.begin(), v.end(),
+  d.begin(),
+  d.begin(),
+  NewMultiplies&lt;int&gt;());        // do integer multiplication
+transform(
+  v.begin(), v.end(),
+  v.begin(),
+  bind2nd(
+    NewMultiplies&lt;double&gt;(), 2) // do double multiplication
+);
+</pre>
+
+<p>As you can see, <B>NewMultiplies</B> gives you everything <B>multiplies</B> gives you, plus the ability to avail yourself of implicit type deduction.</p>
+<p>You could write similar templates and template specializations for the other standard <B>multiplies</B>-like functors (e.g., <B>plus</B>,<B> minus</B>, etc.), but there&#146;s no point in expending that much energy, because Donovan Rebbechi has pointed out that you can automate the process <a href="#2">[2]</a>. Just create a template, <B>NewFunctor</B>, such that <B>NewFunctor&lt;multiplies, T&gt;</B> behaves just like <B>multiplies&lt;T&gt;</B> (i.e., it offers no templatized <B>operator()</B>) while <B>NewFunctor&lt;multiplies&gt;</B> behaves just like our original <B>NewMultiplies</B> (i.e., it does have a templatized <B>operator()</B>). <B>NewFunctor</B> will also work with <B>plus</B>, <B>minus</B>, etc., which is what makes it worth writing.</p>
+<p>Here it is:</p>
+
+<pre>
+// NewFunctor&lt;F,T&gt; inherits from F&lt;T&gt;,
+// hence acts like it - except when T=void
+template &lt;template &lt;typename&gt; class Functor,
+          typename T = void&gt;
+struct NewFunctor: Functor&lt;T&gt; {};
+
+// NewFunctor&lt;F, void&gt; and NewFunctor&lt;F&gt; act like NewF&lt;&gt;
+template &lt;template &lt;typename&gt; class Functor&gt;
+struct NewFunctor&lt;Functor, void&gt; {
+  template &lt;class T&gt;
+  T operator() (const T&amp; left, const T&amp; right) const
+  {
+    return Functor&lt;T&gt;()(left,right);
+  }
+};
+</pre>
+
+<p>The only part of this that might give you pause is the use of a template template parameter in the definition of <B>NewFunctor</B>:</p>
+
+<pre>
+template &lt;template &lt;typename&gt; class Functor,
+          typename T = void&gt;
+struct NewFunctor: Functor&lt;T&gt; {};
+</pre>
+
+<p>This just says that <B>NewFunctor</B>&#146;s first parameter must be a template taking one type argument. The name of the type parameter for this template is omitted. An alternative way to write the same thing is:</p>
+
+<pre>
+template &lt;template &lt;typename U&gt; class Functor,
+          typename T = void&gt;
+struct NewFunctor: Functor&lt;T&gt; {};
+</pre>
+
+<p>but since there&#146;s no way to take advantage of the name <B>U</B> anywhere, the name is customarily omitted. (Andrei Alexandrescu has demonstrated that template templates are far from a mere syntactic curiosity; they are a powerful part of C++. For the full story on this, consult Alexandrescu&#146;s book, <I>Modern C++ Design</I> <a href="#3">[3]</a>.)</p>
+<p>Here&#146;s <B>NewFunctor</B> in action <a href="#4">[4]</a>:</p>
+
+<pre>
+vector&lt;double&gt; v;
+deque&lt;double&gt; d;
+...
+transform(
+  v.begin(), v.end(),
+  d.begin(),
+  d.begin(),
+  NewFunctor&lt;multiplies&gt;());  // deduce that T is double
+transform(  
+  v.begin(), v.end(),
+  d.begin(),
+  d.begin(),
+  NewFunctor&lt;plus, int&gt;());   // do integer addition
+transform(
+  v.begin(), v.end(),
+  v.begin(),
+  bind2nd(
+    // do double subtraction
+    NewFunctor&lt;minus, double&gt;(), 2)  
+  );
+</pre>
+
+<p>It is not difficult to generate similar wrappers for the relational operators (e.g., <B>less</B>, <B>greater</B>, <B>equal_to</B>, etc.). With some additional effort, it is possible to give <B>NewFunctor</B> support for mixed-type operations (e.g., multiplying <B>int</B>s and <B>double</B>s together, yielding a double result, just as would occur for built-in types and unlike what <B>multiply</B> does), but I&#146;ll leave that aspect of the problem in the form of an exercise for the reader <a href="#5">[5]</a>.</p>
+<p>Getting back to the main idea of this article, the transformation from a template class with non-template member function(s) to a non-template class with template member function(s) is worth considering every time you think about writing a class template, but it&#146;s not workable all the time. STL functor classes like <B>multiplies</B> have no state, hence they have no need to declare member variables of the types of the template&#146;s arguments. The situation is quite different for functor classes like <B>binder2nd</B> (the type of object returned by <B>bind2nd</B>). Here&#146;s the top of the interface for <B>binder2nd</B>, copied straight out of section 20.3.6.3 of the Standard:</p>
+
+<pre>
+template &lt;class Operation&gt;
+class binder2nd
+  : public unary_function&lt;
+    typename Operation::first_argument_type,
+    typename Operation::result_type&gt; {
+protected:
+  Operation op;
+  typename Operation::second_argument_type value;
+  ...
+};
+</pre>
+
+<p>As you can see, objects of type <B>binder2nd</B> have two data members, and the type of each depends on <B>binder2nd</B>&#146;s template parameter, <B>Operation</B>. Because the types of these data members must be known before any <B>binder2nd</B> member functions can be called, there is no way to deduce these types via <B>binder2nd</B> member functions. (They can be deduced by non-member function templates, of course. That&#146;s precisely what <B>bind2nd</B> does!)</p>
+
+<H3><FONT COLOR="#000080">Summary</FONT></H3>
+
+<p>Sometimes you need class templates, sometimes you need function templates, and sometimes you need both. Anytime you find yourself writing a class template and giving it a non-template member function (especially <B>operator()</B>), you should ask yourself whether it might be better to make the member function the template and the class the non-template. If so, the best design of all may be one that templatizes both class and member functions and that combines them by putting the templatized member functions in an explicit specialization of the class template.</p>
+
+<H3><FONT COLOR="#000080">Notes and References</FONT></H3>
+
+<p><a name="1"></a>[1]  Scott Meyers. <I>Effective STL: 50 Specific Ways to Improve Your Use of the Standard Template Library</I> (Addison-Wesley, 2001). The <B>DeleteObject</B> functor is described in Item 7.</p>
+<p><a name="2"></a>[2]  Donovan Rebbechi sent me this idea after my inaugural presentation of <B>NewMultiplies</B> at The C++ Seminar in March 2002. The next The C++ Seminar will take place in October 2002. For details, surf to &lt;www.thecppseminar.com/&gt;.</p>
+<p><a name="3"></a>[3]  Andrei Alexandrescu. <I>Modern C++ Design</I> (Addison-Wesley, 2001).</p>
+<p><a name="4"></a>[4]  This code works under Metrowerks CodeWarrior 6.1, the Borland C++ command-line compiler 5.5.1,. Gnu g++ 3.1, and Comeau C/C++ 4.3.0 BETA#4. It fails to compile using Microsoft Visual Studio .NET, (presumably due to that compiler&#146;s lack of support for template templates. All tests were performed under Windows 2000.</p>
+<p><a name="5"></a>[5]  The solution that Donovan Rebbechi sent me includes support for mixed-type operations.</p>
+
+<p><i><B>Scott Meyers</B>, author of the three best-selling <I>Effective C++</I> books, is one of the world&#146;s foremost authorities on C++ software development. He conceived of The C++ Seminar (&lt;www.thecppseminar.com/&gt;) and the Workshops on C++ Template Programming (&lt;www.oonumerics.org/tmpw00/&gt; and &lt;tmpw01/&gt;), is a member of the Software Development advisory board, and provides training and consulting services to clients worldwide. His current interests focus on domain- and language-independent principles for improving software quality. His web site is &lt;www.aristeia.com/&gt;.</i></p>
+
+</blockquote></body></html>

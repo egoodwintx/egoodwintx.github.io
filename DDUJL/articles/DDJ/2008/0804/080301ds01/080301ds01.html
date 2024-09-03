@@ -1,0 +1,243 @@
+<html>
+<head>
+<title>String Search on Multicore Processors</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> April 2008</p>
+
+<h1>String Search on Multicore Processors</h1>
+<h2>Mapping fundamental algorithms onto parallel hardware</h2>
+
+
+<h3>By Daniele Paolo Scarpazza, Oreste Villa, and Fabrizio Petrini</h3>
+
+
+<I>Daniele, Oreste, and Fabrizio were affiliated with the Pacific Northwest National Laboratory when this article was written. Daniele and Fabrizio have since moved to the Cell Solutions  department of IBM. They can currently be contacted at scarpaz@scarpaz.com.</I>
+
+<hr>
+
+
+
+
+<p>While your current PC may be dual- or quad-core, the one sitting on your desk in a couple of years will be a "many-core." Multicores are the future, and because programming them is so different than programming for traditional processors, you must prepare for the change now, especially in mapping basic algorithms efficiently onto the new hardware. </p>
+
+<p>String searching is one of these basic algorithms. It has a host of applications, including search engines, network intrusion detection, virus scanners, spam filters, and DNA analysis, among others. The Cell processor, with its multiple cores, promises to speed-up string searching a lot.</p>
+
+<p>In this article, we show how we mapped string searching efficiently on the Cell. We present two implementations: </p>
+
+
+
+<ul>
+  <li>The fast implementation supports a small dictionary size (approximately 100 patterns) and provides a throughput of 40 Gbps, which is 100 times faster than reference implementations on x86 architectures. </li>
+  <li>The heavy-duty implementation is slower (3.3-4.3 Gbps), but supports dictionaries with tens of thousands of strings.</li>
+</ul>
+
+
+
+<p>This task is not trivial. We had to change our algorithm significantly to reach top performance. In particular, to exploit the memory subsystem at its best, we employ a pipelined parallelization strategy, and we shuffle the data layout to fight congestion&#151;techniques that are unfamiliar to most programmers of traditional architectures. The source code that implements the techniques we present here is available electronically; see <a href="http://www.ddj.com/code/">www.ddj.com/code/</a>.</p>
+
+
+
+
+
+
+<h3>Why Is String Searching  So Important?</h3>
+
+<p>The Internet is a dirty place, with malware, spyware, spam, and viruses trying to penetrate your systems through all possible vulnerabilities. Undesired traffic cannot be filtered anymore on the basis of header information. What's needed is"deep-packet inspection, which checks the payload against a database containing signatures of a large number of threats.</p>
+
+<p>But with network links getting faster (10 Gbps Ethernet, for instance), performing on-the-fly deep-packet inspection isn't child's play. For example, running the Snort (www.snort.org) intrusion-detection system on a Pentium 4 PC only ensures a filtering throughput between 200-400 Mbps. This is why network appliance manufacturers often employ specialized hardware like Field-Programmable Gate Arrays (FPGAs) or Application-Specific Instruction Processors (ASIPs). The Cell processor is a new player in this field, with the potential to offer lots of computing power at low price. In fact, its large production volumes (it's used in the Sony PlayStation 3) contribute to keeping its price low.</p>
+
+
+
+
+
+
+
+
+<h3>Programming the Cell:  Rethinking Bottom-Up</h3>
+
+<p>The Cell is so different from traditional processors that you can't get the best out of it unless your code explicitly takes advantage of its hardware. The Cell contains nine processors&#151;one Power Processing Element (PPE), a 64-bit PowerPC-like processor that is mainly used to run the operating system and load the tasks, and eight worker elements called "Synergistic Processing Elements" (SPEs). </p>
+
+<p>SPEs have 128-bit-wide registers and Single Instruction Multiple Data (SIMD) instructions. Because they have a simple branch prediction, jumps are expensive and your code should avoid them, possibly replacing them with speculative execution. Additionally, SPEs cannot access the RAM directly and they have no cache. Instead, they have a small 256-KB memory called "local store" (LS), and transfer data to/from main memory with asynchronous DMA transfers. By cleverly scheduling DMA transfers in your code (with, for instance, double buffering), you can hide part or all of the transfer latency. See our article "Programming the Cell" (www.ddj.com/dept/64bit/197801624). </p>
+
+<p>These hardware features revolutionize how you write code. Programmers have been told since Programming 101 to develop code in a top-down fashion. Now on the Cell, we are forced to look down to the bottom and make both ends meet. Hardware constraints strongly influence the algorithm.</p>
+
+
+<h3>Searching Strings:  One Problem,  Too Many Solutions</h3>
+
+<p>Whether you are scanning files for viruses, performing full-text searches on a large collection of articles, or detecting intrusions on network traffic, you're doing string searching. Given a text and a dictionary (a set of patterns), your task is to find all occurrences of any of the patterns in the text.</p>
+
+<p>String searching is a beaten track, with many proposed algorithms. We employ Aho-Corasick, which is famous for appearing in the original "fgrep" UNIX utility. Despite its age (it was presented in 1975), this algorithm is simple and appears more suitable to the Cell than others (Knuth-Morris-Pratt, Boyer-Moore, Commentz-Walter, Wu-Manber, and the like). In fact, Aho-Corasick can be expressed well as a branchless data flow that best exploits the SIMD capabilities of the SPEs. On the other hand, its evolutions have more complex control flows, which suffer from frequent and large branch misprediction penalties when run on an SPE.</p>
+
+<p>The variant of Aho-Corasick we employ is based on a Deterministic Finite Automaton (DFA), and is fast for two reasons: </p>
+
+
+
+<ul>
+  <li>The DFA is based on a keyword tree (a trie). A trie has a path of labeled edges per each pattern in the dictionary. To process an input character, you just choose the outgoing edge, which is labeled with that character, and jump to the following node along that edge. </li>
+  <li>In a DFA, no special rollback actions are required in case of mismatches. A non-matching input character triggers a simple state transition, like any other character. For more information, see "The Aho-Corasick Algorithm" (en.wikipedia .org/wiki/Aho-Corasick_algorithm).</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+<h3>Why Aho-Corasick and the Cell Make a Good Match</h3>
+
+<p>The DFA-based Aho-Corasick suits the Cell very well. In fact, processors with SIMD instructions (like the SPE) offer lots of data-level parallelism that you can exploit by running multiple DFAs together. Moreover, the many (128) registers available allow extensive loop unrolling and code replication.</p>
+
+<p>A single instance of a DFA is not sufficient to satisfy this hunger for parallelism. The most natural approach to parallelize the algorithm (thus multiplying throughput) is to adopt multiple instances of the automaton. All the instances act as the same automaton (that is, they share the same state transition table), but they will be provided with distinct chunks of the input text; see Figure 1. The chunks are partially overlapped; otherwise, occurrences of a pattern that appear across a boundary would not be matched.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080301ds01_f1.gif" onclick = "popimage(this,'www.ddj.com - String Search on Multicore Processors - Figure 1')">
+
+<div class="caption">
+Figure 1: Input text.
+</div>
+</div>
+
+
+<p>Because a DFA does exactly one state transition per consumed input character, multiple DFAs are naturally synchronized&#151;they start/finish processing a given quantity of text at the same time. Consequently, they can share a single program control structure. This is a great advantage. We can fuse multiple DFAs in single, long basic blocks, which are crucial for performance on SPEs&#151;they mitigate branch overhead and give the compiler enough elbow room during instruction scheduling. This results in reduced stalls, hiding of load/store latencies, better dual pipeline exploitation, and lower clock Cycles Per Instruction (CPI) values.</p>
+
+
+<h3>Our Fast Solution</h3>
+
+<p>The smaller the dictionary, the smaller the corresponding State Transition Table (STT). If the STT is small enough, we can keep it entirely in the local store rather than in main memory. This speeds up the algorithm because main memory accesses are slow. Our fast implementation is based on the simple idea of keeping the STT in the local store.</p>
+
+<p>As we anticipated, a single automaton poorly utilizes the SPE hardware. Its implementation uses only four registers out of the 127 available, and no SIMD instructions. Moreover, an SPE has two pipelines and could issue two instructions at the same time if they do not conflict, but this implementation does not exploit this feature. As a result, the CPI is high (2.6) and throughput is low (1.35 Gbps).</p>
+
+<p>But if we fuse together 16 automata, things improve a lot, because with SIMD instructions our code can process data from four automata at the same time. This implementation better exploits the registers (40 out of 127) and the two pipelines (43.8 percent of the issues are dual), reaching a CPI of 0.67.  </p>
+
+<p>This is a big improvement, but the code still stalls 7.4 percent of the cycles. To get rid of these stalls, we unroll the code manually, creating longer basic blocks. This gives the compiler more freedom to reschedule instructions and fill the stalls. We found experimentally that the best conditions happen when we unroll the main loop three times. The resulting code uses almost all the registers (124 out of 127) without spilling, it has a high dual-issue rate, and no stalls. This leads to a remarkable throughput of 5.11 Gbps.</p>
+
+<p>Loading text from memory is not in the way: We adopt a double buffering scheme to load the next chunk while the current one is processed. This completely hides the load latency, because transfers happen asynchronously and take less time than processing. In fact, loading a 16-KB text chunk takes 5.94 microseconds, whereas processing it takes 25.64 microseconds. </p>
+
+<p>All this happens on a single SPE. To unleash all of the Cell's power, the remaining seven SPEs can be put to work, too. We can do this in two ways: </p>
+
+
+
+<ul>
+  <li>When they operate in parallel, all the SPEs have identical STTs, but they process distinct chunks of input text. This multiplies the combined throughput by 8, which is 40 Gbps. </li>
+  <li>Alternatively, we can put SPEs "in series." The SPEs are all given the same chunk of input text, but they employ distinct STTs. Each SPE has an STT that represents a portion of the initial dictionary. This way, the available dictionary capacity is multiplied by a factor of 8.</li>
+</ul>
+
+<p>Thanks to the regularity of the DFA and absence of variable-latency operations, the throughput values reported above are independent from the input. This is highly desired in security applications, because it means immunity to content-based attacks.</p>
+
+<p>The main drawback is that the STT must be small enough to fit the local store. Ranging between 190-214 KB in size, each STT will contain between 1520 and 1712 states, assuming an alphabet of 32 characters. Such an STT may encode dictionaries of approximately 150 strings, of average length 10 (more, if many prefixes are common).</p>
+
+
+
+
+
+
+
+
+<h3>The Heavy-Duty Solution</h3>
+
+<p>The aforementioned solution is fast but lacks capacity. Even in the series configuration, it won't support a dictionary larger than 1200 patterns. Additionally, it supports only 32 input symbols, which practically limits us to case-insensitive English text matching only. Instead, popular rule sets available for Snort comprise about 5000 rules, including both text and binary patterns, with a larger average length than 10 characters. And because the bad guys keep themselves busy, this rule set is expected to grow in the future. </p>
+
+<p>Because a solution with more dictionary capacity is needed, we move the STT to a roomier place&#151;main memory. There is a drawback&#151;accessing the STT costs more because each state transition requires a DMA transfer. We can still cache some frequently hit states in the LS, but optimization efforts need to focus on accessing the main memory, where the majority of the STT resides. We must rethink the algorithm "bottom-up" around this goal&#151;making DMA accesses as fast as possible. </p>
+
+<p>Automata spend their lives performing state transitions. This breaks down into two phases: </p>
+
+<ul>
+    <li>Computation. Determining the address of the next state in the STT, depending on current state and input. </li>
+  <li>Data-transfer. Getting data from that address. Because the STT is now in main memory, the data transfer takes much more than computation&#151;13 nanoseconds to compute and 250 to transfer. </li>
+</ul>
+
+<p>Again, a single automaton yields poor utilization of both the processing power and memory subsystem (see Figure 2). And again, we employ multiple automata to improve this. In our code, we statically schedule these automata to run cyclically. The first automaton waits for its transfer to complete, computes the transition, and starts the next data transfer. The second automaton does the same. Then the third, fourth, and so on, up to the last one. At this point, another cycle begins, with the first automaton running again. Figure 3 illustrates this pipelining scheme. We put so much work between two runs of the same automaton, so that we can exploit the DMA latency time to do something useful. </p>
+
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080301ds01_f2.gif" onclick = "popimage(this,'www.ddj.com - String Search on Multicore Processors - Figure 2')">
+
+<div class="caption">
+Figure 2: Processing power and memory subsystem.
+</div>
+</div>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080301ds01_f3.gif" onclick = "popimage(this,'www.ddj.com - String Search on Multicore Processors - Figure 3')">
+
+<div class="caption">
+Figure 3: Pipelining scheme. 
+</div>
+</div>
+
+
+
+<p>In this approach, the bottleneck is the time elapsed between the completion of two subsequent DMA transfers, the memory gap. A new state transition can be completed in no less time than the memory gap. We use 16 automata because benchmarks tell us that the best memory gap is experienced when at least 16 concurrent transfers happen at any time. Benchmarks also prescribe not to transfer blocks larger than 64 bytes, and keep the distribution of accessed memory locations as uniform as possible. </p>
+
+<p>When these conditions hold, the gap falls to 40.68 nanoseconds, when all the 16 SPEs in a double Cell platform are employed. Under these assumptions, transitions happen at a frequency of 24.58 MHz, yielding a maximum overall throughput of 3.15 Gbps. </p>
+
+<p>We designed a first implementation respecting these ideal conditions, and evaluated it in four scenarios: full-text search, network content monitoring, network intrusion detection, and virus scanning (see Figure 4). To our disappointment, performance was largely below the theoretical bound (the curve in red in the figure) and scalability was poor. This degradation is due to congestion in the memory subsystem, caused by a nonuniform state hit distribution. In fact, a tiny percentage of the states are responsible for the last majority of the hits. For example, the states immediately reachable from the initial state are between 0.1-0.5 percent of all the states, but they receive between 46.8-89.8 percent of all hits. Concurrent accesses to the same or adjacent states by multiple automata cause hot spots in the memory subsystem, which show up as longer gaps and lower throughput.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080301ds01_f4.gif" onclick = "popimage(this,'www.ddj.com - String Search on Multicore Processors - Figure 4')">
+
+<div class="caption">
+Figure 4: Evaluation scenarios.
+</div>
+</div>
+
+
+<p>To fight congestion, we employ a combination of state caching, replication, and shuffling. First, we cache in the LS those states that are closest to the initial one, thus completely avoiding memory access for the states that are accessed most frequently. Given the limited size of the LS, we can cache only 180 states out of the 50,000 of the examples considered. </p>
+
+<p>Then we shuffle the states by randomly renumbering them. This redistributes hot spots among the memory banks, ensuring that all of them are subject to the same pressure, but it does not relieve the impact of each single hot spot. For that, we replicate the most frequently hit of the noncached states, such that different automata access different replica of the same STT entry. This way, each replica receives only a fraction of the accesses of the original state. As a drawback, replication causes the STT to grow from approximately 50 to 800 MB.</p>
+
+<p>But these optimizations only solve half of the problem. In fact, if you see the STT as a row/column table, where each row corresponds to a state and each column to an input character, the above optimizations balance pressure only on the rows but not on the columns. Pressure on the columns is unbalanced, especially with English text patterns, because most hits fall on lowercase <i>a-z</i> characters, while almost none fall on characters 128-255. To counter this unbalance, we also shuffle the alphabet space. The offsets at which next states are written in an STT entry are hashed, with a hash function that depends on the stat number, too.</p>
+
+<p>With these optimizations, the aggregate throughput reaches 3.3-4.3 Gbps depending on the scenario (see Figure 5). This suggests that a system composed of three double-Cell blades, each with 1 GB of RAM, can be employed to match traffic at 10 Gbps, against a dictionary comprising at least 5000-25,000 patterns with an average length of 16 bytes.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!--  -->    
+<img class="illowide" src="080301ds01_f5.gif" onclick = "popimage(this,'www.ddj.com - String Search on Multicore Processors - Figure 5')">
+
+<div class="caption">
+Figure 5: Aggregate throughput.
+</div>
+</div>
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

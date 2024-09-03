@@ -1,0 +1,632 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>JAN92: UNTANGLING SMARTDRIVE</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>UNTANGLING SMARTDRIVE<a name="0041_0003"></h1><P>
+<h2><a name="0041_0001"><a name="0041_0000">Effective disk caching</h2><P>
+<h3>Geoff Chappell</h3><P>
+<p><i><a name="0041_0002"><a name="0041_0000">Geoff is a mathematician with a special interest in neural nets.  He can be contacted at International Hall, Brunswick Square, London WC1N 1AS, England or on Internet at uunet!cix.compulink.co.uk!geoffc.</i></p><hr><P>
+For some time now, Microsoft has included SMARTDRV.SYS, a device driver for the SMARTDrive disk cache, with its language compilers, Windows, and (more recently) DOS itself. This article explores SMARTDrive's inner workings so that you can use the cache effectively (or decide not to use it at all).  Additionally, I've included a program that demonstrates how SMARTDrive can be queried or reconfigured using DOS's device driver I/O Control (IOCTL) interface as a starting point for programmers who want to cooperate with SMARTDrive or claim its memory for themselves.<P>
+As of version 3.13, SMARTDRV.SYS accepts two numerical parameters and five switches on its command line in the CONFIG.SYS file.  I'll begin by sketching the general features of a SMARTDRV.SYS device already loaded into memory on a typical machine.<P>
+The cache is created in extended or expanded memory, in a single allocation, the size of which is tailored to a multiple of 16 Kbytes for ease of memory management.  SMARTDrive refuses to load unless at least 128 Kbytes of extended memory are available, although it will proceed with a smaller allocation if the user insists on a smaller cache size.  For the most part, SMARTDrive is indifferent to the type of memory used for the cache.  This article assumes use of extended memory, but bear in mind that the cache will be allocated out of expanded memory if the /a switch is supplied on the device driver's command line.<P>
+The device driver itself stays in conventional memory (or upper memory, if loaded high), where it consumes some 13 Kbytes or so.  Of this, approximately the first 4 Kbytes is code and data for the program.  The bulk of the driver's space is taken by an intermediate buffer as big as the biggest track on any hard disk.  SMARTDrive deals with data from disk in terms of this track size and maintains the intermediate buffer so it may fill requests which do not cover whole tracks.  On a PC with hard disks that are formatted to 17 sectors per track, this buffer will be a little more than 8 Kbytes.  Following the intermediate buffer are the Cache Control Blocks (CCBs)--a double-linked list of 14-byte structures, one for each track the cache has been configured to hold.  The cache in extended memory is nothing but a set of track buffers laid contiguously.  All the information describing a given buffer's contents is held in the corresponding CCB.<P>
+<a href="19920043.htm">Figure 1</A> presents the memory layout, while <a href="#0041_0004">Table 1</A> details the Control Block structure.  Note that although the CCBs are ordered physically in one-to-one correspondence with the track buffers, the logical links between CCBs are maintained by the caching algorithm in such a way that CCBs for less recently used tracks are further down the list.  The double linkage speeds retrieval of recently used tracks and avoids wasting time when searching for a spare buffer to load with a new track.<P>
+<h4><a name="0041_0004">Table 1: The Control Block structure</h4><P>
+<pre>
+  Offset  Size  Description
+  ------------------------------------------------------------------------
+
+  00h     word  Address of CCB for next most recently used track (or FFFFh)
+  02h     word  Address of CCB for next track used more recently (or FFFFh)
+
+  04h    dword  Offset into cache of corresponding track buffer
+
+  08h     word  Flags                   Track buffer's contents are:
+                xxxx  xxxx  xxxx  xxx1  Invalid (empty)
+                xxxx  xxxx  xxxx  xx1x  Dirty
+                xxxx  xxxx  xxxx  x1xx  Nondiscardable
+
+  0Ah     word  Head and drive for track--
+                 dx parameter for int 13h but with bit 80h stripped
+  0Ch     word  Cylinder for track--
+                 cx parameter for int 13h but with sector field cleared
+</pre><P>
+*In a Control Block marked empty, the other flag bits and disk     parameters are meaningless.<P>
+<P>
+*A nondiscardable track will not be considered for replacement during   a search for an old track to make way for a new one, but will be   discarded if the whole cache is invalidated.<P>
+Caching is implemented by intercepting int 13h, the software interrupt used for BIOS-level disk services.  SMARTDrive is interested only in fixed disks, of which existence and characteristics determines during initialization by querying int 13h function 08h.  Support is provided for up to 16 physical hard disks.  (Compare this with the default block device driver in IO.SYS which until DOS 5.0, recognized no more than two.)<P>
+From the outset, it must be understood that SMARTDrive assumes a normal register convention for int 13h calls and is therefore incompatible with a variety of systems for accommodating disks with more than 1024 cylinders.  Recent versions of SMARTDRV.SYS search for partitioning schemes known to indicate problems.  In some cases the difficulty can be overcome, so command line switches are provided to direct SMARTDrive to skip this checking and proceed with its installation on the assumption that the user has obtained a remedy for any incompatibility problems.  Briefly, the /p switch defeats all checks and the recently added /y directs SMARTDrive not to pursue certain schemes involving extended partitioning.<P>
+SMARTDrive also hooks int 19h, as must all programs which seek both to control non-DOS interrupts and be considered well-written.  The point is that int 19h reloads the operating system without reinitializing the ROM BIOS; interrupt vectors that will not be reset by the newly reloaded DOS must therefore be restored before the BIOS receives the int 19h direction.<P>
+Handlers are provided in SMARTDrive's code for two other interrupt vectors, but have so far been left unactivated in SMARTDRV.SYS.  This is because SMARTDrive is a write-through cache. Therefore, it need not intercept the timer interrupt (int 1Ch) to ensure that dirty tracks in the cache get flushed to disk regularly, nor trap attempts to reboot the computer via Ctrl-Alt-Del, although a handler for the int 09h keyboard interrupt is waiting in the wings.<P>
+To complete the general picture, notice that SMARTDrive provides an interface for querying its configuration or changing the behavior of its cache.  This interface is not implemented via software interrupt, but through a service DOS provides for communicating with device drivers that is largely unfamiliar to DOS programmers.  Before constructive use of this interface can be demonstrated, however, we must first discuss the methods SMARTDrive employs to manage the cache.<P>
+<h3><a name="0041_0005">The Cache Algorithm<a name="0041_0005"></h3><P>
+Only int 13h functions 02h (read) and 03h (write) lead to nontrivial processing.  Some functions are passed transparently, but many cause all tracks in the cache to be discarded--a fresh start, needed for instance when a disk is formatted, but also triggered by a write request with implausible parameters or the use of an unknown int 13h function.  In general, any situation (particularly, any error) deemed capable of compromising the integrity of even one cached track is dealt with by invalidating the whole cache.<P>
+Consider the chain of events following the interception of a request to read some number of sectors from a hard disk.  After establishing that the parameters describing the request make sense, SMARTDrive adds the number of sectors involved to a tally it keeps of sectors read during the session.  It then decomposes the request into three pieces: a partial track at the beginning, a body of whole tracks, and a partial track at the end.<P>
+These components are processed in the order given, but it is easiest to consider the body of whole tracks first.  Each track in turn is sought in the cache.  If present, each may be copied immediately to the appropriate location in the int 13h caller's buffer, presenting a considerable gain over a disk access.  To enable SMARTDrive to provide an estimator of its success, a count of sector's retrieved in such &quot;cache hits&quot; is kept for comparison with the total number of sectors read.  The CCB for the track is then moved to first place in the list (as also happens whenever a new track is entered in the cache), both to increase the speed with which the track may be found again and to decrease the chance of its being discarded from the cache, for whenever SMARTDrive needs to enter a new track it goes to the end of the list to begin its search.<P>
+If a track is not in the cache, it will of course have to be read from disk.  But SMARTDrive does not process such tracks individually.  Instead, it builds a set of contiguous tracks which may be read straight to the int 13h caller's buffer in one block.  After reading the tracks from disk, SMARTDrive copies them one by one to the cache.  Ordinarily, this is a simple matter of finding either an empty track buffer or the one used least recently (and therefore most eligible for replacement).  However, tracks in the cache may be marked nondiscardable, leaving open the possibility that no space exists in the cache for a new track.<P>
+SMARTDrive indulges a certain defeatism in this situation and also in response to an error when reading from disk: Although it doesn't discard the cache, it abandons the current request, passing it along the int 13h chain, even though it may have already filled the bulk of the request successfully.<P>
+Partial tracks present a special difficulty, for if the track does not exist in the cache and must therefore be read from disk, where should it be loaded?  It cannot be read directly into the int 13h caller's buffer and must therefore be loaded into an intermediate buffer in SMARTDrive's own memory.  From this buffer, the relevant sectors may be copied to their destination and the whole track may be moved to the cache.<P>
+The special treatment necessary for partial tracks can be turned to advantage.  First, SMARTDrive remembers the disk parameters for any track it loads into the intermediate buffer to fill a request for a partial track, and it is therefore possible that the next time sectors are sought in a partial request, they will not only lie somewhere in the cache, but still be in the intermediate buffer.  This situation can be dealt with very quickly indeed, because it avoids even the small time delay involved in moving data from extended memory, and is regarded as sufficiently special that the statistics maintained by SMARTDrive record these &quot;buffer hits&quot; separately.<P>
+Second, the intermediate buffer may be used indirectly to help systems such as Windows support address paging when running programs in protected mode.  Under these systems, it may be impossible to use the BIOS int 13h services to read from or write to memory the linear and physical addresses of which differ.  Since version 3.11, SMARTDrive's initialization has included verification that the first sector of each hard disk could in fact be read using int 13h, although this may be overridden with the /u switch.  The intermediate buffer is clearly intended to have matching linear and physical addresses.  As such, it would be extravagant for DOS extenders to create another buffer, so SMARTDrive provides a facility for having all the disk read/write activity it intercepts pass through its intermediate buffer.  This double-buffering, as Microsoft calls it, usually works in tandem with the Virtual DMA interface.  This is implemented as protected-mode interrupt 4Bh but indicates its activity to real mode and virtual-8086 mode programs by setting a flag in the BIOS data area.  By monitoring the flag, SMARTDrive supports double-buffering when needed.  Other schemes exist for overcoming DMA problems, so command-line switches are provided both to disable double-buffering (/b-) or to force it to be on all the time (/b+).<P>
+Having covered SMARTDrive's interception of requests to read data from disk, it remains only to elaborate the meaning of &quot;write-through.&quot;  In present versions, SMARTDrive does not retain in memory tracks not sent to disk.  On receipt of a write request, SMARTDrive passes it along the chain immediately, catching the return so that any tracks which were in the cache may be updated.  Any form of error, be it with the disk operation or with the transfer to extended memory, causes SMARTDrive to invalidate the whole cache.<P>
+<h3><a name="0041_0006">Speaking Terms<a name="0041_0006"></h3><P>
+As noted earlier, the interface provided for interrogating SMARTDrive or modifying its behavior has a style which may seem foreign to many DOS programmers.  It is commonplace for resident programs to be coded as device drivers to get them into memory as early as possible, but most such programs follow the familiar method of hooking a software interrupt on which to support their communication with other programs.  Few programs take advantage of the I/O Control interface which DOS provides in parallel to normal read and write functions, despite the opportunity offered to avoid interrupt conflicts.<P>
+Character device drivers are known to DOS by name and as such may be opened with the usual DOS functions or high-level language equivalents.  Ordinarily, device drivers are opened to transfer data to or from a physical device such as a video screen or printer, though in these cases the relevant drivers, CON and PRN, will usually have been opened as predefined handles. IOCTL is provided as a means of communicating with the driver rather than the physical device behind it, most especially for controlling the way in which the driver regards both the device and the data being passed to and fro.<P>
+Reading and writing both require specifying the handle for the device, the number of bytes to transfer, and the whereabouts of the data or buffer.  IOCTL operates the same way, so similarly in fact that the file IOCTL.C presented in <a href="#0041_0009">Listing One</A>  (page 90) contains functions with exactly the same prototypes as the Microsoft C library functions _dos_read() and _dos_write().<P>
+By no means is it obligatory for a device driver to acknowledge an IOCTL call--indeed, DOS does not actually attempt the communication without first inspecting the attribute word in the device driver's header to establish that IOCTL is supported.  Given that a known device driver name has to be supplied in the first place, this makes IOCTL communication much more secure than issuing a software interrupt with only a vague idea of what might be at the receiving end.  With IOCTL, problems are reported by standard DOS error codes.  Note, though, that just as the details of an interrupt-based API vary from one to another, so too is the interpretation of IOCTL data a different matter for each different driver.<P>
+In SMARTDrive's case, the name to use is SMARTAAR, and the structures it understands for the IOCTL read and write functions are described in <a href="#0041_0007">Tables 2</A> and <a href="#0041_0008">3</A>, respectively.  An IOCTL read function, properly executed, should fill a 44-byte buffer with information on SMARTDrive's performance and configuration.  For the IOCTL write function, the first byte in the data packet is interpreted as a command code, to be followed by extra data if the particular command requires it.<P>
+<h4><a name="0041_0007">Table 2: Data structure for SMARTDrive IOCTL Read</h4><P>
+<pre>
+  Offset  Size  Description
+  -------------------------------------------------------------------------
+
+  00h     byte  Unused, except that it may be changed by IOCTL Write
+                 function 04h subfunctions 00h and 01h
+  01h     byte  Unused, except that it may be changed by IOCTL Write
+                 function 04h subfunctions 02h and 03h
+  02h     byte  00h if the cache has been deactivated, 01h if active
+  03h     byte  01h if cache is in extended memory, 02h if in expanded
+                 memory
+  04h     word  Number of timer ticks between flushes -- defaults to 1
+                 minute but is ineffective in current versions because
+                 the int 1Ch handler is not installed
+  06h     byte  00h normally, but 01h if the cache contains tracks marked
+                  nondiscardable
+  07h     byte  00h normally, but 01h to ensure that the cache be flushed
+                 when int 19h is received
+  08h     byte  Unused, except that it may be changed by IOCTL Write
+                 function 0Ah subfunctions 00h and 01h
+  09h     byte  00h if Virtual DMA buffering is disabled, 01h if Virtual
+                 DMA buffering is forced, 02h if the need for Virtual DMA
+                 buffering is determined dynamically
+  0Ah    dword  Address of the handler which is immediately below SMARTDRV
+                 in the int 13h chain
+  0Eh     word  SMARTDRV version number (minor version in the low byte)
+  10h  2 bytes  Unused
+  12h  3 words  These are values maintained for the number of sectors
+                 attempted to be read, the number found in the cache and
+                 the number found in the intermediate buffer--only ratios
+                 should be regarded as meaningful, because all three
+                 values are halved whenever one of them is about to
+                 overflow
+  18h  2 bytes  Statistical information in the form of percentage ratios
+                 for cache his and buffer hits respectively--these are
+                 maintained over the whole of the session and are not
+                 cleared by resetting the cache
+  1Ah     word  Number of tracks the cache can hold
+  1Ch     word  Number of valid tracks in the cache
+  1Eh     word  Number of nondiscardable tracks in the cache
+  20h     word  Number of dirty tracks in the cache
+  22h     word  Current cache size (in multiples of 16Kbytes)
+  24h     word  Maximum cache size (in multiples of 16Kbytes)
+  26h     word  Minimum cache size (in multiples of 16Kbytes)
+  28h    dword  Address of a flag for locking the cache--00h by default,
+                 but set to 01h for global lock (so that a new track may
+                 be entered in the cache only if an empty track buffer
+                 exists, not by displacing an existing track, whether
+                 discardable or not).
+</pre><P>
+<P>
+*The transfer count will be truncated to 0, 28h, or 2Ch, as applicable.<P>
+<h4><a name="0041_0008">Table 3: SMARTDrive IOCTL Write Commands</h4><P>
+<pre>
+  Command  Data        Description
+  -------------------------------------------------------------------------
+
+  00h       --         Flush all dirty tracks to disk
+  01h       --         Flush and reset
+  02h       --         Deactivate cache (flush, reset, and disable)
+  03h       --         Activate cache
+  04h      00h or 01h  Set an otherwise unused flag to 00h or 01h,
+                        respectively
+  04h      2h or 03h   Set (a second) otherwise unused flag to 00h or 01h,
+                        respectively, but also flush the cache
+  05h      word        Set the number of timer ticks between flushes to
+                        the value supplied (but note that current versions
+                        of SMARTDRV do not proceed with the installation
+                        of the int 1Ch handler, thereby rendering this
+                        function ineffective).
+  06h      --          Flush cache and mark current contents as
+                        nondiscardable
+  07h      --          Mark all cached tracks as discardable
+  08h      00h or 01h  Disable or enable respectively the facility for
+                        flushing the cache on int 19h
+  09h      --          Unused (genuinely!)
+  0Ah      00h or 01h  Set an otherwise unused flag to 00h or 01h,
+                        respectively
+  0Bh      word        Reduce cache by the designated multiple of
+                        16Kbytes-- inability to resize the cache's memory
+                        allocation produces the General Failure error, as
+                        do attempts to reduce the cache by more than its
+                        current size
+  0Ch      word        Increase cache by the designated multiple of
+                        16Kbytes--inability to resize the cache's memory
+                        allocation produces the General Failure error, but
+                        attempts to increase the cache to more than its
+                        maximum configured size are simply truncated
+  0Dh      dword       Thread the given address into the int 13h chain
+                        below SMARTDRV (note that a pointer to the int 13h
+                        handler currently below SMARTDRV is returned in the
+                        IOCTL Read structure)
+</pre><P>
+<P>
+
+<UL>
+<li>The data packet contains a command number as its first byte.  For   some commands, extra data may be required, as indicated.  In all such   cases, an insufficiency will be indicated by returning a transfer count of 0 bytes.</li>
+</UL>
+The commands which resize the cache may be especially attractive to those who need more extended memory and would like to recover the memory used by SMARTDrive for the disk cache, as does Windows.  After opening SMARTAAR, an IOCTL read will return the current cache size, the minimum to which it may be reduced, and the maximum to which it may be expanded.  Units of measurement are multiples of 16 Kbytes.  The resizing is conducted by supplying an increment or decrement from the current size, not an absolute size.  Reducing the cache is a simple matter of shrinking the extended memory allocation and removing from the linked list all CCBs corresponding to excised track buffers.<P>
+Increasing cache size is less simple, and in fact, the code responsible for this contains a bug which will overwrite 64 Kbytes of important memory should it occur.  The problem arises only when the cache size has already been reduced to nothing.  In this case, the list of CCBs must be rebuilt from scratch.  The first CCB must provide the end-of-list markers and is therefore constructed outside the loop which builds the others.  If, however, the new cache size will accommodate only one track, as happens if the new cache size is 16 Kbytes (and conceivably 32 Kbytes if a disk exists with more than 32 sectors per track), then no more CCBs need be built.  Unfortunately, the assembly language loop instruction treats 0 as a very large number.<P>
+<a href="#0041_000b">Listings Two</A>, <a href="#0041_000d">Three</A>, and <a href="#0041_000f">Four</A> (page 90) present the C code for a program which I hope is commented sufficiently well that you can adapt it for your own use.  Called without command-line parameters, it displays a selection of information reported by the SMARTDrive IOCTL read function.  Its main purpose is to show you how to resize the cache, which it does repeatedly in order to determine the optimum cache size for a given task.  Hopefully, by now you are sufficiently familiar with SMARTDrive to deduce in which environment it will be most effective.<P>
+
+<PRE>
+
+_UNTANGLING SMARTDRIVE_
+by Geoff Chappell
+
+<a name="0041_0009">
+<a name="0041_000a"></pre><B>[LISTING ONE]</B><pre><a name="0041_000a">
+
+/*ioctl.c-functions to support IOCTL to &amp; from devices under DOS all functions*
+* return 0 if successful, having stored an integer at an address provided as  *
+* the last argument failure is indicated by returning a non-0 DOS error code */
+unsigned _cdecl _dos_gethandlestatus (int handle, unsigned *status)
+{
+    _asm {
+            mov ax,4400h
+            mov bx,handle
+            int 21h
+            jc  done
+            mov bx,status
+            mov [bx],ax
+            xor ax,ax
+    done:
+    }
+}
+unsigned _cdecl _dos_ioctlread (int handle, void _far *buffer,
+    unsigned count, unsigned *numread)
+{
+    _asm {
+            push    ds
+            mov ax,4402h
+            mov bx,handle
+            mov cx,count
+            lds dx,buffer
+            int 21h
+            pop ds
+            jc  done
+            mov bx,numread
+            mov [bx],ax
+            xor ax,ax
+    done:
+    }
+}
+unsigned _cdecl _dos_ioctlwrite (int handle, void _far *buffer,
+    unsigned count, unsigned *numwrt)
+{
+    _asm {
+            push    ds
+            mov ax,4403h
+            mov bx,handle
+            mov cx,count
+            lds dx,buffer
+            int 21h
+            pop ds
+            jc  done
+            mov bx,numwrt
+            mov [bx],ax
+            xor ax,ax
+    done:
+    }
+}
+
+
+
+
+
+
+<a name="0041_000b">
+<a name="0041_000c"></pre><B>[LISTING TWO]</B><pre><a name="0041_000c">
+
+/*** ioctl.h-function prototypes for IOCTL to &amp; from devices under DOS ***/
+unsigned _dos_gethandlestatus (int, unsigned *);
+unsigned _dos_ioctlread (int, void _far *, unsigned, unsigned *);
+unsigned _dos_ioctlwrite (int, void _far *, unsigned, unsigned *);
+
+
+
+
+
+
+<a name="0041_000d">
+<a name="0041_000e"></pre><B>[LISTING THREE]</B><pre><a name="0041_000e">
+
+/* smartdrv.h - structures and definitions relating to smartdrv.sys  */
+#pragma pack (1)
+
+/*  The data packet returned by performing an IOCTL Read from SMARTDrive  */
+struct SD_READ {
+    char unused_1;
+    char unused_2;
+    char IsActive;
+    char MemoryType;
+    unsigned Ticks;
+    char IsLocked;
+    char FlushOnReboot;
+    char unused_3;
+    char DoubleBuffer;
+    void _far *OrgInt13;
+    char MinorVersion;
+    char MajorVersion;
+    char unused_4;
+    char unused_5;
+    unsigned SectorsRead;
+    unsigned SectorsHit;
+    unsigned SectorsBuffered;
+    char HitRatio;
+    char BufferRatio;
+    unsigned TracksInCache;
+    unsigned CurrentTracks;
+    unsigned LockedTracks;
+    unsigned DirtyTracks;
+    unsigned CurrentSize;
+    unsigned ConfiguredSize;
+    unsigned MinimumSize;
+    char _far *GlobalLockFlag;
+};
+struct SD_WRITE {
+    char command;
+    union {
+    char subcommand;
+    int size;
+    char _far *address;
+    };
+};
+#pragma pack ()
+
+
+
+
+
+
+<a name="0041_000f">
+<a name="0041_0010"></pre><B>[LISTING FOUR]</B><pre><a name="0041_0010">
+
+/* smartchk.c-main source file for program smartchk.exe. Compile under small*
+ * or tiny memory models in Microsoft C 6.00 and link with ioctl.obj        */
+#include    &lt;bios.h&gt;
+#include    &lt;dos.h&gt;
+#include    &lt;fcntl.h&gt;
+#include    &lt;process.h&gt;
+#include    &lt;stdio.h&gt;
+#include    &lt;stdlib.h&gt;
+#include    &lt;string.h&gt;
+#include    &quot;ioctl.h&quot;
+#include    &quot;smartdrv.h&quot;
+#define     AND     &amp;&amp;
+#define     NOT     !
+#define     OR      ||
+
+/****  Function prototypes   ***/
+void get_configuration (void);
+void show_configuration (void);
+char ** get_range (int, char **);
+unsigned is_str_zero (char *);
+void format_command (char *, char **);
+void run_test (char *);
+int yes_or_no (void);
+int convert_to_seconds (long, long *, int *);
+void resize_cache (unsigned, unsigned);
+void reset_cache (void);
+void increment_cache (void);
+
+void set_traps (void);
+void quit (char *);
+void cleanup (void);
+void _far CtrlC_trap (void);
+int _far critfail (void);
+
+/***  Data ***/
+/*  The string describing the program's syntax  */
+const char syntax [] = &quot;\
+\nGathers information about the SMARTDrive disk cache.\
+\n\
+\nSMARTCHK [/min [/max [/inc]]] command [arguments]\
+\n\
+\n    times the execution of the designated command,\
+\n    using different sizes for the SMARTDrive cache\
+\n\
+\n    min, max and inc should be multiples of 16KB\
+\n\
+\nType SMARTCHK without parameters to display information\
+\nabout SMARTDrive's configuration and performance.&quot;;
+/*  Structures for SMARTDrive IOCTL  */
+struct SD_READ sd_read;
+struct SD_WRITE sd_write;
+/*  Various pieces of data which must be shared between functions  */
+char terminating = 0;
+char sd_cache_changed = 0;
+unsigned sd_cache_size;
+int sd_handle = -1;
+unsigned min;
+unsigned max;
+unsigned inc;
+
+/*** Code ***/
+int main (register int argc, register char *argv [])
+{
+    char buffer [128];
+  /* Install clean up routines and exception handlers to ensure termination. */
+    set_traps ();
+    /*  Verify that SMARTDrive has been installed and perform an IOCTL Read to
+    obtain configuration data. Error in this operation is fatal to program.  */
+    get_configuration ();
+   /* If no argument has been supplied on the command line, then describe the
+  configuration &amp; report SMARTDrive's statistical estimates of its performance.
+  If the only argument on the command line is &quot;/?&quot;, then display a help
+  message. The most complicated option involves executing and timing a command
+  repeatedly, using different sizes for the SMARTDrive cache. Up to 3 command
+  line arguments may specify range of cache size to use in test-all arguments
+  after these are presumed to be part of the command and are formatted
+  into a buffer for passing to the system () function.  */
+    argv ++;
+    argc --;
+    if (NOT argc) show_configuration ();
+    else if (argc == 1 AND **argv == '/' AND *(*argv + 1) == '?'
+            AND *(*argv + 2) == '\0') printf (syntax);
+    else {
+    argv = get_range (argc, argv);
+    format_command (buffer, argv);
+    run_test (buffer);
+    }
+    exit (0);
+}
+void get_configuration (void)
+{
+    register unsigned exitcode = 0;
+    unsigned status;
+    unsigned count;
+    /*  If smartdrv.sys has been loaded, it may be found in memory as a device
+   driver with name SMARTAAR. Use _dos_open (), which is simply a front-end to
+   the int 21h function 3Dh.  */
+    exitcode = _dos_open (&quot;SMARTAAR&quot;, O_RDWR, &amp;sd_handle);
+   /* On success, call int 21h function 4400h (not supported in MS-C library)
+   to verify that the handle corresponds to a character device driver capable
+   of IOCTL. DOS returns a 16-bit flag whose low byte it takes from the System
+   File Table and high byte from the device driver attribute word. Status bit
+   for a device is masked by 0x0080 and for IOCTL support by 0x4000 - both
+   bits must be set.  */
+    if (NOT exitcode) {
+    exitcode = _dos_gethandlestatus (sd_handle, &amp;status);
+    if (NOT exitcode) {
+        if ((status &amp; 0x4080) != 0x4080) exitcode = 0xFFFF;
+    }
+    }
+    /*  Any error encountered so far can be explained by a common message. Note
+    that all errors occurring in this function are fatal to the program. */
+    if (exitcode) quit (&quot;cannot open SMARTDrive device&quot;);
+   /* Perform IOCTL Read to get configuration info about SMARTDrive. Not only
+   should read be successful but should return as many bytes as requested. */
+    exitcode = _dos_ioctlread (sd_handle, &amp;sd_read, sizeof (sd_read), &amp;count);
+    if (exitcode OR count != sizeof (sd_read))
+    quit (&quot;cannot read data from SMARTDrive device&quot;);
+}
+void show_configuration (void)
+{
+    printf (&quot;\nSMARTDrive Version %u.%02u has been configured to use %uKB&quot;,
+    sd_read.MajorVersion, sd_read.MinorVersion,
+    sd_read.ConfiguredSize &lt;&lt; 4);
+    printf (&quot;\nof %s memory with %uKB set as the minimum size.&quot;,
+    (sd_read.MemoryType == 1 ? &quot;extended&quot; : &quot;expanded&quot;),
+    sd_read.MinimumSize &lt;&lt; 4);
+    printf (&quot;\n\nIts present capacity is %uKB, corresponding to %u tracks.&quot;,
+    sd_read.CurrentSize &lt;&lt; 4, sd_read.TracksInCache);
+    printf (&quot;\nOf these, %u tracks are in use.&quot;, sd_read.CurrentTracks);
+    printf (&quot;\n\nDuring this session, %u%% of sector reads have been filled&quot;,
+    sd_read.HitRatio);
+    printf (&quot;\nfrom the cache and %u%% from the intermediate buffer.&quot;,
+    sd_read.BufferRatio);
+}
+char ** get_range (int argc, register char *argv [])
+{
+    register unsigned temp;
+    /*  Getting numerical arguments for the testing range is a little tedious,
+    but unavoidable if program is to be anything other than a pointless toy.
+    This function returns a value for the argv variable, advanced past any
+    arguments that specify range. Begin by setting default values for range.
+    Change these only after establishing validity of command line value.  */
+    min = sd_read.MinimumSize;
+    max = sd_read.ConfiguredSize;
+    inc = 2;
+    if (**argv == '/') {
+    temp = atoi (*argv + 1) &gt;&gt; 4;
+    if (temp == 0 OR temp &lt; min OR temp &gt;= max) {
+        if (NOT is_str_zero (*argv + 1)) quit (&quot;invalid minimum size&quot;);
+    }
+    min = temp;
+    argv ++;
+    argc --;
+    if (argc AND **argv == '/') {
+        temp = atoi (*argv + 1) &gt;&gt; 4;
+        if (temp &lt;= min OR temp &gt; max) quit (&quot;invalid maximum size&quot;);
+        max = temp;
+        argv ++;
+        argc --;
+        if (argc AND **argv == '/') {
+        temp = atoi (*argv + 1);
+        if (NOT temp OR temp &amp; 15 OR (temp &gt;&gt; 4 &gt; max - min))
+            quit (&quot;invalid increment&quot;);
+        inc = temp &gt;&gt; 4;
+        argv ++;
+        argc --;
+        if (min == 0 AND inc == 1)
+            quit (&quot;parameters rejected to avoid SMARTDrive bug!&quot;);
+        }
+    }
+    }
+    /*  Name of a command to execute is mandatory. If no arguments remain,
+    processing can't continue. Otherwise, return adjusted value for argv.  */
+    if (NOT argc) quit (&quot;program name not supplied&quot;);
+    return (argv);
+}
+/*  The following simple function returns a TRUE value iff the string at
+address ptr is composed entirely of the character '0'.  */
+unsigned is_str_zero (register char *ptr)
+{
+    unsigned ch;
+    while ((ch = *ptr ++) AND (ch == '0')) {
+    }
+    return (ch ? 0 : 1);
+}
+/*  Given an array of pointers to character strings, the following function
+concatenates all strings, separating them with spaces and copying them to
+specified buffer. Its role is to piece together a command string for system ()
+function. Note that it could be developed to strip double-quotes.  */
+void format_command (register char *buffer, char *argv [])
+{
+    register char *ptr;
+    while (ptr = *argv ++) {
+    while (*buffer ++ = *ptr ++) {
+    }
+    *(buffer - 1) = ' ';
+    }
+    *buffer = '\0';
+}
+void run_test (char *command_string)
+{
+    long start, end;
+    long seconds;
+    unsigned hundredths;
+    /*  Shrink the cache to the range's minimum.  */
+    resize_cache (min, sd_read.CurrentSize);
+    sd_cache_size = min;
+    sd_cache_changed = -1;
+    for (;;) {
+    /*  Before executing the command, flush the disk cache and discard its
+       contents.  Each test is therefore started under the same conditions (at
+       least with respect to SMARTDrive, but note that test is not entirely
+        fair, because data from disk is also held in DOS BUFFERS system).  */
+    reset_cache ();
+    /*  Use BIOS functions to get the system clock count, in spite of slight
+    problem with the &quot;midnight&quot; flag. Calling MS-C library functions to obtain
+    the time and convert the difference to seconds brings in floating point
+    arithmetic &amp; a great increase in code size if using an emulator library. */
+    _bios_timeofday (_TIME_GETCLOCK, &amp;start);
+    system (command_string);
+    _bios_timeofday (_TIME_GETCLOCK, &amp;end);
+    convert_to_seconds (end - start, &amp;seconds, &amp;hundredths);
+    /*  Report the cache size and execution time of the test program,
+    then give the user a chance to leave the testing cycle.  */
+    printf (&quot;\n\nExecution time with %uKB disk cache was %lu.%02u seconds&quot;,
+        sd_cache_size &lt;&lt; 4, seconds, hundredths);
+    printf (&quot;\nContinue (y/n)?  &quot;);
+    if (NOT yes_or_no ()) break;
+    printf (&quot;\n&quot;);
+    /*  Increase the cache size for the next round of testing.  */
+    if (sd_cache_size + inc &gt; max) break;
+    increment_cache ();
+    sd_cache_size += inc;
+    }
+}
+/*  The following is a simple function which waits at stdin, returning
+a true value on receipt of 'y' or a false value for 'n'.  */
+int yes_or_no (void)
+{
+    unsigned ch;
+    for (;;) {
+    ch = getch ();
+    if (NOT ch) getch ();
+    else if (ch == 'N' OR ch == 'n') return (0);
+    else if (ch == 'Y' OR ch == 'y') return (1);
+    }
+}
+convert_to_seconds (long clocks, long *seconds, int *hundredths)
+{
+/* Clock ticks at approximately 18.2/second, most easily rounded to 91 / 5.  */
+    *seconds = (clocks * 5) / 91;
+    *hundredths = (((clocks * 5) % 91) * 100) / 91;
+}
+/* === Cache manipulation ==== */
+/*  Next three functions perform IOCTL Write operations to change SMARTDrive
+cache. In this particular program, error-reporting simplified by regarding all
+errors as fatal.  */
+void resize_cache (unsigned new, unsigned old)
+{
+    unsigned exitcode, count;
+    sd_write.command = 0x0B;
+    sd_write.size = old - new;
+    if (sd_write.size == 0) return;
+    if (sd_write.size &lt; 0) {
+    sd_write.size = - sd_write.size;
+    sd_write.command = 0x0C;
+    }
+    exitcode = _dos_ioctlwrite (sd_handle, &amp;sd_write, 3, &amp;count);
+    if (exitcode OR count != 3) quit (&quot;cannot resize SMARTDrive cache&quot;);
+}
+void reset_cache (void)
+{
+    unsigned exitcode, count;
+    sd_write.command = 0x01;
+    exitcode = _dos_ioctlwrite (sd_handle, &amp;sd_write, 1, &amp;count);
+    if (exitcode OR count != 1) quit (&quot;cannot flush SMARTDrive cache&quot;);
+}
+void increment_cache (void)
+{
+    unsigned exitcode, count;
+    sd_write.command = 0x0C;
+    sd_write.size = inc;
+    exitcode = _dos_ioctlwrite (sd_handle, &amp;sd_write, 3, &amp;count);
+    if (exitcode OR count != 3) quit (&quot;cannot increase SMARTDrive cache&quot;);
+}
+/* === Code relating to termination - error messages and cleanup === */
+void set_traps (void)
+{
+   /*  Direct C run-time to call a cleanup routine before it exits program. */
+    atexit (cleanup);
+    /*  Trap Ctrl-C to ensure proper cleanup rather than let DOS terminate
+    program pre-emptively. Critical errors (which might also cause premature
+    termination) may be failed automatically. An advantage to using _harderr ()
+    is that it allows compilation under tiny memory model. Were error handler
+    installed directly, it would have to be declared using the _interrupt
+    keyword, which is (perhaps surprisingly) incompatible with tiny memory
+    model. Even so, coercion to far addresses will generate unwanted segment
+    references in the tiny memory model without some additional manipulation.*/
+    #define FAR_FUNCTION    (void (_far *)())
+    #define FAR_INTERRUPT   (void (_interrupt _far *)())
+    #define CODE_SEG        (void _based (_segname (&quot;_CODE&quot;)) *)
+    _dos_setvect (0x23, FAR_INTERRUPT CODE_SEG CtrlC_trap);
+    _harderr (FAR_FUNCTION CODE_SEG critfail);
+}
+void cleanup (void)
+{
+    terminating = 1;
+    printf (&quot;\n&quot;);
+    if (sd_handle != -1) {
+    if (sd_cache_changed) {
+        sd_cache_changed = 0;
+        reset_cache ();
+        resize_cache (sd_read.CurrentSize, sd_cache_size);
+    }
+    _dos_close (sd_handle);
+    sd_handle = -1;
+    }
+}
+void _far CtrlC_trap (void)
+{
+    if (NOT terminating) {
+    terminating ++;
+    quit (&quot;terminated by user&quot;);
+    }
+}
+int _far critfail (void)
+{
+    return (_HARDERR_FAIL);
+}
+void quit (char *errmsg)
+{
+    printf (&quot;\nUnable to continue - \n%s&quot;, errmsg);
+    exit (0xFF);
+}
+</pre>
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

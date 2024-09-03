@@ -1,0 +1,1037 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>SEP92: AN EXCEPTION HANDLER FOR WINDOWS 3</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>AN EXCEPTION HANDLER FOR WINDOWS 3<a name="01e4_0003"></h1><P>
+<a name="01e4_0001"><a name="01e4_0000"> This article contains the following executables: WIN386.ARC<P>
+<h3>Brett Salter</h3><P>
+<p><i><a name="01e4_0002"><a name="01e4_0000">Brett is the founder and chief developer at The Periscope Co., a maker of software- and hardware-assisted debuggers.  He can be contacted at The Periscope Company, 1197 Peachtree St., Atlanta, GA 30361.</i></p><hr><P>
+I faced a number of hurdles when I began writing Periscope/32 for Windows, a system-level debugger for Microsoft Windows 3.  For one thing, I had never written 32-bit protected-mode code before.  For another, I was learning about the vagaries of the world according to Windows.  Finally, I was in new territory, needing to implement the debugger as an Enhanced Mode Windows virtual device driver (VxD).<P>
+Adding to the challenge was Microsoft's suggestion that you use MASM 5.10B--a funky, 32-bit hybrid version of MASM 5.10 -- to write Windows VxDs.  Since VxDs run in 32-bit mode at Ring 0, you find yourself writing 32-bit code with a good chance of making errors.  One potential pitfall, for example, is when you use the OFFSET directive.  To load an offset into a 32-bit register, you use MOV EDI,OFFSET32 DATUM instead of the usual MOV DI, OFFSET DATUM.  Because the assembler doesn't warn you to use a 32-bit OFFSET32 instead of the 16-bit OFFSET, it's easy to make a typing error that will cause major problems when the code is run, but which is hard to find when scanning the source code.<P>
+There's also the risk of causing a fault, especially the common general-protection (GP) fault (also known as Trap 0Dh).  Here the possibilities are seemingly endless.  They range from something as simple as trying to access memory beyond the limit of a selector to subtle faults like trying to copy the value of the code segment register into any other segment register, as you would in real mode.<P>
+It's possible to use MASM 6.00 to write device drivers, but you'll have to convert the include files supplied in the Windows Device Driver Kit (DDK) to get your programs to assemble without errors.  If you do much 32-bit work, you'll find this conversion appealing, since MASM 6.00 is much more at home with 32-bit code and the 386 instructions you'll tend to use when writing Ring 0 code.  If you decide to go this route, be sure to get MASM 6.OOB, since the original 6.00 has some nasty bugs.<P>
+<h3><a name="01e4_0004">WINX.386 to the Rescue<a name="01e4_0004"></h3><P>
+In my development, I quickly found that any error in a VxD (such as a GP fault) would drop me back to the DOS prompt without a clue of what had happened.  Clearly, I needed some sort of debugger to help me debug my debugger.  Consequently, I developed WINX.386, the Windows exception handler presented in this article.  WINX.386 is implemented as a VxD, so it can run at protected-mode Ring 0 and have access to anything it needs.  A VxD is quite powerful--it's loaded when Enhanced Mode Windows starts up and is available until Windows is shut down.  This means that the VxD can oversee what's happening with other VxDs, normal Windows applications and drivers, and the DOS box, including TSRs and DOS device drivers.  Still, VxDs have two problems: They won't run with Standard-mode Windows since they require Enhanced Mode; and due to the way Microsoft architected the four-part initialization of a VxD, in some blind spots errors in a VxD are not readily trappable.<P>
+WINX.386 works by hooking various 386 CPU exception interrupts.  It determines whether the exception is a normal, expected event that should be passed on to the prior interrupt handler for Windows to field, or if it is something unexpected (a bug!) about which you want more information.  If it is the latter, a register dump appears on the Windows and/or monochrome screen.  With this dump, you can quickly locate the cause of various error conditions.<P>
+The screen display is basically a classic register dump, with some extensions.  <a href="#01e4_0005">Figure 1</A> shows an example of a GP fault, as trapped by WINX.  The first line displays the interrupt type and a description, followed by the CPU mode (Protect or V86) and the Ring (0-3).  The next line displays the error code, as reported by some exceptions, and eight bytes of the instruction stream at CS:EIP.  Next are the general-purpose, 32-bit registers and the segment registers.  The last two lines display the control registers CRO, CR2, CR3, the global descriptor table (GDT) base and limit, the local descriptor table (LDT) selector, the interrupt descriptor table (IDT) base and limit, and the task state segment (TSS) register.  Typically, you use the opcodes and the CS:EIP values to locate the faulting code.  Then you use the other register values and the exception type to help understand and fix the problem.<P>
+<h4><a name="01e4_0005">Figure 1: A sample GP fault, as trapped by WINX.</h4><P>
+<pre>
+  Interrupt 0Dh - General protection     Mode=Protect  Ring=0
+  Error code=0000 B000       Opcodes=66  8E C0 FF FF 90 90 66
+
+  eax=0000 B000  ebx=8048 1000  ecx=8001  7BEC  edx=0000 0000
+  ebp=8001 0D50  efl=0001 3246   fs=0030         gs=0030
+  eip=8001 7BCE  esp=8001 0C48  esi=8040  2074  edi=8040 50B8
+   cs=0028        ss=0030        ds=0030         es=0030
+
+  cr0=8000 001B  cr2=000A 1000  cr3=003E  5000
+  gdt=8003 BC0C/010F  1dt=0000  idt=8000  DA70/02FF  tss=0018
+  Press a key to continue ...</pre><P>
+<P>
+The Windows DDK provides a variety of functions to hook interrupts.  After checking these out, however, I decided to go against Microsoft's suggestions and hook the exception interrupts directly.  This generally isn't a good approach, but I needed a program with the following characteristics:<P>
+<UL>
+<li>It had to be as fast as possible to minimize the performance impact on the system.</li>
+<li>It had to let me process faults before Windows so that WINX.386 could survive a crash inside Windows itself.</li>
+<li>It had to be totally nonintrusive.</li>
+<li>It couldn't return results that could be &quot;sanitized&quot; by windows.</li>
+</UL>
+To be sure of catching as many exceptions as possible, I got out my dogeared Intel i486 Microprocessor Programmer's Reference Manual and looked up exceptions and interrupts.  Based on the discussion in Chapter 9, I decided to hook these exceptions: 06h (invalid opcode), 08h (double fault), 0ah (invalid TSS), 0bh (segment not present), 0ch (stack fault), 0dh (GP fault), and 0eh (page fault).<P>
+From the start, I knew that some of these exceptions would be more useful than others, and I expected most of the use to be centered on interrupts 06h and 0dh.  From my experience with interrupt 6 in real-mode debugging, I knew it to be a valuable exception condition.  It's all too easy to start executing illegal instructions by taking a bad return off the stack or by using an uninitialized pointer.  By the time I started writing WINX.386, most of my protected-mode problems had been with GP faults, so this was a must have too.  Most of the others were thrown in for the sake of completeness.<P>
+In the beginning, I enabled one interrupt at a time and started up Windows to see what exception conditions were &quot;legal.&quot; Then I began the iterative process of adding the opcodes routinely fielded by the Windows interrupt handler.  I found that under normal conditions, interrupts 08h, 0ah, or 0ch weren't triggered by Windows, so I decided to always display the system registers if any of these exceptions were activated.  Not wanting to interfere with Windows page handling, I decided to always pass all Trap 0ehs on through to Windows without stopping.  That left interrupts 06h, 0bh, and 0dh.  As it turns out, Trap 0bh is infrequently used, but interrupts 06h and 0dh are used constantly.<P>
+Recently I benchmarked the number of times each of these traps occur from the time WINX is loaded during Windows startup until CLOCK.EXE (with an embedded illegal instruction) was executed.  I executed WIN CLOCK from the DOS prompt to negate any human &quot;mousing&quot; time.  I found the results (shown in <a href="#01e4_0006">Table 1</A>) surprising.  Now you can see why we call Windows an exception-driven operating environment.  Of the Trap 6s, the 4612 occurrences in V86 mode are all ARPLs, a technique Microsoft has patented to switch from V86 mode into protected mode.  The two traps that occur in protected mode are execution of the illegal instruction sequence Ofh ffh , which debuted in Windows 3.1 and is used to switch from one protected-mode ring to another.<P>
+<h4><a name="01e4_0006">Table 1: Performance results when WINX is loaded during Windows startup.</h4><P>
+<pre>
+  Exception  Protected-  Virtual 86   Total
+  Interrupt  Mode Traps  Modes Traps  Traps
+  -----------------------------------------
+
+      6           2          4612      4614
+      B           3             0         3
+      D         234          3827      4061</pre><P>
+<P>
+Ninety-four percent of the Trap 0dhs occur in V86 mode.  This is to be expected, since in V86 mode numerous instructions are emulated by the Ring 0 code--Trap 0dh is the method used to switch control from V86 code to protected-mode Ring 0 code.  The majority of the Trap 0dhs were caused by IN and OUT instructions, followed distantly by PUSHF, POPF, INT, IRET, CLI, and STI instructions.  The Trap Ds in protected mode (all of which are not at Ring 0) are mostly IN and OUT instructions, with some CLI, STI, and INT instructions.  Trap Ds are an expected part of the overhead in a protected-mode environment, but the extensive use of them by Windows is surprising.  Even more surprising is the high frequency of shifts to and from V86 mode.<P>
+<h3><a name="01e4_0007">The WINX.386 Code<a name="01e4_0007"></h3><P>
+WINX.386 is composed of WINX.ASM (<a href="#01e4_0009">Listing One</A>, page 102); PSEQUATE.INC, a general include file used for equates and handy macros; and the Windows DDK include files (DOSMGR.INC, SHELL.INC, VDD.INC, VMM.INC, and VPICD.INC).  The generation of the executable uses MASM 5.10B, Link386 1.00.058, and Addhdr 1.01.  Because of space constraints, only the main file (WINX.ASM) is printed with this article.  The other files, and a make file used to generate WINX.386, are provided electronically.<P>
+Lines 5 and 6 of WINX.ASM have equates for the flat model CS and DS used by Ring 0 code. Using a CS value of 28h, Windows drivers can access the full four-gigabyte address space of the system.  Similarly, using a DS value of 30h, you can read or write memory anywhere from 00000000 to FFFFFFFFh.<P>
+After the includes is the device-descriptor block, a macro which describes various characteristics of this driver to Windows.  This is followed by a locked data segment, which contains the Ring 0 data used by the driver.  Of particular interest in this segment are the legal opcode lists for Traps 0bh and 0dh (intblist and intdlist, respectively).  These lists identify the legal opcodes that we pass to Windows.  You may modify these lists to change the pass-through logic as needed in your environment.<P>
+Next is the locked code segment, the Ring 0 code for the driver.  At the beginning of this segment is a dispatch table used to pass control off to the protected-mode initialization code.  Procedures p006 through p00e are entry points for the corresponding interrupts. Procedure p013 hooks interrupt 51h, the relocated keyboard interrupt (IRQ 1).  This code counts the number of key presses and releases so that we can implement a nonintrusive method of pausing the system after an exception until a key is pressed (and released).  The next procedure, p020, is the generalized exception handler.  It saves the interrupt type, system registers, and error code and then calls the dispatch code (p2OO).  The dispatch code calls the actual error-check routine (p2O6 through p2Oe) to see if we want to display the registers or not.  If the check routine returns with the carry flag set, the registers are displayed. In all cases, control is then passed on to the original interrupt handler.<P>
+The code at p220 gets the first byte of the instruction, ignoring any prefix bytes, such as 0f3h, a REPZ prefix.  The p300 procedure is a callback routine for Windows.  Windows calls this routine when idle so that we can display a Sysmodal message containing the register dump on the Windows screen.  If this code is disabled using the string Winx-No WinMsg in SYSTEM.INI, then WINX will not use any Windows services after initialization.<P>
+The rest of the resident Ring 0 code (p880 through p970) is used to format and display the screen dump.  Since we're using flat model 32-bit code with a data selector whose base is 0, we can refer to the monochrome display using a 32-bit register with a value of 0b0000h.  Look Ma, no segments!<P>
+The remainder of the code is the transient initialization logic.  The first of these is the real-mode init code at p1000, which just displays a copyright and exits after setting a few key registers.  Next is the real-mode initialization data segment.<P>
+The first phase of the protected-mode init code, which searches for the profile strings in SYSTEM.INI and sets flags based on what it finds, is at p1100.  At the end of this code the interrupts are hooked using procedures p1140 and p1160.  These routines save the current interrupt address and revector the interrupt to point to WINX.  Note that individual-vector hooking can be disabled using the string WinxNoIntxx in SYSTEM.INI, where xx is replaced by the desired interrupt number in hex.  Since Windows has already established its interrupts, we get control before Windows on all interrupts that we hook.<P>
+The second phase of the protected-mode init sets up the callback to p300 unless the user has used WinxNoWinMsg in SYSTEM.INI.  Finally, the third phase is Null, returning with the carry flag clear to indicate that all is well.<P>
+To install WINX, add the statement device = winx.386 in SYSTEM.INI in the [386enh] section. The profile options also go in SYSTEM.INI.  These include: WinxUseMono (display the register dump on a monochrome screen), WinxMonoSave (save the contents of the mono screen before displaying the register dump, then restore it after a key press), WinxNoWinMsg (do not show the register dump on the Windows screen), WinxNoIntxx (do not hook the indicated interrupt, where xx is 06, 08, 0a, 0b, 0c, 0d, or 0e), and Periscope-Port:xxxx (a Periscope Model IV board is using port xxxx, if the port is used, the board's real-time trace buffer will be turned off if an exception has occurred).<P>
+For the least intrusive use, use monochrome-screen output.  Indeed, if you're encountering exceptions before the Windows desktop is displayed, the Sysmodal message is not yet usable, so you must use the monochrome-screen output.  Please note that you can use both monochrome and Windows screens if desired.  The least intrusive keypress is something like the SysReq key or any Shift key other than the Alt key.<P>
+<h3><a name="01e4_0008">Conclusion<a name="01e4_0008"></h3><P>
+There are several possible ways to extend WINX.386 to provide additional information about Windows.  You could enhance it to profile interrupt usage by interrupt number, trap on specific interrupt usage (such as INT 31h, which is used by DPMI services), or trap the usage of specific hardware interrupts by Windows.<P>
+
+<PRE>
+
+
+_AN EXCEPTION HANDLER FOR WINDOWS 3_
+by Brett Salter
+
+
+<a name="01e4_0009">
+<a name="01e4_000a"></pre><B>[LISTING ONE]</B><pre><a name="01e4_000a">
+
+; winx.asm - exception handler for windows 3.x
+.386p               ; 386 protect mode
+wincs equ 28h           ; windows ring 0 cs
+winds equ 30h           ; windows ring 0 ds
+    include psequate.inc    ; general Periscope equates
+    include dosmgr.inc  ; all of these
+    include shell.inc   ; are from the
+    include vdd.inc     ; windows ddk
+    include vmm.inc     ; ...
+    include vpicd.inc   ; ...
+    ; device descriptor block
+Declare_Virtual_Device WINX, 3, 0, VAD_Control, Undefined_Device_ID, VMM_Init_Order \ , , VAD_PM_Svc_Call
+; **************************************************************************
+VxD_Locked_Data_Seg     ; data segment
+datastart equ $         ; symbol for start of data
+    ; global data follows
+psport  dw 0            ; Periscope Model IV port number
+currow  db 0            ; cursor row (0-24)
+curcol  db 0            ; cursor column (0-79)
+showregs db 0           ; 1 when we have something to show
+usemono db 0            ; 1 when output to mono screen
+monosave db 0           ; 1 when saving mono screen
+winmsg  db 1            ; 1 when output to windows screen
+
+even
+hextable db '0123456789ABCDEF'  ; hex conversion table
+even                ; gdt/idt/ldt data
+gdtlimit    dw 0        ; global descriptor table limit
+gdtbase     dd 0        ; and base
+idtlimit    dw 0        ; interrupt descriptor table limit
+idtbase     dd 0        ; and base
+ldtvalue    dw 0        ; value of local descriptor table
+ldtlimit    dw 0        ; and limit
+tssvalue    dw 0        ; value of task state selector
+        ; original interrupt values
+origint6    df 0        ; illegal opcode
+origint8    df 0        ; double fault
+originta    df 0        ; invalid tss
+origintb    df 0        ; segment not present
+origintc    df 0        ; stack fault
+origintd    df 0        ; general protection fault
+originte    df 0        ; page fault
+origirq1    df 0        ; original keyboard interrupt
+align 4
+jumptable   dd offset32 p206,offset32 origint6  ; control table
+        dd 0,0      ; dummy for interrupt 7
+        dd offset32 p208,offset32 origint8
+        dd 0,0      ; dummy for interrupt 9
+        dd offset32 p20a,offset32 originta
+        dd offset32 p20b,offset32 origintb
+        dd offset32 p20c,offset32 origintc
+        dd offset32 p20d,offset32 origintd
+        dd offset32 p20e,offset32 originte
+intlistlen  equ 9       ; number of interrupts in above list
+intlist     db '060708090a0b0c0d0e' ; list of 9 exception vecs
+    ; keep the following together
+hookint06   db 1        ; all but interrupts 7 and 9
+hookint07   db 0        ; get hooked by default
+hookint08   db 1
+hookint09   db 0
+hookint0a   db 1
+hookint0b   db 1
+hookint0c   db 1
+hookint0d   db 1
+hookint0e   db 1
+    ; end of keep together
+intgate     dw 0ee00h   ; value for interrupt gate, dpl=3
+keystrokes  dw 0        ; keystroke count
+errorcode   dd 0        ; error code on interrupts 8 and higher
+inttype     dw 0        ; interrupt type
+exitaddr    df 0        ; original interrupt address as 16:32 ptr
+align 4
+    ; original registers
+saveeax dd 0            ; original eax
+saveebx dd 0            ; original ebx
+saveecx dd 0            ; original ecx
+saveedx dd 0            ; original edx
+saveesp dd 0            ; original esp
+saveebp dd 0            ; original ebp
+saveesi dd 0            ; original esi
+saveedi dd 0            ; original edi
+saveeip dd 0            ; original eip
+saveefl dd 0            ; original eflags
+saveds  dw 0            ; original ds
+savees  dw 0            ; original es
+savess  dw 0            ; original ss
+savecs  dw 0            ; original cs
+savefs  dw 0            ; original fs
+savegs  dw 0            ; original gs
+    ; instruction prefixes - these opcodes are ignored
+    ; when searching for the start of an instruction
+prelist db 026h,02eh,036h,03eh,064h,065h,066h,067h,0f0h,0f2h,0f3h
+prelistlen dd 11
+    ; legal opcodes for int b - pass these on thru to the original handler
+intblist db 0fh             ; improve later to catch only
+                    ; 0f/b2, 0f/b4, 0f/b5
+    db 063h             ; arpl
+    db 09ah             ; far call
+    db 0c4h,0c5h            ; les/lds ... used by visual basic
+    db 0cah,0cbh            ; retf
+    db 0eah             ; far jmp
+    db 0f4h             ; hlt
+    db 0fah,0fbh            ; cli/sti
+    db 0ffh             ; various
+intblistlen dd 12
+    ; legal opcodes for int d - pass these on thru to the original handler
+intdlist  db 06ch,06dh,06eh,06fh    ; in/out
+    db 09ah             ; far call
+    db 09ch             ; pushf
+    db 09dh             ; popf
+    db 0cch,0cdh,0ceh       ; int x
+    db 0cfh             ; iret
+    db 0e4h,0e5h,0e6h,0e7h      ; in/out
+    db 0ech,0edh,0eeh,0efh      ; in/out
+    db 0f4h             ; hlt
+    db 0fah,0fbh            ; cli/sti
+intdlistlen dd 22
+even
+opcode db 8 dup(0)      ; save the opcode bytes here
+opcodecs dw 0           ; cs for opcodes
+opcodeeip dd 0          ; eip for opcodes
+explcount equ 7         ; number of interrupt descriptions
+expllen equ 20          ; length of each interrupt description
+explanations equ $      ; 1 byte for type, 20 bytes for text
+db 06h,'Invalid opcode      '
+db 08h,'Double fault        '
+db 0ah,'Invalid TSS         '
+db 0bh,'Segment not present '
+db 0ch,'Stack exception     '
+db 0dh,'General protection  '
+db 0eh,'Page fault          '
+modep   db 'Protect'        ; mode can be Protect or V86 only - we'll
+modev86 db 'V86    '        ; never seel Real mode here
+            ; start of display area
+regline1 db cr,lf,'Interrupt '
+xinttype db '..h - '
+xexplain db '....................'
+        db '  Mode='
+xmode   db '.......  Ring='
+xring   db '.'
+    db cr,lf
+regline2 db 'Error code='
+errorno db '0000 0000       Opcodes='
+xopcode db '.. .. .. .. .. .. .. ..'
+    db cr,lf
+    db cr,lf
+regline3 db 'eax='
+regeax  db '.... ....  '
+    db 'ebx='
+regebx  db '.... ....  '
+    db 'ecx='
+regecx  db '.... ....  '
+    db 'edx='
+regedx  db '.... ....'
+    db cr,lf
+regline4 db 'ebp='
+regebp  db '.... ....  '
+    db 'efl='
+regefl  db '.... ....  '
+    db ' fs='
+regfs   db '....       '
+    db ' gs='
+reggs   db '....'
+    db cr,lf
+regline5 db 'eip='
+regeip  db '.... ....  '
+        db 'esp='
+regesp  db '.... ....  '
+    db 'esi='
+regesi  db '.... ....  '
+    db 'edi='
+regedi  db '.... ....'
+    db cr,lf
+regline6 db 'cs='
+regcs   db '....       '
+        db ' ss='
+regss   db '....       '
+    db ' ds='
+regds   db '....       '
+    db ' es='
+reges   db '....'
+    db cr,lf
+    db cr,lf
+regline7 db 'cr0='
+regcr0  db '.... ....  '
+    db 'cr2='
+regcr2  db '.... ....  '
+    db 'cr3='
+regcr3  db '.... ....'
+    db cr,lf
+regline8 db 'gdt='
+gdtb db '.... ..../'
+gdtl db '....  '
+    db 'ldt='
+ldtw    db '....  '
+    db 'idt='
+idtb db '.... ..../'
+idtl db '....  '
+    db 'tss='
+tssw    db '....'
+    db cr,lf
+regend  db 0,'$'
+                ; end of display area
+    ; messages
+pause   db 'Press a key to continue ...',0
+crlf    db cr,lf,0
+periscopeid db 'WINX (Windows Exception Handler)'
+    db 0
+align 4
+monoscreen dw 80*25 dup(0)  ; save the mono screen here
+VxD_Locked_Data_Ends        ; end of data segment
+; **************************************************************************
+VxD_Locked_Code_Seg     ; code segment
+codestart equ $         ; symbol for start of code
+    ; device control procedure
+VAD_Control proc near       ; control table
+    Control_Dispatch Sys_Critical_Init, VAD_Sys_Crit_Init ; phase 1
+    Control_Dispatch Device_Init,       VAD_Device_Init   ; phase 2
+    Control_Dispatch Init_Complete,     VAD_Init_Complete ; phase 3
+    Control_Dispatch Create_VM,     VAD_Create_VM
+    clc         ; no errors
+    ret
+VAD_Control endp
+beginproc VAD_Get_Version, SERVICE
+    mov eax,300h
+    clc         ; no errors
+    ret
+endproc VAD_Get_Version
+VAD_PM_Svc_Call proc near
+    ret
+VAD_PM_Svc_Call endp
+align 4
+p006    proc near       ; int 6 handler
+    push eax
+    mov al,6
+    jmp short p020      ; to handler
+p006    endp
+align 4
+p008    proc near       ; int 8 handler
+    push eax
+    mov al,8
+    jmp short p020      ; to handler
+p008    endp
+align 4
+p00a    proc near       ; int a handler
+    push eax
+    mov al,0ah
+    jmp short p020      ; to handler
+p00a    endp
+align 4
+p00b    proc near       ; int b handler
+    push eax
+    mov al,0bh
+    jmp short p020      ; to handler
+p00b    endp
+align 4
+p00c    proc near       ; int c handler
+    push eax
+    mov al,0ch
+    jmp short p020      ; to handler
+p00c    endp
+align 4
+p00d    proc near       ; int d handler
+    push eax
+    mov al,0dh
+    jmp short p020      ; to handler
+p00d    endp
+align 4
+p00e    proc near       ; int e handler
+    push eax
+    mov al,0eh
+    jmp short p020      ; to handler
+p00e    endp
+align 4
+p013    proc near       ; irq 1 handler
+    ; this routine hooks the keyboard; it is used only to count
+    ; the number of keystrokes coming through
+    @save eax,ds
+    mov ax,winds
+    mov ds,ax
+    inc keystrokes      ; count keystrokes
+    @restore
+    jmp cs:[origirq1]   ; pass control onto prior handler
+p013    endp
+align 4
+p020    proc near       ; exception handler
+    ; this is the common entry point for all exception handlers
+    push ds         ; save registers
+    push es
+    push ebp
+    cld         ; up!
+    push eax
+    mov ax,winds
+    mov ds,ax       ; set ds to windows ring 0 ds
+    pop eax
+    mov ah,0
+    mov inttype,ax      ; save interrupt type
+    mov ebp,esp     ; save registers
+    mov eax,[ebp]       ; 0=ebp,4=es,8=ds,12=eax,16=error/eip
+    mov saveebp,eax     ; save ebp
+    mov ax,[ebp+4]      ; get es from stack
+    mov savees,ax       ; save es
+    mov ax,[ebp+8]      ; get ds from stack
+    mov saveds,ax       ; save ds
+    mov eax,[ebp+12]    ; get eax from stack
+    mov saveeax,eax     ; save eax
+    mov saveebx,ebx     ; save ebx
+    mov saveecx,ecx     ; save ecx
+    mov saveedx,edx     ; save edx
+    mov saveesi,esi     ; save esi
+    mov saveedi,edi     ; save edi
+    mov savefs,fs       ; save fs
+    mov savegs,gs       ; save gs
+    mov ebp,esp
+    add ebp,16      ; point to eip/error
+    mov errorcode,0     ; clear error code
+    cmp inttype,8       ; error code?
+    jb short p020a      ; no
+    mov eax,[ebp]       ; get error code
+    mov errorcode,eax   ; save error code
+    add ebp,4
+p020a:  mov eax,[ebp]       ; get eip from stack
+    mov saveeip,eax     ; save eip
+    mov ax,[ebp+4]      ; get cs from stack
+    mov savecs,ax       ; save cs
+    mov eax,[ebp+8]     ; get flags from stack
+    mov saveefl,eax     ; save flags
+    mov savess,ss
+    mov eax,ebp     ; get sp
+    add eax,12      ; skip eip, cs, &amp; flags
+    mov saveesp,eax     ; save esp
+    test saveefl,bit17on    ; v86 mode?
+    jnz short p020d     ; yes
+    test savecs,3       ; ring 0 cs?
+    jz short p020b      ; yes
+p020d:
+    mov eax,[ebp+12]    ; get esp from stack
+    mov saveesp,eax     ; save esp
+    mov ax,[ebp+16]     ; get ss from stack
+    mov savess,ax       ; save ss
+    test saveefl,bit17on    ; v86 mode?
+    jz short p020b      ; no
+    mov ax,[ebp+20]     ; get es from stack
+    mov savees,ax       ; save es
+    mov ax,[ebp+24]     ; get ds from stack
+    mov saveds,ax       ; save ds
+    mov ax,[ebp+28]     ; get fs from stack
+    mov savefs,ax       ; save fs
+    mov ax,[ebp+32]     ; get gs from stack
+    mov savegs,ax       ; save gs
+p020b:  pushad          ; a bit redundant, but it's small
+    call p200       ; check exceptions
+    jnc short p020x     ; ok - skip display
+    mov dx,psport       ; get Periscope port
+    cmp dx,0        ; valid?
+    jz short p020c      ; no
+    mov al,0dbh
+    out dx,al       ; stop Periscope Model IV trace
+p020c:  call p950       ; display registers
+    mov showregs,1      ; indicate we have something to show
+p020x:  popad           ; pop all registers
+    pop ebp
+    pop es
+    pop ds
+    pop eax
+    jmp fword ptr cs:[exitaddr] ; pass control on to original handler
+p020    endp
+align 4
+p200    proc near       ; check exceptions
+    mov ax,ds
+    mov es,ax       ; es=ds
+    movzx eax,inttype   ; get interrupt type
+    sub eax,6       ; table starts at int 6
+    shl eax,3       ; times 8
+    mov esi,[jumptable+eax+4]
+    mov edi,offset32 exitaddr
+    movsw
+    movsd           ; copy original int to exitaddr
+    jmp [jumptable+eax]     ; handle the interrupt
+p200    endp
+align 4
+p206    proc near       ; handle int 6 - illegal instruction
+    call p220       ; get opcode in al
+    cmp al,63h      ; arpl instruction? (ms patented technique!)
+    jz short p206n      ; yes - don't show registers
+    mov ax,word ptr opcode
+    cmp ax,0ff0fh       ; 0f ff opcode? (ms special case)
+    jz short p206n      ; yes - don't show registers
+    stc         ; show registers
+    ret
+p206n:  clc         ; don't show registers
+    ret
+p206    endp
+align 4
+p208    proc near       ; handle int 8 - double fault
+    stc         ; show registers on all int 8
+    ret
+p208    endp
+align 4
+p20a    proc near       ; handle int a - invalid tss
+    stc         ; show registers on all int a
+    ret
+p20a    endp
+align 4
+p20b    proc near       ; handle int b - segment not present
+    test saveefl,bit17on    ; v86 mode?
+    jnz short p20bs     ; yes - show registers
+    call p220       ; get opcode in al
+    mov edi,offset32 intblist
+    mov ecx,intblistlen
+    repnz scasb     ; search for opcode
+    jnz short p20bs     ; no match
+p20bn:  clc         ; don't show registers
+    ret
+p20bs:  stc         ; show registers
+    ret
+p20b    endp
+align 4
+p20c    proc near       ; handle int c - stack fault
+    stc         ; show registers on all int c
+    ret
+p20c    endp
+align 4
+p20d    proc near       ; handle int d - general protection fault
+    call p220       ; get opcode in al
+    mov edi,offset32 intdlist
+    mov ecx,intdlistlen
+    cmp al,0cdh     ; get an int?
+    jz short p20dc      ; yes
+    repnz scasb     ; search for opcode
+    jnz short p20ds     ; no match
+p20dn:  clc         ; don't show registers
+    ret
+p20ds:  stc         ; show registers
+    ret
+p20dc:  ; expand to handle individual interrupts as needed
+    jmp p20dn
+p20d    endp
+align 4
+p20e    proc near       ; handle int e - page fault
+    clc         ; don't show registers
+    ret
+p20e    endp
+align 4
+p220    proc near       ; get opcode byte in register al
+    test saveefl,bit17on    ; v86 mode?
+    jz short p220a      ; no
+    movzx ebx,savecs    ; get opcode address for v86 mode
+    shl ebx,4       ; times 16
+    add ebx,saveeip     ; plus eip
+    mov opcodecs,ds     ; use flat selector
+    mov opcodeeip,ebx   ; and our derived offset
+    jmp short p220b
+p220a:
+    mov bx,savecs       ; get opcode address for protect mode
+    mov opcodecs,bx     ; save cs
+    mov ebx,saveeip
+    mov opcodeeip,ebx   ; and eip
+p220b:  mov edi,offset32 opcode
+    mov ax,ds
+    mov es,ax       ; es=ds
+    mov ecx,8
+    mov esi,opcodeeip
+    push ds
+    mov ds,opcodecs
+    rep movsb       ; copy opcodes from user's cs:eip to us
+    pop ds
+mov esi,offset32 opcode
+p220c:  lodsb           ; get opcode byte
+    cmp esi,offset32 opcode+8   ; too far?
+    jae short p220d     ; yes - bail out
+    mov edi,offset32 prelist    ; is it a prefix byte?
+    mov ecx,prelistlen
+    repnz scasb     ; search for prefix
+    jz p220c        ; got a prefix - get next byte
+p220d:  ret
+p220    endp
+align 4
+p300    proc near       ; display message using Windows services
+    ; this routine is used as a callback unless WinxNoWinMsg is used
+    cmp showregs,1      ; something to show?
+    jz short p300a      ; yes
+    ret         ; no - exit now
+p300a:  @save eax,ebx,ecx,esi,edi   ; save registers
+    VMMcall Get_Cur_VM_Handle   ; get handle in ebx
+    mov eax,mb_iconhand+mb_ok
+    mov ecx,offset32 regline1
+    xor esi,esi     ; no callback
+    mov edi,offset32 periscopeid
+    VxDcall Shell_Sysmodal_Message  ; display message
+    mov showregs,0      ; nothing to show for now
+    @restore
+    ret
+p300    endp
+align 4
+p880    proc near       ; convert byte in al and output it to [edi]
+    push ebx
+    mov ah,0
+    mov ebx,offset32 hextable
+    shl ax,4        ; high nibble in ah
+    shr al,4        ; low nibble in al
+    xlat            ; convert low nibble
+    xchg ah,al
+    xlat            ; convert high nibble
+    mov [edi],ax        ; save the result
+    inc edi
+    inc edi         ; point to next output address
+    pop ebx
+    ret
+p880    endp
+align 4
+p885    proc near       ; convert word in dx and output it to [edi]
+    push eax
+    mov al,dh
+    call p880       ; convert high byte
+    mov al,dl
+    call p880       ; convert low byte
+    pop eax
+    ret
+p885    endp
+align 4
+p889    proc near       ; convert dword in edx and output it to [edi]
+    rol edx,16
+    call p885       ; convert high word
+    inc edi         ; a space between the high and low words
+    rol edx,16
+    call p885       ; convert low word
+    inc edi         ; a space after the low word
+    ret
+p889    endp
+align 4
+p900    proc near       ; display string on mono screen
+    @save eax,esi,edi,es
+    ; entry: esi points to string
+    mov ax,ds
+    mov es,ax       ; es=ds
+p900d:  call p905       ; calc offset
+p900a:  lodsb           ; get next byte
+    cmp al,0        ; end?
+    jz short p900x      ; yes
+    cmp al,cr       ; cr?
+    jz short p900b      ; yes
+    cmp al,lf       ; lf?
+    jz short p900c      ; yes
+    mov ah,0fh      ; high intensity
+    stosw           ; output it
+    inc curcol      ; bump column number
+    cmp curcol,79       ; at end of screen?
+    jbe p900a       ; no
+    mov curcol,0        ; line overflow
+    jmp short p900c     ; force an lf
+p900b:              ; handle cr
+    mov curcol,0        ; column 0
+    jmp short p900d     ; force recalc
+p900c:              ; handle lf
+    inc currow      ; next row
+    cmp currow,25       ; on row 25?
+    jb short p900d      ; no - force recalc
+    call p915       ; scroll the screen
+    jmp short p900d     ; recalc now
+p900x:  @restore
+    ret
+p900    endp
+align 4
+p905    proc near       ; calc offset in di using currow, curcol
+    @save eax,ebx,ecx
+    movzx eax,currow    ; current row
+    mov cl,80*2
+    mul cl          ; times 160
+    movzx ebx,curcol
+    shl ebx,1       ; plus (column times 2)
+    add eax,ebx     ; gives offset relative to mono screen
+    add eax,0b0000h     ; plus mono segment*16 gives 32-bit offset
+    mov edi,eax     ; return result in edi
+    @restore
+    ret
+p905    endp
+align 4
+p910    proc near       ; clear mono screen
+    @save eax,ecx,edi,es
+    mov ax,ds
+    mov es,ax       ; es=ds
+    mov ax,720h
+    mov edi,0b0000h
+    mov ecx,25*80
+    rep stosw       ; init the screen
+    mov currow,cl       ; set these to zero
+    mov curcol,cl
+    @restore
+    ret
+p910    endp
+align 4
+p915    proc near       ; scroll mono screen
+    @save eax,ecx,esi,edi,es
+    mov ax,ds
+    mov es,ax       ; es=ds
+    mov esi,0b0000h
+    mov edi,esi
+    add esi,80*2        ; skip a line
+    mov ecx,24*80/2     ; dwords to copy
+    rep movsd       ; scroll it
+    mov ax,0720h
+    mov ecx,80/2        ; dwords in a line
+    rep stosd       ; blank last line
+    mov currow,24       ; now at row 24
+    mov curcol,cl       ; colum 0
+    @restore
+    ret
+p915    endp
+align 4
+p950    proc near       ; display registers
+    mov ax,inttype
+    mov edi,offset32 xinttype
+    call p880       ; convert byte
+    mov ax,inttype
+    mov ah,al       ; int type in ah
+    mov esi,offset32 explanations   ; point to interrupt descriptions
+    mov ecx,explcount   ; number of descriptions
+p950b:  lodsb           ; get the byte
+    cmp al,ah       ; does it match?
+    jz short p950c      ; yes
+    add esi,expllen     ; add the message length
+    loop p950b      ; and try again
+    jmp short p950d     ; no find
+p950c:  mov edi,offset32 xexplain ; point to output buffer
+    mov ecx,expllen     ; length of message
+    rep movsb       ; copy it across
+p950d:
+    mov ax,savecs
+    and eax,3       ; isolate cs ring bits
+    add al,'0'      ; convert to ascii
+    mov xring,al        ; save it
+    mov esi,offset32 modep  ; assume protect mode
+    test saveefl,bit17on    ; v86 mode?
+    jz short p950e      ; no
+    mov esi,offset32 modev86
+    mov xring,'3'       ; v86 is always ring 3
+p950e:  mov edi,offset32 xmode  ; point to output buffer
+    mov ecx,7
+    rep movsb       ; copy mode across
+    mov edx,errorcode
+    mov edi,offset32 errorno
+    call p889       ; convert error code
+    mov ecx,8
+    mov esi,offset32 opcode ; point to opcode bytes
+    mov edi,offset32 xopcode
+p950a:  lodsb           ; get byte
+    call p880       ; convert byte
+    inc edi
+    loop p950a      ; continue
+    mov edx,saveeax
+    mov edi,offset32 regeax
+    call p889       ; convert eax
+    mov edx,saveebx
+    mov edi,offset32 regebx
+    call p889       ; convert ebx
+    mov edx,saveecx
+    mov edi,offset32 regecx
+    call p889       ; convert ecx
+    mov edx,saveedx
+    mov edi,offset32 regedx
+    call p889       ; convert edx
+    mov edx,saveebp
+    mov edi,offset32 regebp
+    call p889       ; convert ebp
+    mov edx,saveesp
+    mov edi,offset32 regesp
+    call p889       ; convert esp
+    mov edx,saveesi
+    mov edi,offset32 regesi
+    call p889       ; convert esi
+    mov edx,saveedi
+    mov edi,offset32 regedi
+    call p889       ; convert edi
+    mov edx,saveeip
+    mov edi,offset32 regeip
+    call p889       ; convert eip
+    mov edx,saveefl
+    mov edi,offset32 regefl
+    call p889       ; convert efl
+    mov dx,savecs
+    mov edi,offset32 regcs
+    call p885       ; convert cs
+    mov dx,saveds
+    mov edi,offset32 regds
+    call p885       ; convert ds
+    mov dx,savees
+    mov edi,offset32 reges
+    call p885       ; convert es
+    mov dx,savefs
+    mov edi,offset32 regfs
+    call p885       ; convert fs
+    mov dx,savegs
+    mov edi,offset32 reggs
+    call p885       ; convert gs
+    mov dx,savess
+    mov edi,offset32 regss
+    call p885       ; convert ss
+    mov edx,cr0
+    mov edi,offset32 regcr0
+    call p889       ; convert cr0
+    mov edx,cr2
+    mov edi,offset32 regcr2
+    call p889       ; convert cr2
+    mov edx,cr3
+    mov edi,offset32 regcr3
+    call p889       ; convert cr3
+    sidt fword ptr idtlimit
+    mov edx,idtbase     ; get idt base
+    mov edi,offset32 idtb
+    call p889       ; convert idt base
+    mov dx,idtlimit     ; get idt limit
+    mov edi,offset32 idtl
+    call p885       ; convert idt limit
+    sgdt fword ptr gdtlimit
+    mov edx,gdtbase     ; get gdt base
+    mov edi,offset32 gdtb
+    call p889       ; convert gdt base
+    mov dx,gdtlimit     ; get gdt limit
+    mov edi,offset32 gdtl
+    call p885       ; convert gdt limit
+    sldt ldtvalue
+    mov dx,ldtvalue     ; get ldt
+    mov edi,offset32 ldtw
+    call p885       ; convert ldt
+    str tssvalue
+    mov dx,tssvalue     ; get tss
+    mov edi,offset32 tssw
+    call p885       ; convert tss
+    cmp usemono,0       ; use mono screen?
+    jz short p950x      ; no
+    call p960       ; save/clear mono screen if needed
+    mov esi,offset32 regline1
+    call p900       ; display registers
+    mov esi,offset32 pause
+    call p900       ; display pause msg
+    mov keystrokes,0    ; clear keystrokes
+    sti         ; allow interrupts
+p950l:  cmp keystrokes,2    ; get 2 irq1s yet?
+    jb p950l        ; no
+    mov esi,offset32 crlf
+    call p900       ; display a crlf
+    call p970       ; restore mono screen if needed
+    cli         ; no more interrupts for now
+p950x:  ret
+p950    endp
+align 4
+p960    proc near       ; save/clear mono screen
+    cmp monosave,1      ; save it?
+    jnz short p960x     ; no
+    mov ax,ds
+    mov es,ax       ; es=ds
+    mov esi,0b0000h
+    mov edi,offset32 monoscreen
+    mov ecx,80*25/2
+    rep movsd       ; save the screen
+    call p910       ; clear the screen
+p960x:  ret
+p960    endp
+align 4
+p970    proc near       ; restore mono screen
+    cmp monosave,1      ; save it?
+    jnz short p970x     ; no
+    mov ax,ds
+    mov es,ax       ; es=ds
+    mov esi,offset32 monoscreen
+    mov edi,0b0000h
+    mov ecx,80*25/2
+    rep movsd       ; restore the screen
+p970x:  ret
+p970    endp
+VAD_Create_VM proc near
+    ret
+VAD_Create_VM endp
+VxD_Locked_Code_Ends
+; **************************************************************************
+VxD_Real_Init_Seg       ; init seg (real mode)
+p1000   proc near
+    mov ah,9
+    mov dx,offset copyr
+    int 21h         ; display copyright
+    xor ax,ax       ; don't abort load
+    xor bx,bx       ; don't exclude any pages
+    xor si,si       ; no instance data items
+    xor edx,edx     ; dword of reference data
+    ret
+p1000   endp
+copyr   db 'WINX (Windows Exception Handler) Version 0.88'
+    db cr,lf
+    db 'Copyright 1991, The Periscope Company, Inc.  All rights reserved.'
+    db cr,lf,'$'
+VxD_Real_Init_Ends      ; init seg (real mode)
+; **************************************************************************
+VxD_Idata_Seg           ; init data seg (protect mode)
+winxusemono db 'WinxUseMono',0  ; tokens in system.ini
+winxmonosave    db 'WinxMonoSave',0
+winxnowinmsg    db 'WinxNoWinMsg',0
+winxpsport  db 'PeriscopePort',0
+winxnoint   db 'WinxNoInt'
+winxnoint2  db '..',0
+VxD_Idata_Ends
+; **************************************************************************
+VxD_Icode_Seg           ; init code seg (protect mode)
+VAD_Sys_Crit_Init proc near ; init phase 1
+    xor edx,edx     ; pointer to default string
+    xor esi,esi     ; look in [386enh]
+    mov edi,offset32 WinxUseMono
+    VMMcall Get_Profile_String  ; search for 'WinxUseMono'
+    jc short p1100a     ; no find
+    mov usemono,1       ; use mono screen
+    call p1120      ; init mono screen
+p1100a:
+    xor edx,edx     ; pointer to default string
+    xor esi,esi     ; look in [386enh]
+    mov edi,offset32 WinxNoWinMsg
+    VMMcall Get_Profile_String  ; search for 'WinxNoWinMsg'
+    jc short p1100b     ; no find
+    mov winmsg,0        ; no windows messages
+p1100b:
+    xor eax,eax     ; zap value
+    xor esi,esi     ; look in [386enh]
+    mov edi,offset32 WinxPSPort
+    VMMcall Get_Profile_Hex_Int ; search for 'PeriscopePort'
+    jc short p1100c     ; no find
+    mov psport,ax       ; set Periscope's port
+p1100c:
+    xor edx,edx     ; pointer to default string
+    xor esi,esi     ; look in [386enh]
+    mov edi,offset32 WinxMonoSave
+    VMMcall Get_Profile_String  ; search for 'WinxMonoSave'
+    jc short p1100d     ; no find
+    mov monosave,1      ; save/restore mono screen
+    call p1120      ; init mono screen
+p1100d:
+    mov eax,offset32 hookint06
+    mov ebx,offset32 intlist
+    mov ecx,intlistlen  ; count of interrupts
+p1100e: xor edx,edx     ; pointer to default string
+    xor esi,esi     ; look in [386enh]
+    mov edi,offset32 winxnoint
+    push ebx
+    mov bx,[ebx]        ; get int name in ascii
+    mov word ptr [winxnoint2],bx    ; save it
+    VMMcall Get_Profile_String  ; search for 'WinxNoInt..'
+    jc short p1100f     ; no find
+    mov byte ptr [eax],0    ; don't hook this int
+p1100f: pop ebx
+    inc ebx
+    inc ebx
+    inc eax
+    loop p1100e     ; check all of our interrupts
+    call p1140      ; hook the indicated interrupts
+    clc         ; no error
+    ret
+align 4
+p1120   proc near       ; init mono screen
+    mov ax,ds
+    mov es,ax       ; es=ds
+    mov edi,0b0000h     ; init mono screen
+    mov ax,0720h
+    mov ecx,25*80
+    rep stosw
+    ret
+p1120   endp
+align 4
+p1140   proc near       ; set interrupts in idt
+    mov intgate,0ee00h  ; set interrupt gate, dpl=3
+    mov eax,offset32 p006   ; offset of exception handler
+    mov ebx,offset32 origint6   ; offset of original cs:eip
+    mov cl,hookint06    ; if 1, we hook this interrupt
+    mov edi,int6*2      ; offset of interrupt in idt
+    call p1160      ; set int 6
+    mov eax,offset32 p008
+    mov ebx,offset32 origint8
+    mov cl,hookint08
+    mov edi,int8*2
+    call p1160      ; set int 8
+    mov eax,offset32 p00a
+    mov ebx,offset32 originta
+    mov cl,hookint0a
+    mov edi,int0a*2
+    call p1160      ; set int a
+    mov eax,offset32 p00b
+    mov ebx,offset32 origintb
+    mov cl,hookint0b
+    mov edi,int0b*2
+    call p1160      ; set int b
+    mov eax,offset32 p00c
+    mov ebx,offset32 origintc
+    mov cl,hookint0c
+    mov edi,int0c*2
+    call p1160      ; set int c
+    mov eax,offset32 p00d
+    mov ebx,offset32 origintd
+    mov cl,hookint0d
+    mov edi,int0d*2
+    call p1160      ; set int d
+    mov eax,offset32 p00e
+    mov ebx,offset32 originte
+    mov cl,hookint0e
+    mov edi,int0e*2
+    call p1160      ; set int e
+    mov intgate,08e00h  ; interrupt gate, dpl=0
+    mov eax,offset32 p013
+    mov ebx,offset32 origirq1
+    mov cl,1        ; always hook this interrupt
+    mov edi,51h*8
+    call p1160      ; set int 51h (keyboard)
+    ret
+p1140   endp
+p1160   proc near       ; set interrupt in idt
+    ; on entry, eax has offset of new handler,
+    ; ebx points to save area for current handler's address,
+    ; cl contains a 1 if the interrupt is to be hooked, and
+    ; edi has the interrupt number*4
+    cmp cl,1        ; hook it?
+    jnz short p1160x        ; no
+    push eax
+    mov ax,ds
+    mov es,ax       ; es=ds
+    sidt fword ptr idtlimit
+    add edi,idtbase
+    mov ax,[edi]        ; get low offset
+    mov word ptr [ebx],ax
+    mov ax,[edi+6]      ; get high offset
+    mov word ptr [ebx+2],ax
+    mov ax,[edi+2]      ; get segment
+    mov word ptr [ebx+4],ax
+    pop eax
+    stosw           ; save low offset
+    mov ax,cs
+    stosw           ; save cs
+    mov ax,intgate      ; value for interrupt gate
+    stosw           ; save misc bytes
+    shr eax,16
+    stosw           ; save high offset
+p1160x: ret
+p1160   endp
+VAD_Sys_Crit_Init endp
+; **************************************************************************
+VAD_Device_Init proc near   ; init phase 2
+    cmp winmsg,0        ; skip windows msg?
+    jz short p1200a     ; yes
+    mov esi,offset32 p300
+    VMMcall Call_When_Idle  ; setup callback
+p1200a:
+    clc         ; no error
+    ret
+VAD_Device_Init endp
+; **************************************************************************
+VAD_Init_Complete proc near ; init phase 3
+    clc         ; no error
+    ret
+VAD_Init_Complete endp
+VxD_Icode_Ends
+end
+</pre>
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

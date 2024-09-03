@@ -1,0 +1,546 @@
+
+<html>
+<head>
+<title>June, 2004: Cooking with Maypole, Part II</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Cooking with Maypole, Part II</h1>
+<p><i>The Perl Journal</i> June, 2004</p>
+<h2></h2>
+
+
+<h3>By Simon Cozens</h3>
+
+
+<I>Simon is a freelance programmer and author, whose titles include Beginning Perl (Wrox Press, 2000) and Extending and Embedding Perl (Manning Publications, 2002). He's the creator of over 30 CPAN modules and a former Parrot pumpking. Simon can be reached at simon@ simon-cozens.org.</I>
+
+<hr>
+
+
+
+
+
+<p>We began our gastronomic adventures with Maypole last time, when we constructed a recipe collection and a way to index and investigate the current state of food stocks in the house. Now we're going to combine the two concepts, and search for recipes that fit what we've got available to eat.</p>
+
+<p>First, though, we'll take a brief look at how Maypole works and what it actually does.</p>
+<h3>How Maypole Works</h3>
+
+<p>In Part I, we saw Maypole primarily in terms of putting an interface onto an existing data structure and applying templates to this. However, to think of it like this is to miss the flexibility and extensibility of Maypole as a web application framework.</p>
+
+<p>Perhaps the best way to think of Maypole is as a tool for mapping a URL onto an "action," where an action is specified as a method call and a template. So the URL "/recipe/view/12" is asking for the <i>view</i> action to be performed on a <i>recipe</i> class, with argument "12." Practically, this means that the <i>view </i>method will be called on the <i>Larder::Recipe</i> class on the object representing the 12th row in the table, and then the <i>view</i> template used to display the results.</p>
+
+<p>This process is carried out by the gradual fleshing out of a "Maypole request object"&#151;analogous to an Apache <i>request</i> object but at a much higher level. As well as containing the means to communicate with the web server (such as an <i>Apache::Request</i> object), it begins with the configuration and some idea of the path requested: /recipe/view/12.</p>
+
+<p>Next, it decomposes the path down to its components:</p>
+
+<blockquote>
+<pre>
+{ table =&gt; "recipe",
+  action =&gt; "view",
+  args =&gt; [ 12 ]
+}
+
+</pre>
+</blockquote>
+
+<p>Then it associates the table with the <i>Larder::Recipe</i> class and calls the <i>view</i> method. Finally, the output from the templating stage gets added to the request, and the request is sent back to the front-end <i>Maypole</i> class (usually <i>Apache::MVC</i> or <i>CGI::Maypole</i>) for eventual output to the browser.</p>
+<h3>Avoiding Rotten Tomatoes</h3>
+
+<p>We'll begin our extension of the Larder application by adding an action to the contents of our larder that are in imminent danger of going off. To help us do this, we'll write a utility method in the <i>Larder::Contents</i> class called <i>ripe_food</i>, which returns all the objects that need to be eaten. This is pure <i>Class::DBI</i> for the time being.</p>
+
+<p>First, SQL dates are a bit of a pain to do anything sensible with, so we have <i>Class::DBI</i> automatically inflate them to <i>Time::Piece</i> objects:</p>
+
+<blockquote>
+<pre>
+Larder::Contents-&gt;has_a(use_by =&gt; 'Time::Piece',
+     inflate =&gt; sub { Time::Piece-&gt;strptime(shift, "%Y-%m-%d") },
+     deflate =&gt; 'ymd',
+       );
+
+</pre>
+</blockquote>
+
+<p>Now, every time we call <i>use_by</i>, we get a <i>Time::Piece</i> object. This doesn't really affect our display because <i>Time::Piece</i> stringifies nicely.</p>
+
+<p>We can now look for those <i>Contents</i> objects that have a <i>use_by</i> date under five days away:</p>
+
+<blockquote>
+<pre>
+use Time::Seconds;
+use Time::Piece;
+
+sub ripe_food {
+  my $class = shift;
+  my $deadline = localtime + 5 * ONE_DAY;
+  grep { $_-&gt;use_by &lt;= $deadline } $class-&gt;retrieve_all;
+}
+
+</pre>
+</blockquote>
+
+<p>(If more efficiency is required, we could do the searching in the SQL by using <i>Class::DBI::AbstractSearch</i>, but my larders aren't big enough to warrant it.)</p>
+
+<p>To turn this method into an action that can be called from the Web, we need to create an "Exported" method that places these objects into the Maypole request object:</p>
+
+<blockquote>
+<pre>
+sub must_eat :Exported {
+  my ($self, $r) = @_;
+  $r-&gt;{objects} = [ $self-&gt;ripe_food ];
+}
+
+</pre>
+</blockquote>
+
+<p>We create a template in contents/must_eat, and we can now view these items from the URL /contents/must_eat. In order to suggest recipes that use these up, we need to link ingredients to recipes.</p>
+<h3>Categories and Ingredients</h3>
+
+<p>Our data loader in Part I looked like this:</p>
+
+<blockquote>
+<pre>
+use Larder;
+use XML::Simple;
+use File::Slurp;
+for my $recipe (&lt;xml/*&gt;) {
+  my $xml = read_file($recipe);
+  my $structure = XMLin($xml, ForceArray =&gt; 1)-&gt;{recipe}-&gt;[0];
+  my $name = $structure-&gt;{head}-&gt;[0]-&gt;{title}-&gt;[0];
+  my @ingredients = @{$structure-&gt;{ingredients}[0]{ing}};
+  my @cats = @{$structure-&gt;{head}[0]{categories}[0]{cat}};
+  Larder::Recipe-&gt;find_or_create({
+    name =&gt; $name,
+    xml =&gt; $xml
+  });
+}
+
+</pre>
+</blockquote>
+
+
+
+<p>Now we're going to extend this, and our <i>Larder</i> class, to support the linkages between recipes and categories, and recipes and their ingredients. <i>Class::DBI</i> makes it easy for us to do this: We tell it the name of the accessor we want, the name of the mapping class, and the name of the accessor in that class that returns what we want.</p>
+
+<p>In our case, we first have to tell <i>Class::DBI</i> about the relationship between the ingredient table and the food table:</p>
+
+<blockquote>
+<pre>
+Larder::Ingredient-&gt;has_a(food =&gt; "Larder::Food");
+
+</pre>
+</blockquote>
+
+
+
+<p>and vice versa:</p>
+
+<blockquote>
+<pre>
+Larder::Food-&gt;has_many(ingredients =&gt; "Larder::Ingredient");
+
+</pre>
+</blockquote>
+
+
+
+<p>So, in our case, we want the <i>Larder::Recipe</i> class to have an accessor called <i>ingredients</i>, which uses <i>Larder::Ingredient</i> to get a list of ingredients for a recipe and calls <i>food</i> on each one to return a <i>Larder::Food</i> object. The code for that looks like this:</p>
+
+<blockquote>
+<pre>
+Larder::Recipe-&gt;has_many(ingredients =&gt; [ Larder::Ingredient =&gt; "food" ]);
+
+</pre>
+</blockquote>
+
+
+
+<p>Similarly, we can get from a <i>Larder::Food</i> object to the recipes that contain it:</p>
+
+<blockquote>
+<pre>
+Larder::Ingredient-&gt;has_a(recipe =&gt; "Larder::Recipe");
+Larder::Food-&gt;has_many(recipes =&gt; [ Larder::Ingredient =&gt; "recipe" ]);
+
+</pre>
+</blockquote>
+
+<p>And all the same for categories. Of course, we could do this a little more easily by using my module <i>Class:DBI::Loader::Relationship</i>. This uses <i>Class::DBI::Loader</i> (which Maypole also uses; this is no coincidence) to express the relationships between classes in more natural terms. It's not as powerful, but it is easier to remember:</p>
+
+<blockquote>
+<pre>
+Larder-&gt;config-&gt;{loader}-&gt;relationship(
+  "A recipe has categories via categorizations"
+);
+
+</pre>
+</blockquote>
+
+<p>With our relationships set up, we can tell the loader to associate a recipe with its categories and ingredients:</p>
+
+<blockquote>
+<pre>
+for (@categories) {
+  my $cat = Larder::Category-&gt;find_or_create({ name =&gt; $_ });
+  $recipe-&gt;add_to_categories({ category =&gt; $cat });
+}
+
+for (@ingredients) {
+  my ($ing, $amt) = ($_-&gt;{item}[0], $_-&gt;{amt}[0]);
+  my $ingredient = Larder::Food-&gt;find_or_create({ name =&gt; $ing });
+  my $quantity = $amt-&gt;{qty}[0]. " " . $amt-&gt;{unit}[0];
+  $recipe-&gt;add_to_ingredients({ food =&gt; $ingredient,
+                  quantity =&gt; $quantity   });
+  }
+}
+
+</pre>
+</blockquote>
+
+<p>Now we can create a template that suggests some recipes to go with our moribund ingredients:</p>
+
+<blockquote>
+<pre>
+&lt;h1&gt; You need to use up some food! &lt;/h1&gt;
+
+[% FOR content = contents %]
+  &lt;h2&gt; [% content.food.name %] &lt;/h2&gt;
+
+  &lt;P&gt; Needs to be used up by [% content.use_by %] &lt;/P&gt;
+
+  &lt;P&gt;
+  Some recipes you could make with this:
+  &lt;P&gt;
+  &lt;UL&gt;
+     [% FOR recipe = content.food.recipes %] 
+    &lt;LI&gt; &lt;A HREF="/recipe/view/[% recipe.id %]"&gt; [% recipe %]&lt;/A&gt;
+    [% END]
+  &lt;/UL&gt;
+[% END %]
+
+</pre>
+</blockquote>
+
+<p>Of course, these aren't necessarily the best recipes for the job; ideally, we're going to find the recipes that use up as many of the ingredients as possible. We can't do this with a plain database search. My initial plan was to gather up all the potential recipes, then score them based on the ingredients that they use and the immediacy of getting rid of the ingredient.</p>
+
+<p>But then an even more interesting technology came along.</p>
+<h3>Plucene</h3>
+
+<p>Plucene is a Perl port of the Java Lucene search engine, a Jakarta project (see http://jakarta.apache.org/lucene/ for more information). Rather than a standalone search tool, it is a library with which you can construct your own indexing and searching tools. The easiest interface to it is through the Perl module <i>Plucene::Simple</i>, which we'll use for indexing the recipes.</p>
+
+<p>Plucene works in terms of "documents," which are a little like pages in a book. When you're building an index to a book, the index will relate a word or phrase from the page (the index term) to a page number&#151;it doesn't directly relate the word to the entire contents of the page, or the index would be exponentially longer than the book itself! Instead, the reader is responsible for turning the page number into the original page contents. If we're indexing a book with Plucene, we might create documents like this:</p>
+
+<blockquote>
+<pre>
+@documents = (
+1 =&gt; {
+  chapter_title =&gt; "Preface",
+  text =&gt; "We have many emotions as we ..."
+},
+3 =&gt; {
+  chapter_title =&gt; "Ethos",
+  text =&gt; "We have made fundamental assumptions  ..."
+},
+...
+);
+
+</pre>
+</blockquote>
+
+<p>We create a <i>Plucene::Simple</i> object that represents the index:</p>
+
+<blockquote>
+<pre>
+use Plucene::Simple;
+my $index = Plucene::Simple-&gt;open("/home/simon/ow_book/index");
+
+</pre>
+</blockquote>
+
+<p>And we can add the documents:</p>
+
+<blockquote>
+<pre>
+$index-&gt;add(@documents);
+$index-&gt;optimize;
+
+</pre>
+</blockquote>
+
+<p>The optimization step defragments the index once we've finished adding a lot of data at once. To run a search, we open the index again and call its search method:</p>
+
+<blockquote>
+<pre>
+use Plucene::Simple;
+my $index = Plucene::Simple-&gt;open("/home/simon/ow_book/index");
+my @results = $index-&gt;search("we");
+
+</pre>
+</blockquote>
+
+<p>Now a search for "<i>we</i>" would return "<i>1</i>" and "<i>3</i>," and we could narrow down our search by looking for "we chapter_title:Ethos," which would return only page 3. It's assumed that we have an easy way of turning the ID, "<i>3</i>," into the full text of the book's page.</p>
+
+<p>However, we're not indexing a book, but a set of recipes. In this case, our documents are going to look like this:</p>
+
+<blockquote>
+<pre>
+52 =&gt; {
+  title =&gt; "Aioli",
+  categories =&gt; "Salads Condiment Classic",
+  ingredients =&gt; "Garlic Mayonnaise",
+}
+
+</pre>
+</blockquote>
+
+<p>where "<i>52</i>" is the ID of the recipe in the recipe table. We can, of course, look this up again by doing <i>Larder::Recipe-&gt;retrieve(52)</i>. We're going to skip the process of indexing the directions part of the recipe because we're only interested in searching for particular ingredients at the moment. So, once again, we edit our recipe loader script, which currently has this at the end of the loop:</p>
+
+<blockquote>
+<pre>
+Larder::Recipe-&gt;find_or_create({
+  name =&gt; $name,
+  xml =&gt; $xml
+});
+
+</pre>
+</blockquote>
+
+<p>We need to keep hold of that recipe's ID and build up our hash of things to index:</p>
+
+<blockquote>
+<pre>
+my $recipe = Larder::Recipe-&gt;find_or_create({
+    name =&gt; $name,
+    xml =&gt; $xml
+  });
+my $hash = {
+  title =&gt; $name,
+  categories =&gt; (join " ", @categories),
+  ingredients =&gt; (join " ", map { $_-&gt;{item}[0] } @ingredients)
+};
+$index-&gt;add( $recipe-&gt;id =&gt; $hash );
+
+</pre>
+</blockquote>
+
+<p>Finally, we optimize the index outside of the loop once everything has been added:</p>
+
+<blockquote>
+<pre>
+$index-&gt;optimize;
+
+</pre>
+</blockquote>
+
+
+
+<p>Now we have, in addition to our database of recipes, an index by which we can look for entries in that database. How does this help us find good recipes for food that's going off?</p>
+<h3>Locating the Best Recipe</h3>
+
+<p>Once our index has been built up, we can now start searching for recipes by their ingredients, and Plucene automatically makes sure that those recipes that match "better"&#151;that is, use more of the ingredients&#151;are returned first. So, for instance, if we have some carrots, bacon, and mushrooms to use up, we can create a simple test search script like this:</p>
+
+<blockquote>
+<pre>
+use Plucene::Simple;
+use Larder;
+my $index = Plucene::Simple-&gt;open("pl_index");
+for ($index-&gt;search("carrots bacon mushrooms")) {
+  my $r = Larder::Recipe-&gt;retrieve($_);
+  print $r-&gt;name,"\n", join ", ", map { $_-&gt;name } $r-&gt;ingredients;
+  print "\n\n";
+}
+
+</pre>
+</blockquote>
+
+<p>And we'll be given a list of recipes that contain any of those ingredients, but starting with the best matches:</p>
+
+<blockquote>
+<pre>
+24 Hour Vegetable Salad
+Iceberg lettuce, Mushrooms, Peas, Carrots, Egg whites, Bacon,
+Cheese, Fat-free mayonnaise, Lemon Juice
+
+Beef Burgundy
+Mushrooms, Onions, Butter, Bacon, Sirloin Steaks, Flour,
+Burgundy, Beef Broth, Bay leaf, Garlic, Ground Thyme, Carrots, 
+Salt And Pepper, Noodles, Chopped Parsley
+
+Bacon Supper Snack
+Gammon, Tomatoes, Stuffing, Butter, Mushrooms, Soft White
+Bread Crumbs, Salt and pepper, Mixed Herbs, Egg
+
+All-In-One-Breakfast
+Whole Wheat Bread, Butter, Mushrooms, Tomatoes, Cheese, Bacon
+
+...
+
+</pre>
+</blockquote>
+
+<p>The last two recipes shown here (and there were many more) don't contain all three ingredients, but do contain two; as we carry on down the list, we get less and less specific.</p>
+
+<p>What we're doing, then, is using the built-in scoring techniques of a standard search engine to find the best recipes for us&#151;web search engines are all about finding the most appropriate pages relating to the user's terms; we're using the same mechanism to find the most appropriate lunch relating to what's in the cupboard.</p>
+
+<p>Now we can turn our "must eat" page into a page that helps us search for the best recipes to eat:</p>
+
+<blockquote>
+<pre>
+sub must_eat :Exported {
+  my $index = Plucene::Simple-&gt;open("recipe_index");
+  my @ripe = $self-&gt;ripe_food;
+  $r-&gt;{objects} = \@ripe;
+  my @terms = map { '"'. $_-&gt;name. '"' } @ripe;
+  my @results = map { Larder::Recipe-&gt;retrieve($_) }
+      $index-&gt;search(join " ", @terms);
+  $r-&gt;{template_args}{recipes} = \@results;
+  $r-&gt;{template_args}{highlight} = { map { $_-&gt;name =&gt; 1 } @ripe };
+}
+
+</pre>
+</blockquote>
+
+<p>Notice that we surround our ingredient names in double quotes&#151;Plucene understands the concept of phrase matches, as one would expect from a search engine: "<i>fish fingers</i>" searches for recipes containing fish fingers, whereas fish fingers (no quotes) will search for recipes that make use of both fish and fingers. (One can only hope that neither of those searches will turn up any hits in your recipes.) When we've retrieved the results from our search engine and turned them into recipe objects, we add them to our set of arguments to the template. We also add a hash of the ingredient names we're looking for&#151;this will help us highlight the ingredients when we're producing a summary of the recipe. So, for instance, we want our page to look like <a name="rf1"></a><a href="0406df1.html">Figure 1</a>.</p>
+
+<p>The associated template would go as follows:</p>
+
+<blockquote>
+<pre>
+&lt;h2&gt; You need to use up some food! &lt;/h2&gt;
+&lt;P&gt;
+The following food is getting a bit ripe:
+&lt;/P&gt;
+&lt;UL&gt;
+[% FOR content = contents %]
+  &lt;LI&gt; [% content.food.name %]
+[% END %]
+&lt;/UL&gt;
+
+&lt;H2&gt; Suggested recipes &lt;/H2&gt;
+&lt;P&gt;
+These recipes will help you use up those ingredients:
+&lt;/P&gt;
+
+</pre>
+</blockquote>
+
+<p>Now we look at each recipe in our search results:</p>
+
+<blockquote>
+<pre>
+[% FOR recipe = recipes %]
+  &lt;h3&gt; &lt;A HREF="/recipe/view/[%recipe.id%]"&gt; [% recipe.name %] &lt;/a&gt; &lt;/h3&gt;
+  Requires:
+  &lt;p&gt;
+  [% FOR ingredient = recipe.ingredients;
+     SET name = ingredient.food.name;
+
+</pre>
+</blockquote>
+
+<p>And now for each ingredient, we can show their names and check whether or not to highlight them:</p>
+
+<blockquote>
+<pre>
+     '&lt;span class="searchresult"&gt;' if highlight.$name;
+     name;
+     '&lt;/span&gt;' if highlight.$name;
+     END;
+  %]
+  &lt;/p&gt;
+[% END %]
+
+</pre>
+</blockquote>
+
+<p>Hooray&#151;now we not only know which recipes will use up the dying ingredients, but also which ones will include the most of them at once. There's one final touch we can add to our application before we head off to the kitchen&#151;a sense of urgency.</p>
+
+<p>If something needs to be used by today, we want a recipe that uses it today. Let's change <i>ripe_food</i> so that it returns us a hash of ingredients and a score representing the need to eat them:</p>
+
+<blockquote>
+<pre>
+sub ripe_food {
+  my $class = shift;
+  my $deadline = localtime + 5 * ONE_DAY;
+  map { 5 - int(($deadline - $_-&gt;use_by) / ONE_DAY) }
+  grep { $_-&gt;use_by &lt;= $deadline } $class-&gt;retrieve_all;
+}
+
+</pre>
+</blockquote>
+
+<p>Now if we have some cheese that really needs to be eaten today and some ham that has two days to go, we get:</p>
+
+<blockquote>
+<pre>
+( Cheese =&gt; 5, Ham =&gt; 3 )
+
+</pre>
+</blockquote>
+
+
+
+<p>We want Plucene to score up recipes that contain cheese, relative to those that contain ham. We can do this using a boost factor in the search term. Plucene allows us to search for <i>"Cheese"^5 "Ham"^3</i>&#151;now it tries to find recipes that have both ham and cheese in it, then those that contain cheese, then those that contain ham. With a list of 10 or 20 ingredients to get rid of, this is more or less guaranteed to give us recipes that use up the widest range of the most desperate ingredients first, giving us the most economical ways to clean out our cupboards. We'll need to modify the <i>must_eat</i> action to understand the list returned:</p>
+
+<blockquote>
+<pre>
+sub must_eat :Exported {
+  my $index = Plucene::Simple-&gt;open("recipe_index");
+  my @ripe = $self-&gt;ripe_food;
+  $r-&gt;{objects} = [];
+  my @terms;
+  while (my ($obj, $score) = splice(@ripe, 0, 2)) {
+    push @{$r-&gt;{objects}}, $obj;
+    push @terms, '"'. $obj-&gt;name. '"^'. $score;
+    $r-&gt;{template_args}{highlight}{$obj-&gt;name}++;
+  }
+
+  my @results = map { Larder::Recipe-&gt;retrieve($_) }
+      $index-&gt;search(join " ", @terms);
+  $r-&gt;{template_args}{recipes} = \@results;
+}
+
+</pre>
+</blockquote>
+
+<p>We're using a list of pairs instead of a real hash because the "keys" are objects, and Perl doesn't let us use objects as hash keys&#151;they store just fine, but as they are stored, they get stringified and we can't use them as objects again when we retrieve from the hash. The technique of using</p>
+
+<blockquote>
+<pre>
+while (my ($key, $value) = splice(@list, 0, 2)) {
+
+</pre>
+</blockquote>
+
+
+
+<p>where you'd normally expect</p>
+
+<blockquote>
+<pre>
+while (my ($key, $value) = each %hash) {
+
+</pre>
+</blockquote>
+
+
+
+<p>is quite a common one you can use where you'd like to use objects as hash keys.</p>
+
+<p>With this in place, Plucene scores each ingredient according to its freshness, in a nice simple way that frees us from having to think up a complicated algorithm to do the job. That's code re-use! And now, what's in the fridge?</p>
+<h3>Happy Cooking</h3>
+
+<p>I hope you've enjoyed our two-part foray into cooking with Perl; we've covered quite a lot of ground on the way. This time we've focused particularly on Maypole and showed how to turn it from a simple front-end to databases into a web application framework on which to base more complex applications. We've also taken a look at Plucene, a pure Perl search engine that allows us to index and search through all kinds of data&#151;including recipes!</p>
+
+<p>If you want to find out more about Maypole, there's a growing set of documentation at http://maypole.simon-cozens.org/docs/, including a large manual with several examples of real-life applications. Plucene can be downloaded from CPAN, and there's a longer introduction to it at http://www.perl.com/pub/a/2004/02/ 19/plucene.html. Finally, for a load of great recipes in RecipeML, try http://dsquirrel.tripod.com/recipeml/indexrecipes2.html.</p>
+
+<p>Bon appetit!</p>
+<p><b>TPJ</b></p>
+
+
+
+
+</body>
+</html>

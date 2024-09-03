@@ -1,0 +1,410 @@
+
+<html>
+<head>
+<title>June, 2005: Portability &amp;  Data Management</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Portability &amp;  Data Management</h1>
+<p><i>Dr. Dobb's Journal</i> June, 2005</p>
+<h2>Simplify the reuse of data-management code in new environments</h2>
+
+
+<h3>By Andrei Gorine</h3>
+
+
+<I>Andrei is principal architect at McObject. He can be reached at gor@mcobject.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Whether an embedded-systems database is developed for a specific application or as a commercial product, portability matters. Most embedded data-management code is still homegrown, and when external forces drive an operating system or hardware change, data-management code portability saves significant development time. This is especially important because  the lifespan of hardware is increasingly shorter than that of firmware. For database vendors, compatibility with the dozens of hardware designs, operating systems, and compilers used in embedded systems provides a major marketing advantage.</p>
+
+<p>For real-time embedded systems, database code portability means more than the ability to compile and execute on different platforms: Portability strategies also tie into performance. Software developed for a specific OS, hardware platform, and compiler often performs poorly when moved to a new environment, and optimizations to remedy this are very time consuming. Truly portable embedded systems data-management code carries its optimization with it, requiring the absolute minimum adaptation to deliver the best performance in new environments.</p>
+<h3>Using Standard C</h3>
+
+<p>Writing portable code traditionally begins with a commitment to use only ANSI C. But this is easier said than done. Even code written with the purest ANSI C intentions frequently makes assumptions about the target hardware and operating environment. In addition, programmers often tend to use available compiler extensions. Many of the extensions&#151;prototypes, stronger type checking, and so on&#151;enhance portability, but others may add to platform dependencies.</p>
+
+<p>Platform assumptions are often considered necessary for performance reasons. Embedded code is intended to run optimally on targets ranging from the low-end 8051 family, to 32-bit DSP processors, to high-end Pentium-based SMP machines. Therefore, after the software has been successfully built for the specific target, it is customary to have a performance tuning stage that concentrates on bringing out the best of the ported software on the particular platform. This process can be as straightforward as using compiler-specific flags and optimizations, but often becomes complex and time-consuming and involves patching the code with hardware-specific assembler. Even with C language patches, hardware-optimized code is often obscure and, more importantly, performs poorly on different machines.</p>
+
+<p>Programmers also attempt to maintain portability through conditional code (<i>#ifdef/#else</i>) in a master version that is preprocessed to create platform-specific versions. Yet in practice, this method can create the customization and version-management headaches that portability is meant to eliminate. Another conditional code approach, implementing if-else conditions to select a processor-specific execution path at runtime, results in both unmanageable code and wasted CPU cycles.</p>
+
+<p>All told, it's better to stick to ANSI C and to use truly platform-independent data structures and access methods as much as possible to work around compiler- and platform-specific issues.</p>
+
+<p>In the process of creating the eXtremeDB in-memory embedded database at McObject (where I work), we developed several techniques that are useful for any developer seeking to write highly portable, maintainable, and efficient embedded code. Some of these techniques apply to embedded systems portability generally, but are particularly important for data management. In many cases, an embedded application's database is its most complex component, and getting it right the first time (by implementing highly portable code) saves programmer-months down the road. Other techniques I present here, such as building lightweight database synchronization based on a user-mode spinlock, constitute specific key building blocks for portable embedded systems databases.</p>
+<h3>Word Sizes</h3>
+
+<p>One proven technique is to avoid making assumptions about integer and pointer sizes. Defining the sizes of all base types used throughout the database engine code, and putting theses <i>typedefs</i> in a separate header file, makes it much easier to change them when moving the code from one platform to another or even using a different compiler for the same hardware platform; see <a name="rl1"></a><a href="#l1">Listing One</a>.</p>
+
+<p>Defining a pointer size as a <i>sizeof(void*) </i>and using the definition to calculate memory layout offsets or using it in pointer arithmetic expressions avoids surprises when moving to a platform such as ZiLOG eZ80 with 3-byte pointers:</p>
+
+<blockquote>
+#define PTRSIZE sizeof(void *) <br>
+
+</blockquote>
+
+<p>The <i>void*</i> type is guaranteed to have enough bits to hold a pointer to any data object or to a function.</p>
+<h3>Data Alignment</h3>
+
+<p>Data alignment can be a portability killer. For instance, on various hardware architectures a 4-byte integer may start at any address, or start only at an even address, or start only at a multiple-of-four address. In particular, a structure could have its elements at different offsets on different architectures, even if the element is the same size. To compensate, our in-memory data layout requires data object allocation to start from a given position, and aligns elements via platform-independent macros. <a name="rl2"></a><a href="#l2">Listing Two</a> aligns the position of the data object (<i>pos</i>) at a 4-byte boundary.</p>
+
+<p>Another alignment-related pitfall is that, on some processors (such as SPARC), all data types must be aligned on their natural boundaries. Using Standard C data types, integers are aligned as follows:</p>
+
+
+
+<ul>
+  <li><i>short</i> integers are aligned on 16-bit boundaries. </li>
+  <li><i>int</i> integers are aligned on 32-bit boundaries. </li>
+  <li><i>long</i> integers are aligned on either 32-bit boundaries or 64-bit boundaries, depending on whether the data model of the kernel is 64-bit or 32-bit. </li>
+  <li><i>	long long</i> integers are aligned on 64-bit boundaries. </li>
+</ul>
+
+
+
+<p>Usually, the compiler handles these alignment issues and aligns the variables automatically; see <a name="rl3"></a><a href="#l3">Listing Three</a>. But redefining the way a variable or a structure element is accessed, while possible and sometimes desirable, can be risky. For example, consider the declaration in <a name="rl4"></a><a href="#l4">Listing Four</a> of an object handle (assuming the data object size is <i>N</i> bytes). Such opaque handle declarations are commonly used to hide data object representation details from applications that access the data object with an interface function, using the handle merely as the object identifier as shown in <a name="rl5"></a><a href="#l5">Listing Five</a>. Because <i>d</i> is a byte array, the address is not memory aligned. The handle is further used as an identifier of the object to the library:</p>
+
+<blockquote>
+void* function (  appData *handle);<br>
+
+</blockquote>
+
+<p>Furthermore, internally the library "knows" about the detail behind the handle and declares the object as a structure with the elements defined as short integers, long integers, references, and so on; see <a name="rl6"></a><a href="#l6">Listing Six</a>.</p>
+
+<p>Accessing object elements leads to a bus error because they are not correctly aligned. To avoid the problem, we declare in <a name="rl7"></a><a href="#l7">Listing Seven</a> the object handle as an array of operands of the maximum size (as opposed to a byte array). In this case, the compiler automatically aligns the operands to their natural boundaries, preventing the bus error.</p>
+<h3>Word Endianness</h3>
+
+<p>Byte order is the way the processor stores multibyte numbers in memory. Big-endian machines, such as Motorola 68k and SPARC, store the byte with the highest value digits at the lowest address while Little-endian machines (Intel 80x86) store it at the highest address. Furthermore, some CPUs can toggle between Big- and Little-endian by setting a processor register to the desired endian-architecture (IBM PowerPC, MIPS, and Intel Itanium offer this flexibility). Therefore, code that depends on a particular orientation of bits in a data object is inherently nonportable and should be avoided. Portable, endian-neutral code should make no assumptions of the underlying processor architecture, instead wrapping the access to data and memory structures with a set of interfaces implemented via processor-independent macros, which automatically compile the code for a particular architecture.</p>
+
+<p>Furthermore, a few simple rules help keep the internal data access interfaces portable across different CPU architectures. </p>
+
+<ul>
+    <li>Access data types natively; for instance, read an <i>int</i> as an integer number as opposed to reading 4 bytes. </li>
+  <li>Always read/write byte arrays as byte arrays instead of different data types. </li>
+  <li>Bit fields defined across byte boundaries or smaller than 8 bits are nonportable. When necessary, to access a bit field that is not on byte boundaries, access the entire byte and use bit masks to obtain the desired bits. </li>
+  <li>Pointer casts should be used with care. In endian-neural code, casting pointers that change the size of the pointed-to data must be avoided. For example, casting a pointer to a 32-bit value 0x12345678 to a byte pointer would point to 0x12 on a Big-endian and to 0x78 on a Little-endian machine.</li>
+</ul>
+<h3>Compiler Differences</h3>
+
+<p>Compiler differences often play a significant role in embedded systems portability. Although many embedded environments are said to conform to ANSI Standards, it is well known that in practice, many do not. These nonconformance cases are politely called "limitations." For example, although required by the Standard, some older compilers recognize <i>void</i>, but don't recognize <i>void*</i>. It is difficult to know in advance whether a compiler is in fact a strict ANSI C compiler, but it is very important for any portable code to follow the Standard. Many compilers allow extensions; however, even common extensions can lead to portability problems. In our development, we have come across several issues worth mentioning to avoid compiler-dependent problems.</p>
+
+<p>When <i>char</i> types are used in expressions, some compilers treat them as unsigned, while others treat them as signed. Therefore, portable code requires that <i>char</i> variables be explicitly cast when used in expressions; see <a name="rl8"></a><a href="#l8">Listing Eight</a>.</p>
+
+<p>Some compilers cannot initialize autoaggregate types. For example, <a name="rl9"></a><a href="#l9">Listing Nine</a> may not be allowed by the compiler. The most portable solution is to add code that performs initialization, as in <a name="rl10"></a><a href="#l10">Listing Ten</a>.</p>
+<h3>C-Runtime Library</h3>
+
+<p>Databases in nonembedded settings make extensive use of the C runtime. However, embedded systems developers commonly avoid using the C runtime, to reduce memory footprint. In addition, in some embedded environments, C-runtime functions, such as dynamic memory allocations/deallocations (<i>malloc()/free()</i>), are implemented so poorly as to be virtually useless. </p>
+
+<p>An alternative, implementing the necessary C-runtime functionality within the database runtime itself, reduces memory overhead and increases portability. For main-memory databases, implementing dynamic memory management through the database runtime becomes vitally important because these engines' functionality and performance are based on the efficiency of memory-oriented algorithms. We incorporate a number of portable embedded memory-management components that neither rely on OS-specific, low-level memory-management primitives, nor make any fundamental assumptions about the underlying hardware architecture. Each of the memory managers employs its own algorithms, and is used by the database runtime to accomplish a specific task. </p>
+
+
+
+<ul>
+  <li>A dynamic memory allocator provides functionality equivalent to the standard C runtime library functions <i>malloc(),</i> <i>calloc(), free(),</i> and <i>realloc()</i> according to the POSIX Standard. The heap allocator is used extensively by the database runtime, but also can be used by applications. </li>
+  <li>Another memory manager is a comprehensive data layout page manager that implements an allocation strategy adapted to the database runtime requirements. Special care is taken to avoid introducing unnecessary performance overhead associated with multithreaded access to the managed memory pools. </li>
+  <li>A simple and fast single-threaded memory manager is used while parsing SQL query statements at runtime, and so on.</li>
+</ul>
+<h3>Synchronization</h3>
+
+<p>Databases must provide concurrent access across multiple simultaneously running tasks. Regardless of the database locking policies (optimistic or pessimistic, record level or table level, and the like), this mechanism is usually based on kernel synchronization objects, such as semaphores, provided by the underlying OS. While each operating system provides very similar basic synchronization objects, they do so with considerably different syntax and usage, making it nontrivial to write portable multithreaded synchronization code. In addition, an embedded systems database must strive to minimize the expense associated with acquiring kernel-level objects. Operating-system semaphores and mutexes are usually too expensive, in performance terms, to be used in embedded settings.</p>
+
+<p>In our case, the solution was to build up the database runtime synchronization mechanism based on a simple synchronization primitive&#151;the test-and-set method&#151;that is available on most hardware architectures. Foregoing the kernel for a hardware-based mechanism reduces overhead and increases portability. All we must do is port three functions to a specific target. This approach can also be used for ultra low-overhead embedded systems where no operating system is present (hence, no kernel-based synchronization mechanism is available). Furthermore, the performance of the test-and-set "latch" in <a name="rl11"></a><a href="#l11">Listing Eleven</a> remains the same regardless of the target operating system and depends only on the actual target's CPU speed. <a name="rl12"></a><a href="#l12">Listing Twelve</a>(a) provides implementations for Win32, <a name="rl12"></a><a href="#l12">Listing Twelve</a>(b) the Sun SPARC platform, and <a name="rl12"></a><a href="#l12">Listing Twelve</a>(c) is the Green Hills INTEGRITY OS. </p>
+
+<p>The concept of mutual exclusion is crucial in database development&#151;it provides a foundation for the ACID properties that guarantee safe sharing of data. The synchronization approach just discussed slants toward the assumption that for embedded systems databases, it is often more efficient to poll for the availability of a lock rather than allow fair preemption of the task accessing the shared database. </p>
+
+<p>It is important to note that even though this approach is portable in the sense that it provides consistent performance of the synchronization mechanism over multiple operating systems and targets, it does not protect against the "starvation" of tasks waiting for, but not getting, access to the data. Also, provisions must be made for the database system to clean itself up if the task holding the lock unexpectedly dies, so that other tasks in line for the spinlock do not wait eternally. In any case, embedded data management is often built entirely in memory, generally requires a low number of simultaneous transactions, and the transactions themselves are short in duration. Therefore, the chances of a resource conflict are low and the task's wait to gain access to data is generally shorter than the time needed for a context switch.</p>
+<h3>Nonportable Features</h3>
+
+<p>While replacing C runtime library functionality and memory managers, and implementing custom synchronization primitives lead to greater data-management code portability, sometimes it is not possible or practical to overload the database with functionality&#151;such as network communications or filesystem operations&#151;that belongs to the operating system. A solution is to not use these services directly, or recreate them in the database, but instead create an abstraction of them that is used throughout the database engine code. The actual implementation of the service is delegated to the application. This allows hooking up service implementations without changing the core engine code, which again contributes to portability.</p>
+
+<p>For example, data-management solutions often include online backup/restore features that, by their nature, require file system or network interaction. Creating an abstraction of stream-based read and write operations, and using this abstraction layer within the database runtime during backup, allows the database to implement the backup/restore logic while staying independent of the actual I/O implementation. At the same time, this approach allows a file-based, socket-based, or other custom stream-based transport to be plugged in with no changes needed to the database runtime. <a name="rl13"></a><a href="#l13">Listing Thirteen</a> illustrates such a plug-in interface. The application needs to implement the actual read-from-stream/write-to-stream functionality; see <a name="rl14"></a><a href="#l14">Listing Fourteen</a>.</p>
+
+<p>Another example of the database "outsourcing" services to the application involves network communications. Embedded databases often must provide a way to replicate the data between several databases over a network. Embedded settings always demand highly configurable and often deterministic communication that is achieved using a great variety of media access protocols and transports. Thus, as a practical matter, a database should be able to adopt the communication protocol used for any given embedded application, regardless of the underlying hardware or the operating system. Instead of communicating directly with the transport or a protocol, a database runtime goes through a thin abstraction layer that provides a notion of a "communication channel." Like the backup/restore interfaces, the network communication channel can also be implemented via a stream-based transport; see <a name="rl15"></a><a href="#l15">Listing Fifteen</a>. The database uses a set of API functions that provide the ability to initiate and close the channel, send and receive the data, and so on. </p>
+<h3>Conclusion</h3>
+
+<p>By following general rules of developing portable code&#151;such as using Standard C and avoiding assumptions about hardware related parameters&#151;you can greatly simplify the reuse of your data-management code in new environments. And new approaches to implementing standard database services, such as those presented here, can ensure that the old concept of a database delivers the portability, performance, and low-resource consumption demanded for embedded systems.</p>
+
+
+<p><b>DDJ</b></p>
+<p><b></b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>#ifndef BASE_TYPES_DEFINED
+
+typedef unsigned char   uint1;
+typedef unsigned short  uint2;
+typedef unsigned int    uint4;
+typedef signed char     int1;
+typedef short           int2;
+typedef int             int4; 
+
+#endif</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>#define ALIGNEDPOS(pos, align) ( ((pos) + (align)-1) &amp; ~((align)-1) ) 
+pos = ALIGNEDPOS(pos, 4);</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>char c;
+//(padding)
+long  l;       - the address is aligned</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l4"></a>Listing Four</b><br>
+<pre>#define handle_size      N  
+typedef uint1 hobject    [handle_size ]; </pre>
+<a href="#rl4">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l5"></a>Listing Five</b><br>
+<pre>typedef struct  appData_ { hobject h; } appData;
+char c;
+appData d;    /* d is not aligned */</pre>
+<a href="#rl5">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l6"></a>Listing Six</b><br>
+<pre>typedef struct objhandle_t_
+{
+  ...
+  obj_h         po;            
+  ...
+  uint4         mo;            
+  uint2         code;
+  ...
+} objhandle_t;</pre>
+<a href="#rl6">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l7"></a>Listing Seven</b><br>
+<pre>#define handle_size      N  
+#define handle_size_w 
+((( handle_size + (sizeof(void*) -1)) &amp; ~(sizeof (void*) -1)) / sizeof(void*));
+
+typedef void * hobject [handle_size_w ]; </pre>
+<a href="#rl7">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l8"></a>Listing Eight</b><br>
+<pre>#if defined( CFG_CHAR_CMP_SIGNED )
+#define CMPCHARS(c1,c2) ((int)(signed char)(c1)-(int)(signed char)(c2) )
+#elif defined( CFG_CHAR_CMP_UNSIGNED )
+#define CMPCHARS(c1,c2) ((int)(unsigned char)(c1)-(int)(unsigned char)(c2) )
+#else
+#define CMPCHARS(c1,c2) ( (int)(char)(c1) - (int)(char)(c2) )
+#endif</pre>
+<a href="#rl8">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l9"></a>Listing Nine</b><br>
+<pre>struct S { int i; int j; };
+S s = {3,4};</pre>
+<a href="#rl9">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l10"></a>Listing Ten</b><br>
+<pre>struct S { int i; int j; };
+S s;
+s.i = 3; s.j = 4;</pre>
+<a href="#rl10">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l11"></a>Listing Eleven</b><br>
+<pre>/* this is the TAS (test-and-set) latch template*/
+void sys_yield()
+{
+  /* relinquish control to another thread */    
+}
+void sys_delay(int msec)
+{
+  /* sleep */
+}
+int  sys_testandset( /*volatile*/ long * p_spinlock)
+{
+  /* The spinlock size is up to a long ;
+   * This function performs the atomic swap (1, *p_spinlock) and returns
+   * the previous spinlock value as an integer, which could be 1 or 0
+  */
+}</pre>
+<a href="#rl11">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l12"></a>Listing Twelve
+(a)</b><br>
+<pre>#ifndef SYS_WIN32_H__
+#define SYS_WIN32_H__
+
+/* sys.h definitions for WIN32 */
+
+#define WIN32_LEAN_AND_MEAN
+#include &lt;windows.h&gt;
+#include &lt;process.h&gt;
+
+#define sys_yield() SleepEx(0,1) /*yield()*/
+#define sys_delay(msec) SleepEx(msec,1)
+#define sys_testandset(ptr) InterlockedExchange(ptr,1)
+
+#endif  /* SYS_WIN32_H__ */</pre>
+<a href="#rl12">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l13"></a>(b) </b><br>
+<pre>#ifndef SYS_SOL_H__
+#define SYS_SOL_H__
+
+/* sys.h definitions for Solaris */
+
+#include &lt;sys/time.h&gt;
+#include &lt;unistd.h&gt;
+#include &lt;sched.h&gt;
+
+int  sys_testandset( /*volatile*/ long * p_spinlock)
+{
+  register char result = 1;
+  volatile char *spinlock = ( volatile char * ) p_spinlock;
+    __asm__ __volatile__(
+        "   ldstub  [%2], %0    \n"
+:       "=r"(result), "=m"(*spinlock)
+:       "r"(spinlock));
+    return (int) result;
+}
+void sys_yield()
+{
+  sched_yield();
+}
+void sys_delay(int msec)
+{ /* */ }
+
+</pre>(c)
+<pre>#ifndef SYS_GHSI_H__
+#define SYS_GHSI_H__
+
+/* sys.h definitions for Green Hills Integrity OS */
+#include &lt;INTEGRITY.h&gt;
+
+void sys_yield()
+{
+  Yield();
+}
+void sys_delay(int msec)
+{
+}
+int  sys_testandset(long * p_spinlock)
+{
+  return ! ( Success == TestAndSet(p_spinlock, 0, 1) );
+}</pre>
+<a href="#rl13">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l14"></a>Listing Thirteen</b><br>
+<pre>/* abstraction of write and read stream interfaces;
+ * a stream handle is a pointer to the implementation-specific data 
+*/
+typedef int (*stream_write)
+  ( void *stream_handle, const void * from, unsigned nbytes);
+typedef int (*stream_read)
+  ( void *stream_handle, /*OUT*/ void * to, unsigned max_nbytes);
+/* backup the database content to the output stream */
+RETCODE db_backup
+  ( void * stream_handle, stream_write output_stream_writer, void * app_data);
+/* restore the database from input stream */
+RETCODE  db_load
+   ( void * stream_handle, stream_read input_stream_reader, void *app_data);</pre>
+<a href="#rl14">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l15"></a>Listing Fourteen</b><br>
+<pre>int file_writer(void *stream_handle, const void * from, unsigned nbytes)
+{
+  FILE *f = (FILE*)stream_handle;
+  int nbytes = fwrite(from,1,nbytes,f);
+  return nbytes;
+}
+int file_reader(void *stream_handle, void * to, unsigned max_nbytes)
+{
+  FILE *f = (FILE*)stream_handle;
+  int nbytes = fread(to,1,max_nbytes,f);
+  return nbytes;
+}</pre>
+<a href="#rl15">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l16"></a>Listing Fifteen</b><br>
+<pre>#define channel_h void* 
+typedef int (*xstream_write)(channel_h ch, const void * from,
+                             unsigned nbytes, void * app_data);
+typedef int (*xstream_read) (channel_h ch, void * to,
+                             unsigned max_nbytes, void* app_data);
+typedef struct {
+  xstream_write fsend;
+  xstream_read  frecv;
+  ...
+ } channel_t, *channel_h;</pre>
+<a href="#rl16">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

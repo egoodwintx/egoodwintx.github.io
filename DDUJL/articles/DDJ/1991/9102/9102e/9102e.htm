@@ -1,0 +1,887 @@
+<HTML>
+<META NAME="year" CONTENT="1991">
+<HEAD>
+<TITLE>FEB91:  PORTING UNIX TO THE 386: THREE INITIAL PC UTILITIES</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1> PORTING UNIX TO THE 386: THREE INITIAL PC UTILITIES<a name="0072_0002"></h1><P>
+<h2><a name="0072_0001"><a name="0072_0000">Getting to the hardware</h2><P>
+<h3>William Frederick Jolitz and Lynne Greer Jolitz</h3><P>
+<p><i><a name="0072_0000">Bill was the principal developer of 2.8 and 2.9 BSD and the chief architect of National Semiconductor's GENIX.  Lynne established TeleMuse, a market research firm specializing in the telecommunications and electronics industry.  They can by contacted via e-mail at william@berkeley.edu or at uunet!william.  Copyright (c) 1990 TeleMuse.</i></p><hr><P>
+In last month's installment, we discussed the elements of the 386BSD port, which required planning prior to the actual coding.  In brief, the specification we outlined emphasized BSD compatibility, efficient use of the 80386 architecture, interoperability with extant commercial standards, and rapid implementation to leverage BSD UNIX to port the rest of itself.  We also discussed the conflicts inherent between a segmented architecture and a virtual memory system which prefers paging, other microprocessor idiosyncrasies and requirements, and the basic planning for the surrounding hardware.  By taking a &quot;practical approach&quot; to this port and focusing on &quot;hard adherence&quot; to BSD operability and high-performance, we identified the key milestones required for this (or any) advanced operating system port and set the stage for our next effort: Writing the PC utilities that allow us to initially load the first programs and data onto our 386 target host.<P>
+With this in mind, we'll now examine code from three PC-based utilities -- boot.exe, cpfs.exe, and cpsw.exe -- that facilitate the basic access to the hardware from MS-DOS needed to begin a UNIX port. boot.exe executes a GCC-compiled program (using the Free Software Foundation's GNU C Compiler) in protected mode from MS-DOS.  (Note that GCC generates only 32-bit protected-mode code.) cpfs.exe installs a root filesystem onto the hard disk. cpsw.exe copies files to a shared portion of disk so that MS-DOS and UNIX can exchange information.<P>
+In examining these areas, we will illustrate how the UNIX bootstrap process functions, because these programs mimic that process to a great degree.  This will be important in later articles when we discuss the code and strategies used to build the bootstraps that allow the newly ported system to become independent of MS-DOS.<P>
+<h3><a name="0072_0003">The Purpose of Our PC Utilities<a name="0072_0003"></h3><P>
+To port UNIX, we needed to devise methods to: Load large 32-bit protected-mode programs (that is, the BSD kernel); load the initial root filesystems; and communicate information onto our early UNIX system to augment its capabilities as we port increasing numbers of utilities.<P>
+An initial UNIX port to a brand-new architecture with no native software can be a miserable task for the inexperienced.  One of the authors has done this for other architectures and survived, but we don't recommend it because it forces you to write absolute code for the purposes outlined above, only to abandon it for the UNIX code, which eventually provides the same function.  Writing absolute code is difficult to debug (because there is no debugging environment), time consuming (one needs to support and initialize the entire machine in addition to the above functions), and subtle (tiny machine-dependent characteristics thwart the development effort).  These concerns, especially when working with a processor as complex as the 386, arise when the port is most vulnerable -- when there is little project history.<P>
+One of the advantages of porting an operating system to a popular machine like the PC lies in the wealth of previously written program development software.  (In other words, someone else has already suffered to our art.)  We chose to use Borland's Turbo C and Microsoft's MASM, primarily because they &quot;were there,&quot; and also because they were appropriate to rapid PC program prototyping.  While these programs do rely on a few object library primitives in Turbo C, they are reasonably portable to other MS-DOS C implementations, and on the whole are not restricted solely to Turbo C (or MASM, for that manner).<P>
+Another advantage of the 386 PC environment is that MS-DOS and it's applications programs run on the absolute machine, and do not rely on memory management, relocation, or protection. Thus, we could write programs that would ultimately usurp control from the MS-DOS operating system without regard for it's functions and strategies.  An operating system that makes extensive use of memory management mechanisms, such as System V UNIX, would have made it more difficult to write and debug an absolute program loader.  In this case, we would have spent more time defeating those mechanisms than we would have spent writing absolute programs in the first place!<P>
+<h3><a name="0072_0004">The First PC Utility: boot.exe<a name="0072_0004"></h3><P>
+boot.exe is quite simple in theory, as our mock code fragment in <a href="#0072_0005">Example 1</A> demonstrates.  It just loads a GCC executable into memory at location 0, enters into protected mode, and then executes it.  Simple, huh?  There are some niggling little gotchas, however:<P>
+<h4><a name="0072_0005">Example 1: Mock code that loads a GCC executable into memory</h4><P>
+<pre>
+           main() {
+                    int fi;
+           struct exec hdr;
+
+                    fi = open (&quot;pgm&quot;, O_RDONLY);
+                    read (fi, &amp;hdr, sizeof (hdr));
+                    read (fi, (char *) 0, hdr.a_text +
+
+  hdr.a_data);
+           (* (void * () 0) ();
+                       /* NOTREACHED */
+           }</pre><P>
+<P>
+* Programs are frequently larger than is considered &quot;convenient&quot; in the PC world.  On the PC, 64K or less is considered adequate, while the UNIX kernel we must load averages about 280 Kbytes in size, so we will have to manage the so-called &quot;far&quot; pointers in a large model 8086 program.<P>
+<a href="#0072_000d">More Details.</A><P>
+* The bottom (address 0) of PC memory contains a critical portion of the MS-DOS operating system.  We will need to use MS-DOS itself to load the program, so we can't touch this area until after we read in the entire program.  We will therefore have to allocate a pool of memory space large enough to temporarily hold a copy of the program we are loading until it is safe to overwrite location 0.<P>
+* Once we enter into protected mode, we can't easily go back and enter MS-DOS again, so we must do all our checks and anticipate needs prior to taking that last giant step.<P>
+<a href="#0072_000f">Listing One</A> is the boot.c program which resolves these three areas.  Note that it is no longer a simple eight-line program.  Ah well, life is never simple.<P>
+<h3><a name="0072_0006">The GCC Executable Format<a name="0072_0006"></h3><P>
+The programs to be loaded have been generated on another UNIX system, where the GCC compiler, GAS assembler, and BSD linkage editor provide cross-development support, allowing us to generate BSD a.out format files.  This format is the oldest of the many (and, unfortunately still growing) different UNIX executable file formats.  The BSD a.out format consists of a header structure (see <a href="#0072_0011">Listing Two</A> exec.h) that details the size of sections following, the instruction segment (or text), the data segment, relocation information, and finally, a symbol-table segment.  At this time, we are interested only in the information contained in instruction and data sections, which we then load into a large, dynamically allocated temporary array, before moving it into position.  We do not use the relocation information or the symbol-table segment.<P>
+<h3><a name="0072_0007">Consistency Checks<a name="0072_0007"></h3><P>
+Loading this large array of data containing the programs to be executed is a complex task, because many different 64K segments may be used.  A &quot;fence-post&quot; error arising from incorrectly maintained far pointers can lead to unpredictable results when the protected mode program runs.  Therefore, to verify that the program contents are loaded correctly, we use a simple checksum just before we dispatch to it in protected mode (see <a href="#0072_000f"> Listing One</A>, boot.c).<P>
+<h3><a name="0072_0008">GATE A20<a name="0072_0008"></h3><P>
+Another feature which deserves mention involves the PC hardware feature known as GATE A20. Because the original IBM PC had only 20 bits of address (2{10} or 1 Mbyte, denoted as A19 &lt; -- &gt; A0), newer machines possessing greater physical address space (80286 with 16 Mbytes and the 80386 with 4 gigabytes) might exhibit a small difference when executing in real mode.  GATE A20 was designed to mitigate this problem.  Without it, a reference at the topmost address incrementing up would actually reference outside of the 20-bit address space, because the rollover would be carried up instead of being wrapped around to address zero.  GATE A20 would not be necessary were it not for the presence of a considerable body of ancient MS-DOS applications that rely on the address space execution, assuming that this would rollover to the same address space occupied by the bottom of physical memory.  Thus, the urgent need for GATE A20 (short for &quot;Gate the A20 address line to logic zero&quot;).  With our UNIX system, we will want to grab all available RAM memory, especially that above 1 Mbyte, so we need to defeat the GATE A20 feature and allow all the processor's address lines to be functional.  We did this with our gatea20.asm module in <a href="#0072_0013">Listing Three</A> invoked by boot.c in <a href="#0072_000f">Listing One</A>.<P>
+<h3><a name="0072_0009">Entering Protected Mode<a name="0072_0009"></h3><P>
+Protected-mode programming frequently has a mystique about it, probably due, in large part, to the difficulty in going between modes on the 80(2/3/4)86 processors on which it is supported. You can't just poke a bit, or execute a single instruction, and end up executing in protected mode.  The transition is a methodical one, where, over the course of tens of instructions, the processor is incrementally prepared for the transition (which, by the way, is not intuitively obvious).  This, of course, gives errors many opportunities to sneak in.  Writing and debugging a subroutine for reliable entry into protected mode was not exactly the evening's diversion we estimated; embarrassingly enough, it took nearly a month.<P>
+As you examine the code from protentr.asm in <a href="#0072_0015">Listing Four</A> you can see that many different things are being reconciled at once.  There are three different kinds of addressing standards being interconverted as needed:<P>
+<UL>
+<li>20-bit segment:offset pair &quot;real&quot; mode addresses</li>
+<li>32-bit absolute or physical addresses</li>
+<li>32-bit segment selector: offset protected mode addresses</li>
+</UL>
+Protected-mode instructions are being &quot;generated&quot; from within a &quot;real&quot; mode assembler.  A descriptor table is encoded in its peculiar and convoluted structure style, which has its base address split into high and low address chunks on separate portions of the descriptor.  Note that in some versions of MASM, LIDT/LGDT instructions present undocumented surprises.<P>
+Our goal with this subroutine is to turn the 386 into a &quot;flat&quot; 32-bit address space, reminiscent of a 68000, and to dispatch to location 0 to execute the above loaded program. Because we don't anticipate using any other descriptors while our stand-alone program runs, the descriptor table itself is abandoned in memory -- probably to be written over during protected-mode program execution.<P>
+Interrupts are disabled before entry into protected mode.  We don't yet know where the interrupt and exception processing code exists in the protected-mode program, so we must leave the IDT uninitialized (zero length).  This means that if an exception or interrupt occurs, the processor will spontaneously reset.  Thus, the first responsibility of a just-loaded 32-bit program must be to sensibly initialize itself to catch these conditions.<P>
+Note that the code for entry into protected mode is PIC (Position Independent Code).  We can easily overwrite the memory of the bootstrap program itself, so we must arrange to copy this entry into protected-mode code just above our protected-mode program.  This insures its survival when we overwrite MS-DOS, and quite possibly our boot program, never to return.<P>
+<h3><a name="0072_000a">The Second PC Utility: cpfs.exe<a name="0072_000a"></h3><P>
+In addition to being able to run 32-bit protected-mode programs, we need to load a preliminary root filesystem for our BSD UNIX kernel to access as it initializes itself during the late phase of boot-up.  Like MS-DOS, UNIX needs a dedicated region of the hard disk drive to store the data structures and data blocks that support its filesystem scheme.  As we do not have a drive dedicated to BSD, we must instead secure a second partition on the sole disk drive to contain the BSD root filesystem.<P>
+cpfs.c (see <a href="#0072_0017">Listing Five</A>) is a program which loads this filesystem from a previously downloaded MS-DOS file.  cpfs.c leverages BIOS disk calls to write appropriately to the absolute disk.  If this program were to be commonly used, you might wish to dig out the disk geometry and BSD partition from additional MS-DOS and/or BIOS calls, but for our purposes, this program is sufficient.<P>
+The first block of the root (typically, the first sector of the drive) contains the disk label (see <a href="#0072_0019">Listing Six</A> diskl.h).  This data structure will eventually be used in the 386BSD port to make the system drive-independent.  However, we first need to place the seminal label on the very first filesystem.  cpfs.c, which has hard-wired geometry constants, can initially be compiled (by defining &quot;FIRST&quot;) to blindly write that first filesystem with this label.  In subsequent use (compiled without &quot;FIRST&quot; defined) cpfs.c will use this label to validate a load, hopefully saving a bleary-eyed developer from ultimate disaster.<P>
+When using this program with disk drives greater than 1024 cylinders, logical translation by the disk controller to a different geometry is a problem.  Some calls used by MS-DOS and applications programs would invoke a 10-bit field for cylinder address in the disk address data structure, reflecting an early limitation of some PC disk controllers (the WD1010 disk controller chip, for example).  One clever workaround which doesn't require altering the operating system is to encode disk addresses with a logical mapping scheme so that some of the cylinder address bits would be mapped into more plentiful sector and head address bits.  This scheme, while quite acceptable to MS-DOS (which is never picky about sector placement), is not acceptable to BSD (which is extremely picky about sector placement).  The BSD Fast Filesystem uses rotational and head placement algorithms to improve filesystem performance by taking disk latency into account.  Therefore, running on a logically mapped disk may significantly degrade performance by throwing off this mechanism in the Fast Filesystem.  Additional code is required to detect and defeat this condition, because this translation must be maintained while MS-DOS is running.<P>
+<h3><a name="0072_000b">The Third PC Utility: cpsw.exe<a name="0072_000b"></h3><P>
+Our last of three programs is of use when the early BSD operating system kernel is running and must receive additional files.  Ordinarily, we would prefer to use either serial communications or floppy disks to add files to our nascent BSD root filesystem.  However, our early kernel has drivers for only the display, keyboard, and hard disk drive (that is, the &quot;bare minimum&quot;), because we want to use the system itself to develop and test further extensions and improvements.  In a nutshell, we want to leverage our tiny BSD UNIX system with MS-DOS's drivers and applications programs by using MS-DOS to receive information into a MS-DOS file, and then using a trivial program to place this information on a reserved portion of the disk, where BSD can easily access it.<P>
+At this point, we had seriously considered giving BSD the ability to read MS-DOS file structures directly, but this is a nontrivial process and we wished to devote our energies toward developing and improving the BSD kernel to become self-supporting.  As a consequence, we decided to push this project off and favor instead an expedient solution to a temporary problem.<P>
+If more disk space had been available, a partition could have been dedicated to the MS-DOS communications functions.  Unfortunately, our early host machine contained only a 40-Mbyte drive, so we were very tight on space.  (Yes, I know we have large machines now, but when you begin a project, it is usually on the cheap until you convince people that it is worthwhile -- of course, by that time you've probably finished the project, or at least a fair portion of it).  We elected to force the swap space to do double duty, by arranging to use it to hold information from and to MS-DOS just after or before BSD system operation.  We were counting on the fact that we only use the swap space when the system really gets rolling.  While this arrangement is somewhat heretical, it worked adequately enough to let us finish our nascent system to the point where it no longer required MS-DOS to boot or exchange files with other systems.<P>
+cpsw.c (see <a href="#0072_001b">Listing Seven</A>) differs from cpfs.c in that it uses the disk label to configure itself.  Disk geometry is determined entirely from the disk label. Prior to using cpsw.c, a TAR file image is created on a cross-host.  This file is then transferred to an MS-DOS file via one of the many MS-DOS communications programs available. cpsw.exe is used to make this file accessible to 386BSD. 386BSD is then booted, and the 386BSD TAR utility is invoked to extract the information (prior to paging).  This method is somewhat tedious, but proved adequate for the early stages of this port.<P>
+cpsw.exe is very similar in function to cpfs.exe, and both could be subsumed into a single program.  Simplicity, however, has allowed us to achieve our goal of getting 386BSD off the ground and running, without becoming an outright diversion into a MS-DOS/ UNIX merger, a weighty and significant objective not suited for an early operating system project of considerable and ever-increasing scope, but still short on history.<P>
+<h3><a name="0072_000c">Where We Go From Here<a name="0072_000c"></h3><P>
+Now that we have our PC utilities in place, we can plan for the next stage in our 386BSD effort: development of the stand-alone system /sys/stand and its utilities.  This system will possess the rudimentary drivers and a library of support routines which allow GCC programs to access devices and UNIX file-structures on the hard disk.  It will also provide us with a platform to examine the requirements which must be met so that the 386 will support features to be incorporated into 386BSD.<P>
+<h3><a name="0072_000d"><a name="0072_000e">The 386BSD Project and Berkeley UNIX<a name="0072_000e"></h3><P>
+The 386BSD project was established in the summer of 1989 for the specific purpose of porting the University of California's Berkeley Software Distribution (BSD) to the Intel 80386 microprocessor platform.  Encompassing over 150 Mbytes of operating systems, networking, and applications software, BSD is a fully functional and nonproprietary complete operating systems software distribution.  The goal of this project was to make this cutting-edge research version of UNIX widely available to small research and commercial efforts on an inexpensive PC platform.  By providing the base 386BSD port to Berkeley, our hope is to foster new interest in Berkeley UNIX technology and to speed its acceptance and use worldwide.  We hope to see those interested in this technology build upon it in both commercial and noncommercial ventures.<P>
+In each of these articles we will examine the key aspects of software, strategy, and experience that make up a project of this magnitude.  We intend to explore the process of the 386BSD port, while learning to effectively exploit features of the 386 architecture for use with an advanced operating system.  We also intend to outline some of the trade-offs in implementation goals, which must be periodically reexamined.  Finally, we will highlight extensions which remain for future work.<P>
+Currently, 386BSD is available on the 386 PC platform and supports the following:<P>
+<UL>
+<li>Many different PC platforms, including the Compaq 386/20, Compaq Systempro 386, any 386 with the Chips and Technologies chipset, any 486 with the OPTI chipset, Toshiba 3100SX, and more</li>
+<li>ESDI, IDE, and ST-506 drives</li>
+<li>3.5 inch and 5.25 inch floppy drives</li>
+<li>Cartridge tape drive</li>
+<li>Novell NE2000 and Western Digital Ethernet controller boards</li>
+<li>EGA, VGA, CGA, and MDA monitors</li>
+<li>287/387 floating point, including the Cyrix EMC</li>
+<li>A single-floppy, stand-alone UNIX system, supporting modems, Ethernet, SLIP, and Kermit to facilitate down-loading of 386BSD to any PC over the INTERNET network.</li>
+</UL>
+Copies of 386BSD source code can be obtained by contacting the Computer Systems Research Group (CSRG) at UC Berkeley.  Some restrictions may apply.<P>
+While working with us through our 386BSD article series, the following texts on Berkeley UNIX and the 80386 microprocessor are also recommended:<P>
+<UL>
+<li>The Design and Implementation of the 4.3BSD UNIX Operating System, by Samuel J. Leffler, Marshall Kirk McKusick, Michael J. Karels, and John S.  Quarterman (Addison-Wesley, 1989).</li>
+<li>Programming the 80386 by John H. Crawford and Patrick P. Gelsinger (Sybex, 1987).</li>
+<li>IBM Technical Reference: Personal Computer AT (IBM, 1984).</li>
+</UL>
+In addition, an augmented and detailed book on 386BSD by William Frederick Jolitz and Lynne Greer Jolitz, The 386BSD Handbook, will be available in the summer of 1991.<P>
+<P>
+-- B.J., L.J.<P>
+
+<PRE>
+
+
+_PORTING UNIX TO THE 386: THREE INITIAL PC UTILITIES_
+by William F. Jolitz and Lynne G. Jolitz
+
+
+<a name="0072_000f">
+<a name="0072_0010"></pre>
+
+<B>[LISTING ONE]</B><pre><a name="0072_0010">
+
+/* Copyright (c) 1989, 1990 William Jolitz. All rights reserved.
+ * Written by William Jolitz 7/89
+ * Redistribution and use in source and binary forms are freely permitted
+ * provided that the above copyright notice and attribution and date of work
+ * and this paragraph are duplicated in all such forms.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ * This program allows the bootstrap load of GCC cross compiled
+ * 32 bit protected mode absolute programs onto the obtuse architecture
+ * of PC AT/386, destroying the running DOS in the process.
+ * Currently works with TURBO C 1.5 &amp; MASM 5.0, relies on farmalloc().
+ */
+
+#pragma inline
+#include &lt;io.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;alloc.h&gt;
+#include &lt;dos.h&gt;
+#include &lt;sys\stat.h&gt;
+#include &quot;exec.h&quot;
+
+#define PGSIZE  4096
+#define CLOFSET (PGSIZE - 1)     /* 386 page roundup */
+
+/* Header record of BSD UNIX executable file */
+struct exec exec;
+
+long far_read(), to_long();
+char far *to_far();
+char far *add_to_far(char far *p, long n);
+
+/* Get a file we can open, attempt to load it */
+main(argc, argv)
+char *argv[];
+{   int fd, i;
+        long addr, totalsz;
+   char far *base;
+
+   if (argc != 2) {
+      printf(&quot;usage: boot &lt;filename&gt;\n&quot;);
+      exit(1);
+   }
+   fd = open(argv[1], O_BINARY);
+   if (fd &lt; 0) {
+           printf(&quot;boot: Cannot open file \&quot;%s\&quot; \n&quot;, argv[1]);
+          exit(1);
+   }
+
+   /* Reasonable file to load? */
+   i = read(fd, (char *)&amp;exec, sizeof exec);
+   if (i != sizeof exec ||
+      (exec.a_magic != OMAGIC &amp;&amp; exec.a_magic != NMAGIC
+            &amp;&amp; exec.a_magic != ZMAGIC)) {
+            printf(&quot;Not a recognized object file format\n&quot;);
+            exit(1);
+   }
+
+        /* Allocate buffer for temporary copy of protected mode executable
+        Buffer space requirements: |&lt;--a.out------------&gt;| pageroundup heap */
+        totalsz = exec.a_text + exec.a_data + exec.a_bss + 4096L + 20*1024L;
+
+        /* Pad with trailing portion to put protected mode entry code in */
+   base = farmalloc(totalsz + 64*1024L);
+   if (base == 0) {
+        printf(&quot;Cannot allocate enough memory\n&quot;);
+        exit(1);
+   }
+        /* Load Instruction (e.g. text) portion of file */
+   printf(&quot;Text %ld&quot;, exec.a_text);
+   if (far_read(fd, base, exec.a_text) != exec.a_text)
+          goto eof;
+        /* Load Data portion of file */
+   addr = exec.a_text;
+
+        /* Adjust for page alignment for pure procedure format */
+   if (exec.a_magic == NMAGIC &amp;&amp; (addr &amp; (PGSIZE-1)))
+          while (addr &amp; CLOFSET)
+           * add_to_far(base, addr++) = 0;
+   printf(&quot;\nData %ld&quot;, exec.a_data);
+   if (far_read(fd, add_to_far(base,addr), exec.a_data) != exec.a_data)
+         goto eof;
+        /*  Clear Uninitialized data (BSS) space */
+   addr += exec.a_data;
+   printf(&quot;\nBss %ld&quot;, exec.a_bss);
+   for ( ; addr &lt; totalsz; )
+       * add_to_far(base,addr++) = 0;
+        if(exec.a_entry)
+           printf(&quot;\nStart 0x%lx&quot;, exec.a_entry);
+#ifdef  CKSUM
+
+    /* Optionally calculate checksum to validate against cross host's copy. */
+        far_cksum(base, addr-1L);
+#endif  CKSUM
+
+        printf(&quot;\n&quot;);
+
+        /* Effect copydown to absolute 0 and entry into protected mode at
+        location &quot;a_entry&quot;. */
+        transfer(base, totalsz, exec.a_entry);
+        /* NOTREACHED */
+eof:
+        printf(&quot; - File incomplete, load aborted\n&quot;);
+        exit(1);
+}
+
+/* We use the routines below to always keep far pointers normalized
+ * to simplify comparision/subtraction. */
+char far *to_far(l) long l; {
+        unsigned seg, offs;
+        seg = l&gt;&gt;4;
+        offs = l &amp; 0xf;
+        return(MK_FP(seg,offs));
+}
+
+long to_long(f) char far *f; {
+        unsigned long l;
+        l = FP_SEG(f)*16L + (unsigned long)FP_OFF(f);
+        return(l);
+}
+
+char far *add_to_far(f,l) char far *f; long l; {
+        return(to_far(to_long(f)+l));
+}
+
+char far *normalize(f) char far *f; {
+        unsigned seg,offs ;
+
+        /* add in offset */
+        seg =  FP_SEG(f); offs =  FP_OFF(f);
+        seg += (offs &gt;&gt; 4) ; offs &amp;= 0xf ;
+        return(MK_FP (seg, offs));
+}
+
+/* read() that works anywhere in DOS address space for any size data,
+ * works via bounce buffer. Not designed for speed or elegance.  */
+long far_read(io, base, len) int io; long len; char far *base; {
+        char far *fp;
+
+        /* normalize far pointer to handle segment rollover case */
+        fp = base = normalize(base);
+        while (len) {
+                static char dbuf[PGSIZE];
+                long rlen,tlen;
+
+                /* bounce buffer between my data segment and ultimate dest */
+                tlen = (len &gt; PGSIZE)? PGSIZE : len;
+                if ((rlen = read (io, dbuf, tlen)) &lt; 0) return (rlen);
+
+                /* shoot into place */
+                movedata (_DS, (unsigned)dbuf, FP_SEG(fp), FP_OFF(fp), rlen);
+
+                /* update transfer address and count */
+                fp = add_to_far(fp, rlen);
+                len -= rlen ;
+                if (tlen != rlen) break ;
+        }
+        return (to_long(fp) - to_long(base));
+}
+
+extern far protentry(); /* known to be less than 0x200 bytes long */
+extern far gatea20();
+
+/* set up to transfer to 386 program; call protentry to do the dirty work.  */
+transfer(base, len, entry) char far *base; long len, entry; {
+        unsigned seg,offs ;
+        long rbase;
+        char far *fp;
+
+         /* Copy code to top of the system and execute there. This keeps it
+             from getting stepped on. */
+        /* make 32 bit address */
+        rbase = to_long(base);
+        fp = add_to_far(base,len);
+        seg =  FP_SEG(fp); offs =  FP_OFF(fp);
+
+     /* protect possible conflict of top paragraph of bss */
+     if (offs) seg++ ;
+
+     /* force to protentry's offset so offsets agree */
+     offs =  FP_OFF(&amp;protentry);
+     movedata (FP_SEG(&amp;protentry), offs, seg, offs, PGSIZE);
+
+    /* degate A20 - from now on, full physical memory address bus */
+    gatea20();
+
+    /* enter prot_entry program, relocated to top of loaded program, via
+    intersegment return */
+    asm push word ptr rbase+2 ;
+    asm push word ptr rbase ;
+    asm push word ptr len+2 ;
+    asm push word ptr len ;
+    asm push word ptr entry+2 ;
+    asm push word ptr entry ;
+    asm push word ptr seg;
+    asm push word ptr offs;
+    asm db 0cbh;    /* lret - intersegment return */
+
+    /* within protentry: go into 32 bit mode, copy entire system to 0 with
+    single string instruction, intrasegment jump to entry point */
+    printf(&quot;protentry returned?!?\n&quot;);
+    exit(1);
+
+   /* NOTREACHED */
+}
+
+#ifdef  CKSUM
+/* 16 bit checksum of program. */
+far_cksum(base, len) long len; char far *base; {
+    char far *tmp;
+    unsigned seg,offs ;
+    long nbytes,sum, tlen;
+    tmp = base;
+    sum = 0;
+    nbytes = 0;
+    while (len) {
+               /* normalize far pointer to handle segment rollover case */
+          tmp = normalize(tmp);
+
+               /* Do a page at a time */
+           tlen = (len &gt; PGSIZE)? PGSIZE : len;
+          len -= tlen ;
+          while (tlen--) {
+         nbytes++;
+         if (sum&amp;01)
+            sum = (sum&gt;&gt;1) + 0x8000;
+         else
+            sum &gt;&gt;= 1;
+         sum += *tmp++ ;
+         sum &amp;= 0xFFFF;
+           }
+   }
+    printf(&quot;\nChecksum %05lu%6ld &quot;, sum, (nbytes+CLSIZE)/PGSIZE);
+}
+#endif CKSUM
+
+
+
+
+<a name="0072_0011">
+<a name="0072_0012"></pre><B>[LISTING TWO]</B><pre><a name="0072_0012">
+
+/* Excerpted with permission from 4.3BSD include file
+ * &quot;/usr/include/sys/exec.h&quot;
+ * Redistribution and use in source and binary forms are freely permitted
+ * provided that the above copyright notice and attribution and date of work
+ * and this paragraph are duplicated in all such forms.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ * Header prepended to each a.out file.
+ */
+struct exec {
+        long    a_magic;        /* magic number */
+unsigned long   a_text;         /* size of text segment */
+unsigned long   a_data;         /* size of initialized data */
+unsigned long   a_bss;          /* size of uninitialized data */
+unsigned long   a_syms;         /* size of symbol table */
+unsigned long   a_entry;        /* entry point */
+unsigned long   a_trsize;       /* size of text relocation */
+unsigned long   a_drsize;       /* size of data relocation */
+};
+
+#define OMAGIC  0407            /* old impure format */
+#define NMAGIC  0410            /* read-only text */
+#define ZMAGIC  0413            /* demand load format */
+ &lt;/LT &gt;
+
+
+<a name="0072_0013">
+<a name="0072_0014"></pre><B>[LISTING THREE]</B><pre><a name="0072_0014">
+
+        title   _gatea20
+;  Copyright (c) 1989, 1990 William Jolitz. All rights reserved.
+;  Written by William Jolitz, July 1989
+;  THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+;  IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+;  WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+;       (void) gatea20();
+;       Enable Address Bit 20 that was disabled by BIOS for MSDOS
+;       We need it off to use entire memory space of the AT.
+;       We do this just prior to entering protected mode, never to return.
+;
+
+_TEXT   segment byte public 'CODE'
+        assume  cs:_TEXT,ds:_TEXT
+_TEXT   ends
+
+Status_Port     equ     64h             ; 8042 Status Port
+Cmd_rdy         equ     2               ;  Keyboard is ready?
+Write_outpt     equ     0d1h            ;  Write next data to output port
+Port_A          equ     60h             ; 8042 Keyboard Scan and Diagnostic
+EnableA20       equ     0dfh            ; Enable Address bit 20 for use
+
+_TEXT   segment byte public 'CODE'
+
+;       Wait for Keyboard controller to be ready for command
+wait42  proc    near
+chkrdy:
+        in      al, Status_Port
+        and     al, Cmd_rdy
+        jnz     chkrdy
+        ret
+wait42  endp
+
+;       Turn on A20 again.
+_gatea20        proc far
+        call    wait42
+        mov     al, Write_outpt
+        out     Status_Port, al
+        call    wait42
+        mov     al, EnableA20
+        out     Port_A, al
+        call    wait42
+        ret
+_gatea20        endp
+
+        public  _gatea20
+_TEXT   ends
+        end
+
+
+
+
+
+<a name="0072_0015">
+<a name="0072_0016"></pre><B>[LISTING FOUR]</B><pre><a name="0072_0016">
+
+        title   protentry
+; Copyright (c) 1989, 1990 William Jolitz. All rights reserved.
+; Written by William Jolitz 7/89
+; Redistribution and use in source and binary forms are freely permitted
+; provided that the above copyright notice and attribution and date of work
+; and this paragraph are duplicated in all such forms.
+; THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+; IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+; WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+;       protentry(entry,len,addr,...) long entry,len,addr;
+;       Entered via jump or &quot;ret&quot; (e.g. no return address on stack),
+;       builds necessary data structures and transfers into 32-bit
+;       mode, then copies the 32-bit mode program at address &quot;addr&quot;
+;       and byte length &quot;len&quot; to location 0 and enters the program
+;       at location &quot;entry&quot;. Note that both &quot;entry&quot; and &quot;addr&quot; are
+;       true 32-bit absolute pointers, NOT segment:offset pairs. It
+;       is assumed that both the stack and this program will not be
+;       overwritten in the subsequent copy to 0 of the program to be
+;       entered, so caller is responsible to place this in a location
+;       above the program.
+;
+;       Note that this program is position-independant (self relocating).
+;
+;       Any additional args past the necessary three will be passed on the
+;       stack to the entered program [note: we obviously don't provide a
+;       &quot;return&quot; address]
+;
+_TEXT   segment byte public 'CODE'
+        assume  cs:_TEXT,ds:nothing
+_TEXT   ends
+
+Data32  equ     66h ; prefix to toggle 16/32 data operand
+JMPFAR  equ     0eah ; opcode for JMP intersegment
+
+        .186    ; allow use of shl ax,cnt insn
+_TEXT   segment byte public 'CODE'
+
+_protentry      proc far
+        jmp short relstrt
+
+; Global Descriptor Table contains three descriptors:
+;  0h: Null: not used
+;  8h: Code: code segment starts at 0 and extents for 4 gbytes
+; 10h: Data: data segment starts at 0 and extends for 4 gbytes(overlays code)
+GDT:
+NullDesc dw     0,0,0,0       ; null descriptor - not used
+CodeDesc dw     0FFFFh        ; limit at maximum: (bits 15:0)
+         db     0,0,0         ; base at 0: (bits 23:0)
+         db     10011111b     ; present/priv level 0/code/conforming/readable
+         db     11001111b     ; page granular/default 32-bit/limit(bits 19:16)
+         db     0             ; base at 0: (bits 31:24)
+DataDesc dw     0FFFFh        ; limit at maximum: (bits 15:0)
+         db     0,0,0         ; base at 0: (bits 23:0)
+         db     10010011b     ; present/priv level 0/data/expand-up/writeable
+         db     11001111b     ; page granular/default 32-bit/limit(bits 19:16)
+         db     0             ; base at 0: (bits 31:24)
+
+; Load Pointers for Tables
+; contains 6-byte pointer information for: LIDT, LGDT
+
+; Interrupt Descriptor Table pointer
+IDTPtr   dw     7FFh    ; limit at maximum (allows all 256 interrupts)
+         dw     0       ; base at 0: (bits 15:0)
+         dw     0       ; base at 0: (bits 31:16)
+
+; Global Descriptor Table pointer
+GDTPtr   dw     17h     ; limit to three 8 byte selectors(null,code,data)
+         dw offset GDT  ; base address of GDT (bits 15:0)
+         dw     0h      ; base address of GDT (bits 31:16)
+
+; Constructed instruction for entry into 32 bit protected mode
+;       ljmp    far Note
+dispat: db      Data32  ; 32-bit  override prefix
+        db      JMPFAR  ; opcode for JMP intersegment
+offl    dw      0       ; starting address of 32-bit code (low-word)
+        dw      0h      ; starting address (high word of linear address)
+        dw      8h      ; CodeDesc selector=8h
+
+relstrt:
+        cli             ; disable interrupts
+        ; do address fixups
+        mov     ax,ss   ; first, make a new 32 bit stack pointer!
+        mov     cx,4
+        shl     ax,cl   ; ax now contains segment address low 16 bits
+        mov     bx,ss
+        mov     cx,12
+        shr     bx,cl   ; bx now contains segment address high 16 bits
+        add     ax,sp
+        adc     bx,0    ; ax contains esp 15:0, bx contains esp 31:16
+        mov     si,ax   ; pass new stack to 32bit mode via si &amp; di
+        mov     di,bx
+
+        mov     ax,cs
+        mov     cx,4
+        shl     ax,cl   ; ax now contains segment address low 16 bits
+        mov     bx,cs
+        mov     cx,12
+        shr     bx,cl   ; bx now contains segment address high 16 bits
+
+        mov     cx,cs:GDTPtr+2
+        mov     dx,bx
+        add     cx,ax
+        mov     cs:GDTPtr+2,cx
+        adc     cs:GDTPtr+4,dx
+        mov     cx, OFFSET(cpydwn)
+        mov     dx,bx
+        add     cx,ax
+        mov     cs:offl,cx              ; overflow?
+        adc     cs:offl+2,dx
+
+        ;  Load the descriptor tables
+
+;       lidt    cs:IDTPtr    ; load Interrupt Descriptor Table
+db 2eh,0Fh,01h,00011110b
+dw offset IDTPtr
+;       lgdt    cs:GDTPtr    ; load Global Descriptor Table
+db 2Eh,0Fh,01h,00010110b
+dw offset GDTPtr
+;       smsw    ax            ; put Machine Status Word in AX
+db 0fh, 01h, 11100000b
+        or al,1               ; activate Protection Enable bit
+;       lmsw    ax            ; store Machine Status Word, begin protected mode
+db 0fh,01h,11110000b
+
+        jmp short Next  ; flush prefetch queue
+
+        ;  Load the segment registers with approriate descriptor selectors
+
+Next:   mov     bx,10h  ; set segment registers to DataDesc
+        mov     ss,bx   ; load SS,DS,ES segment registers with DataDesc
+        mov     ds,bx
+        mov     es,bx
+
+        ; Load CS via above's constructed ljmp, entering 32 bit protected mode
+        jmp short dispat
+
+        ; Finally running in Protected 32-bit Mode
+cpydwn:
+        mov     ax,di   ; movl  %edi,%eax
+        shl     ax,16   ;db 0c1h,0e0h,10h       ; shll  $16,%eax
+        db Data32
+        mov     ax,si   ; movw  %si,%ax
+        mov     sp,ax   ; movl  %eax,%esp
+        pop     ax      ; pop   eax     ; entry addr
+        pop     cx      ; pop   ecx     ; byte size
+        pop     si      ; pop   esi     ; source address
+        xor     di,di   ; xor   edi,edi ; destination address
+        cld
+        rep     movsb   ; copy into place
+        mov     sp,si   ; movl esp,esi
+        jmp     ax      ; jmp   eax     ; go to entry
+_protentry      endp
+
+        public  _protentry
+_TEXT   ends
+        end
+&lt;/LT &gt;
+
+
+<a name="0072_0017">
+<a name="0072_0018"></pre><B>[LISTING FIVE]</B><pre><a name="0072_0018">
+
+/* Copyright (c) 1989, 1990 William Jolitz. All rights reserved.
+ * Written by William Jolitz 7/89
+ * Redistribution and use in source and binary forms are freely permitted
+ * provided that the above copyright notice and attribution and date of work
+ * and this paragraph are duplicated in all such forms.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ * This program copies a BSD filesystem out of an MSDOS file and
+ * places it on an pre-reserved disk partition. Note that both the
+ * geometry of the particular disk, and the particulars of the
+ * BSD partition need to be adjusted to suit the drive on which this will
+ * be used. Normally, this would be a very rude requirement, but
+ * we tolerate this because this program is a throw-away used to get
+ * us started, and we have better schemes to deal with configuration
+ * a little further down the pike.
+ * Currently works with TURBO C 1.5 .
+ */
+
+#include &lt;bios.h&gt;
+#include &lt;io.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys\stat.h&gt;
+#include &quot;diskl.h&quot;
+
+/* Disk geometry (here, a NEC DS5146). Adjust parameters to suit drive. */
+#define   NCYL   615
+#define   NTRACK   8
+#define   NSECT   17
+
+#define   BSIZE   512   /* Disk block size */
+
+/* Location &amp; size of root partition. Adjust for drive partition layout. */
+#define   OFF_CYL   290   /* Cylinder offset of start of BSD root partition */
+#define   ROOTSZ   50   /* size of root partition, in units of cylinders */
+
+char trkbuf[NSECT*BSIZE];
+
+struct label_blk {
+   char bufr[LABELOFFSET];
+   struct disklabel dl;
+} lbl;
+
+main (argc, argv) char *argv[]; {
+   int fi, rem, cyl, head, sector, tfrcnt;
+   if (argc != 2) {
+      printf (&quot;usage: cpfs &lt;rootfs&gt;\n&quot;);
+      exit (1);
+   }
+   fi = open (argv[1],O_BINARY);
+   if (fi &lt; 0) {
+      printf (&quot;Cannot open \&quot;%s\&quot; file to read filesystem\n&quot;,
+         argv[1]);
+      exit (1);
+   }
+   cyl = OFF_CYL;
+   tfrcnt = head = 0;
+
+#ifndef FIRST
+   /* check for presence of disklabel */
+   biosdisk (2, 0x80, 0, OFF_CYL, LABELSECTOR, 1, &amp;lbl);
+   if (lbl.dl.dk_magic != DISKMAGIC) {
+      printf (&quot;BSD Disk partition does not have a label!\n&quot;);
+      exit (1);
+   }
+
+   /* Treat first track of data special; use disk label in first block of
+         * file to validate that the file to be loaded and disk drive
+         * partition are appropriate for each other. */
+   read (fi, trkbuf, BSIZE);
+   if (strncmp (trkbuf, &amp;lbl, BSIZE) != 0) {
+      printf (&quot;BSD root partition and filesystem mismatch!\n&quot;);
+      exit (1);
+   }
+
+   /* reset filesystem file to beginning */
+   lseek (fi, 0, SEEK_SET);
+#endif
+
+   printf (&quot;WARNING! About to overwrite disk (will loose previous\n&quot;);
+   printf (&quot;contents). Are you certain of your use of this program?&quot;);
+   if (getche () != 'y') exit (1);
+   printf(&quot;\n&quot;);
+
+   /* Transfer file to absolute disk section, a track at a time,
+         because we're impatient. */
+   while ((rem = read (fi, trkbuf, NSECT*BSIZE)) == NSECT*BSIZE) {
+      biosdisk (3, 0x80, head, cyl, 1, NSECT, trkbuf);
+      if (++head == NTRACK) {
+         head = 0;
+         if (++cyl &gt; NCYL || cyl &gt; OFF_CYL+ROOTSZ ) {
+            printf (&quot;Overran root partition!\n&quot;);
+            exit (1);
+         }
+      }
+      tfrcnt += NSECT;
+      printf (&quot;Amount transferred %5dK bytes\r&quot;,
+         tfrcnt*BSIZE/1024);
+   }
+
+   /* Transfer any remainder leftover in track buffer. */
+   if (rem &gt; BSIZE-1) {
+      biosdisk (3, 0x80, head, cyl, 1, rem/BSIZE, trkbuf);
+      tfrcnt += rem/BSIZE;
+      printf (&quot;Amount transferred %5dK bytes\n&quot;,
+         tfrcnt*BSIZE/1024);
+   }
+
+   exit (0);
+}
+
+
+
+
+<a name="0072_0019">
+<a name="0072_001a"></pre><B>[LISTING SIX]</B><pre><a name="0072_001a">
+
+
+/* Copyright (c) 1985,1986,1989,1990 Micheal J. Karels. All rights reserved.
+ * Based on a concept by Sam Leffler. Written by Michael J. Karels 4/85
+ * Revised by William Jolitz 86-90.
+ * Redistribution and use in source and binary forms are freely permitted
+ * provided that the above copyright notice and attribution and date of work
+ * and this paragraph are duplicated in all such forms.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ * Each disk has a label which includes information about the hardware
+ * disk geometry, filesystem partitions, and drive specific information.
+ * The label is in block 1, offset from the beginning to leave room
+ * for a bootstrap, etc.
+ */
+
+#define LABELSECTOR   1      /* sector containing label */
+#define LABELOFFSET   (BSIZE-120)   /* offset of label in sector */
+#define DISKMAGIC   0xabc      /* The disk magic number */
+#define   DTYPE_ST506   1      /* ST506 Winchester */
+#define   DTYPE_FLOPPY   2      /* 5-1/4&quot; minifloppy */
+#define   DTYPE_SCSI   3      /* SCSI Direct Access Device */
+
+struct disklabel {
+   short   dk_magic;      /* the magic number */
+   short   dk_type;      /* drive type */
+   struct dcon {
+      short   dc_secsize;   /* # of bytes per sector */
+      short   dc_nsectors;   /* # of sectors per track */
+      short   dc_ntracks;   /* # of tracks per cylinder */
+      short   dc_ncylinders;   /* # of cylinders per unit */
+      long   dc_secpercyl;   /* # of sectors per cylinder */
+      long   dc_secperunit;   /* # of sectors per unit */
+      long   dc_drivedata[4]; /* drive-type specific information */
+   } dc;
+   struct dpart {         /* the partition table */
+      long   nblocks;   /* number of sectors in partition */
+      long   cyloff;      /* starting cylinder for partition */
+   } dk_partition[8];
+   char   dk_name[16];      /* pack identifier */
+};
+
+#define dk_secsize      dc.dc_secsize
+#define dk_nsectors      dc.dc_nsectors
+#define dk_ntracks      dc.dc_ntracks
+#define dk_ncylinders      dc.dc_ncylinders
+#define dk_secpercyl      dc.dc_secpercyl
+#define dk_secperunit      dc.dc_secperunit
+
+/* Drive data for ST506. */
+#define dk_precompcyl   dc.dc_drivedata[0]
+#define dk_ecc      dc.dc_drivedata[1]   /* used only when formatting */
+#define dk_gap3      dc.dc_drivedata[2]   /* used only when formatting */
+
+/* Drive data for SCSI */
+#define dk_blind   dc.dc_drivedata[0]     /* can we work in &quot;blind&quot; i/o */
+
+
+
+
+
+
+<a name="0072_001b">
+<a name="0072_001c"></pre><B>[LISTING SEVEN]</B><pre><a name="0072_001c">
+
+
+/* Copyright (c) 1989, 1990 William Jolitz. All rights reserved.
+ * Written by William Jolitz 7/89
+ * Redistribution and use in source and binary forms are freely permitted
+ * provided that the above copyright notice and attribution and date of work
+ * and this paragraph are duplicated in all such forms.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ * This program copies a MSDOS file to BSD's idea of a swap partition,
+ * known to be the second one in the disklabel. Typical use is to place
+ * a TAR formatted file, obtained from a cross-host, onto swap. Then
+ * BSD is booted with the boot program and the BSD tar utility is
+ * used to extract the files being transferred within the TAR image,
+ * hopefully before we need to page on the swap space. Again, this
+ * program is rude in requiring one to adjust the manifest constant
+ * denoting the cylinder on which the BSD root filesystem appears,
+ * but this is another throw-away program to get the real work started.
+ * Currently works with TURBO C 1.5 .
+ */
+
+#include &lt;bios.h&gt;
+#include &lt;alloc.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;sys\stat.h&gt;
+#include &quot;diskl.h&quot;
+
+/* Location of root partition. Adjust to suit given drive partition layout. */
+#define   OFF_CYL   290   /* Cylinder offset of start of BSD root partition */
+
+char *trkbuf;
+
+#define BSIZE   512
+struct label_blk {
+   char bufr[LABELOFFSET];
+   struct disklabel dl;
+} lbl;
+
+main(argc, argv) char *argv[]; {
+   int fi, rem, cyl, head, tfrcnt;
+   int bsize, ncyl, ntrack, nsect, off_cyl, maxcyl;
+
+   if (argc != 2) {
+      printf(&quot;usage: cpsw &lt;file&gt;\n&quot;);
+      exit(1);
+   }
+
+   fi = open(argv[1], O_BINARY);
+   if (fi &lt; 0) {
+      printf(&quot;Cannot open \&quot;%s\&quot; file to BSD swap\n&quot;,
+         argv[1]);
+      exit(1);
+   }
+
+   /* check for presence of disklabel */
+   biosdisk(2, 0x80, 0, OFF_CYL, LABELSECTOR, 1, &amp;lbl);
+   if (lbl.dl.dk_magic != 0xabc) {
+      printf(&quot;BSD root disk partition does not have a label!\n&quot;);
+      exit(1);
+   }
+
+       /* Extract disk geometry and swap partition location from disk label. */
+   bsize = lbl.dl.dk_secsize;
+   nsect = lbl.dl.dk_nsectors;
+   ntrack = lbl.dl.dk_ntracks;
+   off_cyl = lbl.dl.dk_partition[1].cyloff;
+   maxcyl = lbl.dl.dk_partition[1].cyloff +
+      lbl.dl.dk_partition[1].nblocks / lbl.dl.dk_secpercyl;
+
+   /* Allocate track buffer */
+   trkbuf = malloc (nsect*bsize);
+
+   printf(&quot;WARNING! About to overwrite disk (will loose previous\n&quot;);
+   printf(&quot;contents). Are you certain of your use of this program?&quot;);
+   if (getche() != 'y') exit(1);
+   printf(&quot;\n&quot;);
+
+   tfrcnt = head = 0;
+   cyl = off_cyl;
+
+   /* Transfer file to absolute disk section, a track at a time,
+         because we're impatient. */
+   while ((rem = read(fi, trkbuf, nsect*bsize)) == nsect*bsize) {
+      biosdisk(3, 0x80, head, cyl, 1, nsect, trkbuf);
+      if (++head == ntrack) {
+         head = 0;
+         if (++cyl &gt; maxcyl) {
+            printf(&quot;Overran swap partition!\n&quot;);
+            exit(1);
+         }
+      }
+      tfrcnt += nsect;
+      printf(&quot;Amount transferred %5dK bytes\r&quot;,
+         tfrcnt*BSIZE/1024);
+   }
+
+   /* Transfer any remainder leftover */
+   if (rem &gt; BSIZE-1) {
+      biosdisk(3, 0x80, head, cyl, 1, rem/bsize, trkbuf);
+      tfrcnt += rem/bsize;
+      printf(&quot;Amount transferred %5dK bytes\n&quot;,
+         tfrcnt*bsize/1024);
+   }
+   exit(0);
+}
+</pre>
+
+<HR><P>Copyright &copy; 1991, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

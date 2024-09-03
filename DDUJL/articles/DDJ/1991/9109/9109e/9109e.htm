@@ -1,0 +1,754 @@
+<HTML>
+<META NAME="year" CONTENT="1991">
+<HEAD>
+<TITLE>SEP91: OBJ LIBRARY MANAGEMENT</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>OBJ LIBRARY MANAGEMENT<a name="01ff_0003"></h1><P>
+<h2><a name="01ff_0001"><a name="01ff_0000">Building your own object module manager</h2><P>
+<h3>Thomas Siering</h3><P>
+<p><i><a name="01ff_0002"><a name="01ff_0000">Thomas, a graphics software engineer for Software Publishing Corporation, is interested in graphics, systems programming, and software tools.  He encourages responses, and enhancements to this article and can be reached through DDJ.</i></p><hr><P>
+With just about any popular programming environment, library management utilities appear to be little more than an afterthought on the designer's part.  Typically, the user interface is primitive, the options limited, and report generation unwieldy.  It offers little information about the object modules contained, is not extendable by macros or hooks to user code, and does very little to track intermodule dependencies.  In short, most object (OBJ) module library tools have evolved very little from the original LIB utility offered by Microsoft in the earliest versions of DOS and DOS-development tools.<P>
+While the less than satisfied LIB user can buy third-party OBJ library managers, there is one solution that will always fit -- roll your own.  This approach, however, has one prerequisite: The OBJ library manager internals must emulate Microsoft's Library Manager. Short of that requirement, no linker or other library manager will be able to interpret a library generated with a custom-made product, and it will lead a very lonely and unproductive life!<P>
+I don't pretend to know what the ultimate library manager should look like, nor do I claim to have found an exhaustive feature list that will please everybody.  Instead, I'll discuss the technology underlying the Microsoft standard and present code that implements these concepts.  Armed with this know-how and a Microsoft-compatible library of functions, you can then focus on designing the ultimate additional capabilities, the snazziest user interface, or the most enlightening library analysis reports.<P>
+<h3><a name="01ff_0004">Why OBJ Libraries?<a name="01ff_0004"></h3><P>
+OBJ module libraries are an essential part of software development.  Even if a programmer chooses not to organize code in a library and to maintain OBJ modules as separate single entities, most programming environments require at least a couple of libraries to be linked in for handling floating-point support, standard runtime functions, graphics, and the like. Ignorance about their internals may be acceptable until problems arise -- missing symbols, multiple definitions, library overflows -- or library interdependencies have to be analyzed.<P>
+Although the LIB format is an industry-wide de facto standard, existing libraries can lead to compatibility problems that may require analytic tools.  These problems may arise when it is unclear which Microsoft language tool a library was created with.  Worse yet, a library may be constructed with a third-party librarian, and module extraction may work in some cases when a &quot;compatible&quot; tool is applied while mysteriously failing for other member modules.  Our emphasis will, therefore, be on analytical tools.  Any available librarian can add modules to a library (most of the time), and will (hopefully) extract them successfully.  While the code presented here covers all the bases required for constructing a complete librarian, it seemed prudent to avoid the clutter inherent in a larger program and to emphasize and demonstrate the building blocks common to any library-related tool instead.<P>
+<h3><a name="01ff_0005">OBJ Modules<a name="01ff_0005"></h3><P>
+While a library is composed of a number of object modules, these are in turn each a collection of object records.  A great variety of object record types exist, all of which must be understood by linkers.  A librarian will only concern itself with a select few, as shown in <a href="19910201.htm">Figure 1</A>.<P>
+All object record types share the same basic format.  They are identified by a 1-byte record type, followed by a 2-byte length field (whose value excludes the first 3 bytes).  The subsequent record layout varies by record type, and concludes with a checksum byte.  As a result, system tools can traverse object modules efficiently, considering only the record types of interest to the purpose at hand.<P>
+Every object module starts off with a THEADR (header) and is terminated by a MODEND (module end) record.  The chief purpose of the header record is to list either the module's name or the name of the source file used to compile it.  Subtle differences exist between vendors. Borland C++, for example, uses the header record for the object module's name.  If the module's filename changes, so will the THEADR record, thus losing its connection to the source code's filename.  Microsoft C, on the other hand, will always maintain the source filename (including even the source file extension, and possibly the full path name).  To provide the object module name, which may differ from the source's, an additional record type, LIBMOD, has been added.  Interestingly enough, this object record type will be present only while the module resides in the library.  When it is extracted, the LIBMOD will be stripped out. (LIBMOD records are actually a subclass of a more general type, namely the COMENT, designed for vendor-specific comments and extensions.)<P>
+Object module libraries are collections of code and data shared by client code, utilizing only the members needed.  PUBDEF records contain the names of publicly defined or global symbols.  Public definitions are of such fundamental importance that the library manager creates an additional dictionary for speedy lookup.<P>
+Library managers can optionally use numerous other record types to enhance their analytic capabilities.  For example, the EXTDEF record complements the PUBDEF type.  It lists external definitions, meaning symbols referenced in a given module but expected to be defined in another.  Knowledge of external definitions can be useful in determining whether a library still needs to retain a member.  If no other library member contains EXTDEFs for a module's PUBDEFs, it may be safely removed (unless of course client code outside the library requires it).<P>
+The Object Module Format (OMF) constitutes a comprehensive subject in its own right, so details are beyond the scope of this discussion.  For further information and analytical software, consult Siering or Wilton (see &quot;References&quot;).<P>
+<h3><a name="01ff_0006">The OBJ Library Standard<a name="01ff_0006"></h3><P>
+OBJ module libraries consist of various individual records that resemble in appearance object module records: Library records are identified by a 1-byte record type, followed by a 2-byte page size and variable-length, record-specific data.  Unlike object modules, no checksum byte is appended.<P>
+Every library follows the same simple general layout: The first record must be the Library Header.  The header is immediately followed by the Object Modules.  Both appear in the same form as they would individually.  The Marker follows, its only purpose being to pad between the modules and the following library record type.  Next, the Symbol Dictionary serves as an index to the object modules' public symbols.  Finally, an optional Extended Dictionary may follow.<P>
+<h3><a name="01ff_0007">The Library Header Record<a name="01ff_0007"></h3><P>
+Every OBJ module library starts with a Library Header (record type F0h), shown in <a href="19910202.htm">Figure 2</A>.  After the 2-byte length field (as usual, this value does not include the first 3 bytes already traversed), a 4-byte longword provides the file position of the Symbol Dictionary, and a 2-byte field gives the dictionary's size in blocks. Finally, a 1-byte flag field may contain specifics about the library.  Currently, the only nonzero value defined is 01h, indicating case sensitivity.<P>
+Besides identifying a file as a library, the header maps out the basic structure of the OBJ module library.  The header's end marks the beginning of the modules themselves.  Their end is implied in the file position of the Symbol Dictionary, which resides after the modules (although a Marker record may be present, as we will see).<P>
+Another crucial piece of structural information is implied in the header.  OBJ modules are allocated file space in &quot;pages.&quot;  Page size is user-definable as a power of 2 between 4 and 15, allowing for pages as small as 16 bytes (the default) and as large as 32,768.  A library's actual page size is simply inferred from the header record size because the header always fills (with padding) one page.<P>
+<h3><a name="01ff_0008">OBJ Module Records<a name="01ff_0008"></h3><P>
+Immediately following the library header are the object modules.  They appear as they would in standalone object format, although padded with 0s to the next page boundary.  One other possible difference is that the Microsoft LIB program might have added a LIBMOD comment record containing the object module's name (as opposed to the source file's name which appears in THEADR, the header record).  Borland's TLIB will change the THEADR to reflect the OBJ module's name if it has been renamed since it was compiled.<P>
+The vast majority of libraries will employ a page size of 16.  (Borland TLIB does not even allow for any user-specified page sizes, although it will handle libraries created with alternative page sizes.)  Page size is significant because in libraries, reference is made to modules not by their actual file position (which would require a longword) but by their page number.  As a result, modules always begin on a new page.  Page numbers are unsigned integers, allowing the modules to occupy a maximum of 65,536 pages.  Increasing the page size will allow for more modules to reside in a library but will lead to more wasted space because on an average, the last one-half page will be unused by the module and zero-padded.<P>
+<h3><a name="01ff_0009">The Marker Record<a name="01ff_0009"></h3><P>
+As mentioned previously, object modules are zero-padded to the next page unit, typically 16 bytes.  Symbol Dictionary blocks which immediately follow the object modules, however, are always aligned to a block size of 512 bytes.  Straddling the netherworlds between these two allocation units is the Marker record.  Its only purpose is to fill up space between the last object module and the dictionary, as illustrated in <a href="19910203.htm">Figure 3</A> .<P>
+Marker records are of trivial structure.  They are identified by a library record type of F1h, followed by the length word.  The remainder of their &quot;data&quot; is simply zero-padding.<P>
+<h3><a name="01ff_000a">The Symbol Dictionary<a name="01ff_000a"></h3><P>
+The Symbol Dictionary follows the object modules (and the Marker, if any).  It is located via the Library Header's dictionary offset entry, and consists of 512-byte blocks.  The number of blocks, recorded in the Library Header's dictionary size field, is a prime value between 2 and 251.  A prime number is chosen for the benefit of the symbol hashing algorithm (although Borland's TLIB conserves space by not limiting its page numbers to primes).<P>
+While building an executable, one of the primary tasks of the linker is to resolve all external references.  In other words, if code is referencing global data or calling an external function, the linker will first search other object modules for this symbol's defining instance.  After that, it will search through libraries, deciding whether to pull any of their members into the final executable.  This could conceivably be done by searching through every module in a library and scanning every public definition (PUBDEF) record for the symbol definition.  Instead, however, a library's Symbol Dictionary makes these names directly accessible: For every symbol lookup, two hash values are computed.  One value determines which directory block the symbol entry resides in, and the other yields the entry number within the block, the bucket.  Every block contains 37 buckets.<P>
+Symbol Dictionary blocks are laid out as follows.  The first 37 bytes constitute the hash table.  If a bucket is vacant, the value is 0.  Otherwise, it contains the dictionary entry's word offset (relative to the dictionary block).  The 38th byte contains the offset of the next available word for directory entries.  If the block's directory entry space is full (which may be the case, even if not all buckets are utilized), this byte will be set to FFh.<P>
+Directory entries immediately follow the hash table.  They are variable-length, containing the following data.  The symbol name is in typical object module format: a 1-byte length field and a character array without a null-terminator.  A 2-byte page number follows, indicating the location of the object module defining the symbol.  Finally, an alignment byte may appear, because directory entries have to be word aligned.<P>
+<h3><a name="01ff_000b">The Dictionary Hashing Algorithm<a name="01ff_000b"></h3><P>
+Despite recent publication of parts of Microsoft's de facto library standard (see &quot;References&quot;), no information about the hashing algorithm has ever appeared in print before this article.  Once understood, the hashing algorithm is fairly simple.  This simplicity is obviously required for efficient implementation.<P>
+The hash function requires as input the string to be hashed and the number of blocks over which the hash is to be distributed.  It computes hash values for the dictionary block, as well as the hash table bucket.  In anticipation of hash clashes (that is, two strings hashing to the same value), two more values will be computed: the block overflow and the bucket overflow.  These values can then be added repeatedly to the block and the bucket values to find an available hash table position.<P>
+The hash function sets a pointer to the first symbol string character as well as the last one (the null terminator).  Disregarding the current characters' case, hash values are calculated by exclusive - or of the current character to the previous hash value rotated by 2.  This process is repeated once for every character in the string.  By letting the two pointers traverse the string in opposite directions and performing the rotations to the left as well as right, four values are generated.<P>
+<h3><a name="01ff_000c">The Extended Dictionary<a name="01ff_000c"></h3><P>
+Library managers may choose to implement one additional library element, the Extended Dictionary.  This implementation-specific record will appear after the Symbol Dictionary, its contents vary and are typically proprietary.  The purpose of an Extended Dictionary is to provide information on the object modules designed to speed up the linker's tasks.  The presence of this record is optional, and all its information content can be obtained from the generally-supported record types.  As an aside, linker vendors may choose to rely on the Extended Dictionary instead of the &quot;regular&quot; Symbol Dictionary.  This becomes obvious from a bug in Borland's TLIB, Versions 3.01 and earlier, which will occasionally result in a corrupt dictionary.  While library managers depending on a correct Symbol Dictionary (such as our utility) will fail, Borland's linker doesn't notice the problem and builds a correct executable by either ignoring the Symbol Dictionary or exclusively using the Extended Dictionary (I brought the problem to Borland's attention and an updated, corrected version is now available from their technical support group).<P>
+<h3><a name="01ff_000d">Applications of Library Manager Internals<a name="01ff_000d"></h3><P>
+Having endured the details of the object module library format thus far, it seems perfectly appropriate to look for practical applications of this insider knowledge.  The code presented in this article handles all low-level details of library management, making the construction of new utilities a simple matter of higher-level design.<P>
+Let's briefly consider a few areas where existing library management falls short.  For one, quality assurance could benefit from advanced library tools.  For developers of function libraries, verification of the finished product is of utmost importance.  For example, a simple linear scan of the Symbol Dictionary blocks gave away the previously discussed TLIB bug.  Also, once an object module is in the library, many internal forms of corruption may never be detected.  A utility could easily traverse the object modules and verify their checksums.  Equally simple, a group of object modules can be compared to their versions as library members, and thus can be verified as current and correct.<P>
+A similar area is dependency management.  In order to ensure the completeness of a library, yet prevent the inclusion of unneeded modules, both public definitions (PUBDEF) and external definitions (EXTDEF) are of interest.  Current library managers are not prepared to generate this information, which can be critical when considering removal of a module from a library. Dependency management also enables you to generate reports such as call trees.  Even an extension of a MAKE-like utility can be created to replace library modules by current stand-alone versions of the same object files.<P>
+Dealing with a library without owning its source code can also be made much more manageable.  How about a list of all occurrences of a given symbol, not only the symbols included in the Symbol Dictionary?  Or an &quot;explode&quot; option that extracts all object modules from a library without the user having to know or enter them by names?  (As simple as this option is, it does not exist in popular library managers.)  The latter option can also be used in situations where a library is best &quot;decomposed&quot; for overlay design.  A &quot;rename&quot; facility that allows the changing of a symbol, its dependent entries in other modules, and the update of the Symbol Dictionary can be useful in case of a name clash.  Or a symbol could be hidden by some easily reversible bit manipulation to allow for a temporary dual definition.<P>
+Another area not adequately supported in existing products is performance tweaking.  When a hash table becomes densely packed, more hash clashes occur, and link time slows.  If the number of Symbol Dictionary blocks is increased above their required minimum, access speed will increase at the expense of space.  (This requires that the linker not ignore the dictionary; this can be tested by purposefully corrupting a dictionary entry and attempting a link involving this symbol.)  Where space is at a premium (especially where a library overflow is imminent), the problem can be helped by removing unneeded COMENT object records from modules.<P>
+Finally, library manager user interfaces can be made more appealing and convenient.  For example, a full-screen symbol browser may allow for the tracing of dependencies by clicking on symbols.  There is virtually no limit to the designs which may be based on this library management code.<P>
+<h3><a name="01ff_000e">The OBJ Library Manager Source Code<a name="01ff_000e"></h3><P>
+The source code for my OBJ library manager is divided into three categories.  <a href="#01ff_0011">Listings One</A> and <a href="#01ff_0013">Two</A> (page 90) dispense with the unexciting stuff first, namely, the service functions used for routine purposes unrelated to our task.  The second category is the Object Library Engine (OL E), again divided between <a href="#01ff_0015">Listings Three</A> (page 90) and <a href="#01ff_0017">Four</A> (page 91). Finally, <a href="#01ff_0019">Listings Five</A> and <a href="#01ff_001b">Six</A> (page 94) provide sample applications.  <a href="#01ff_0019">Listing Five</A> dumps an entire Symbol Dictionary by sequential scan, while <a href="#01ff_001b">Listing Six</A> performs either a library explode or selective library member extractions.<P>
+This code is meant to be self-documenting and will build on the concepts discussed without further ado.<P>
+<h3><a name="01ff_000f">Acknowledgments<a name="01ff_000f"></h3><P>
+I am indebted to Greg Lobdell of Microsoft as well as David Intersimone and Eli Boling of Borland International for providing documents, software, and discussions of their respective library management products.<P>
+<h3><a name="01ff_0010">References<a name="01ff_0010"></h3><P>
+Siering, Thomas.  &quot;Understanding and Using .obj Files.&quot;  The C Gazette (Spring 1991).<P>
+Wilton, Richard.  &quot;Object Modules.&quot;  The MS-DOS Encyclopedia.  Redmond, Wash.: Microsoft Press, 1988.<P>
+Wilton, Richard.  &quot;The Microsoft Object Linker.&quot;  The MS-DOS Encyclopedia.  Redmond, Wash.: Microsoft Press, 1988.<P>
+Microsoft C Developer's Toolkit Reference.  Redmond, Wash.: Microsoft Corp., 1990.<P>
+
+<PRE>
+
+_OBJ LIBRARY MANAGEMENT_
+by Thomas Siering
+
+<a name="01ff_0011">
+<a name="01ff_0012"></pre><B>[LISTING ONE]</B><pre><a name="01ff_0012">
+
+//****** svc.h  --  Service functions *******
+
+#define NOFILE              NULL        // no error log file
+typedef enum {
+    Message,
+    Warning,
+    Error
+} MESSAGETYPE;
+
+char *MakeASCIIZ(unsigned char *LString);
+void Output(MESSAGETYPE MsgType, FILE *Stream, char *OutputFormat, ...);
+
+
+
+
+<a name="01ff_0013">
+<a name="01ff_0014"></pre><B>[LISTING TWO]</B><pre><a name="01ff_0014">
+
+//****** svc.c  --  Service functions *******
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;stdarg.h&gt;
+#include &quot;svc.h&quot;
+
+// MakeASCIIZ - Take a string of 1-byte length/data format, and make it ASCIIZ.
+char *MakeASCIIZ(unsigned char *LString)
+{
+    char *ASCIIZString;
+    unsigned char StringLength;
+
+    StringLength = *LString++;
+    if ((ASCIIZString = malloc((int) StringLength + 1)) == NULL)
+        return (NULL);
+    strncpy(ASCIIZString, (signed char *) LString, StringLength);
+    ASCIIZString[StringLength] = '\0';
+    return (ASCIIZString);
+}
+
+// Output -- Write to the output stream. This function adds an exception-
+// handling layer to disk IO. It handles abnormal program termination, and
+// warnings to both stderr and output. Three types of message can be handled:
+// Message, simply printed to a file; Warning, print to file AND stderr;
+// Error, same as warning, but terminate with abnormal exit code.
+void Output(MESSAGETYPE MsgType, FILE *Stream, char *OutputFormat, ...)
+{
+    char OutputBuffer[133];
+    va_list VarArgP;
+
+    va_start(VarArgP, OutputFormat);
+    vsprintf(OutputBuffer, OutputFormat, VarArgP);
+    // If this is (non-fatal) warning or (fatal) error, also send it to stderr
+    if (MsgType != Message)
+        fprintf(stderr, &quot;\a%s&quot;, OutputBuffer);
+    // In any case: attempt to print message to output file.  Exception check.
+    if (Stream != NOFILE)
+        if ((size_t) fprintf(Stream, OutputBuffer) != strlen(OutputBuffer)) {
+            fprintf(stderr, &quot;\aDisk Write Failure!\n&quot;);
+            abort();
+        }
+    /* If this was (fatal) error message, abort on the spot */
+    if (MsgType == Error) {
+        flushall();
+        fcloseall();
+        abort();
+    }
+    va_end(VarArgP);
+}
+
+
+
+
+<a name="01ff_0015">
+<a name="01ff_0016"></pre><B>[LISTING THREE]</B><pre><a name="01ff_0016">
+
+//***** ole.h  --  Global include info for Object Library Engine (ole.c) ******
+
+#define THEADR              0x80        // OMF module header
+#define COMENT              0x88        // OMF comment record
+#define MODEND              0x8A        // OMF module end record
+#define LIBMOD              0xA3        // library module name comment class
+#define LIBHEADER           0xF0        // LIB file header
+#define MARKER_RECORD       0xF1        // marker between modules &amp; dictionary
+#define NUMBUCKETS          37          // number of buckets/block
+#define DICTBLOCKSIZE       512         // bytes/symbol dictionary block
+#define DICTBLKFULL         0xFF        // Symbol dictionary block full
+
+#define UNDEFINED           -1          // to indicate non-initialized data
+#define STR_EQUAL           0           // string equality
+
+// These two macros will rotate word operand opw by nbits bits (0 - 16)
+#define WORDBITS            16
+#define ROL(opw, nbits) (((opw) &lt;&lt; (nbits)) | ((opw) &gt;&gt; (WORDBITS - (nbits))))
+#define ROR(opw, nbits) (((opw) &gt;&gt; (nbits)) | ((opw) &lt;&lt; (WORDBITS - (nbits))))
+
+typedef enum {
+    false,
+    true
+} bool;
+
+#pragma pack(1)
+
+typedef struct {
+    unsigned char RecType;
+    int RecLength;
+} OMFHEADER;
+
+typedef struct {
+    unsigned char RecType;
+    int RecLength;
+    unsigned char Attrib;
+    unsigned char CommentClass;
+} COMENTHEADER;
+
+typedef struct {                    // Record Type F0h
+    int PageSize;                   // Header length (excl. first 3 bytes)
+                                    // == page size (module at page boundary)
+                                    // page size == 2 ** n, 4 &lt;= n &lt;= 15
+    long DictionaryOffset;          // file offset of Symbol Dictionary
+    int NumDictBlocks;              // number of Symbol Dictionary blocks
+                                    // &lt;= 251 512-byte dictionary pages
+    unsigned char Flags;            // only valid flag: 01h =&gt; case-sensitive
+    bool IsCaseSensitive;
+    bool IsLIBMODFormat;            // is MS extension type LIBMOD present?
+} LIBHDR;
+
+typedef struct {
+    unsigned char MarkerType;       // This's better be F1h
+    int MarkerLength;               // filler to dictionary's 512-byte alignment
+} DICTMARKER;
+
+typedef struct {
+    int  BlockNumber;
+    int  BucketNumber;
+    unsigned char *SymbolP;
+    long ModuleFilePos;
+    bool IsFound;
+} DICTENTRY;
+
+typedef struct {
+    int BlockHash;
+    int BlockOvfl;
+    int BucketHash;
+    int BucketOvfl;
+} HashT;
+
+void GetLibHeader(LIBHDR *LibHeader, FILE *InLibFH);
+HashT Hash(char SymbolZ[], int NumHashBlocks);
+DICTENTRY FindSymbol(char *SymbolZ, LIBHDR *LibHeader, FILE *InLibFH);
+void GetSymDictBlock(int BlockNumber, LIBHDR *LibHeader,
+        FILE *InLibFH);
+long FindModule(char *ModuleName, LIBHDR *LibHeader, FILE *InLibFH);
+DICTENTRY GetSymDictEntry(int BlockNumber, int BucketNumber,
+        LIBHDR *LibHeader, FILE *InLibFH);
+char *GetModuleName(long ModuleFilePos, LIBHDR *LibHeader, FILE *InLibFH);
+bool FindLIBMOD(FILE *InLibFH);
+bool FindObjRecord(FILE *ObjFH, unsigned char RecType);
+bool ExtractModule(char *ModuleName, char *NewModuleName, LIBHDR *LibHeader,
+        FILE *InLibFH);
+void CopyObjModule(FILE *NewObjFH, long FilePos, FILE *InLibFH);
+
+
+
+
+<a name="01ff_0017">
+<a name="01ff_0018"></pre><B>[LISTING FOUR]</B><pre><a name="01ff_0018">
+
+//***** ole.c  --  Object Library Engine ******
+
+#include &lt;stdio.h&gt;
+#include &lt;io.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &quot;ole.h&quot;
+#include &quot;svc.h&quot;
+
+typedef struct {
+    unsigned char SymbolDictBlock[DICTBLOCKSIZE];   // symbol dictionary block
+    int FreeSpaceIdx;                // cursor to next free symbol space slot
+    bool IsFull;                     // is this sym. dict. block full?
+    int BlockNumber;                 // current block number
+} DICTBLOCK;
+
+// The number of pages in the Symbol Dictionary has to be a prime &lt;= 251.
+// NOTE: The smallest page number in MS LIB is 2, in Borland TLIB it's 1.
+static int Primes[] = { 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43,
+        47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109, 113,
+        127, 131, 137, 139, 149, 151, 157, 163, 167, 173, 179, 181, 191, 193,
+        197, 199, 211, 223, 227, 229, 233, 239, 241, 251 };
+// Symbol Dictionary Block
+static DICTBLOCK DictBlock;
+//  GetLibHeader -- Get header of an object module library. The library
+//  header's ( record type F0) main purpose is to identify this data file as a
+//  library, give page size, and size and location of Symbol Dictionary.
+void GetLibHeader(LIBHDR *LibHeader, FILE *InLibFH)
+{
+    if (fgetc(InLibFH) != LIBHEADER)
+        Output(Error, NOFILE, &quot;Bogus Library Header\n&quot;);
+    // NOTE: The LIBHDR data structure has been enlarged to include more
+    // info than the actual LIB header contains.  As a result, a few more bytes
+    // are read in past the actual header when we take sizeof(LIBHDR).  This
+    // is no problem since there's plenty to read after the header, anyway!
+    if (fread(LibHeader, sizeof(LIBHDR), 1, InLibFH) != 1)
+        Output(Error, NOFILE, &quot;Couldn't Read Library Header\n&quot;);
+    // Add in Header length word &amp; checksum byte
+    LibHeader-&gt;PageSize += 3;
+    // Determine if LIB includes Microsoft's LIBMOD extension
+    // Find the first OBJ module in the LIB file
+    if (fseek(InLibFH, (long) LibHeader-&gt;PageSize, SEEK_SET) != 0)
+        Output(Error, NOFILE, &quot;Seek for first object module failed\n&quot;);
+    LibHeader-&gt;IsLIBMODFormat = FindLIBMOD(InLibFH);
+    LibHeader-&gt;IsCaseSensitive = LibHeader-&gt;Flags == 0x01 ? true : false;
+    // Make it clear that we haven't read Symbol Dictionary yet
+    DictBlock.BlockNumber = UNDEFINED;
+ }
+//  FindModule -- Find a module in Symbol Dictionary and return its file
+//  position.  If not found, return -1L.
+long FindModule(char *ModuleName, LIBHDR *LibHeader, FILE *InLibFH)
+{
+    char *ObjName;
+    DICTENTRY DictEntry;
+    char *ExtP;
+    // Allow extra space for terminating &quot;!\0&quot;
+    if ((ObjName = malloc(strlen(ModuleName) + 2)) == NULL)
+        Output(Error, NOFILE, &quot;OBJ Name Memory Allocation Failed\n&quot;);
+    strcpy(ObjName, ModuleName);
+    // Allow search for module name xxx.obj
+    if ((ExtP = strrchr(ObjName, '.')) != NULL)
+        *ExtP = '\0';
+    // NOTE: Module names are stored in LIB's with terminating '!'
+    strcat(ObjName, &quot;!&quot;);
+    DictEntry = FindSymbol(ObjName, LibHeader, InLibFH);
+
+    free(ObjName);
+    return (DictEntry.IsFound == true ? DictEntry.ModuleFilePos : -1L);
+}
+//  FindSymbol  --  Find a symbol in Symbol Dictionary by (repeatedly, if
+//  necessary) hashing the symbol and doing dictionary lookup.
+DICTENTRY FindSymbol(char *SymbolZ, LIBHDR *LibHeader, FILE *InLibFH)
+{
+    DICTENTRY DictEntry;
+    char *SymbolP;
+    HashT HashVal;
+    int MaxTries;
+    int Block, Bucket;
+
+    HashVal = Hash(SymbolZ, LibHeader-&gt;NumDictBlocks);
+    Block = HashVal.BlockHash;
+    Bucket = HashVal.BucketHash;
+    MaxTries = LibHeader-&gt;NumDictBlocks * NUMBUCKETS;
+    DictEntry.IsFound = false;
+
+    while (MaxTries--) {
+        DictEntry = GetSymDictEntry(Block, Bucket, LibHeader, InLibFH);
+        // Three alternatives to check after Symbol Dictionary lookup:
+        // 1. If the entry is zero, but the dictionary block is NOT full,
+        //    the symbol is not present:
+        if (DictEntry.IsFound == false &amp;&amp; DictBlock.IsFull == false)
+            return (DictEntry);
+        // 2. If the entry is zero, and the dictionary block is full, the
+        //    symbol may have been rehashed to another block; keep looking:
+        // 3. If the entry is non-zero, we still have to verify the symbol.
+        //    If it's the wrong one (hash clash), keep looking:
+        if (DictEntry.IsFound == true) {
+            // Get the symbol name
+            SymbolP = MakeASCIIZ(DictEntry.SymbolP);
+            // Choose case-sensitive or insensitive comparison as appropriate
+            if ((LibHeader-&gt;IsCaseSensitive == true ? strcmp(SymbolZ, SymbolP) :
+                    stricmp(SymbolZ, SymbolP)) == STR_EQUAL) {
+                free(SymbolP);
+                return (DictEntry);
+            }
+            free(SymbolP);
+        }
+        // Cases 2 and 3 (w/o a symbol match) require re-hash:
+        Block += HashVal.BlockOvfl;
+        Bucket += HashVal.BucketOvfl;
+        Block %= LibHeader-&gt;NumDictBlocks;
+        Bucket %= NUMBUCKETS;
+    }
+    // We never found the entry!
+    DictEntry.IsFound = false;
+    return (DictEntry);
+}
+//  Hash  --  Hash a symbol for Symbol Dictionary entry
+//  Inputs: SymbolZ - Symbol in ASCIIZ form; NumHashBlocks - current number of
+//    Symbol Dictionary blocks (MS LIB max. 251 blocks)
+//  Outputs: Hash data structure, containing: BlockHash, index of block
+//    containing symbol; BlockOvfl, block index's rehash delta; BucketHash,
+//    index of symbol's bucket (position) on page; BucketOvfl, bucket index's
+//    rehash delta
+//  Algorithm: Determine block index, i.e. page number in Symbol Dictionary
+//    where the symbol is to reside, and the bucket index, i.e. the position
+//    within that page (0-36). If this leads to collision, retry with bucket
+//    delta until entire block has turned out to be full. Then, apply block
+//    delta, and start over with original bucket index.
+HashT Hash(char SymbolZ[], int NumHashBlocks)
+{
+    HashT SymHash;                     // the resulting aggregate hash values
+    unsigned char *SymbolC;            // symbol with prepended count
+    int  SymLength;                    // length of symbol to be hashed
+    unsigned char *FwdP, *BwdP;        // temp. pts's to string: forward/back.
+    unsigned int FwdC, BwdC;           // current char's at fwd/backw. pointers
+    unsigned int BlockH, BlockD, BucketH, BucketD;   // temporary values
+    int i;
+    SymLength = strlen(SymbolZ);
+    // Make symbol string in Length byte/ASCII string format
+    if ((SymbolC = malloc(SymLength + 2)) == NULL)
+        Output(Error, NOFILE, &quot;Memory Allocation Failed\n&quot;);
+    SymbolC[0] = (unsigned char) SymLength;
+    // copy w/o EOS
+    strncpy((signed char *) &amp;SymbolC[1], SymbolZ, SymLength + 1);
+    FwdP = &amp;SymbolC[0];
+    BwdP = &amp;SymbolC[SymLength];
+    BlockH = BlockD = BucketH = BucketD = 0;
+    for (i = 0; i &lt; SymLength; i++) {
+        // Hashing is done case-insensitive, incl. length byte
+        FwdC = (unsigned int) *FwdP++ | 0x20;
+        BwdC = (unsigned int) *BwdP-- | 0x20;
+        // XOR the current character (moving forward or reverse, depending
+        // on variable calculated) with the intermediate result rotated
+        // by 2 bits (again, left or right, depending on variable).
+        // Block Hash: traverse forward, rotate left
+        BlockH = FwdC ^ ROL(BlockH, 2);
+        // Block Overflow delta: traverse reverse, rotate left
+        BlockD = BwdC ^ ROL(BlockD, 2);
+        // Bucket Hash: traverse reverse, rotate right
+        BucketH = BwdC ^ ROR(BucketH, 2);
+        // Bucket Overflow delta: traverse forward, rotate right
+        BucketD = FwdC ^ ROR(BucketD, 2);
+    }
+    // NOTE: Results are zero-based
+    SymHash.BlockHash = BlockH % NumHashBlocks;
+    SymHash.BucketHash = BucketH % NUMBUCKETS;
+    // Obviously, hash deltas of 0 would be nonsense!
+    SymHash.BlockOvfl = max(BlockD % NumHashBlocks, 1);
+    SymHash.BucketOvfl = max(BucketD % NUMBUCKETS, 1);
+
+    free(SymbolC);
+    return (SymHash);
+}
+//  GetSymDictBlock  --  Read and pre-process a Symbol Dictionary block
+void GetSymDictBlock(int BlockNumber, LIBHDR *LibHeader, FILE *InLibFH)
+{
+    // Find and read the whole Symbol Dictionary block
+    if (fseek(InLibFH, LibHeader-&gt;DictionaryOffset + (long) BlockNumber *
+            (long) DICTBLOCKSIZE, SEEK_SET) != 0)
+        Output(Error, NOFILE, &quot;Could Not Find Symbol Dictionary\n&quot;);
+    if (fread(DictBlock.SymbolDictBlock, DICTBLOCKSIZE, 1, InLibFH) != 1)
+        Output(Error, NOFILE, &quot;Couldn't Read Library Header\n&quot;);
+    // Is this block all used up?
+    DictBlock.FreeSpaceIdx = DictBlock.SymbolDictBlock[NUMBUCKETS];
+    DictBlock.IsFull = (DictBlock.FreeSpaceIdx == DICTBLKFULL) ? true : false;
+    // For future reference, remember block number
+    DictBlock.BlockNumber = BlockNumber;
+}
+//  GetSymDictEntry  --  Look up and process a Symbol Dictionary block entry
+DICTENTRY GetSymDictEntry(int BlockNumber, int BucketNumber,
+        LIBHDR *LibHeader, FILE *InLibFH)
+{
+    DICTENTRY DictEntry;
+    unsigned char SymbolOffset;
+    unsigned char SymbolLength;
+    int PageNumber;
+    // Remember entry's block/bucket and init. to no (NULL) entry
+    DictEntry.BlockNumber = BlockNumber;
+    DictEntry.BucketNumber = BucketNumber;
+    DictEntry.SymbolP = NULL;
+    DictEntry.IsFound = false;
+    // Make sure the appropriate block was already read from obj. mod. library
+    if (DictBlock.BlockNumber != BlockNumber)
+        GetSymDictBlock(BlockNumber, LibHeader, InLibFH);
+    // WORD offset of symbol in dictionary block: 0 means no entry
+    SymbolOffset = DictBlock.SymbolDictBlock[BucketNumber];
+    if (SymbolOffset != 0) {
+        // Since it's word offset, need to multiply by two
+        DictEntry.SymbolP = &amp;DictBlock.SymbolDictBlock[SymbolOffset * 2];
+        // Get the symbol's object module offset in LIB
+        SymbolLength = *DictEntry.SymbolP;
+        // Object module's LIB page number is right after symbol string
+        PageNumber = *(int *) (DictEntry.SymbolP + SymbolLength + 1);
+        DictEntry.ModuleFilePos = (long) PageNumber *
+                (long) LibHeader-&gt;PageSize;
+        DictEntry.IsFound = true;
+    }
+    return (DictEntry);
+}
+//  GetModuleName -- Read the OMF module header record (THEADR - 80h) or, if
+//    present, MS's LIBMOD extension record type. NOTE: For Microsoft C,
+//    THEADR reflects the source code name file at compilation time. OBJ name
+//    may differ from this; the LIBMOD record will contain its name. For
+//    Borland C++, THEADR is the only pertinent record and will contain OBJ
+//    module's name rather than the source's.
+char *GetModuleName(long ModuleFilePos, LIBHDR *LibHeader, FILE *InLibFH)
+{
+    int SymbolLength;
+    char *ModuleName;
+    OMFHEADER OmfHeader;
+    // Position at beginning of pertinent object module
+    if (fseek(InLibFH, ModuleFilePos, SEEK_SET) != 0)
+        Output(Error, NOFILE, &quot;Seek for object module at %lx failed\n&quot;,
+                    ModuleFilePos);
+    if (LibHeader-&gt;IsLIBMODFormat == false) {
+        if (fread(&amp;OmfHeader, sizeof(OmfHeader), 1, InLibFH) != 1)
+            Output(Error, NOFILE, &quot;Couldn't Read THEADR at %lx\n&quot;,
+                    ModuleFilePos);
+        if (OmfHeader.RecType != THEADR)
+            Output(Error, NOFILE, &quot;Bogus THEADR OMF record at %lx\n&quot;,
+                    ModuleFilePos);
+    }
+    else
+        if (FindLIBMOD(InLibFH) == false) {
+            Output(Warning, NOFILE, &quot;No LIBMOD record found at %lx\n&quot;,
+                    ModuleFilePos);
+            return (NULL);
+        }
+    SymbolLength = fgetc(InLibFH);
+    if ((ModuleName = malloc(SymbolLength + 1)) == NULL)
+        Output(Error, NOFILE, &quot;Malloc failure Reading module name\n&quot;);
+    if (fread(ModuleName, SymbolLength, 1, InLibFH) != 1)
+        Output(Error, NOFILE, &quot;Couldn't Read THEADR\n&quot;);
+    ModuleName[SymbolLength] = '\0';
+    return(ModuleName);
+}
+//  FindLIBMOD  --  Get a LIBMOD (A3) comment record, if present.
+//  NOTE: This is a special OMF COMENT (88h) record comment class used by
+//  Microsoft only.  It provides the name of the object modules which may
+//  differ from the source (contained in THEADR). This record is added when an
+//  object module is put into library, and stripped out when it's extracted.
+//  This routine will leave file pointer at the LIBMOD name field.
+bool FindLIBMOD(FILE *InLibFH)
+{
+    COMENTHEADER CommentHdr;
+    // Search (up to) all COMENT records in OBJ module
+    while (FindObjRecord(InLibFH, COMENT) == true) {
+        if (fread(&amp;CommentHdr, sizeof(CommentHdr), 1, InLibFH) != 1)
+            Output(Error, NOFILE, &quot;Couldn't Read OBJ\n&quot;);
+        if (CommentHdr.CommentClass == LIBMOD)
+            return (true);
+        else
+            // if not found: forward to next record, and retry
+            if (fseek(InLibFH, (long) CommentHdr.RecLength -
+                    sizeof(CommentHdr) + sizeof(OMFHEADER), SEEK_CUR) != 0)
+                Output(Error, NOFILE, &quot;Seek retry for LIBMOD failed\n&quot;);
+    }
+    // We got here only if COMENT of class LIBMOD was never found
+    return (false);
+}
+//  FindObjRecord  --  Find an object module record in one given module.
+//  On call, file pointer must be set to an objec record.  Search will
+//  quit at the end of current module (or when record found).
+bool FindObjRecord(FILE *ObjFH, unsigned char RecType)
+{
+    OMFHEADER ObjHeader;
+    while (fread(&amp;ObjHeader, sizeof(ObjHeader), 1, ObjFH) == 1) {
+        // If it's the record type we're looking for, we're done
+        if (ObjHeader.RecType == RecType) {
+            // Return with obj module set to record requested
+            if (fseek(ObjFH, -(long) sizeof(ObjHeader), SEEK_CUR) != 0)
+                Output(Error, NOFILE, &quot;Seek for Record Type %02x failed\n&quot;,
+                        RecType &amp; 0xFF);
+            return (true);
+        }
+        // End of object module, record type NEVER found
+        if (ObjHeader.RecType == MODEND)
+            return (false);
+        // Forward file pointer to next object module record
+        if (fseek(ObjFH, (long) ObjHeader.RecLength, SEEK_CUR) != 0)
+            Output(Error, NOFILE, &quot;Seek retry for Record Type %02x failed\n&quot;,
+                        RecType &amp; 0xFF);
+    }
+    // If this quit due to I/O condition, it's either EOF or I/O error
+    if (feof(ObjFH) == 0)
+    Output(Error, NOFILE, &quot;Couldn't Read OBJ\n&quot;);
+    // we completed w/o error and w/o finding the record (should NEVER happen)
+    return (false);
+}
+//  ExtractModule -- Find an object module in a library and extract it into
+//  &quot;stand-alone&quot; object file.  Return true if ok, else false.
+//  Optional: Can specify a new name for the module.
+bool ExtractModule(char *ModuleName, char *NewModuleName, LIBHDR *LibHeader,
+        FILE *InLibFH)
+{
+    long FilePos;
+    char *NewObjP;
+    char *NewObjName;
+    FILE *NewObjFH;
+    // Find the object module's position in the library file
+    FilePos = FindModule(ModuleName, LibHeader, InLibFH);
+    if (FilePos == -1L)
+        return (false);
+    // Determine name for new .obj, and set it up
+    NewObjP = NewModuleName != NULL ? NewModuleName : ModuleName;
+    if ((NewObjName = malloc(strlen(NewObjP) + 5)) == NULL)
+        Output(Error, NOFILE, &quot;Malloc failure Making module name %s\n&quot;,
+                NewObjP);
+    strcpy(NewObjName, NewObjP);
+    // Open the new .obj file, and pass everything off to low-level routine
+    if ((NewObjFH = fopen(NewObjName, &quot;wb&quot;)) == NULL)
+        Output(Error, NOFILE, &quot;Open failure new module %s\n&quot;, NewObjName);
+    CopyObjModule(NewObjFH, FilePos, InLibFH);
+    fclose(NewObjFH);
+    free(NewObjName);
+    return (true);
+}
+//  CopyObjModule  --  Low-level copy of LIB member to OBJ file.
+void CopyObjModule(FILE *NewObjFH, long FilePos, FILE *InLibFH)
+{
+    OMFHEADER RecHdr;
+    // Get to the object module in LIB
+    if (fseek(InLibFH, FilePos, SEEK_SET) != 0)
+        Output(Error, NOFILE, &quot;Seek failure to file position %ld\n&quot;, FilePos);
+    // Write module from LIB to separate obj file
+    do {
+        // Read OMF header record, this will give record type and length
+        if (fread(&amp;RecHdr, sizeof(RecHdr), 1, InLibFH) != 1)
+            Output(Error, NOFILE, &quot;Couldn't Read OBJ\n&quot;);
+        // Need to check every COMENT record to make sure to strip LIBMOD out
+        if (RecHdr.RecType == COMENT) {
+            // Throw away next byte (Attrib COMENT byte) for now
+            fgetc(InLibFH);
+            // Check COMENT's Comment Class
+            // If it's a LIBMOD, set file pointer ro next record and continue
+            if (fgetc(InLibFH) == LIBMOD) {
+               if (fseek(InLibFH, (long) RecHdr.RecLength - 2L, SEEK_CUR) != 0)
+                    Output(Error, NOFILE, &quot;Seek error on COMENT\n&quot;);
+                continue;
+            }
+            else
+                // Wasn't a LIBMOD: reset file pointer to continue normally
+                if (fseek(InLibFH, -2L, SEEK_CUR) != 0)
+                    Output(Error, NOFILE, &quot;Seek error on COMENT\n&quot;);
+        }
+        if (fwrite(&amp;RecHdr, sizeof(RecHdr), 1, NewObjFH) != 1)
+            Output(Error, NOFILE, &quot;Couldn't Write new OBJ\n&quot;);
+        while (RecHdr.RecLength--)
+            fputc(fgetc(InLibFH), NewObjFH);
+    } while (RecHdr.RecType != MODEND);
+}
+
+
+
+
+<a name="01ff_0019">
+<a name="01ff_001a"></pre><B>[LISTING FIVE]</B><pre><a name="01ff_001a">
+
+//***** olu1.c  --  Object Library Utility, Sample Application 1. *****
+// This utility performs a linear scan and dump of an object module library's
+// Symbol Dictionary. NOTE: Due to Borland TLIB bug, this utility may NOT work
+// with libraries generated with versions 3.01 or less.
+//**************************************************************************
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &quot;ole.h&quot;
+#include &quot;svc.h&quot;
+
+static void DumpSymbolDictionary(LIBHDR *LibHeader, FILE *InLibFH);
+void main(int argc, char *argv[]);
+
+//  main  --   Surprise!
+void main(int argc, char *argv[])
+{
+    FILE *InLibFH;
+    LIBHDR LibHeader;
+    long ModFilePos;
+    if (argc != 2)
+        Output(Error, NOFILE, &quot;Usage: %s file.lib\n&quot;, argv[0]);
+    if ((InLibFH = fopen(argv[1], &quot;rb&quot;)) == NULL)
+        Output(Error, NOFILE, &quot;Couldn't Open %s\n&quot;, argv[1]);
+    GetLibHeader(&amp;LibHeader, InLibFH);
+    DumpSymbolDictionary(&amp;LibHeader, InLibFH);
+}
+//  DumpSymbolDictionary  --  Print out an entire Symbol Dictionary
+static void DumpSymbolDictionary(LIBHDR *LibHeader, FILE *InLibFH)
+{
+    int BlockIdx, BucketIdx;
+    DICTENTRY DictEntry;
+    char *ModuleName;
+    char *SymbolP;
+    for (BlockIdx = 0; BlockIdx &lt; LibHeader-&gt;NumDictBlocks; BlockIdx++)
+        for (BucketIdx = 0; BucketIdx &lt; NUMBUCKETS; BucketIdx++) {
+            DictEntry = GetSymDictEntry(BlockIdx, BucketIdx, LibHeader,
+                    InLibFH);
+            if (DictEntry.IsFound == false)
+                continue;
+            // Get the symbol name
+            SymbolP = MakeASCIIZ(DictEntry.SymbolP);
+            // Get to the corresponding module name record (THEADR or LIBMOD)
+            ModuleName = GetModuleName(DictEntry.ModuleFilePos, LibHeader,
+                    InLibFH);
+            printf(&quot;%s -- Module %s (%08lxh)\n&quot;, SymbolP,
+                    ModuleName, DictEntry.ModuleFilePos);
+            printf(&quot;Hash: Block %d , Bucket %d\n&quot;, BlockIdx, BucketIdx);
+            free(SymbolP);
+            free(ModuleName);
+        }
+}
+
+
+
+
+<a name="01ff_001b">
+<a name="01ff_001c"></pre><B>[LISTING SIX]</B><pre><a name="01ff_001c">
+
+//***** olu2.c -- Object Library Utility, Sample Application 2. *****
+//  This utility explodes an object module library, i.e. move all its members
+//  out into .obj form. This functionality is absent from popular library
+//  managers; useful for libraries the user is unfamiliar with. Optionally,
+//  named single members can be copied, as well. NOTE: Modules can be
+//  extracted in sequence efficiently, but we're showing off functions!
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &quot;ole.h&quot;
+#include &quot;svc.h&quot;
+
+static void ExplodeLibrary(LIBHDR *LibHeader, FILE *InLibFH);
+void main(int argc, char *argv[]);
+
+//  main  --   Surprise!
+void main(int argc, char *argv[])
+{
+    FILE *InLibFH;
+    LIBHDR LibHeader;
+
+    if (argc != 2 &amp;&amp; argc!= 3)
+        Output(Error, NOFILE, &quot;Usage: %s file.lib [file.obj]\n&quot;, argv[0]);
+    if ((InLibFH = fopen(argv[1], &quot;rb&quot;)) == NULL)
+        Output(Error, NOFILE, &quot;Couldn't Open %s\n&quot;, argv[1]);
+    GetLibHeader(&amp;LibHeader, InLibFH);
+    if (argc == 3) {
+        if (ExtractModule(argv[2], NULL, &amp;LibHeader, InLibFH) == false)
+            Output(Error, NOFILE, &quot;Extraction of Module %s failed\n&quot;,
+                    argv[2]);
+    }
+    else
+        ExplodeLibrary(&amp;LibHeader, InLibFH);
+}
+//  Explode Library  -- Extract all (or one specific) library member(s).
+//  NOTE: This is done in a contrived way just to show off some of functions.
+//  We go through entire Symbol Dict., determine if a symbol is a module name
+//  by comparing its entry to the module name that entry is leading to, and
+//  then extract the module.
+static void ExplodeLibrary(LIBHDR *LibHeader, FILE *InLibFH)
+{
+    int BlockIdx, BucketIdx;
+    DICTENTRY DictEntry;
+    char *ModuleName;
+    char *SymbolP;
+    char *ModuleFN;
+    for (BlockIdx = 0; BlockIdx &lt; LibHeader-&gt;NumDictBlocks; BlockIdx++)
+        for (BucketIdx = 0; BucketIdx &lt; NUMBUCKETS; BucketIdx++) {
+            DictEntry = GetSymDictEntry(BlockIdx, BucketIdx, LibHeader,
+                    InLibFH);
+            if (DictEntry.IsFound == false)
+                continue;
+            // Get the symbol name
+            SymbolP = MakeASCIIZ(DictEntry.SymbolP);
+            ModuleName = GetModuleName(DictEntry.ModuleFilePos, LibHeader,
+                    InLibFH);
+            // If it compares, it's a module name
+            if (strnicmp(SymbolP, ModuleName, strlen(ModuleName)) ==
+                    STR_EQUAL) {
+                if ((ModuleFN = malloc(strlen(ModuleName) + 4)) == NULL)
+                    Output(Error, NOFILE, &quot;Couldn't malloc file name %s\n&quot;,
+                            ModuleName);
+                strcpy(ModuleFN, ModuleName);
+                strcat(ModuleFN, &quot;.obj&quot;);
+                if (ExtractModule(ModuleFN, NULL, LibHeader, InLibFH) ==
+                        false)
+                    Output(Error, NOFILE, &quot;Extraction of Module %s failed\n&quot;,
+                            ModuleFN);
+                free(ModuleFN);
+            }
+            free(SymbolP);
+            free(ModuleName);
+        }
+}
+</pre>
+
+
+<HR><P>Copyright &copy; 1991, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

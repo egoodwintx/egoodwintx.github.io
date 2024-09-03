@@ -1,0 +1,133 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v09, i08: Taint so Easy, Is It?</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink>Article</a></span></td>
+		<td><a href="../../../../source/SA/2000/aug2000.tar"><b class=codeListing>aug2000.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<! -- Insert Content ------ >
+
+<H1>Taint so Easy, Is It?</H1><p>
+<P>Randal L. Schwartz
+<P>
+If you&#146;ve been reading my columns for any length of time, you&#146;ve probably seen me mention &#147;taint mode&#148;, usually briefly while I&#146;m describing a &#147;hash-bang&#148; line of something like:<P>
+<pre>
+#!/usr/bin/perl -Tw
+</pre>
+which turns on warnings (the <B>-w</B>) and &#147;taint mode&#148; (the <B>-T</B>). But what is taint mode?<P>
+Taint mode is a security feature of Perl and includes two levels of operation. First, while taint mode is in effect, some operations are forbidden. One of these is that <B>$ENV{PATH}</B> cannot contain any world-writeable directories when firing off a child process (like with backticks or <B>system</B>). Should your program attempt an unsafe action, the program aborts immediately (via <B>die</B>), before the action has a chance to create a potential security violation. You could have included code to check this yourself, but having Perl perform the checks ensures a consistency and a &#147;best practices&#148; level of competence that you may not have the capability or resources to include explicitly.<P>
+The second level of operation is much more interesting and unique to Perl (amongst all the popular languages I know of), in which Perl keeps track of a &#147;distrust&#148; of each scalar value in the program. Every item of data coming from input sources (command-line arguments, environment variables, locale information, some system calls, and all file input) is marked &#147;tainted&#148;.<P>
+For example, the following operations all generate tainted data:<P>
+<pre>
+$t1 = &lt;STDIN&gt;;
+$t2 = $ENV{USER};
+$t3 = $ARGV[2];
+@t4 = &lt;*.txt&gt;;
+</pre>
+In each of these examples, the data has come &#147;from the outside world&#148;, and is therefore treated as potentially dangerous. Once data is tainted, the taint propagates to any data <I>derived</I> from the tainted data:<P>
+<pre>
+$t5 = $t4[0];
+$t6 = "/home/$t2";
+chomp($t1);
+@x = ("help", "me", $t3, "please");
+</pre>
+Note that tainting is on a per-scalar basis. So <B>$x[2]</B> is tainted, not the entire array <B>@x</B>.<P>
+Once data is marked tainted, nearly any attempt to use the data to affect the outside world will be blocked, causing an immediate <B>die</B> with a taint violation. For example, invoking <B>rename</B>, where either the source name or destination name is tainted, is considered dangerous. This permits normal operations:<P>
+<pre>
+rename $x[0], $x[1];
+</pre>
+But not operations that involve tainted data (recall that <B>$x[2]</B> is tainted from earlier):<P>
+<pre>
+rename $x[0], $x[2];
+</pre>
+This means that data coming in from the outside world cannot trivially affect the outside world as well. Why is this important?<P>
+Well, the typical use of taint mode is to enable programs that act on behalf of other users to operate in a safer manner. For example, a &#147;setuid&#148; or &#147;setgid&#148; program borrows the privileges of its owner for the duration of execution, allowing an ordinary user to act as <B>root</B> (or some other user) for a selected set of operations. Or a CGI program, executing as the Web server ID (typically <B>nobody</B>), is acting with that user&#146;s privileges on behalf of a request from any Web client, generally without direct access to the server except through the Web server.<P>
+In both of these cases, it&#146;s important that input data be checked so as not to permit the user who invokes the program from borrowing the privileges of the executing user ID to perform unintended actions.<P>
+For example, it&#146;d be pretty dangerous to rename a file based on the input from a CGI form:<P>
+<pre>
+use CGI qw(param);
+...
+my $source = param('source');
+my $dest = param('destination');
+rename $source, $dest;
+</pre>
+Now perhaps the author of this CGI script believed that since the form contained only radio buttons or pop-up menus that were clearly defined that this would be a safe program. But in reality, a person with intent to damage or break in could just as easily invoke this script passing arbitrary data in <B>source</B> and <B>destination</B>, and potentially rename any file to which the Web userid has access!<P>
+With taint mode enabled, the CGI parameters (having been derived from either reading <B>STDIN</B> or an environment variable) are marked tainted, and therefore the <B>rename</B> operation would fail before it has committed potential damage. (To enable taint mode on a CGI script, just include <B>-T</B> in the <B>#!</B> line, as shown earlier.) And that&#146;s exactly the safest thing to do here.<P>
+But obviously, there are times when input data must in fact legitimately affect the outside world. Here&#146;s where the next feature of taint mode comes in. As a sole exception, the results of a regular expression memory reference (usually accessed as the numeric variables like <B>$1</B> and <B>$2</B> and so on) are never tainted, even though the match may have been performed on tainted data. This gives us the &#147;carefully guarded gate in the fence&#148;, when used properly. For example:<P>
+<pre>
+my $source = param('source');
+unless ($source =~ /^(gilligan|skipper|professor)$/) {
+  die "unexpected source $source\n";
+}
+$safe_source = $1;
+</pre>
+Here, <B>$source</B> is expected to be one of <B>gilligan</B>, <B>skipper</B>, or <B>professor</B>. If not, we&#146;ll die before executing the next statement, which copies the captured memory into <B>$safe_source</B>. (Note that the parens in the regular expression match are performing double duty, needed for both proper precedence regarding the vertical bar and the beginning and ending of string anchors, as well as having the side-effect of setting up the first backreference memory. Sometimes, you get lucky.)<P>
+The value of <B>$safe_source</B> can now legitimately be used in the <B>rename</B> operation earlier, as it came from a regular expression memory, and not directly from input data. In fact, we could even have assigned it back over <B>$source</B> (a common thing to do):<P>
+<pre>
+$source = $1; # source now untainted
+</pre>
+Of course, we&#146;d have to perform a similar operation on <B>$destination</B> to complete the operation.<P>
+So, if someone attempts to give us an incorrect value for the source parameter, like <B>ginger</B>, the program aborts. Certainly, this program would have aborted with or without taint mode, but in taint mode it works only because we <I>added</I> the extra code to perform a regular expression match, during which we needed to think about what the possible legal values for the string might have been.<P>
+And that brings up the next point: we typically can&#146;t perform an explicit match against a known list of values. More often, the data is a user-specified value that needs to fit a general description. But again, regular expressions are pretty good at matching many things.<P>
+So, let&#146;s say the <B>$source</B> there came from a text field box, rather than a pop-up menu, permitting an arbitrary string. How do we pass that along to the <B>rename</B> operator? First, we must decide what a legitimate string might be. For example, let&#146;s restrict to filenames that contain only <B>\w</B>-matching characters, including a dot (as long as the dot is not the first character). That&#146;d be like this:<P>
+<pre>
+$source = param('source');
+$source =~ /^(\w[\w.]*)$/ or die;
+$source = $1;
+</pre>
+Once again, if the string is not as expected, we die. And only if we haven&#146;t died will we continue on to use <B>$1</B>, which has now been verified to be a name of the form that we expect.<P>
+Note that it&#146;s <I>very</I> important to test the result of the regular expression match, because <B>$1</B> (and the other memory variables) is set only when you have a successful regular expression match. Otherwise, you get an earlier match, and that&#146;s definitely bad news:<P>
+<pre>
+## bad code do not use ##
+$param('source') =~ /^(\w[\w.]*)$/;
+$source = $1;
+## bad code do not use ##
+</pre>
+A slightly more compact way of writing this correctly might be:<P>
+<pre>
+my ($source) = param('source') =~ /^(\w[\w.]*)$/
+  or die "bad source";
+</pre>
+Here, I&#146;m using <B>$1</B> implicitly as the list context result of the regular expression match, and declaring the variable that will hold it, and checking for errors, all in one compact statement.<P>
+The regular expression pattern should be as restrictive as you can get. For example, if you use something like <B>/(.*)/s</B>, you&#146;ve effectly removed any of the benefits of taint mode for that particular data, making it potentially possible for someone to hijack your program in unintended ways.<P>
+So, I hope this gives you a bit of insight into how to use taint mode, and why it is useful. If this column &#146;taint enough for you, I suggest you check out the <B>perlsec</B> manpage (perhaps using the command <B>perldoc</B> <B>perlsec</B> at a prompt). Until next time, enjoy your new security knowledge. <P>
+<p>
+<h1>About the Author</h1><p>
+Randal L. Schwartz is a two-decade veteran of the software industry &#151; skilled in software design, system administration, security, technical writing, and training. He has coauthored the &#147;must-have&#148; standards: <I>Programming Perl</I>, <I>Learning Perl</I>, <I>Learning Perl for Win32 Systems</I>, and <I>Effective Perl Programming</I>, as well as writing regular columns for <I>WebTechniques</I> and <I>Unix Review</I> magazines. He&#146;s also a frequent contributor to the Perl newsgroups, and has moderated comp.lang.perl.announce since its inception. Randal&#146;s desire to give back to the Perl community inspired him to help create and provide initial funding for The Perl Institute (<B>perl.org</B>). He is also a founding board member of the Perl Mongers (<B>pm.org</B>), the worldwide association of &#147;Perl users groups&#148;. Since 1985, Randal has owned and operated Stonehenge Consulting Services, Inc.
+
+
+
+<! -- Begin Content ------ >
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

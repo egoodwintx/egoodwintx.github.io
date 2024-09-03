@@ -1,0 +1,394 @@
+<HTML>
+<META NAME="year" CONTENT="1990">
+<HEAD>
+
+<TITLE>FEB90: PROGRAMMING RISC ENGINES</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>PROGRAMMING RISC ENGINES<a name="0071_0003"><a name="0071_0003"></h1><P>
+<h2><a name="0071_0001"><a name="0071_0000">Instruction sets are designed for fast, pipelined execution</h2><P>
+<h3>Neal Margulis</h3><P>
+<p><i><a name="0071_0002"><a name="0071_0000">Neal is chief applications engineer for high-performance processors at Intel Corp. and can be reached at 2625 Walsh Ave., SC4-40, Santa Clara, CA 95051.  Neal is the author of the i860 Programmer's Guide, (Osborne/McGraw-Hill) due out this spring.</i></p><hr><P>
+The innovation of the assembly line revolutionized manufacturing.  By breaking assembly down into simple steps, tremendous efficiency is gained.  Instead of each unit taking one hour to produce, it can be broken down into six steps of ten minutes each.  This results in a new unit produced every ten minutes without increasing the manufacturing machinery needed.  As long as each step takes about the same time, the assembly line is kept filled and the throughput is much higher than if all operations are done serially.<P>
+RISC processors rely on the same concept.  They define an instruction set that can efficiently move through the processor's pipeline.  To do this, the instruction set must meet several criteria.  First, each instruction takes only one clock to execute.  Also, each instruction must be easily fetched and quickly identified.  Unlike their CISC counterparts, RISC processors expose some of their pipeline to software and allow the programmer to arrange instruction sequences to avoid pipeline freezes.<P>
+Compilers are an important part of developing code for RISC processors.  RISC instructions are highly regular in form and have consistent behavior, allowing compilers to generate efficient code.  However, the opportunities to further tune portions of a program by hand-coded assembly language always exist.  Also, hardware-specific portions of device drivers are convenient to write in assembly language.  This article shows how RISC instructions operate and gives some examples including C compiler-generated machine code.<P>
+The Intel i860 microprocessor exemplifies a modern RISC processor.  It includes other features such as floating point, memory management, and caches on one chip, but at its heart is an efficient RISC core that, like other RISC processors, is easy to program.  The i860's RISC core architecture will be used for the examples in this article, but the concepts discussed extend to most other RISC processors as well.  With a general understanding of how the RISC core's pipeline is organized, you will gain insight into how to order instruction sequences.<P>
+<h3><a name="0071_0004">Programming Goals<a name="0071_0004"></h3><P>
+The technique for programming RISC processors involves understanding the instructions and, equally important, the interaction between instructions.  The acronym &quot;reduced instruction set computer&quot; (RISC) alerts you that some instructions are no longer available.  While this may be true, they have been replaced with a powerful set of simple operations.  Together, these simple operations perform the same functions as the more complex instructions you are used to.  The RISC programming challenge is to sequence these operations to get maximum performance from the processor.<P>
+If each instruction takes only one clock at each pipeline stage, then the number of instructions executed per second is equal to the processor's clock frequency.  After adjusting to allow for uncooperative instructions, a measure that is often called the &quot;native MIPS&quot; rating can be calculated as follows:<P>
+<pre>                       Clock Frequency
+Native MIPS = -----------------------
+                       Clocks per Instruction</pre><P>
+This number has little meaning.  The native MIPS rating has been compared to RPMs (revolutions per minute) of a car: It tells you how fast the engine is going, but not how fast the car is going.  Instead, the native MIPS rating needs to be normalized to a common metric that indicates what you really want to measure -- the time per task.  Such as miles per hour for the car, the VAX MIPS rating has become the standard.  The most common method for calculating VAX MIPS is through benchmarking: Compare the duration of a task on the processor with its duration on the VAX 11/780.  The task's time ratio is the VAX MIPS rating.  Do not attempt to gain information on a processor's native MIPS rating from its VAX MIPS rating.<P>
+The time per task can also be calculated analytically as follows:<P>
+<pre>time/task=(instructions/task) * (clocks/ instruction) * (time/clock).</pre><P>
+While RISC processors may require more instructions per task than traditional processors, they more than make up for it by reducing the average clocks per instruction and increasing the clock speed.<P>
+<h3><a name="0071_0005">Instruction Processing<a name="0071_0005"></h3><P>
+In order to execute each instruction efficiently, processing is broken into four stages.  Each stage performs a designated operation in one cycle and passes the instruction to the next stage.  The stages are &quot;Fetch,&quot; &quot;Decode,&quot; &quot;Execute,&quot; and &quot;Write.&quot;<P>
+The Fetch stage gets the instruction from the instruction cache into an internal storage latch.  The Decode stage accesses the source registers and decodes the instruction.  The ALU operation is performed in the Execute stage.  Address calculation is done here for memory operations.  The results of the instruction are written to the register file in the Write stage if the instruction was not a memory operation.  The data cache access is accessed here for memory operations.<P>
+To allow each stage of the pipeline to complete in one cycle, careful attention is paid to the instruction format.  <a href="9002f.htm#0071_0006">Figure 1</A> shows the general format for all of the RISC core instructions.  All instructions are 32 bits long with designated fields for the opcodes and registers.  To access any of the i860's 32-integer registers, 5 bits are used for each register designator.  Without having to decode the length of the instruction, or take multiple cycles to read the instruction into the processor, the Fetch stage can execute in one cycle.  In the Decode stage, the source register accesses can begin before the instruction type is known, because the field within the instruction that indicates the source register is always in the same place.  By allowing only instructions that can be executed in one stage, the Execute stage is always performed in one cycle.  During the Write stage, the result is written back into the register file.<P>
+<h4><a name="0071_0006"><a name="0071_0006">Figure 1: The general format for all of the RISC core instructions</h4><P>
+<pre>
+                        General Format
+
+  31         25     20     15     10                          0
+  ---------------------------------------------------------------
+  | OPCODE/I | SRC2 | DEST | SRC1 |    null/immediate/offset    |
+  ---------------------------------------------------------------
+
+         16 - Bit Immediate Variant (except bte and btne)
+
+  31            25     20     15                               0
+  ---------------------------------------------------------------
+  |        |   |      |      |            IMMEDIATE             |
+  | OPCODE | 1 | SRC2 | DEST |                                  |
+  |        |   |      |      |    CONSTANT OR ADDRESS OFFSET    |
+  ---------------------------------------------------------------
+
+                       st, bia, bte and btne
+
+  31       25         20       15      10                      0
+  --------------------------------------------------------------
+  |        |          | OFFSET | SRC1  |                       |
+  |OPCODE/I|   SRC2   |        |       |       OFFSET LOW      |
+  |        |          |  HIGH  | SRC13 |                       |
+  --------------------------------------------------------------
+
+            bte and btne with 5 - Bit Immediate
+
+  31           25     20       15          10                   0
+  ---------------------------------------------------------------
+  |        |   |      | OFFSET |           |                    |
+  | OPCODE | 1 | SRC2 |        | IMMEDIATE |     OFFSET LOW     |
+  |        |   |      |  HIGH  |           |                    |
+  ---------------------------------------------------------------
+</pre><P>
+<P>
+Besides allowing efficient instruction execution, the four-stage pipeline allows instructions to be overlapped.  Overlapping the instructions allows a new instruction to start with each clock cycle.  <a href="9002f.htm#0071_0007">Figure 2</A> illustrates the resulting speed-up of overlapping instructions.  With sequential (scalar) execution, each instruction passes through all four stages of the pipeline before the next instruction starts.  With pipeline execution, instructions start as soon as the previous instruction enters the second stage.  In the same number of cycles that sequential execution processes three instructions, pipelined execution processes 12 instructions, a fourfold improvement.<P>
+<h4><a name="0071_0007"><a name="0071_0007">Figure 2: The speed-up of overlapping instructions</h4><P>
+<pre>
+                Sequential (Scalar) Instruction Execution
+
+                 -----------------
+  Instruction 1  | F | D | X | W |
+                 ----------------|----------------
+  Instruction 2                  | F | D | X | W |
+                                 ----------------|----------------
+  Instruction 3                                  | F | D | X | W |
+                                                 -----------------
+
+                Pipelined Instruction Execution
+
+                 -----------------
+  Instruction 1  | F | D | X | W |
+                 ----|---|---|---|----
+  Instruction 2      | F | D | X | W |
+                     ----|---|---|---|----
+  Instruction 3          | F | D | X | W |
+                         ----|---|---|---|----
+  Instruction 4              | F | D | X | W |
+                             ----|---|---|---|----
+  Instruction 5                  | F | D | X | W |
+                                 ----|---|---|---|----
+  Instruction 6                      | F | D | X | W |
+                                     ----|---|---|---|----
+  Instruction 7                          | F | D | X | W |
+                                         ----|---|---|---|----
+  Instruction 8                              | F | D | X | W |
+                                             ----|---|---|---|----
+  Instruction 9                                  | F | D | X | W |
+                                                 ----|---|---|---|
+  Instruction 10                                     | F | D | X | *
+                                                     ----|---|---|
+  Instruction 11                                         | F | D | *
+                                                         ----|---|
+  Instruction 12                                             | F | *
+                                                             -----
+</pre><P>
+<P>
+To maintain performance, the pipeline needs to keep all of the stages active all of the time.  If an instruction were to take two cycles in any of the stages, it would cause the other three stages to wait an extra cycle.  This is referred to as a freeze condition. Although all instructions are designed to take only one cycle in each stage, freeze conditions can occur.  The two types of instructions that are most likely to cause freezes in the pipeline are memory operations and branch instructions.  RISC processors define the instructions to allow the programmer to reduce the occurrence of such freeze.<P>
+<h3><a name="0071_0008">Load/Store Instructions<a name="0071_0008"></h3><P>
+Unlike earlier processors that allow operations on data in memory, the only memory operations permitted on RISC processors are loads and stores.  All other operations are performed directly on the values in the registers.  The load/store architecture simplifies the design of the processor and allows the programmer to hide the delay caused by memory accesses.<P>
+Loads from memory always have at least a one-clock delay, even if the data is in the on-board cache.  <a href="9002f.htm#0071_0009">Figure 3</A> shows a pipeline sequence for a load instruction and the subsequent two instructions.  The data from the load operation is available at the end of the load instruction's Write stage.  This is too late for the instruction immediately following the load to use the data as a source operand.  The instruction slot following a load is called the &quot;load-delay slot.&quot;<P>
+<h4><a name="0071_0009"><a name="0071_0009">Figure 3: A pipeline sequence for a load instruction and the subsequent two instructions</h4><P>
+<pre>
+                      Load Delay Slot
+
+                     ------------------------------------
+  Load Instruction:  | Fetch | Decode | Execute | Write |
+                     ------------------------------------
+            
+  Load Delay Slot:           --------------------------------------
+  [cannot use load data]     | Fetch  | Decode  | Execute | Write |
+                             --------------------------------------
+
+                                      ---------------------------------------
+  First use of load data              | Fetch   | Decode  | Execute | Write |
+                                      ---------------------------------------
+</pre><P>
+<P>
+The i860 gives the programmer two options for the load-delay slot.  The most beneficial option is to rearrange the sequence of instructions so that a useful instruction, which does not depend on the load data, is placed in the load-delay slot.  In this case the load instruction takes only one clock and causes no disruption to the pipeline.  The second option, if no suitable instruction for the load-delay slot can be found, is simply to order the instructions sequentially.  When the register operation attempts to read the data from the register being loaded, the processor will freeze for one clock and then proceed.  The i860 keeps track of which register has a load pending by way of a scoreboard.  Although most loads will be cache hits, the scoreboard technique has further utility in the case of a cache miss. Instructions can proceed following a cache miss load until an instruction specifies the pending register.  Programs can benefit by placing the load instructions as far away as possible from instructions that operate on the data.<P>
+The store instructions write data from a register to memory.  For the i860, this can result in a write to the cache or a write to main memory.  In both cases, the processor's pipeline does not have to wait for the write to complete.  For cache hits, the new data is updated in the cache.  For cache misses, the data is written to the on-chip write buffers, and the bus control unit carries out the memory write.<P>
+<h3><a name="0071_000a">Addressing Modes<a name="0071_000a"></h3><P>
+The integer load and store instructions access memory with one addressing mode that emulates several common ones.  The basic load/store instruction format is shown in <a href="9002f.htm#0071_000b">Figure 4</A> where src2_ reg and dest_ reg can be any of the 32-integer registers.  The src2_ reg is the base address, and src1, the offset, is added to it.  For store instructions, const is a 16-bit offset constant that is embedded in the instruction.  Load instructions also allow src1 to be another one of the registers.<P>
+<h4><a name="0071_000b"><a name="0071_000b">Figure 4: Load/store instruction format</h4><P>
+<pre>
+  Id.x src1(src2_ reg), dest_reg  ;dest_reg&lt;-memory[src1 + src2_reg]
+  st.x dest_reg, const(src2_reg)  ;memory [const+src2_reg]&lt;-rdest
+</pre><P>
+<P>
+The instruction can specify data of 8-, 16-, and 32-bit values.  For 8- and 16-bit values the operation occurs with the lower bits of the register.  The .x designator in the instruction is set to .b, .s, and .l, according to the data size.  Data must be aligned in memory to correspond to the effective address boundary (that is, 32-bit values on 32-bit address boundaries).<P>
+The integer register r0 always contains the value 0.  This aids in implementing multiple addressing forms without different instructions.  The load instructions in <a href="9002f.htm#0071_000c">Figure 5</A> show direct mode, register indirect mode, based mode, and based index mode addressing.<P>
+<h4><a name="0071_000c"><a name="0071_000c">Figure 5: Direct mode, Register indirect mode, Based mode, and Based index mode addressing load examples</h4><P>
+<pre>
+  Id.l 8(r0), r15    ;r15&lt;-memory[8]
+  Id.l 0(r14), r15   ;r15&lt;-memory[r14]
+  Id.l 8(r14), r15   ;r15&lt;-memory[8 + r14]
+  Id.lr13(r14), r15  ;r15&lt;-memory[r13 + r14]
+</pre><P>
+<P>
+<a href="9002f.htm#0071_000d">Table 1</A> is a complete list of the i860 core instructions.  The i860's RISC core is also responsible for performing the memory operations for the floating-point registers.  This allows the RISC core to keep the floating-point execution units fed with data, as the processor's architecture allows both a core and a floating-point instruction to be executed each clock.  Floating-point memory access has an additional addressing mode.<P>
+<h4><a name="0071_000d"><a name="0071_000d">Table 1: i860 core instructions</h4><P>
+<pre>
+             Core Unit
+  ----------------------------------
+  Mnemonic   Description
+  ----------------------------------
+  Load and Store Instructions
+
+  Id.x       Load integer
+  st.x       Store integer
+  fld.y      F-P load
+  pfld.z     Pipeline F-P load
+  fst.y      F-P store
+  pst.d      Pixel store
+
+  Register to Register Moves
+
+  ixfr       Transfer integer to
+             F-P register
+  fxfr       Transfer F-P to
+             integer register
+
+  Integer Arithmetic Instructions
+
+  addu       Add unsigned
+  adds       Add signed
+  subu       Subtract unsigned
+  subs       Subtract signed
+
+  Shift Instructions
+
+  shl        Shift left
+  shr        Shift right
+  shra       Shirft right arithmetic
+  shrd       Shift right double
+
+  Logical instructions
+
+  and        Logical AND
+  andh       Logical AND high
+  andnot     Logical AND NOT
+  andnoth    Logical AND NOT high
+  or         Logical OR
+  orh        Logical OR high
+  xor        Logical exclusive
+             OR
+  xorh       Logical exclusive
+             OR high
+
+  Control-Transfer Instructions
+
+  trap       Software trap
+  intovr     Software trap on
+             integer overflow
+  br         Branch direct
+  bri        Branch indirect
+  bc         Branch on CC
+  bc.t       Branch on CC taken
+  bnc        Branch on not CC
+  bnc.t      Branch on not CC taken
+  bte        Branch if equal
+  btne       Branch if not equal
+  bla        Branch on LCC and add
+  call       Subroutine call
+  calli      Indirect subroutine call
+
+  System Control Instructions
+
+  flush      Cache flush
+  Id.c       Load from control
+             register
+  st.c       Store to control register
+  lock       Begin interlocked
+             sequence
+  unlock     End interlocked
+             sequence
+</pre><P>
+<P>
+<h3><a name="0071_000e">Integer Operations<a name="0071_000e"></h3><P>
+Once data has been loaded into the integer registers, any of the integer operations can be performed.  These register operations are performed in one clock, and the result can be used as a source in the instruction that immediately follows.  The i860 includes arithmetic, shift, and logical instructions and uses the form operation src1, src2_reg, dest_reg.  The three operand-style instructions allow the operation to specify two source registers (or a source register and an immediate for src1) and to store the result to a third register without destroying any of the source values.  This saves the program from copying a source value to a temporary register before the operation.<P>
+The add and subtract instructions allow an immediate value to be used as the subtractend or the minuend.  For example, r6 = 2-r5 is encoded as subs 2,r5,r6 and r6 = r5 - 2 is encoded as adds -2,r5,r6.<P>
+Both signed and unsigned versions of each instruction are available.  Add and subtract are also used to implement the compare function by specifying r0 as the destination.  For example subs r4, r5, r0 will set the condition code (CC) if the contents of r5 are greater than those of r4.  The CC is used for the conditional branch instructions that are discussed later.<P>
+The logical instructions include the AND, ANDNOT, OR, and XOR operations and can be used to implement bit operations.  For bit operations an immediate is used as src1 with a 1 in the bit position to be operated on and zeros in the other bit positions.  In addition to performing the operation, the logical instructions set the CC if the result is zero.<P>
+Because an instruction has only 32 bits, 32-bit constants cannot be embedded in a single instruction.  Moving a 32-bit value into a register uses the special high version of the logical instructions that is indicated by the h.  For example, the 32-bit hex value 9A9A5B5BH is moved into r5 by first loading the lower half of the register and then using the orh instruction to modify the upper half of the register.<P>
+or 0x5B5B, r0, r5; r5 &lt;- 5B5BH orh 0x9A9A, r5, r5; r5 &lt;- 9A9A5B5BH<P>
+The final class of integer operations is made up of the shift instructions.  The i860 can barrel shift up to 31 bit positions in one cycle.  The number of bit positions to shift is specified in src1.  The shift right instruction also loads the src1 into a special field in a control register.  This field is used by the double shift instruction which concatenates two registers and shifts them into a third register.  A rotate operation is performed by designating the same register as both src1 and src2 for the double shift.<P>
+<a href="9002f.htm#0071_0016">More Details.</A><P>
+Although the assembler allows you to specify a move instruction, the i860 does not need a separate move opcode.  A shift instruction is used to implement the register-to-register move as it does not affect the condition code.  The assembler will allow you to specify mov r3, r4 and implement it as shl r0, r3, r4.<P>
+<h3><a name="0071_000f">Branch and Call Instructions<a name="0071_000f"></h3><P>
+Instructions that change the sequence of program execution have long been the nemesis of pipelined machines.  For many processors, these branch instructions require that the pipeline be flushed and restarted from the new branch target address.  Because branches happen frequently, RISC processors use a delayed branch instruction where the instruction following the branch is executed before the branch takes effect.  This allows the processor to continue the execution of a useful instruction while it begins fetching the new instruction from the branch target.  The branch delay slot can be filled with a useful instruction from the block of code leading up to the branch; otherwise the target of the branch instruction can be moved to the delay slot and the target adjusted.  The operation of delayed branches causes the execution order of code to differ from the assembly language sequence, as shown in <a href="9002f.htm#0071_0010">Figure 6</A>.<P>
+<h4><a name="0071_0010"><a name="0071_0010">Figure 6: The operation of delayed branches causes the execution order to differ from the assembly language sequence</h4><P>
+<pre>
+  ASSEMBLY LANGUAGE SEQUENCE
+
+                   *
+                   *
+           Instruction1
+           Instruction2
+           Instruction3
+           Delayed_branch label1
+           Instruction4
+           Instruction5
+                   *
+  label1:  Instruction6
+           Instruction7
+
+          EXECUTION SEQUENCE
+           Instruction1
+           Instruction2
+           Instruction3
+           Instruction4
+           Instruction6
+           Instruction7
+</pre><P>
+<P>
+The i860 includes four unconditional delayed branches: br, bri, call, and calli.  The br (branch) and call instructions allow a 26-bit offset as part of the instruction.  The offset is in units of instructions, not in bytes, allowing a 256-Mbyte range.  The bri (branch indirect) and calli (call indirect) instructions use the contents of a register as the target, thus allowing a full 32-bit address specification.  In addition to changing the instruction flow, the call instructions save in r1 the address of the second instruction after the call (the one directly after the call is the delay instruction).  This is used as the return address for the subroutine by specifying bri r1.<P>
+The conditional branches that rely on the CC are the bc (branch on condition) and the bnc (branch on not).  These include both delayed and non-delayed versions; the delayed version is indicated with a .t.  At compile time, the programmer can usually predict if a conditional branch is going to be taken or not taken more frequently.  If a conditional branch instruction is more likely to be taken, such as at the bottom of a loop, the delayed form should be used. For cases in which the branch is likely not to be taken, the non-delayed version allows more efficient coding.  During execution, when the delay version is taken or the non-delay version is not taken, no disruptions are caused in the pipeline.  A one clock penalty is incurred when the code guesses incorrectly.<P>
+By choosing an integer or a logical operation followed by a bc or a bnc instruction, all of the needed branch idioms can be implemented.  There is also a non-delay branch instruction that branches on a compare-for-equality operation.  The bte (branch if equal) and btne (branch if not equal) operations do register-to-register comparisons (or a register compare with a 5-bit immediate).  Either of these branches can replace two instructions where appropriate, but at the expense of the offset being reduced to 16 bits.<P>
+Finally, there is a loop control instruction, called bla, that uses its own condition code called Loop-Condition-Code (LCC).  The bla instruction is a delayed branch that performs a conditional branch-on-LCC, an add, and updates the LCC in the same instruction.<P>
+<h3><a name="0071_0011">Programming Examples<a name="0071_0011"></h3><P>
+Now that we have looked at the basic instructions and instruction sequences, we can look at some simple yet revealing examples.  <a href="9002f.htm#0071_0012">Example 1</A> lists a conversion routine that converts days and hours into total hours.<P>
+<h4><a name="0071_0012"><a name="0071_0012">Example 1: This conversion routine converts days and hours into total hours</h4><P>
+<pre>
+  /* convert days &amp; hours into hours */
+  /* C code */
+  int convert (days, hours)
+    register unsigned int days, hours;
+  {
+    unsigned int total;
+    total = days * 24 + hours;
+    return (total);
+  }
+  /* Compiler generated asm code */
+             .file       &quot;hours.c&quot;
+  _convert:
+             shl         2,r16,r28
+             subs        r28,r16,r16
+             shl         3,r16,r16
+             bri         r1
+              adds       r17,r16,r16
+  //_total   r16         local
+  //_days    r16         local
+  //_hours   r17         local
+</pre><P>
+<P>
+The first optimization is that the parameters &quot;days&quot; and &quot;hours&quot; are passed in the registers r16 and r17 instead of being passed on the stack.  This avoids having a pointer frame, or any entry or exit code.  Second, the multiply by 24 is implemented as two shifts and a subtract. The first shift left by 2 implements a multiply by 4 and the subtract reduces it to a multiply by 3.  The second shift left by 3 implements a multiply by 8 giving the total multiply of 24 (three times eight).  Note that the first shift left takes advantage of the three operand instruction format, not destroying the original value in r16.  This eliminates copying r16 into a temporary register at the start of the routine, and allows the original contents of r16 to be used as the source register in the subtract instruction that immediately follows.  The final optimization is the add being performed in the branch-delay slot.  The bri r1 returns control to the calling routine with the result of the call returned in r16.<P>
+A subroutine called sum_ints that adds a series of integers is shown in <a href="9002f.htm#0071_0013"> Example 2</A>.  Because the integers to be summed are likely too numerous to fit in the registers, the routine is called with a pointer to the integers in r16.  The other parameter, passed in r17, is the number of integers in the series.  The example shows a loop where the data must be retrieved from memory.<P>
+<h4><a name="0071_0013"><a name="0071_0013">Example 2: A subroutine called sum_ints that adds a series of integers</h4><P>
+<pre>
+  main ( )
+  { int  sum,summer( ),n,a[ ];
+        *
+        *
+  sum= summer (a,8);
+        *
+        *
+  }
+        int summer (a,n)
+        int *a,n;
+  {     int i, sum=0;
+        for (i = n-1; i &gt;=0; i--)
+             sum = sum + a[i];
+        return (sum);
+  }
+        .file      &quot;sum.c&quot;
+                     *
+        mov        r7,r16
+        call       _summer
+        or          8,r0,r17
+        mov         r16,r17
+                     *
+                     *
+  _summer:
+        mov         r0,r18
+        adds        -1,r17,r17
+        shl         2,r17,r28
+        adds        r16,r28,r28
+        adds        1,r17,r17
+        adds        -1,r0,r20
+        bla         r20,r17,.L65
+        mov         r28, r16
+  .L65:
+        bla         r20,r17,.L43
+          nop
+        br          .L42
+             nop
+  .L43:
+        ld.l       0(r16),r19
+        adds       -4,r16,r16
+        bla        r20,r17,.L43
+        adds       r19,r18,r18
+  .L42:
+        bri        r1
+        mov        r18,r16
+  //_a  r16        local
+  //_n  r17        local
+</pre><P>
+<P>
+The setup prior to the loop initializes LCC (with the bla instruction), checks that at least one loop iteration should occur, and moves zero into the sum register r18.  Although the setup portion of the program may be slightly less than ideal, the routine's performance is clearly dominated by the loop portion.  The loop loads the data from memory, decrements the pointer to the next integer, performs the loop control, and accumulates the sum of the integers.  These four instructions are arranged to avoid any freeze conditions.  The data from the load is not operated on until the branch-delay slot.  The use of bla replaces the two or three separate instructions that would be required for this loop.<P>
+Although the compiler has done a good job of arranging the inner loop as a four-clock loop, it is not ideal.  It is possible to use a loop index directly as the memory pointer and reduce it to a three-clock loop.  An even more aggressive approach would be to unroll the loop to perform more loads and adds for each pass through the loop.  This amortizes the loop overhead over a greater number of useful instructions.  For the i860, a feature not discussed in this article, dual-instruction mode, allows the load and loop control to be overlapped with the summation performed in the floating-point registers.<P>
+<h3><a name="0071_0014">Summary<a name="0071_0014"></h3><P>
+In this article we have seen how RISC instruction sets are designed for fast, pipelined execution.  We have seen how simple RISC instructions operate and how these instructions can be sequenced to perform various functions and reduce freeze conditions.  Although most programs will be written in high-level languages, there is always the opportunity to check the compiler's output for efficiency, or to code the most time-critical routines by hand.<P>
+<h3><a name="0071_0015">How to Build a Fast Chip<a name="0071_0015"></h3><P>
+The answer to that question is the real issue facing the next generation of microprocessors. The answer is concurrency.  To run fast, you want a hell of a lot of concurrency.  You get a hell of a lot of concurrency by having a huge silicon budget.  The i860 has a huge silicon budget.  The i860 has a hell of a lot of concurrency.<P>
+Why are the MIPS and 88000 chips limited to a throughput of about seven single-precision MFLOPS at best, even though they are in principle capable of issuing instructions at a 25-MFLOP rate?  Simple.  On those clocks where they issue a load or store, they cannot issue a math operation.  And because, in conformance with RISC theory, they don't have an autoincrement address mode, they also don't issue a math operation when incrementing the address pointer or index.  (There are other issues: Slower clock, 32-bit external data bus, no on-board data cache.  But the biggie is the lack of concurrency.)<P>
+The i860, which is sampling now at 33 MHz and will run at 40 MHz in its production version, can perform all of the following in a single clock:<P>
+<ol>1.     Execute a 32-bit floating-point multiply</ol><P>
+<ol>2.     Execute a 32-bit floating-point add or subtract</ol><P>
+3a. Initiate a 64-bit floating-point register load or store that will take two clocks, or<P>
+3b. Initiate a 128-bit floating-point load or store, taking four clocks to finish<P>
+<ol>4.     Increment, by an arbitrary amount, the address pointer that was just used for the load or store operation in (3a) or (3b)</ol><P>
+As a result of the above, the i860 can do 21-bit convolutions (a common image-processing task) at 78 MFLOPS throughput.  Not six or seven.  Seventy-eight.  Performing back propagations, FFTs, or matrix inversions, it will run at about 36 MFLOPS.<P>
+The fastest SPARC workstation that Sun is now shipping, the model 330, takes about 40 clocks to perform an integer multiply.  The model 330 runs at 25 MHz, so that's 1.6 microseconds. During those 40 clocks, nothing else goes on in the integer execution unit.  In that same 1.6 microseconds, the i860 can:<P>
+<ul>
+<li>perform 64 32-bit multiplies</li>
+<li>perform 64 32-bit floating-point adds</li>
+<li>do 256 bytes of memory I/O</li>
+<li>and perform all autoincrement addressing to support that memory I/O</li>
+</ul>
+And get this: If you use 128-bit load/stores for your I/O, the integer unit has 48 clocks left over to do something else while all this is going on.  All this while the SPARC is executing one integer instruction.  Isn't RISC wonderful?<P>
+True, the i860 is only good for floating-point number-crunching and (mostly) 3-D graphics acceleration.  But Intel is coming out with a new chip, the superscalar i960.  This is a completely new design, with a 64-bit external data bus, some elaborate schedulers, and three on-board integer-only execution units.  This gives the new i960 a peak performance of 66 MIPS at a 33 MHz clock rate.  No, those two numbers are not reversed; the i960 will perform two instructions per clock.  The third execution unit is provided so that the unit can catch up if the scheduler postpones an instruction because of a resource (register) conflict.<P>
+You'll be able to purchase a workstation that uses the i960 for the main CPU and an i860 for floating-point and graphics for under $15K.<P>
+Intel paid for the performance of the i860 in cash.  With its R&amp;D budget of 86.6 million dollars per quarter, Intel is spending $780 million dollars per generation of microprocessors out of its own pocket.  Intel has also received substantial funds ($100 million or so) from Siemens to develop the original i960 chip.  That's why Intel was able to introduce two microprocessor designs, each with about 1.2 million active transistors, in a two-month period.  And the new superscalar i960 will be introduced later this year.  Where did the money come from?  Why, from profits generated by the 386 family of chips, of course.<P>
+Hal called after writing to us about the i860 to tell us about the processor recently announce by Sharp.  What he had to say was preliminary, but sounded interesting: 800,000 transistors, 4K internal scratchpad RAM, and ... a throughput of 400 single-precision MFLOPS??  That's just ten times the throughput Hal says you can expect from an i860. -- Eds.<P>
+<h3><a name="0071_0016"><a name="0071_0016"><a name="0071_0017">Religious Artifacts and Code Museums<a name="0071_0017"></h3><P>
+Hal Hardenbergh<P>
+Hardware engineer Hal Hardenbergh follows developments in microprocessor technology closely. He also (but not often enough) writes about his conclusions, which are always entertaining, frequently outrageous, and usually right on target.  The following essay on RISC, CISC, and the Intel i860 came to us shortly after Hal had a chance to evaluate the i860.<P>
+In the newer generation of U.S.-made micros, there is not a single CISC chip.  The latest x86 and 680x0 chips are in fact code museums, not CISC chips, intended to support their enormous software bases.  (The excellent term &quot;code museum&quot; was apparently coined by Gordon Bell.)  The reason they have, for instance, fewer registers than one would like in 1990 is because they have to provide binary compatibility for code written for the 8088 and 68000 back in 1980. The 32532 is a code museum for code developed for the 16032, and the Z80000 is a code museum for Z8000 code.<P>
+The chief competitors of the code museums, we are led to believe, are the artifacts of a new religion called RISC.  The two processors (SPARC and 29000) that most closely follow the RISC religion thereby require 32 multiply-step instructions to perform an integer multiply, plus up to eight more clocks for a trap or function call.  Remember, nothing else can happen in those 40 clocks.  Some programmers working with the latest &quot;high performance&quot; SPARC unit, the 330, say that it is a Pig when doing integer arithmetic.<P>
+Other chips usually called RISC processors do not in fact follow the RISC philosophy with respect to integer multiplies.  The MIPS chip has a special functional unit that performs the multiply independently (other instructions can proceed during this multiply) with a latency of eight clocks.  The 88000 uses its floating-point unit to perform integer multiplies; again, instructions can proceed in parallel.  By not following the RISC philosophy, MIPS and the 88000 gain a significant performance advantage.<P>
+The RISC followers would have you believe that they alone try to make instructions run in the fewest clocks.  Bull puckey.  Worse, RISC zealots brag about their super-efficient load-store architectures.  Hah.  The i486, a mere code museum, performs push/pop operations 2.5 times faster than Sun's latest and highest-performing SPARC system (the 330).  Why?  One reason is that the i486 uses part of its budget of 1.2 million transistors to perform the register increment/decrement in parallel.  This violates the RISC philosophy, so the SPARC and other RISC chips don't do it.<P>
+In other words, some of the &quot;RISC features&quot; are not exclusive to RISC, and some of the features that are exclusive to RISC degrade performance.<P>
+Are the i486 and 68040, then, the fastest possible chips?  No; they're the fastest code museums that Intel and Motorola could make.  Because they have a huge number of active devices, they are almost as fast as the conventional 32-bit RISC chips, which have the significant advantage of larger register sets and an instruction set optimized for the 32-bit world rather than a 16- or 8-bit world.<P>
+The simple fact is, if you use that 1.2 million transistor budget to build a device that does not have to support ancient code, you can build a hell of a fast device.  Much faster than the SPARC, MIPS, 88000, or 29000, all of which have comparatively modest silicon budgets.  Intel has proved this point with the i860.  The i860 is not a religious artifact or code museum, but a very fast processor, looking sometimes like a RISC chip, sometimes like a CISC chip, and sometimes like a DSP chip.<P>
+The Intel i860 routinely performs single-precision floating-point math from four to twelve times faster than the MIPS or the 88000, even though both of those chips are capable of initiating a single-precision floating-point operation on every clock cycle.<P>
+How can this be?<P>
+<P>
+
+<a name="0071_0018"><a name="0071_0018">
+_PROGRAMMING RISC ENGINES_
+by Neal Margulis
+
+<P>
+<P>
+</pre></BODY></HTML>

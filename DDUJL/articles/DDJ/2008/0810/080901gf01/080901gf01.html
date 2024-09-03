@@ -1,0 +1,378 @@
+<html>
+<head>
+<title>Safe Coding Practices</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> October 2008</p>
+
+<h1>Safe Coding Practices</h1>
+<h2>Tips and tricks for C, C++, and Java</h2>
+
+
+<h3>By Gwyn Fisher</h3>
+
+
+<I>Gwyn, Chief Technology Officer at Klocwork, has over 20 years of global technology experience. At Klocwork, Gwyn focuses on his original passion, compiler theory, to move static source code analysis to the next level. </I>
+
+<hr>
+
+
+
+
+<p>Security is becoming more and more critical to developers in all types of environments&#151;even those such as embedded systems that have until recently considered security a non-issue. In this article, I examine several types of coding vulnerabilities, pointing out what the vulnerability is, how you can mitigate the risk of exploit within your code, and how to best find these types of flaws in your code.</p>
+
+
+<h3>Injection Flaws</h3>
+
+<p>When attempting to inject information into a running process, attackers are trying to compromise the running state of the process to reflect some end goal that is unprotected by developers. For example, attackers could be trying to inject code into the process via stack corruption, resulting in the ability to execute code of the attacker's choice. Alternatively, attackers could be trying to inject data into a database for future use, or unguarded strings into a database query to extract more information than was the original developer's intent. Injection for any purpose is a bad thing and needs careful consideration at all times.</p>
+
+<p>Perhaps the most malicious form of injection attack is code injection&#151;placing new code into the memory space of the running process and then directing the running process to execute it. Successful attacks of this type can do almost anything, as the running process is totally hijacked and compromised to perform whatever the attacker desires.</p>
+
+<p>One of the most famous instances of this type of attack is the Windows animated cursor attack, and it's this pattern that I examine here. Using a simple webpage, attackers can cause a malformed animated cursor file to be downloaded to the viewer's PC, cause that animated cursor to be invoked by the browser, and upon invocation cause arbitrary code injection to take place. In essence, it is a perfect attack vector, given that it requires zero physical access to the machine being attacked, zero end-user knowledge that anything untoward might be happening, and zero outward impact to end users if the payload of the attack is suitably malicious.</p>
+
+<p>Consider Example 1(a), which is paraphrased from the Windows exploit, of course, that forms the basis for this type of attack vector. The developer here is making a basic assumption about the trustworthiness of the incoming stream. Trust the stream and everything is fine. Call that function with a stack-based type to be deserialized, and an unknown stream of data and code injection is bound to happen at some point.</p>
+
+
+
+<div>
+
+<pre class="code">
+
+<b>(a)</b>
+void LoadTypeFromStream(unsigned char* stream, SOMETYPE* typtr)
+{
+  int len;
+  // Get the size of our type's serialized form
+  memcpy(&amp;len, stream, sizeof(int));
+  // De-serialize the type
+  memcpy(typtr, stream + sizeof(int), len);
+}
+
+<b>(b)</b>
+
+void foo(unsigned char* stream)
+{
+  SOMETYPE ty;
+  LoadTypeFromStream(stream, &amp;ty);
+}
+
+<b>(c)</b>
+void LoadTypeFromStream
+      (unsigned char* stream, SOMETYPE* typtr)
+{
+    int len;
+    // Get the size of our type's serialized form
+    memcpy(&amp;len, stream, sizeof(int));
+    // GUARD
+    if( len &lt; 0 || len &gt; sizeof(SOMETYPE) )
+        throw TaintedDataException();
+    // De-serialize the type
+    memcpy(typtr, stream + sizeof(int), len);
+}
+</pre>
+
+<div class="caption">
+Example 1: Injections attacks.
+</div>
+</div>
+
+
+<p>So how does it happen? Assume you call the function in Example 1(b). Now we have an attack vector that is wide open to exploit. The problem here is that SOMETYPE has a defined size at compile time. Assume that it is represented in memory using 128 bytes. Now assume you construct the incoming stream so that the lead 4 bytes (the length of what will get deserialized) reads 256. Now, without checking the validity of what you're doing, you copy 256 bytes into a stack area reserved at only 128 bytes.</p>
+
+<p>Given the typical layout of a release-mode stack, you're in trouble. Take a look at the stack to see why this is. Each function that is called lays out its local data in a frame on the stack, typically by subtracting the known size of that local data from the stack pointer on entry (plus any management data required to deal with the call chain itself). An idealized (pseudocode) function prolog emitted by the compiler reads something like:</p>
+
+<pre class="code">
+
+ .foo
+ sub sp, 128  ; sizeof SOMETYPE
+
+
+</pre>
+<p>The call to our exploitable function then reads something like:</p>
+
+<pre class="code">
+
+push sp   ; push the SOMETYPE 
+  local variable
+push ap   ; push the stream 
+  pointer (comes from 1st argument)
+call LoadTypeFromStream
+ret
+
+
+</pre>
+<p>On calling <i>foo(),</i> the caller pushes the stream address onto the stack, along with the return address (pushed as an implicit side effect of using the call directive, or whatever platform equivalent is made available), so that the stack contents have the 128 bytes that are reserved for our type abutted directly against the return address back to the caller of <i>foo();</i> see Figure 1.</p>
+
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!--  -->    
+<img class="illowide" src="080901gf01_f1.gif" onclick = "popimage(this,'www.ddj.com - Safe Coding Practices - Figure 1')">
+
+<div class="caption">
+Figure 1: Calling functions.
+</div>
+</div>
+
+
+<p>Now <i>LoadTypeFromStream</i> executes and writes 256 bytes into the address provided; that is, the value of the stack pointer (sp) before we called the function. This effectively overwrites the 128 bytes that are supposed to be used (at address 0x1000 in our example), plus the ensuing 128 bytes, including the incoming argument pointer, the return address, and whatever other information is stored in the next 128 bytes of the stack.</p>
+
+<p>So how do attackers exploit this vulnerability? Well, it's not simple, and requires a tremendous amount of trial and error. In essence, attackers arrange the payload of the attack so that the overwritten return address transfers control to the attacker's payload rather than to the expected calling function. The attacker therefore needs to know exactly what data structure is being exploited, how big it is on whatever version of the operating system or application that is being attacked, what surrounds it (so that the bogus return address can be placed correctly), and how to meaningfully insert enough information so that the return address plus the rest of the payload can do something harmful.</p>
+
+<p>Not easy things to do, but as many different attacks have shown, some people have way too much time on their hands!</p>
+
+<p>How should you defend against this type of attack? Is it one attack, or several? Does the code being written really have to be as dumb as that shown here? And don't modern compilers do weird things to stack frame layout to get around this problem?</p>
+
+<p>In summary, obfuscation is no defense. We all realize that the easier the programmer makes the attack, the surer that the attack will come. Yet, even complex code that isn't suitably defensive can (and will) be attacked sooner or later. This attack vector, which leverages both tainted data flow and a very basic buffer overflow vulnerability, has been the subject of continuous and heated research for years now, but still yields a significant number of exploits every year.</p>
+
+<p>Defense against this flaw is as trivial as the attack is complex&#151;guard your data assumptions. The addition of one simple line of code to Example 1(a) makes it solid; see Example 1(c). Obviously, as the stream interaction becomes more complex so does the guarding requirement, but at its most basic, code injection qualifies as an "unforgivable" sin in coding, as the known defenses are so prevalent and so simple.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>SQL Injection</h3>
+
+<p>There are also several different types of SQL injection that can cause significant problems for database-centric applications. In some cases, attackers are simply attempting to gain access to more information than they should normally see. In other cases, attackers are more concerned with storing new information in the database that will then be used naively by the application at a later date to compromise the end user's session.</p>
+
+<p>Query-based attacks focus on a prevalent antipattern that involves constructing queries on the fly using string concatenation. This vulnerability type shows up most frequently in web-facing applications, and is equally visible in all the usual page stacks&#151;PHP, ASP, JSP, and so on&#151;along with their backing controller logic.</p>
+
+<p>The core of this vulnerability revolves around developers using direct query execution rather than query preparation to run database interaction. Consider this example of a login validation query:</p>
+
+<pre class="code">
+
+SELECT ID FROM USERS WHERE NAME= 'user' AND PWD='password'
+
+
+</pre>
+<p>Users are presented with a simple HTML form containing two input boxes and using this antipattern. The incoming parameters from this form (however they're received by the page stack in question) are simply substituted into a string form of the query by concatenation.</p>
+
+<p>Consider a set of parameters provided by an attacker:</p>
+
+<pre class="code">
+
+NAME:   x
+PWD:    x' OR '1' = '1
+
+
+</pre>
+<p>Run the concatenation and the result is the&#151;now exploited&#151;query:</p>
+
+<pre class="code">
+
+SELECT ID FROM USERS WHERE NAME=
+  'x' AND PWD='x' OR '1' = '1'
+
+
+</pre>
+<p>If this is compounded by the login simply checking for success or failure of this statement's execution (as opposed to counting result rows), attackers are quickly granted whatever access rights might be available from whatever user records are processed by the application. In applications where the first row of the user table is reserved for the superuser, the application could easily be completely compromised.</p>
+
+<p>There are many other forms of attack possible using applications that are not careful in their treatment of substitution strings within database statements. As common as this antipattern is (see recent announcements from Microsoft and others to see the prevalence that's out there), the mitigation is very simple and is built into basic database APIs: Use prepared statements, not string concatenation.</p>
+
+<p>For example, consider the incorrect implementation in Example 2. This function follows the antipattern rigorously, and also performs another significant no-no by throwing an exception that includes incoming (unfiltered) data&#151;the user name. Put this data up in front of the user as a response and you're open to several knock-on exploits, notably the potential for cross-site scripting.</p>
+
+
+<div>
+
+<pre class="code">
+
+
+public void validateUser(String user, String pwd, Connection db)
+    throws InvalidUserException
+{
+  Statement stmt = null;
+  ResultSet rs = null;
+  try
+  {
+      // Create the statement
+      stmt = db.createStatement();
+      String sql = "select id from users where user='" + user +
+                   "' and pwd='" + pwd + "'";
+      // Execute it, process the result
+      rs = stmt.executeQuery(sql);
+      if( rs == null || rs.next() == null )
+          throw new InvalidUserException(user);
+  }
+  catch( SQLException e )
+  {
+      throw new InvalidUserException(user);
+  }
+  finally
+  {
+    try { if( rs != null ) rs.close(); } catch( Exception e ) { }
+    try { if( stmt != null ) stmt.close(); } catch( Exception e ) { }
+  }
+}
+</pre>
+
+<div class="caption">
+Example 2: An incorrect implementation.
+</div>
+</div>
+
+
+<p>To fix this code, instead of constructing the SQL query on the fly, simply construct a prepared statement and then use it to substitute the incoming parameters.</p>
+
+<p>The statement that we're going to prepare reserves space for parameters and is not vulnerable to this exploit because it isn't lexically brittle in the same way as string concatenation.</p>
+
+<p>Consider this statement (which I'll prepare for the same purpose as the aforementioned concatenated string):</p>
+
+<pre class="code">
+
+SELECT ID FROM USERS WHERE USER=?
+   AND PWD=?
+
+
+</pre>
+<p>I use this prepared statement to substitute our incoming data into the <i>user</i> and <i>pwd</i> parameter reservations. If we provide the same previously exploited strings as input, the result will be a failure during query substitution, as you can't provide an argument to a prepared query that includes metacharacters like the single quote.</p>
+
+<p>Other potential exploits will be caught at different stages, but as you can see the new implementation, as in Example 3, is just as simple to create as the original, but is now much safer (we've also removed the username from the thrown exception, to avoid any temptation to expose it unfiltered to the caller).</p>
+
+
+<div>
+
+<pre class="code">
+
+
+public void validateUser(String user, String pwd, Connection db)
+    throws InvalidUserException
+{
+  PreparedStatement stmt = null;
+  ResultSet rs = null;
+
+  try
+  {
+      // Prepare the statement, rather than concatenating it
+      String sql = "select id from users where user=? and pwd=?");
+      stmt = db.prepareStatement(sql);
+
+      // Substitute our incoming parameters into the query
+      stmt.setString(1, user);
+      stmt.setString(2, pwd);
+
+      // Execute the query and process the results as before
+      rs = stmt.executeQuery();
+      if( rs == null || rs.next() == null )
+          throw new InvalidUserException();
+  }
+  catch( SQLException e )
+  {
+      throw new InvalidUserException();
+  }
+  finally
+  {
+    try { if( rs != null ) rs.close(); } catch( Exception e ) { }
+    try { if( stmt != null ) stmt.close(); } catch( Exception e ) { }
+  }
+}
+</pre>
+
+<div class="caption">
+Example 3: A safe version of Example 2.
+</div>
+</div>
+
+
+<p>In general, whether working with queries or DML, when dealing with data coming from the end user, always use prepared statements to take advantage of filtering and parsing built into the database itself.</p>
+
+
+
+
+
+
+
+
+
+<h3>Cross-Site Scripting (XSS)</h3>
+
+<p>One of the first restrictions placed on JavaScript in early browser versions was to build a wall around page content so that scripts executing within a frame served by one site could not access content of frames served by another site. Cross-site scripting, therefore, is an attack pattern that focuses on enabling scripts from one site (the attacker's site) to access content from another site (for instance, the user's bank account site). </p>
+
+<p>To do this, users must typically visit either a malicious or naive website, although many experiments in social engineering have shown that users can be funneled toward even the most outlandish of sites quite readily.</p>
+
+<p>The most common form of this type of vulnerability is a simple reflection flaw, and focuses on unfiltered HTML parameters (form parameters, typically) being reflected back to the user from a server request. The canonical form of this attack vector was first shown by search engine result pages, which typically reflected the user's query term in the title of the page. Without filtering, this reflected query term could easily contain HTML tags that were not correctly encoded and would therefore be interpreted as valid HTML by the receiving browser.</p>
+
+<p>In essence, any reflection of unfiltered incoming data is a problem, as the number and variety of exploits resulting from XSS grows everyday; see Example 4.</p>
+
+
+
+<div>
+
+<pre class="code">
+
+public void doGet(HttpServletRequest req, HttpServletResponse res)
+{
+    string title = req.getParameter("searchTerm");
+    res.getOutputStream().write(title.getBytes("UTF-8"));
+}
+</pre>
+
+<div class="caption">
+Example 4: Unfiltered incoming data is a problem.
+</div>
+</div>
+
+
+<p>Just as the manifestation of XSS reflection is simple to describe, the mitigation is also incredibly simple&#151;encode anything that is read from the incoming request before sending it back to the browser. While we're using Java here to show examples, all the prevalent page stacks include HTML encoding mechanisms that are easily employed to avoid this vulnerability. For example, this ASP statement is exploitable:</p>
+
+
+
+<pre class="code">
+Response.Write Request.Form("username""
+
+</pre>
+<p>In contrast, the following statement is not:</p>
+
+<pre class="code">
+
+Response.Write Server.HTMLEncode(
+  Request.Form("username"))
+
+
+</pre>
+<p>Likewise, the same kind of transformation can be used in Java to prevent this exploit, although there's (still) no built-in object to perform a standard transformation. That said, it's simple to write such a <i>String</i> transformer. For those in search of an "off the shelf" package, the JTidy project (jtidy.sourceforge.net) is a good place to start.</p>
+
+<p>Other, more complex, manifestations of XSS revolve around the persistent storage of unfiltered user input that is later used to provide response content. This is a more difficult type of XSS to diagnose, as the attack pattern depends not only on a user's unfiltered input being stored, but on that stored data being made available to other users from that point onward.</p>
+
+<p>Naive forum software packages were particularly susceptible to this attack pattern in the early days of the Web. But even today, any application that stores incoming unfiltered data in a database (or file) and then sends that stored data to the user at a later date is vulnerable to this persistent form of XSS.</p>
+
+<p>Once again, the mitigation is simple, requiring the program to either encode information before being stored or worst case to encode before sending information from the persistent store to the user. In general, it is always safer to encode data before storage, as in this way every possible future usage of that data is already guarded against XSS. </p>
+
+
+<h3>Finding the Flaws</h3>
+
+<p>Obviously, while the mitigations described here are simple to implement, the biggest challenge facing developers or development organizations trying to come to grips with security within an existing code base, or within code being newly created, is finding the areas of vulnerability. Manual code inspection can obviously be leveraged, but sitting around a table looking at reams of code, trying to find what might be extensively obfuscated vulnerabilities isn't anybody's idea of a fun time, I'm sure.</p>
+
+<p>Static source-code analysis offers a potential solution to this problem, focusing on the potential vulnerabilities or weaknesses that are present in the code, rather than attempting to find existing exploits or attack vectors as a traditional application security or pen test dynamic tool might. Using an SCA tool can significantly shorten the time and effort involved in finding these issues and preparing them for mitigation.</p>
+
+<p>There are many of these tools available with varying capabilities, both open source and commercial. Klocwork (the company I work for) provides one such commercial static source-code analysis product suite, focusing on C, C++, and Java, and providing developers fast, accurate analysis of operational defects and security vulnerabilities, integrated within your IDE of choice.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

@@ -1,0 +1,235 @@
+
+<html>
+<head>
+<title>September, 2005: Improving Performance With Custom Pool Allocators for STL</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Improving Performance With Custom Pool Allocators for STL</h1>
+<p><i>Dr. Dobb's Journal</i> September, 2005</p>
+<h2>An efficient method for providing allocation services </h2>
+
+
+<h3>By Anthony Aue</h3>
+
+
+<I>Anthony is a software developer in the Natural Language Processing group at Microsoft Research. He can be contacted at anthaue@microsoft.com.</I>
+
+<hr>
+
+
+
+
+
+<p>When preaching the benefits of C++, evangelists invariably mention things such as type safety, generic programming, and multiple inheritance when trying to convince devotees of other languages that C++ is better. For me, one of the most attractive features of C++ is the Standard Template Library (STL). Having access to a standardized, well-designed, and well-tested set of containers with algorithms to operate on them takes the load off programmers and lets us concentrate on the interesting parts of the code. </p>
+
+<p>At the root of the STL is an incredibly rich set of containers. The STL provides default implementations for contiguous storage (vectors), lists, sets, and maps. Most STL implementations have hash sets and hash maps, which will become canonical in the next version of the Standard. This rich set of containers lets you store data in the most efficient manner. If frequent insertions and deletions are likely but the data does not need to be sorted by a key, the data can be put in a list. If constant-time lookup is a requirement, they can be put in a hash map instead. Best of all, if your requirements change, you can usually change container types without having to touch too much of your code. While the ideal of container-neutral code is unfortunately unattainable&#151;see Item 2 of <i>Effective STL: 50 Specific Ways to Improve Your Use of the Standard Template Library</i>, by Scott Meyers (Addison-Wesley, 2001)&#151;much of the code that inserts, iterates through, and retrieves elements from the various container types is, thanks to the magic of iterators, similar if not identical.</p>
+<h3>The Problem</h3>
+
+<p>As is always the case, however, general solutions do not come without a price. With STL containers, one of the ways we pay that price is in the final template argument to all of the containers&#151;<i>std::alloc&lt;T&gt;.</i> Every STL container lets you specify the type of the allocator used to acquire storage for whatever it is you're storing, as well as the container's bookkeeping information. You don't have to specify it, because the Standard Library provides a default argument for you in the form of <i>std::allocator</i>.</p>
+
+<p>The default implementations of <i>std::allocator</i> provided by STL implementations vary in complexity by the STL implementation from thin wrappers around <i>new</i> and <i>delete</i> to carefully built allocators running to thousands of lines of code. Different allocator implementations shine in different scenarios. If you're allocating a big block of memory, holding on to it for a long time, and then releasing it all at once (as is the case with vectors and deques), it may be hard to beat the minimalist wrapper around <i>new</i> and <i>delete</i>. If you're using node-based containers (such as maps, sets, or lists), allocators optimized for smaller objects are probably a better way to go.</p>
+
+<p>In some situations, however, the standard allocator can penalize you heavily in terms of both time and space, and unless you're paying attention, you won't even realize it. There won't be any memory leaks, and your program won't crash (at least, not until it runs out of memory). You'll just be using more memory than you should, and possibly spending a lot of unnecessary time in calls to allocate and delete. The problem is that <i>std::allocator</i> is, by definition, a general-purpose allocator, and yet there's really no such thing as general-purpose memory usage. Different programs use memory differently. Even within the same program, different areas have different memory usage patterns. </p>
+<h3>What To Do?</h3>
+
+<p>I'm certainly not the first person to realize that this is a problem. Scott Meyers, for instance, talks about using alternatives to <i>std::allocator</i> (see <i>Effective STL</i>). Andrei Alexandrescu devotes an entire chapter of <i>Modern C++ Design: Generic Programming and Design Patterns Applied </i>(Addison-Wesley, 2001) to an allocator for small objects. The Boost library provides two wrappers around its <i>pool_allocator</i> that are <i>std::allocator</i>s. It would be nice to have a whole family of allocators, each optimized for a different memory usage pattern, ideally sharing as much code as possible. It should be possible to switch from one allocation strategy to another as easily as possible.</p>
+
+<p>Again, each program has different memory usage patterns, and this makes it difficult for memory allocator writers to write a general-purpose allocator that's good for all cases. No matter how your memory allocator is designed, it's possible to write pathological programs that result in fragmented memory and poor allocation times (see "An Estimate of the Store Size Necessary for Dynamic Storage Allocation," by J.M. Robson, <i>Journal of the ACM</i>, 18(3):416-423, 1971). However, there are common usage patterns that are seen again and again, especially with standard containers. Once you know how your container is going to be used, you ought to be able to specify the allocation strategy that performs best with your particular usage pattern. In addition, the environment in which the code is being executed plays a part in design decisions. For instance, if an allocator is only going to be used in single-threaded environments, there's no need to worry about protecting its data against access from multiple threads. </p>
+
+<p>The family of allocators just described is a perfect example of a case where policy-based design can really shine. Knowledge of how the container will be used, performance requirements on the container, the size of the objects that will be allocated, and the environment in which the code will be executed are all generally known at compile time. Ideally, users of the allocator could specify the right combination of policies, and an allocator configured to perform well for the given situation would be generated at compile time. </p>
+<h3>Design</h3>
+
+<p>The allocator library I present here (available electronically; see "Resource Center," page 3) is a pool allocator. Pool allocators are an extremely efficient method for providing allocation services for objects of fixed size <i>s</i>. The basic strategy is to reserve a chunk of memory sufficient for storing <i>N</i> objects of size <i>s</i> all at once. When the allocator is asked to provide a chunk of memory, it simply returns an offset <i>mod s</i> into the allocated chunk. This is far more efficient than calling operator <i>new</i> separately for each request because it avoids the bookkeeping overhead required of a general-purpose memory allocator that has to service requests for different-sized allocations. It's an economy of scale.</p>
+
+<p>The decision to use a pool allocation scheme limits its usability in some cases. Because pool allocators are based on the idea that you'll be allocating objects of a single size, using them with containers that are likely to request different amounts of memory with each allocation doesn't pay off. This means that you won't see the same performance boosts when using the allocator with large containers of type <i>std::vector</i>, <i>std::deque</i>, or <i>std::string</i> as you would in node-based containers&#151;such as <i>std::map</i>, <i>std::set</i>, and <i>std::list</i> To guarantee <i>O</i>(1) amortized insertion time, <i>std::vector</i> and friends have to request memory proportional to the amount of memory currently allocated at each request. In fact, requests for allocations greater than 64 bytes will be shunted off to <i>malloc</i> and <i>free</i>. This isn't such a serious limitation because the default memory allocator is generally optimized for dealing with large, variable-sized memory blocks anyway. </p>
+
+<p>A potentially more serious caveat is that, since the allocator uses nonstatic data, it's not technically Standard compliant because the Standard requires that allocators of the same type be equivalent. See<i> Effective STL</i> (Item 10) for a thorough explanation of the issue. This amounts to requiring that an allocator for a given type be able to deallocate memory allocated by any other instance of an allocator for that type. For many uses of standard containers, this requirement is unnecessary (some might say Draconian). However, there are two cases where this requirement is absolutely necessary: <i>list::splice</i> and <i>swap().</i> The case of <i>swap()</i> is especially serious because it is needed in order to implement certain operations on containers in an exception-safe manner (see <i>Exceptional C++</i>, Item 12). Technically, <i>swap</i> could be (and in some cases, is) implemented in the face of allocators that don't compare equally&#151;items could be copied or the allocators could be swapped along with the data&#151;but this is not always the case. For this reason, if you're using <i>swap()</i> or <i>list::splice</i>, you should make sure to use <i>HoldingPolicySingleton</i>; otherwise, you're bound to run into some really nasty behavior.</p>
+
+<p>The lowest level of the allocator is the <i>PoolChunk</i> class, which represents a contiguous chunk of memory living at <i>m_pMem</i>, big enough for <i>NUMBLOCKS</i> objects of size <i>ALLOCSIZE.</i> It uses a neat space-saving trick (used by many implementations of pool allocators) to store a linked list of memory blocks in the same space that it uses for servicing allocation requests. Upon construction, the beginning of each block is an integer pointing to the next free block. The object keeps track of the head of this list in <i>m_pNext</i>. When a block is requested, the head of the list is updated to point to the second chunk in the list, and the chunk of memory that used to be the head is returned. When a block is freed, the beginning of the block is updated to point to the old head, and this block becomes the new head. </p>
+
+<p><i>PoolChunk</i> exposes a very basic interface:</p>
+
+<ul>
+    <li><i>PoolChunk(size_t allocsize_set, IndexType num_blocks_set) </i>constructs a new <i>PoolChunk</i> for <i>num_blocks_set</i> objects of size <i>allocsize_set</i>.</li>
+  <li><i>bool In(void* p) </i>simply tells you whether the memory at <i>p</i> comes from this <i>PoolChunk</i>.</li>
+  <li><i>bool Empty()</i> tells you whether the chunk is empty.</li>
+  <li><i>bool Full()</i> tells you whether the chunk is full.</li>
+  <li><i>void* allocate() </i>returns the next item from the free list, or null if the chunk is full.</li>
+  <li><i>void deallocate(void* p) </i>puts <i>p</i> at the head of the free list.</li>
+</ul>
+
+
+
+<p>The second layer of the allocator is the <i>BunchOfChunks</i> object, so named because it aggregates multiple <i>PoolChunks</i>. Because each <i>PoolChunk</i> has a static size, you need more than one of them in order to be able to satisfy an arbitrary number of allocation requests. Like the <i>PoolChunk</i> object, the <i>BunchOfChunks</i> object only handles allocation for objects of a fixed size. It does so by keeping a collection of <i>PoolChunk</i> objects and farming the requests out to them. The <i>BunchOfChunks</i> interface is even simpler than the <i>PoolChunk</i> interface. Aside from the constructor and destructor, only two public functions are exposed:</p>
+
+<ul>
+  <li>&#8226;<i>	void* allocate()</i> finds a nonempty <i>PoolChunk</i> and allocates a block of memory from it.</li>
+  <li><i>void deallocate(void* p)</i> finds the <i>PoolChunk</i> that allocated <i>p</i>, and deallocates it from that <i>PoolChunk</i>.</li>
+</ul>
+
+
+
+<p>I've deliberately left the exact mechanisms for storing and accessing individual <i>PoolChunk</i>s vague in this description, since these are details handled by <i>BunchOfChunks</i>'s <i>STORAGEPOLICY</i> (one of the required template arguments). </p>
+
+<p>The previous two objects provide allocation services for objects of fixed size. In order to be able to handle requests for allocations of arbitrary size, which is required of an <i>std::allocator</i>, you need to aggregate <i>BunchOfChunks</i> objects for various sizes. <i>PoolAllocator</i>, the third level in the design hierarchy, does just this. It keeps a vector of <i>BunchOfChunks</i> objects at <i>m_vboc</i>, sorted by size. Once again, the interface is straightforward:</p>
+
+
+
+<ul>
+  <li><i>void* allocate(size_t stNumBytes) </i>does a binary search in <i>m_vboc</i> to find a <i>BunchOfChunks</i> for size <i>stNumBytes</i>. If it finds one, it just calls the <i>allocate()</i> method on it. If it doesn't find one, it creates a new one and inserts it into the vector.</li>
+  <li><i>void deallocate(void* pDeallocateMe, size_t stNumBytes)</i> finds the <i>BunchOfChunks</i> for <i>stNumBytes</i> and calls the <i>deallocate()</i> method on it.</li>
+</ul>
+
+
+
+<p>The final layer of the allocator is <i>pool_allocator_stl</i>, which contains the implementation of the <i>std::allocator</i> interface. It holds an instance of <i>PoolAllocator</i> and delegates allocation and deallocation requests to it.</p>
+
+<p>The multitiered design (individual chunk object -&gt; collection of chunks -&gt; collection of collections of chunks for various sizes) is a typical design for pool allocators&#151;both <i>boost::pool</i> and Alexandrescu's <i>SmallObject</i> follow similar designs. Readers will notice a more-than-passing resemblance to Alexandrescu's <i>SmallObject</i> implementation, to which I am much indebted, as it was my first exposure to the issue of small object allocation. What makes this implementation more flexible is the rich set of policies for specifying the behavior of the allocator.</p>
+<h3>Evaluation</h3>
+
+<p>Evaluating memory allocators is notoriously difficult because every program uses memory somewhat differently. To measure allocation and deallocation directly, I wrote a drop-in <i>std::allocator</i> (implemented in trace_allocator.hpp, available electronically) that records each allocation and deallocation to a log file. I specified this allocator in containers that use memory in different ways, and then wrote a testing application that "plays back" the memory allocations and deallocations using different allocators, monitoring memory usage, page faults, and execution times. </p>
+
+<p>The four containers I attached the allocator to are:</p>
+
+
+
+<ul>
+  <li><i>simple_map</i>: creates an <i>int-&gt;int</i> map, fills it with some integer pairs, then lets it go out of scope. Based on a quick survey of my colleagues, as well as a look through code I've written and/or maintain, this is a very common scenario.</li>
+  <li><i>fixed_priority_queue</i>: is based on a <i>std::set</i> of fixed size. The set is allowed to grow to a certain size. Thereafter, new inserts are only allowed if the item to be inserted is greater than the smallest item in the set. The smallest item is deleted and the new item is inserted. A real-world example of this would be an MRU cache.</li>
+  <li><i>remove_if</i>: creates an <i>int-&gt;int</i> map and adds a number of integer pairs to it. Generate a random integer, call <i>remove_if</i> on the map with that integer. Repeat three times. </li>
+  <li><i>random</i>: creates an <i>int-&gt;int</i> map. Insert a number of integer pairs to it. Then, for some number of iterations, randomly either insert a new pair or delete an old pair.</li>
+</ul>
+
+
+
+<p>Figures 1 through 4 (<a href="0509df1.html" name="rf1">1</a>, <a href="0509df2.html" name="rf2">2</a>, <a href="0509df3.html" name="rf3">3</a>, <a href="0509df4.html" name="rf4">4</a>)depict the memory profiles for the cases I instrumented. I played each allocator trace back using allocators built with these compilers, in each case running once with the default (compiler included) STL, and once with STLport 4.6.2:</p>
+
+<ul>
+    <li>Microsoft Visual C++ 7.1</li>
+  <li>GCC 3.3.3 under cygwin</li>
+  <li>GCC 3.3.3 under Linux</li>
+  </ul>
+
+<p>Performance data for each combination of policies, on all configurations, is in the spreadsheet entitled "results.xls" (available electronically).</p>
+<h3>Policies</h3>
+
+<p>The actual definition of <i>pool_allocator_stl</i> is as follows:</p>
+
+<blockquote>
+template&lt;<br>
+   class T,<br>
+   class STORAGEPOLICY,<br>
+   template&lt;class&gt; class ThreadingPolicy,<br>
+   template&lt;class&gt; class HoldingPolicy,<br>
+   class GrowthPolicy,<br>
+ bool DeletionPolicy=true&gt;<br>
+ class pool_allocator_stl.<br>
+
+</blockquote>
+
+<p>Aside from the first template argument <i>T</i>, which is the type of object to be allocated, the rest of the arguments are all configurable policies that govern various aspects of the allocator's behavior. </p>
+
+<p>I'll now give a quick description of each of the policies, along with some charts showing the effects of each policy on each of the data sets. The performance numbers I present for each policy are based on code compiled with the Microsoft Visual C++ 7.1 compiler using the default STL implementation, with aggressive speed optimizations turned on (/Ox /Os).</p>
+
+
+
+<p><b>StoragePolicy.</b> The <i>StoragePolicy</i> is the most interesting and challenging part of the allocator. It dictates how individual <i>PoolChunks</i> are stored in a <i>BunchOfChunks</i>. It is also responsible for actually releasing the memory allocated by <i>BunchOfChunks</i>. The interface is defined by the following functions:</p>
+
+<ul>
+    <li><i>void Store(ChunkType* pStoreMe)</i> stores the chunk in question for later retrieval.</li>
+  <li>&#8226;<i>	void Purge()</i> releases all memory from the container.</li>
+  <li><i>ChunkType* GetChunkForAlloc()</i> returns a pointer to a nonempty <i>PoolChunk</i> in the collection, or NULL if there is not one.</li>
+  <li><i>ChunkType* FindChunkDealloc(void* p, iterator</i>&amp;<i> itrRet)</i> finds and returns the <i>PoolChunk</i> containing <i>p</i>. Also returns a <i>StoragePolicy::iterator</i> (necessary <i>typedef</i>) via <i>itrRet</i> that points to the deallocated chunk. This enables us to efficiently remove the chunk from our collection if necessary</li>
+  <li><i>void DealWithEmptyChunk(iterator itr)</i> is called by <i>BunchOfChunks</i> whenever a chunk becomes empty as the result of a deallocation.</li>
+</ul>
+
+
+
+<p>I've implemented three different <i>StoragePolicies</i>:</p>
+
+
+
+<ul>
+  <li><i>StoragePolicySimple</i> keeps its <i>PoolChunks</i> in an <i>std::list</i>. When a chunk is requested for allocation, it looks in the chunk most recently allocated from. If there's still room, it just returns that chunk. If the current chunk is full, it does a linear search in the list for a chunk with free space. Allocation and deallocation are<i> O(c)</i>, where <i>c</i> is the number of chunks in the list. Deallocation is handled similarly.</li>
+  <li><i>StoragePolicyBoundary </i>is similar to <i>StoragePolicySimple</i>, but it does a bit of extra housekeeping to enforce a boundary between full and nonfull chunks. This improves worst-case allocation speed to <i>O</i>(1), though deallocation is still <i>O(c)</i> in the number of chunks in the list.</li>
+  <li><i>StoragePolicyOrdered</i> keeps its <i>PoolChunks</i> in an <i>std::map</i>. Allocation is <i>O(c),</i> but deallocation is<i> O(</i>log<i>c).</i></li>
+</ul>
+
+<p><a name="rf5"></a><a href="0509df5.html">Figure 5</a> shows the effect of <i>StoragePolicy</i> on speed in each of the contains I profiled.</p>
+
+
+
+<p><b>HoldingPolicy.</b> The <i>HoldingPolicy</i> is a simple policy that lets you control the lifetime of the <i>pool_allocator</i> object held by <i>pool_allocator_stl</i>. It has only a single function,<i> T</i>&amp;<i> Get()</i>, which returns a reference to the encapsulated object.</p>
+
+<p>Currently, there are two <i>HoldingPolicies</i>:</p>
+
+<ul>
+    <li><i>HoldingPolicyStack</i>, which puts the encapsulated object on the stack, to be cleaned up whenever it goes out of scope.</li>
+  <li><i>HoldingPolicySingleton</i>, which provides access to a shared <i>pool_allocator</i> for all objects.</li>
+</ul>
+
+
+
+<p><b>ThreadingPolicy.</b> <i>ThreadingPolicy</i> consists of a few simple <i>typedef</i>s:</p>
+
+
+
+<ul>
+  <li><i>VolatileType</i>, inspired by Alexandrescu's <i>ThreadingModel</i>, is a way to make sure that data members shared across multiple threads are properly qualified as volatile.</li>
+  <li><i>MutexType</i> indicates a type that must in turn have a <i>scoped_lock typedef</i>. Thread safety for multithreaded policies is guaranteed by wrapping all state-changing code in a <i>scoped_lock</i>.</li>
+</ul>
+
+
+
+<p>I've provided two separate threading policies:</p>
+
+<ul>
+    <li><i>ThreadingSingleThreaded</i> is a policy in which the lock is not operational. As you might expect, it's always preferred for single-threaded programs. You can use it in multithreaded programs as well, so long as you are using <i>HoldingPolicyStack</i>. Each container has its own copy of the allocator, and any container operations causing allocation or deallocation that might be called from multiple threads have to be locked by the client for thread safety anyway, so there's no need to lock the allocator separately.</li>
+  <li><i>ThreadingMultiThreaded</i> is a policy suitable for use in multithreaded situations. It's a thin wrapper around <i>boost::mutex</i> for maximum portability.</li>
+</ul>
+
+
+
+<p><b>GrowthPolicy.</b> Each <i>BunchOfChunks</i> object has a <i>GrowthPolicy</i> member that's responsible for calculating the size of the next chunk to allocate. The policy implements a single function, <i>unsigned int NextChunkSize()</i>.</p>
+
+<p>Two <i>GrowthPolicies</i> are defined:</p>
+
+
+
+<ul>
+  <li><i>GrowthPolicyLinear</i> allocates fixed-size chunks of size 255 each time.</li>
+  <li><i>GrowthPolicyExponential</i> doubles the size of the last chunk.</li>
+</ul>
+
+
+
+<p>The <i>GrowthPolicy</i> basically controls the relationship between <i>N,</i> the number of objects allocated; and <i>C</i>, the number of <i>PoolChunks</i> encapsulated by the <i>BunchOfChunks</i>. This has a predictable effect on the performance guarantees of the container. When you use <i>GrowthPolicyLinear</i>, <i>C</i> is <i>O(N).</i> When you use <i>GrowthPolicyExponential</i>, <i>C</i> is <i>O(</i>log<i>(N)).</i> This lets you optimize for time or space. For instance, recall that allocation and deallocation time using <i>StoragePolicySimple</i> were both <i>O(C).</i> If you use <i>GrowthPolicyLinear</i>, then allocation and deallocation time will be <i>O(N),</i> but the amount of wasted space will be <i>O</i>(1) because you'll never be wasting space for more than 255 objects. If you use <i>GrowthPolicyExponential</i>, allocation and deallocation will be<i> O(</i>log<i>(N)),</i> but the amount of wasted space will be <i>O(N).</i> <a name="rf6"></a><a href="0509df6.html">Figures 6</a> and <a name="rf7"></a><a href="0509df7.html">7</a> show the effect of <i>GrowthPolicy</i> on speed and working set size. </p>
+
+
+
+<p><b>DeletePolicy.</b> <i>DeletePolicy</i> is just a Boolean flag that's passed as a template argument to <i>pool_allocator_stl</i>. It controls whether  objects are actually deallocated when <i>deallocate()</i> is called. When <i>DeletePolicy</i> is set to True, deallocation is performed as per normal. When it's set to False, deallocation becomes nonoperational. There are plenty of times when this can come in handy. For instance, a very common memory usage pattern is to fill a container, perform some processing with the elements in it, save the results as temporary, and then destroy the object (or let it go out of scope). In this case, you know you're going to be getting rid of the entire container at once, so there's no need to call <i>deallocate()</i> separately for each object. All of the memory will be released at once as soon as the allocator goes out of scope. <a name="rf8"></a><a href="0509df8.html">Figure 8</a> shows the effect of <i>DeletePolicy</i> on speed.</p>
+<h3>Comparative Performance</h3>
+
+<p>As you can see in Figures 9 through 12, the graphs comparing different policies, the best set of policies to use can vary depending on the allocation pattern. To determine how much performance gain I could achieve over less-configurable solutions, I also ran each scenario against the default <i>std::allocator</i> for the STL I was using, as well as against <i>boost::pool_allocator</i> and <i>boost::fast_pool_allocator</i>. </p>
+
+<p>In most platform/STL combinations, the allocator presented in this article performs better than the others. This is not surprising because, in each case, we were able to tune the instantiated allocator type according to the specific memory use at hand. One thing that puzzles me, however, is that the <i>boost::fast_allocator</i> is invariably faster on Linux when using the STL provided with GCC, sometimes by a large margin. The most likely explanation seems to me that the allocator was probably optimized in this configuration.</p>
+<h3>Conclusion</h3>
+
+<p>I've presented here a highly flexible and configurable replacement for <i>std::allocator</i> for use with node-based standard containers. An efficient and configurable allocator is useful because of the widespread use of standard containers. On several occasions, I've been able to make substantial improvements to the performance and/or memory usage of programs by a simple one-line modification that specifies a different allocator for a given container. Hopefully, the allocator described here can be as useful to you as it has been to me&#151;give it a try and see!</p>
+<h3>Acknowledgments</h3>
+
+<p>Thanks to Eric Niebler for pointing out the danger of <i>swap()</i>ing containers whose allocators have state, and to Andrei Alexandrescu for pointing out the necessity of special allocators for small objects in the first place.</p>
+
+
+
+
+<p><b>DDJ</b></p>
+
+
+
+
+</body>
+</html>

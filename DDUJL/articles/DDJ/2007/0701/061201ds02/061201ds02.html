@@ -1,0 +1,407 @@
+<html>
+<head>
+<title>Practical Parsing for ANSI C</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> January 2007</p>
+
+<h1>Practical Parsing for ANSI C</h1>
+<h2>The devil is in the details</h2>
+
+
+<h3>By Daniele Paolo Scarpazza</h3>
+
+
+<I>Daniele is a post-doctoral researcher at the Pacific Northwest National Laboratory focusing on supercomputing. He also has a background in low-power software optimization at the source-code level for embedded systems. He can be contacted at scarpaz@scarpaz.com.</I>
+
+<hr>
+
+
+
+
+<p>Front-ends are present in all applications that process source code&#151;compilers, interpreters, linters, and the like. Common beliefs about the design of front-ends are that they are made up of phases (lexical, syntactic, and semantic analysis), are largely decoupled, and that lexical analysis consists of regular-expression matching. When these assumptions are true, the design of a parser is facilitated. Unfortunately, these assumptions aren't always true in the real world. In this article, I discuss the design of a front-end for ANSI C, and show the pitfalls that make it trickier than you'd expect. </p>
+
+<p>Myth #1:  Front-Ends Are Made Up of Independent Phases</p>
+
+<p>A front-end is a program that accepts text input and produces a representation of that text in a desired form&#151;an abstract syntax tree, for instance. Again, front-ends are present in any application that manipulates source code in a nontrivial way&#151;compilers, interpreters, pretty printers, code analyzers (such as splint or Purify), and so on.</p>
+
+<p>Anyone who has taken a compiler course recognizes the classic flow diagram of a front-end in Figure 1. It includes three phases&#151;lexical, syntax, and semantic analysis. The lexer and parser recognize the word-level and phrase-level structure of the input text. The lexer splits the undifferentiated stream of characters of the input program (after preprocessing, if any) into a sequence of tokens, each belonging to a well-defined category such as keyword, operator, literal constant, identifier, or type name. For example, the lexer determines that the consecutive characters "+=" constitute a single operator, rather than two separate "+" and "=" operators, and that "18.52" is a floating-point literal constant rather than the two integer literal constants "18" and "52" with a dot punctuator in the middle. The parser recognizes the language constructs (expressions, statements, declarations, and so on), and usually outputs the syntax tree corresponding to the program. Traditionally, lexers and parsers are obtained automatically by running tools such as flex and bison over a set of specifications. Lexers are specified as a set of actions, each associated to a regular expression; parsers are specified as a set of actions, each associated to BNF syntax rules. Finally, the semantic analyzer contains all the remaining application-dependent algorithms, which implement context checks (for example, making sure that there are no nested function definitions in a C program) and connect to the back-end. </p>
+
+
+<div>
+    
+<!--  -->    
+<img class="illowide" src="061201ds02_f1.gif" style="width:250">
+
+<div class="caption" style="width:252">
+Figure 1: The classical structure of a front-end.
+</div>
+</div>
+
+<p>Unfortunately, Figure 1 can be misleading in suggesting that the three phases&#151;lexer, parser, semantics&#151;are independent and operate sequentially without overlaps. In fact, the input can first be entirely tokenized, then its syntax tree derived, and finally all the semantics evaluated on top of this tree. Consequently, you'd think you could design the lexer, parser, and semantic analyzer as separate, distinct problems. While this might be true for simple languages and applications (such as command-line calculators), it isn't true for complex languages like C. For C, it isn't even possible to complete the lexical analysis of a token before some semantic analysis has been completed for the preceding input. For instance:</p>
+
+<pre class="code">
+
+typedef     unsigned long int ulint_t;  
+
+
+</pre>
+<p>contains the declaration of a user type <i>ulint_t</i>. Parsing this declaration according to the grammar of C leads to the parse tree in Figure 2(a), where <i>ulint_t</i> must be tokenized as an IDENTIFIER. (I write tokens such as "IDENTIFIER" in uppercase to differentiate them from nonterminal symbols in the grammar, such as "expression," "statement," and "type_name"). As a consequence of the type declaration, if this declaration is encountered:</p>
+
+<pre class="code">
+
+ulint_t my_ul_int;
+
+</pre>
+<p><i>ulint_t</i> must be tokenized not as an IDENTIFIER (as before), but as a TYPE_NAME. The syntax tree of this declaration is in Figure 2(b).</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!--  -->    
+<img class="illowide" src="061201ds02_f2.gif" onclick = "popimage(this,'www.ddj.com - Practical Parsing for ANSI C - Figure 2')">
+
+<div class="caption">
+Figure 2: Tokens and parse tree for the declarations in the example.
+</div>
+</div>
+
+
+<p>C lets you define new type names, and the standard C grammar is based on this distinction. Therefore, lexers must be able to actively enforce this distinction. Simple solutions to circumvent this difficulty do not help. For example, a lazy solution may abolish the distinction between IDENTIFIER and TYPE_NAME, and consider each name an IDENTIFIER, adapting the grammar accordingly. This solution fails, however, because it makes the grammar ambiguous, so that some declarations or statements may be parsed in multiple, inconsistent ways. </p>
+
+<p>Two points are clear:</p>
+
+
+
+<ul>
+  <li>Lexers based on regular-expression matching alone cannot do the job. More intelligence is needed. The lexer needs to know the entire set of declarations and definitions, which are visible in the current scope. Lexers must access the symbol tables associated with the previous input in a way that is consistent with the scoping rules of the language. Unlike simple languages, for which the symbol table is entirely the semantic phase's business, the lexer operates on the basis of the information in the symbol table. </li>
+  <li>Symbol tables cannot be maintained by lexers alone; therefore, lexers, parsers, and semantic actions cannot operate sequentially. They must work in an intertwined way. Symbol tables cannot be maintained by lexers because understanding the structure of the declarations and definitions is the parser's job, and processing them is the responsibility of the semantic layer.</li>
+</ul>
+
+
+
+<p>This leads to the structure in Figure 3&#151;a call graph representing the simplified structure of a front-end developed with flex and bison. The application-specific code calls the parser (traditionally, function<i> yyparse()</i>) just once to parse the entire input. The parser calls the lexer (function <i>yylex()</i>) as many times as there are input tokens in the input text. Every time the parser recognizes a syntax rule, an appropriate semantic action is triggered. If a declaration is recognized by the parser, the corresponding action adds a new entry in the symbol table. The new entry is visible to the lexer the next time it is invoked to fetch the following token, and it may influence whether the token is categorized as IDENTIFIER or TYPE_NAME.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!--  -->    
+<img class="illowide" src="061201ds02_f3.gif" onclick = "popimage(this,'www.ddj.com - Practical Parsing for ANSI C - Figure 3')">
+
+<div class="caption">
+Figure 3: Call-graph of a realistic front-end designed with flex and bison.
+</div>
+</div>
+
+
+
+
+
+
+
+
+
+
+
+<h3>Myth #2: Lexers Are "Dumb" Objects</h3>
+
+<p>Listing One is the simplified flex specification for a lexer that distinguishes between identifiers and type names, depending on the context. As flex requires, sections are separated by "%%" lines. </p>
+
+
+<pre class="code">
+Digit         [0-9]
+Letter        [a-zA-Z_]
+ ...
+%%
+","                { return ','; }
+":"                { return ':'; }
+"="                { return '='; }
+ ...
+"+="               { return ADD_ASSIGN;   }
+"&gt;&gt;="              { return RIGHT_ASSIGN; }
+"&lt;&lt;="              { return LEFT_ASSIGN;  }
+ ...
+"auto"             { return AUTO;         }
+"break"            { return BREAK;        }
+"case"             { return CASE;         }
+ ...
+{Letter}({Letter}|{Digit})* 
+                  { return category();   }
+ ...
+%%
+#include &lt;blocks.hpp&gt;
+ ...
+int category()
+{
+  Block * blockp = Block::currentp;
+  ...
+  while (blockp) 
+  {
+     if (blockp-&gt;            symbol_table.name_is_defined(yytext)) 
+     {
+        if (blockp-&gt;            symbol_table.name_is_typedef(yytext)) 
+          return TYPE_NAME;    
+        else 
+          return IDENTIFIER; 
+     }
+     blockp = blockp-&gt;parentp;
+  }
+  return IDENTIFIER;
+}
+ ...</pre>
+<div class="caption">
+   Listing One
+</div>	
+	
+	
+
+<ul>
+  <li>The first section defines a shorthand notation for digits and letters. </li>
+  <li>The second section gives rules for each lexical element of the language; for example, for one-character operators ("+", "=", ...), the lexer returns a token code equal to the character encoding, by convenience; for multicharacter operators ("+=", "&lt;&lt;=", ...) and keywords ("auto," "break," "case," ...), it returns symbolic token codes. </li>
+  <li>Finally, for strings of letters and digits starting with a letter, the lexer invokes function <i>category()</i> to determine whether the string must be recognized as an IDENTIFER or a TYPE_NAME. The third section gives the implementation of function <i>category()</i>. The function <i>category()</i> complies with the C scoping rules: It looks up the current token (stored in variable <i>yytext</i>) in the current block, then in the block that immediately surrounds it, and so on, until an entry is found or the outmost block is hit with no success. This is the purpose of the <i>while</i> loop in the function. </li>
+</ul>
+
+
+
+<p>Remember that in C, any open brace "{" creates a new block and a new scope, where new variables and types can be declared that hide the objects with the same names declared in the outer blocks. Our front-end maintains a representation of all the blocks encountered in the input source code so far, in the form of a tree of objects of class <i>Block</i> (and yes, I write semantic actions and support code in C++). Each block contains a pointer <i>parentp</i> to its surrounding block, which is NULL for the global block. Each block also contains an object of class <i>SymbolTable</i>&#151;a symbol table with all the variable and type declarations that have appeared so far in that block. Class <i>SymbolTable</i> provides a method named <i>name_is_typedef(...),</i> which tells whether the given name appears as a defined type name in that symbol table current block.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>A Lazy Trick </h3>
+
+<p>Tags are optional names you can associate to a <i>struct</i> or union definition in order to recall that definition later. In this example, <i>tag_employee</i> is a tag:</p>
+
+<pre class="code">
+struct tag_employee 
+{ 
+   char     * name;
+   unsigned   age;
+};
+/* ... */
+struct tag_employee my_employee;
+
+</pre>
+<p>The peculiar thing with tags is that they live in a separate namespace from declared variables and types. Consequently, it is perfectly legal (although it may be very stupid) to use the same name both as a <i>struct</i> tag and as a user type name:</p>
+
+<pre class="code">
+
+ 1:  typedef unsigned long int ulint_t;
+ 2:  struct ulint_t {
+ 3:     char a;
+ 4:     float b;
+ 5:  } a;
+ 6:  void function()
+ 7:  {
+ 8:     ulint_t         my_var;
+ 9:     struct ulint_t  my_struct;
+10:  }
+
+</pre>
+<p>Unfortunately, our current front-end fails to parse this code. In fact, it tokenizes <i>ulint_t</i> on line 8 as TYPE_NAME, when an IDENTIFIER is expected after the <i>struct</i> or <i>union</i> keyword, as the syntax rules from the C grammar show:</p>
+
+<pre class="code">
+
+struct_or_union_specifier	
+	: struct_or_union IDENTIFIER
+	| struct_or_union IDENTIFIER '{' struct_declaration_list '}'
+	| struct_or_union            '{' struct_declaration_list '}'
+	;
+
+</pre>
+<p>To solve this, I use a simple (though not elegant) workaround. I do not make the lexer capable of distinguishing tags from identifiers and type names. Instead, I modify the grammar to make it irrelevant whether a tag is tokenized as IDENTIFIER or TYPE_NAME. To do so, in the previous rules, I add for each rule involving IDENTIFIER a copy that involves TYPE_NAME. The result is: </p>
+
+<pre class="code">
+
+struct_or_union_specifier	
+  : struct_or_union IDENTIFIER
+  | struct_or_union IDENTIFIER      '{' struct_declaration_list '}'
+  | struct_or_union TYPE_NAME
+  | struct_or_union TYPE_NAME       '{' struct_declaration_list '}'
+  | struct_or_union      '{' struct_declaration_list '}'   
+   ;
+
+
+</pre>
+<p>The solution is simple and effective, it does not cause any ambiguity in the grammar, and it addresses all the cases where a tag can be used, including cast expressions such as <i>pq = (struct tag_q *) ps;</i>.</p>
+
+
+
+
+
+
+
+
+
+
+
+<h3>But Things  Get Tricky...</h3>
+
+<p>Where declarations are concerned, C is much more permissive than you might think. This permissiveness may lead to poor readability and understandability, as in:</p>
+
+<pre class="code">
+
+1: typedef unsigned long int ulint_t;  
+2: void function() 
+3: {
+4:    ulint_t another_var;  
+ /* ulint_t is used as type name */
+5:    char ulint_t;         
+ /* ulint_t is used as identifier */
+6:    /*...*/
+7: }
+
+</pre>
+<p>Despite first impressions, this code is perfectly legal ANSI C, but the front-end based on the lexer in Listing One fails to recognize it. </p>
+
+<p>More precisely, line 1 defines <i>ulint_t</i> as a user type; therefore, <i>ulint_t</i> must be tokenized here as IDENTIFIER. Then, line 4 declares a variable of this type; therefore, <i>ulint_t</i> is tokenized here as TYPE_NAME, as the scoping rules require. So far, nothing is new. Now, line 5 declares a variable named <i>ulint_t</i>&#151;this is allowed. Inner blocks can declare new variables and types that hide outer objects with the same names. Moreover, in the current block, there are no conflicts because no previous declarations in this block involve the name <i>ulint_t</i>. Since line 5 declares a variable, the lexer should tokenize <i>ulint_t</i> in line 5 as IDENTIFIER. Unfortunately, the lexer as specified in Listing One tokenizes it as TYPE_NAME because it finds a type declaration with that name in the outer block.</p>
+
+	
+	
+
+<pre class="code">
+int category()
+{
+  Block * blockp = Block::currentp;
+  ...
+  while (blockp) 
+  {
+     if (blockp-&gt;symbol_table.name_is_defined(yytext)) 
+     {
+        if (blockp-&gt;symbol_table.name_is_typedef(yytext)) 
+        {
+           if (Block::currentp-&gt;type_stack.is_valid_type())
+         return IDENTIFIER;
+       else 
+         return TYPE_NAME;    
+        } 
+        else 
+          return IDENTIFIER; 
+     }
+     blockp = blockp-&gt;parentp;
+  }
+  return IDENTIFIER;
+}
+ ...</pre>
+<div class="caption">
+   Listing Two
+</div>	
+	
+	
+	
+
+<p>To solve this, the lexer must cooperate with the parser and the semantic layer. Listing Two presents a solution. You force the current token (<i>ulint_t</i>) as IDENTIFIER when it is the last part of a variable declaration; for instance, when what appears before the current token is a valid type specifier. Although this condition seems simple to verify, the simple condition:</p>
+
+<pre class="code">
+
+if (Block::currentp-&gt;       type_stack.is_valid_type()) 
+
+</pre>
+<p>hides a full implementation of the C type system provided by the semantic layer. Declarations in C are defined by 108 syntax rules, which is a large part of the entire grammar of the C language. The declaration syntax of C is complex and counterintuitive, and even experienced programmers find it troublesome&#151;qualifiers (<i>const</i> and <i>volatile</i>) may appear in different orders, type specifiers (such as <i>long</i> or <i>unsigned)</i> may modify another type specifier or come alone (then <i>int</i> is implied), declarations of pointers to functions are poorly readable, and much more. A real-life example of a nontrivial declaration is: </p>
+
+<pre class="code">
+
+void (*signal(int sig,       void (*func)(int))) (int);
+
+</pre>
+<p>My approach maintains a stack of type records in each block, which describes the state of the current declaration. When each element in a declaration (type record) is parsed, according to the correct precedence implied by the grammar rules, it is pushed onto a stack. Whenever a direct declarator identifier is encountered, a snapshot of the current type stack is taken, saved into the symbol table of the current block, and associated to that identifier. Figure 4 illustrates this mechanism. </p>
+
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!--  -->    
+<img class="illowide" src="061201ds02_f4.gif" onclick = "popimage(this,'www.ddj.com - Practical Parsing for ANSI C - Figure 4')">
+
+<div class="caption">
+Figure 4: How type stacks are used to process declarations.
+</div>
+</div>
+
+
+
+<p>Type stacks are easy data structures to process, they capture the full complexity of C declarations; and unlike declarations, they are easy to read. To get the type of a variable in plain English, just read its type stack from top to bottom. For example, "c" in Figure 4 is an array of five pointers to integers. (For brevity, I don't discuss type-stack normalization.)</p>
+
+<p>Finally, type stacks are the key to solve the issue described at the beginning of this section. In short, when the records in the current type stack constitute a valid type, the lexer prevents tokens that are declared as user type names outside (such as <i>ulint_t</i>) to be tokenized as TYPE_NAME, and forces them to be IDENTIFIER. </p>
+
+
+
+
+
+
+
+
+
+
+<h3>...And Trickier</h3>
+
+<p>Type stacks are employed to process type specifiers, but type specifiers can appear both in declarations and in cast expressions. You observe no conflicts, except when the two features are used together, as in:</p>
+
+<pre class="code">
+
+1: typedef int * intp_t;
+2: char pc;
+3: void f() {
+4: int * pi = (intp_t) &amp; pc;
+5: }
+
+
+</pre>
+<p>where line 4 contains a variable declaration and initialization, and the initializer contains a cast expression. Appropriate countermeasures must be taken to tokenize <i>intp_t</i> in line 4 as TYPE_NAME. In fact, according to the aforementioned logic, it is tokenized as IDENTIFIER. The lexer should inhibit the behavior "force to IDENTIFIER" when it is in the middle of a variable initializer. Unfortunately, whether or not we are in the middle of a variable initializer is something that only the parser can say, and only after the lexical analysis is complete. The lexical choice to tokenize <i>intp_t</i> would then depend on how a superset of input text is parsed after lexical analysis: It is a circular dependence. </p>
+
+<p>To solve the issue, I exploit the fact that cast expressions always appear between parentheses. The lexer maintains a "parenthesis level"; that is, a counter of how many parentheses are open. This counter is incremented at each encountered "(", and decremented at each ")". Then, type names are not forced to IDENTIFIER when we are inside a couple of parentheses. The corresponding modification can be seen in Listing Three.</p>
+	
+	
+
+<pre class="code">
+int category()
+{
+  Block * blockp = Block::currentp;
+  ...
+  while (blockp) 
+  {
+     if (blockp-&gt;symbol_table.name_is_defined(yytext)) 
+     {
+        if (blockp-&gt;symbol_table.name_is_typedef(yytext)) 
+        {
+           if (Block::currentp-&gt;type_stack.is_valid_type() &amp;&amp;
+               parenthesis_level==0)
+         return IDENTIFIER;
+       else 
+         return TYPE_NAME;
+        } 
+        else 
+          return IDENTIFIER; 
+     }
+     blockp = blockp-&gt;parentp;
+  }
+  return IDENTIFIER;
+}
+ ...</pre>
+<div class="caption">
+   Listing Three
+</div>	
+	
+	
+
+
+</body>
+</html>

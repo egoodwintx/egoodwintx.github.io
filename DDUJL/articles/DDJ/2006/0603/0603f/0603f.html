@@ -1,0 +1,98 @@
+
+<html>
+<head>
+<title>March, 2006: Debugging &amp; Embedded Linux Runtime Environments</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<p><i>Dr. Dobb's Journal</i>, March 2006</p>
+<h1>Debugging &amp; Embedded Linux Runtime Environments</h1>
+<h2>Modifying the kernel gives you the tools</h2>
+
+
+<h3>By Rajesh Mishra</h3>
+
+
+<I>Raj is a senior software engineer at the Digital Media Technology Center of Analog Devices. He can be contacted at rajesh.mishra@analog.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Over the past decade, Linux has become increasingly prevalent in many areas of computing&#151;including in the embedded space where it has been adapted to numerous processors. Embedded Linux, also known as "uClinux" (pronounced "micro-see-Linux"), is a minimized version of standard Linux that runs on highly resource-constrained devices. uClinux is maintained by the Embedded Linux/Microcontroller Project (http://www.uClinux.org/), a group whose sponsors include (among others) Analog Devices, the company I work for. Analog Devices has also ported uClinux to its Blackfin architecture (http://blackfin.uclinux.org/).</p>
+
+<p>Applications executing in resource-constrained environments typically try to conserve on CPU and memory use, while still executing in a robust and secure fashion. However, during development, these barriers can be broken. For example, memory leaks, stack overflows, missed real-time application deadlines, process starvation, and resource deadlocks are frequently encountered. In this article, I present tools and techniques for resolving these critical issues, thereby facilitating development of robust application software for Embedded Linux.</p>
+<h3>Desktop to Embedded Debugging</h3>
+
+<p>One of Linux's most attractive features is its programming environment. Not only is the standard desktop environment friendly to traditional UNIX developers, but modern Linux programmers are also equipped with state-of-the-art IDEs such as Eclipse. uClinux, however, is much more restricted than the native Linux development environment. The typical uClinux development environment consists of a remote interface from a host to the target platform.</p>
+
+<p>The host platform is usually the standard Linux or Windows desktop executing a debugger such as a GDB or commercial IDE. This debugger communicates with the target platform over a bridge, which interconnects a host interface (USB or PCI) to the target processor, such as serial JTAG. The target device (Analog Device's Blackfin processor, for instance) sits on a firmware board interfaced to all requisite peripherals and external interfaces (network, memories, RS-232, and other serial interfaces, possibly PCI and other system buses). Although the host platform may communicate with the target over any of these external interfaces (network and RS-232), the JTAG interface is the primary means of communication to the target device because JTAG enables "on-chip" debugging and control. That is, it lets you remotely start, stop, and suspend program execution, examine the state of the target processor, memories, and I/O devices, and execute a series of target instructions. </p>
+
+<p>Despite the capabilities provided by on-chip JTAG interfaces to IDEs, debugging a remote uClinux platform is still not the same as that of native Linux. Under the desktop, a native debugger can execute in a protected environment, allowing application processes to be traced and monitored throughout their life. If exceptions or error events occur in the program, the native debugger detects and responds to them, without affecting the overall system. Embedded Linux environments, on the other hand, do not provide this level of program protection. When an exception occurs, the remote debugger may detect the event and halt it; however, all other processes within the system are also halted, including the kernel.  </p>
+
+<p>To emulate the native scenario, uClinux developers use gdbserver, a uClinux application program that executes just like other user-level processes. However, its primary function is to enable control of a target program's execution and communicate with remote host debuggers (such as GDB) over standard links (TCP/IP or serial connections).</p>
+<h3>Application Awareness</h3>
+
+<p>Although gdbserver has the advantage of stepping through uClinux application programs and monitoring their execution state, it does have significant shortcomings. For instance, if the network or serial connection is not 100 percent available as a trusted communications interface, then gdbserver cannot be used. Because uClinux programs run in a virtually unprotected environment, when the program encounters an exception or error event, it is likely that gdbserver itself fails, resulting in all debugging capability being lost. In the uClinux environment, most catastrophic errors are unrecoverable by the system. And so, other mechanisms are required to enable a more robust debugging environment.</p>
+
+<p>One such strategy we've developed for Analog Devices' Blackfin-based eM30 platform (which is designed for set-top boxes, media servers, portable entertainment devices, and the like) is to let the host debugger become "application aware." In this case, the uClinux kernel provides knowledge of what application processes are executing and where they reside in memory to the host debugger. It does this by maintaining a table of all active application processes and sharing it with the host debugger. The debugger examines this table and uses it to reference symbol table information for the corresponding application to control its execution and report its state. With these capabilities, users can set breakpoints within any of the application programs, step through these programs at source level, examine expressions of data variables, and so on. Also, users can continually step through application code into runtime library code and across into kernel space. Users have simultaneous access to all user-space and kernel-space structures.</p>
+<h3>Kernel Awareness</h3>
+
+<p>Exceptions and errors encountered within the uClinux kernel are the most frequent cause of system failure. Such causes are memory overwrites due to stack and data overflows, missed deadlines of kernel threads and interrupt service routines, and resource deadlocks and starvation due to race conditions in semaphore usage. To debug these conditions, more debugging information is required from the kernel for the debugger than is currently available.</p>
+
+<p>For the eM30 platform, we've added extensions to the standard uClinux 2.6.x kernel and GDB Blackfin-uClinux target debugger to expose this relevant internal kernel state. </p>
+
+<p>Most of the kernel state is visible through existing kernel data structures, such as the <i>task_struct</i> task structure and network statistics. However, certain states are not captured in the existing kernel and require code extensions. One of these is the processor mode, which describes whether the processor is in kernel/supervisory mode, user mode, or is idling. This state is updated only during mode switching, as in the state diagram in <a name="rf1"></a><a href="0603ff1.html">Figure 1</a>. As shown, the processor states are assigned only when the appropriate state transition occurs, such as when a processor event occurs or a kernel routine is invoked.</p>
+
+<p>During debugging, it may also be of interest when timer and scheduler events took place&#151;to know when processes are scheduled, how long the processor was occupied in them, and when deadlines may have passed or missed. We've added profiling of these events in the entry and exit points of the existing <i>timer_interrupt</i> and <i>schedule</i> routines. This not only provides information about when these events took place, but also how long it took to process these events.</p>
+
+<p>The Linux kernel does not provide all necessary structures for accessing the entire kernel state. Wait queues and spin locks are some of these structures that cannot be accessed globally. To gain visibility into these structures, we customized the Blackfin uClinux GDB debugger to support this awareness. During the kernel load process, a GDB script examines all declared static and dynamic <i>wait_queue</i> and <i>spin_lock</i> structures and initializes a global list of both types of structures within kernel memory. It also loads the static portions of these structures. For dynamic instantiation of these structures, we modified the kernel allocation routines to load the respective information into this global list. With this scheme, we can examine and access the state of all resource-locking mechanisms within the kernel. This gives us the ability to debug resource deadlock and starvation scenarios.</p>
+<h3>Modes of Interaction</h3>
+
+<p>Debugging under uClinux requires you to interact in different ways with the target system: </p>
+
+<ul>
+  <li>When a system crash occurs, you can resort to examining postmortem information from the last preserved system state within the debugger. </li>
+  <li>When a memory leak is suspected, the amount of free memory may be periodically checked to see if it is shrinking. </li>
+  <li>When a resource deadlock occurs, you may require a history of all locking and unlocking events on the resource to see how the state was arrived at. </li>
+</ul>
+
+
+
+<p>Each of these scenarios requires a unique approach to collecting and analyzing debugging information. </p>
+
+<p>The first scenario requires interactive debugging on the target device from within a debugger. The debugger may halt when a program exception event occurs on the target device to let you examine the postmortem state from within the debugger. You can define specific events (breakpoints) in the program code to trigger the debugger to halt. You may decide to walk through program execution (single-step) as each statement (or instruction) is executed. You may interrupt an already-running program by entering a specific key sequence (for example, CTRL-C) or resume a halted program. The debugger may let you change the state of the program, contents of memory, and machine state (internal and shadow registers). All of these methods necessarily intrude upon the actual execution of the program on the target machine.</p>
+
+<p>Because debugging under the debugger can result in modifying program behavior, a second type of interactive debugging can be used to periodically examine the state of the target device. In the second scenario, dynamic memory allocation may be affected when the machine state is altered (such as when an interrupt service routine allocates memory). Hence, debugging via the debugger may not accurately reproduce the given scenario. An alternate means of debugging this problem is to examine the system state via the operating system.</p>
+
+<p>uClinux provides the /proc filesystem for examining (and even modifying) system state from the target's shell command prompt. In this example, the output of the shell command <i># cat /proc/meminfo </i>(<a name="rf2"></a><a href="0603ff2.html">Figure 2</a>) may be inspected. If the <i>MemFree</i> field shrinks during the course of program execution, this may provide evidence for a memory leak.</p>
+
+<p>The usefulness of the /proc filesystem was exploited in the eM30 to output more details of the internal state of the Linux kernel. This uClinux enhancement has been incorporated inside a special miscellaneous, character-mode driver called "bfin_profiler." This driver provides not only this /proc facility but also a mechanism for the kernel to log events and a user application to output these events to a filesystem. </p>
+
+<p>Listing One (available electronically; see "Resource Center," page 5) presents the functions that dump the bfin_profiler driver output to the /proc filesystem. Listing Two (also available electronically) is sample output from this dump. Measurements provided under "read count" indicate the user application response time to an interrupt event in clock cycles. Special instrumentation is provided within the kernel to measure this latency. The count itself indicates the number of response events that were received by the application. Cycle measurements indicate average, minimum, and maximum wait times. The CPU profiler provides special instrumentation to measure how much of the processor's time was spent in user mode, kernel mode, and idle state. Performance figures as cycle counts are reported under "CPU profiler." Measurements of how long was spent in the timer interrupt service routine <i>timer_interrupt</i> and the scheduler <i>schedule</i> are also reported. Telemetry statistics are reported following the scheduler. Finally, the number of active user application processes currently running in the system is reported, along with each program's pathname, code and data size, pointer to task structure, and process ID. The report in Listing Two identifies the key elements of the uClinux kernel state, directly accessible by users to monitor system activity.</p>
+
+<p>Interactive debugging, from within a debugger or within an operating-system console, is intrusive to overall system operation, although to a lesser extent using the /proc filesystem. Also, it does not provide a history of system activity, only the current system state. This history information is often needed, as in the third scenario, when trying to debug resource deadlocks. A history of all resource locking and unlocking events is necessary to analyze how the deadlock conditions were arrived at. </p>
+
+<p>To assist uClinux programmers in gathering this type of event history, we added a kernel-callable function, <i>bfin_profiler_event</i> (available electronically; see "Resource Center," page 5) to the bfin_profiler driver. In addition, we inserted event-capture calls to specific areas of the kernel for measurement. For instance, the <i>timer_interrupt</i> kernel routine (also available electronically) shows event-capture code inserted into the timer-interrupt service routine <i>timer_interrupt</i>. Upon entry into this routine, the <i>bfin_profiler_event</i> procedure is invoked with a unique event identifier <i>BLACKFIN_PROFILER_TIMER_ENTER</i> (value of 0x20000) to denote entry; likewise, upon exit, <i>BLACKFIN_PROFILER_TIMER_EXIT</i> (value of 0x20001) is used to denote the exit event. Both calls unconditionally timestamp each event. Only the first call increments the event counter, so that both the exit and entry events are associated with the same event instance. The event ID, timestamp, and event count are recorded for each instance into a telemetry buffer called <i>bfin_profiler_telem_buffer</i>. <a name="rf3"></a><a href="0603ff3.html">Figure 3</a> shows sample contents of this buffer. The prof2txt postprocessing utility generated this output. The <i>Id</i> field indicates the event ID (<i>BLACKFIN_PROFILER_TIMER_ENTER</i> and <i>BLACKFIN_PROFILER_TIMER_EXIT</i> in this example), <i>Cycles</i> indicates a relative timestamp based on the interval between current and last event, and <i>Value</i> denotes the event instance (note that the timer entry and exit events are associated according to each instance).   </p>
+
+<p>The <i>bfin_profiler_event</i> utility routine may be used to log any kernel event. All that is required is that a unique event ID be passed as an argument. As illustrated, timestamps are taken as a 64-bit sample of a hardware cycle counter to allow accurate measurements to be performed at the finest granularity. Although not all architectures may provide a hardware cycle counter, a programmable timer may also be used for this purpose.</p>
+
+<p>Once event information has been logged into the target machine's system memory, there are several ways to store the event data for external monitoring and analysis. For offline analysis, the telemetry buffer may be read out by a user application using the <i>ioctl(BFIN_PROFILER_TELEM_READ)</i> driver call and storing its contents to a file. For online analysis, the contents can be read out the same way and sent to a remote host over the network. Because this method may interfere with event logging (for instance, if network events are being logged), a separate JTAG interface is provided for transmitting the event data. Although the JTAG interface is much slower than the network interface, it is much less intrusive to the overall system.</p>
+
+<p>Once the event data has either been captured to a file or delivered to a remote host program, the event trace may be analyzed for relationship between events, timing, and so on. Two utility problems have been written for postprocessing analysis. Again, the prof2txt utility dumps the event trace in readable format with event IDs, relative timestamps, and instance values. In the simplest analysis, the dump displays an ordering of events when they occurred chronologically. Alternatively, for more complex analysis, the output of this utility may be loaded into a spreadsheet or math-processing tool such as MATLAB. Using these tools, event plots may be obtained, performance metrics may be calculated, and correlation between events and timing can be analyzed. The profbin utility performs a histogram analysis of each pair of events. It places each event pair instance into a separate bin and calculates the minimum, maximum, and average frequency of each event pair in number of cycles. Sample output of this utility is provided for the timer entry/exit example in <a name="rf4"></a><a href="0603ff4.html">Figure 4</a>. As illustrated in this example, during a run of 5.1 seconds, the timer interrupt service routine spent 0.11 percent of the CPU and took an average of 6092 cycles for each timer event.</p>
+<h3>Conclusion</h3>
+
+<p>Debugging in the uClinux environment requires an assortment of tools, including interactive debuggers, operating-system facilities such as the /proc filesystem, and event-based telemetry capture and analysis tools. However, this is not all. The Linux kernel and debugger require key modifications to enable visibility into the internal kernel state and the applications executing on top. </p>
+<p><b></b></p>
+<p><b></b></p>
+<p><b>DDJ</b></p>
+
+
+
+
+</body>
+</html>

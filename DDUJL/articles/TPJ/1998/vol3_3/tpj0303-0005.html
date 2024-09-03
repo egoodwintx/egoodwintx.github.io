@@ -1,0 +1,421 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+  <title>A Web Proxy Module for mod_perl - The Perl Journal, Fall 1998</title>
+  <meta name="generator" content=
+  "HTML Tidy for Linux/x86 (vers 12 April 2005), see www.w3.org">
+  <meta name="vscategory" content="Perl">
+  <meta name="vsisbn" content="">
+  <meta name="vstitle" content="A Web Proxy Module for mod_perl">
+  <meta name="vsauthor" content="Lincoln D. Stein">
+  <meta name="searchdescription" content=
+  "How web proxy servers work is one of the darker secrets of the web protocols. In this article we plunge into the depths to show you how to write a proxy module for the Apache web server. This module will handle the proxy's basic job of fetching web documents on your behalf and forwarding them to you, but with a twist: it acts as an advertisement filtering service">
+  <meta name="vsimprint" content="The Perl Journal">
+  <meta name="vspublisher" content="Earthweb">
+  <meta name="vspubdate" content="Fall 1998">
+  <!-- always update the article title and issue -->
+
+</head>
+
+<body bgcolor="#FFFFFF">
+  <font face="verdana" size="1">Issue 11, Fall 1998</font>
+
+  <h2 align="center">A Web Proxy Module for <tt>mod_perl</tt></h2>
+
+  <h4><i>Lincoln D. Stein</i></h4>
+  <!-- packages described, if necessary -->
+
+  <div align="center">
+    <table border="1" cellspacing="0" cellpadding="5">
+      <tr>
+        <td align="center" bgcolor="#CCCC99">
+        <b>Requirements</b></td>
+      </tr>
+
+      <tr>
+        <td>
+        Apache&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<a href="http://apache.org"
+        target="resource window">http://apache.org</a><br>
+        <tt>mod_perl</tt>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<a href="http://perl.apache.org"
+        target="resource window">http://perl.apache.org</a><br>
+        LWP
+        5.08&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CPAN/modules/by-module/LWP<br>
+
+        Image::Size
+        2.6&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CPAN/modules/by-module/Image<br>
+
+        GD
+        1.8&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CPAN/modules/by-module/GD</td>
+      </tr>
+    </table>
+  </div>
+
+  <p>How web proxy servers work is one of the darker secrets of the
+  web protocols. In this article we plunge into the depths to show
+  you how to write a proxy module for the Apache web server. This
+  module will handle the proxy's basic job of fetching web
+  documents on your behalf and forwarding them to you, but with a
+  twist: it acts as an advertisement filtering service.</p>
+
+  <p>An ordinary web server returns local documents in response to
+  incoming requests. In contrast, a proxying server has elements of
+  both server and client. Instead of sending the proxy server a
+  request for a local document, the client requests the URL of a
+  document located somewhere else on the Internet. The proxy then
+  acts as a client itself by fetching the document and forwarding
+  it to the waiting client.</p>
+
+  <h3>WHY PROXY?</h3>
+
+  <p>What's the purpose of this? Proxy servers have several uses.
+  Historically the most important use for proxies was to allow web
+  requests to cross firewalls. Many firewall systems are configured
+  to prohibit port 80 traffic. In order to circumvent this
+  restriction, administrators installed web server proxies on the
+  firewall system. Users then configured their browsers to connect
+  to the firewall machine for web access, and the proxy did the
+  rest. Nowadays all commercial firewall systems come with built-in
+  web proxies and it is no longer necessary to run a general
+  purpose web server on the firewall (which was never much of a
+  good idea for security reasons).</p>
+
+  <p>A second reason to proxy is that some proxying servers, Apache
+  included, can cache the contents of the remote documents by
+  sav-ing them to disk files. If they later receive a request for a
+  previously cached document, they return the cached document
+  instead of fetching it remotely. This cuts down on network
+  bandwidth and improves performance, particularly if the server is
+  connected to the Internet by a slow connection. America Online
+  uses caching proxies to improve response time for its large and
+  content-hungry membership. Unfortunately, caching introduces a
+  lot of complexity. When is a cached document no longer fresh,
+  requiring another fetch again from its source? Given the web's
+  eclectic mixture of static pages, CGI scripts, dynamic HTML, and
+  server-side includes, not even the best caching proxies answer
+  this question correctly 100% of the time.</p>
+
+  <p>A third use for proxy servers is to filter the request. A
+  proxy server can change the outgoing request or modify the
+  document on its way back to the user. This allows for many useful
+  applications. One popular use of this technique is to create an
+  anonymizing proxy. Such a proxy sits on the Internet somewhere
+  and is used by people who want to protect their identity. As the
+  ano- nymizer receives incoming requests, it strips out all
+  potentially identifying information from the outgoing request,
+  including the User-Agent field, which identifies the browser make
+  and model, HTTP cookies, and the Referer field, which contains
+  the URL of the last document the user viewed.</p>
+
+  <p>Like an anonymizer, the example proxy in this article filters
+  the data that passes through it. However, instead of modifying
+  the outgoing request, it modifies the document that is returned
+  to the user. Each proxied document is examined to see whether it
+  might be an advertising banner image. If so, the proxy replaces
+  the banner with a transparent GIF generated on the fly,
+  preserv-ing the size and shape of the original image. The result
+  is shown in <a href="images/stein-fig1.gif">Figure 1</a>
+  ("before") and <a href="images/stein-fig2.gif">Figure 2</a>
+  ("after").</p>
+
+  <p>You might use this proxy if you are offended by the web's
+  crass commercialism, or just easily distracted by the blinking,
+  brightly colored ads on your favorite search page. The proxy is
+  written as an add-in module for the Apache server running
+  <tt>mod_perl</tt>, the embedded Perl interpreter that Doug
+  MacEachern and I wrote about in <a href="../vol3_1/ewtoc.html"
+  target="resource window">TPJ #9</a>. The code itself was written
+  by Doug MacEachern, and is used with his permission.</p>
+
+  <h3>HOW THE PROXY PROTOCOL WORKS</h3>
+
+  <p>Despite its aura of the arcane, the basic proxy protocol is
+  ridiculously simple. A normal web request begins with the browser
+  sending a server a line of ASCII text that looks like this:</p>
+  <pre>
+GET /path/to/document HTTP/1.0
+</pre>
+
+  <p>The server responds by returning the document located at the
+  indicated path.</p>
+
+  <p>In contrast, to make a proxy request, the browser modifies the
+  first line of the request to look like this:</p>
+  <pre>
+GET http://some.site/path/to/document HTTP/1.0
+</pre>
+
+  <p>If the server is proxy-capable, it sees that the requested URL
+  contains the protocol and hostname, and forwards the request to
+  the indicated remote host. Some proxies can only handle requests
+  for HTTP URLs, while others can also handle FTP, Gopher, and
+  (occasionally) WAIS.</p>
+
+  <p align="center"><a href="images/stein-fig1.gif"><img src=
+  "images/stein-fig1_sm.gif" align="center" alt=
+  "Figure 1: An Alta Vista page with ads" border="0" width="265"
+  height="218"></a></p>
+
+  <p align="center"><font size="-1"><b>Figure 1:</b> An Alta Vista
+  page with ads</font></p>
+
+  <p>As you may recall from the <tt>mod_perl</tt> article, Apache
+  divides each browser transaction into ten different phases
+  responsible for handling everything from translating a URI into a
+  physical pathname, to generating the page content, to writing
+  information about the completed transaction into a log file. To
+  extend the server's abilities, you write "handlers" to intercept
+  one or more of the phases, supplementing Apache's built-in
+  handlers or replacing them entirely.</p>
+
+  <p>The easiest way to intercept and handle proxy requests is to
+  write two different handlers. The first handler operates during
+  the URI translation phase and is responsible for distinguishing a
+  proxy request from an ordinary one. When the URI translation
+  handler detects a proxy request, it installs the second handler,
+  whose job is to service the content-generation phase of the
+  transaction. It is the content handler that does the actual proxy
+  request and returns the (possibly modified) document.</p>
+
+  <p><a href="tpj0303-0005a.html">Listing 1</a> gives the complete
+  code for a module called Apache::AdBlocker. To use this module,
+  you'll need LWP 5.08 (or higher), Image::Size 2.6 (or higher),
+  and GD 1.18 (or higher). LWP is needed to fetch the remote page,
+  Image::Size is used to determine the size of retrieved GIF and
+  JPEG advertisements, and GD is used to generate a transparent GIF
+  of the same size and shape as the blocked ad. You'll also need
+  Apache 1.3.0 or higher, and a recent version of <tt>mod_perl</tt>
+  (currently at revision 1.15).</p>
+
+  <p>The module starts by declaring its package name. By
+  convention, Apache modules are placed in the Apache:: namespace.
+  We then turns on strict syntax checking, and bring in code from
+  GD, Image::Size and LWP::UserAgent. We also bring in commonly
+  used constants from the Apache::Constants package.</p>
+
+  <p>Lines 9 and 10 inherit from the LWP::UserAgent class.
+  LWP::UserAgent is used by the LWP library for all objects that
+  are capable of making web client requests, such as robots and
+  browsers. Although we don't actually override any of
+  <tt>LWP::UserAgent</tt>'s methods, declaring the module as a
+  subclass of <tt>LWP::UserAgent</tt> allows us to cleanly
+  customize these methods at a later date should we need to. We
+  then define a version number, as every module intended for
+  reusability should.</p>
+
+  <p align="center"><a href="images/stein-fig2.gif"><img src=
+  "images/stein-fig2_sm.gif" align="center" alt=
+  "Figure 2: The same page viewed through Apache::AdBlocker."
+  border="0" width="265" height="218"></a></p>
+
+  <p align="center"><font size="-1"><b>Figure 2:</b> The same page
+  viewed through Apache::AdBlocker.</font></p>
+
+  <p>In lines 11 to 14, we create two package globals. <tt>$UA</tt>
+  is the LWP::UserAgent that we will use for our proxy requests. It
+  is created using the special token <tt>__PACKAGE__</tt>, which
+  evaluates at run time to the name of the current package. In this
+  case, <tt>__PACKAGE__-&gt;new</tt> is equivalent to
+  Apache::AdBlocker-&gt;new (or <tt>new Apache::AdBlocker</tt> if
+  you prefer Perl's indirect object style of method call).
+  Immediately afterward we call the object's <tt>agent()</tt>
+  method with a string composed of the package name and version
+  number. This is the calling card that LWP sends to the remote
+  hosts' web servers as the HTTP <tt>User-Agent</tt> field.
+  Provided that the remote server records this information, the
+  string that will show up in the access log will be
+  <tt>Apache::AdBlocker/</tt> 1.00.</p>
+
+  <p>Line 14 defines a regular expression that detects many (but
+  not all) banner ads. It's a simple expression that matches the
+  words "ads", "banners", "promotion" and so on. If you use this
+  service regularly, you'll probably want to broaden this
+  expression to catch more ads.</p>
+
+  <p>Lines 16 through 22 define the <b><i>translation
+  handler</i></b>, a subroutine which, by convention, is named
+  <tt>handler()</tt>. This subroutine is simple enough. It begins
+  by copying the Apache request object from the argument stack to a
+  lexical variable, <tt>$r</tt>. The request object is the
+  interface between user-written modules and Apache, and can be
+  used both to learn about the current transaction and to send
+  commands back to the server.</p>
+
+  <p>In this case, we call the request object's <tt>proxyreq()</tt>
+  method to learn whether the current request is an ordinary one
+  for a local document, or a proxy request for a URL on another
+  system. If this is just an ordinary request, we decline to handle
+  it, returning the <tt>DECLINED</tt> status code. This tells
+  Apache to handle the translation phase using its default
+  mechanism. Otherwise, we set the stage for a custom content phase
+  handler.</p>
+
+  <p>There are now two things that need to be done. First we need
+  to tell Apache that the Perl interpreter will be handling the
+  content phase. We do this with a call to the request object's
+  <tt>handler()</tt> method, giving it an argument of
+  <tt>perlscript</tt>, which is the internal name that
+  <tt>mod_perl</tt> uses for the Perl interpreter. Next we need to
+  tell Perl what user-written subroutine to call when the time
+  comes. We do this with a call to <tt>push_handlers()</tt>. This
+  routine takes two arguments: the name of the phase to handle, and
+  a reference to the subroutine to call. PerlHandler is the name
+  used for the content phase (the others are more descriptive, such
+  as <tt>PerlTransHandler</tt> or <tt>PerlLogHandler)</tt>, and
+  <tt>proxy_handler()</tt> is the subroutine that we want to run.
+  As its name implies, you can call <tt>push_handlers()</tt>
+  multiple times in order to set up a chain of handlers that will
+  be called in order. (We don't take advantage of this facility in
+  this example.) The last thing we do is to return an OK status
+  code, telling Apache that we handled the request ourselves and no
+  more needs to be done.</p>
+
+  <p>Apache now takes over very briefly until it reaches the
+  content-handling phase of the transaction, at which point we find
+  ourselves inside the <tt>proxy_handler()</tt> routine (lines 24
+  through 62). As a content handler, this subroutine is responsible
+  for producing the document that is eventually trans-mitted back
+  to the browser. When a proxied document is requested, this
+  routine will be called once for the main document, and once for
+  each image, sound, or other inline content.</p>
+
+  <p>The routine starts as before by copying the request object
+  into lexical variable <tt>$r</tt>. It now uses the LWP library to
+  construct an <tt>HTTP::Request</tt>, an object that contains the
+  various and sundry headers in an HTTP request. We need all the
+  header fields that were passed to Apache to be passed through to
+  the LWP library. This is so that cookies, authorization
+  information, and the list of acceptable MIME types continue to
+  work as expected. First we create a generic
+  <tt>HTTP::Request</tt> object by calling its <tt>new()</tt>
+  method with the request method and the request URI (derived from
+  the request object's <tt>method()</tt> and <tt>uri()</tt> methods
+  respectively). Next we copy all the incoming header fields to the
+  new HTTP::Request object. The Apache request object's
+  <tt>headers_in()</tt> method returns a hash of field name-value
+  pairs. We iterate over this hash, inserting each header into the
+  <tt>HTTP::Request</tt> object.</p>
+
+  <p>If the current request uses the POST method, there's also
+  content data to copy over&mdash;typically the contents of
+  fill-out forms. In lines 34 through 39 we retrieve the request's
+  content length by calling the request object's
+  <tt>header_in()</tt> method with an argument of Content-length.
+  This call is similar to <tt>headers_in()</tt>, but returns the
+  value of a single field, rather than a hash containing them all
+  (yes, we could reuse <tt>%headers_in</tt> here, but then you
+  would have missed a useful part ofobject's <tt>read()</tt> method
+  to read the data into a buffer, and then add the buffer to the
+  outgoing <tt>HTTP::Request</tt>, with the help of its
+  <tt>content()</tt> method.</p>
+
+  <p>Line 41 is where we actually send out the request. We pass the
+  fully prepared <tt>HTTP::Request</tt> object to the user agent
+  object's <tt>request()</tt> method. After a brief delay for the
+  network fetch, the call returns an <tt>HTTP::Response</tt>
+  object, which we copy into the lexical variable
+  <tt>$response</tt>. Now the process of copying the headers is
+  reversed. Every header in the LWP <tt>HTTP::Response</tt> object
+  must be copied to the Apache request object. First we handle a
+  few special cases. The Apache API has a call named
+  <tt>content_type()</tt> to get and set the document's MIME type.
+  In line 42 we call the <tt>HTTP::Response</tt> object's
+  <tt>header()</tt> method to fetch the content type, and
+  immediately pass the result to the Apache request object's
+  <tt>content_type()</tt> method. Next, we set the numeric HTTP
+  status code and the human-readable HTTP status line (this is the
+  text like <tt>200 OK</tt> or <tt>404 Not Found</tt> that begins
+  each response from a web server). We call the
+  <tt>HTTP::Response</tt> object's <tt>code()</tt> and
+  <tt>message()</tt> methods to return the numeric code and human
+  readable messages respectively, and copy them to the Apache
+  request object, using the <tt>status()</tt> and
+  <tt>status_line()</tt> methods to set the values.</p>
+
+  <p>When the special case headers are done, we copy all the other
+  header fields, using the <tt>HTTP::Response</tt> object's
+  <tt>scan()</tt> method to rapidly loop through each of the header
+  name-value pairs (lines 47 through 49). For each header field,
+  <tt>scan()</tt> invokes an anonymous callback routine that sets
+  the appropriate field in the Apache request object with the
+  <tt>header_out()</tt> method. <tt>header_out()</tt> works just
+  like <tt>header_in()</tt>, but accepts the name-value pair of a
+  outgoing header field to set.</p>
+
+  <p>At this point, the outgoing header is ready to be sent to the
+  waiting browser. We call the request object's
+  <tt>send_http_header()</tt> method (line 51) to have Apache send
+  a correctly-formatted HTTP header.</p>
+
+  <h3>IDENTIFYING ADS</h3>
+
+  <p>The time has now come to deal with potential banner ads. To
+  identify something an ad, we require that the document be an
+  image and that its URI satisfy a regular expression match that
+  detects words like "advertisement" and "promotion." On line 52 we
+  call the <tt>HTTP::Response</tt> object's <tt>content()</tt>
+  method to return the data contained within the response, and
+  store a reference to it in the lexical variable
+  <tt>$content</tt>. Next, in lines 54-57 we use the information
+  stored in the Apache request object to check whether the MIME
+  type corresponds to an image, and if so, whether the URL matches
+  the ad scanner pattern. If both these conditions are true, we set
+  the content type to image/gif and call an internal subroutine
+  named <tt>block_ad()</tt> to replace the original image with a
+  custom GIF. On line 59, we send the possibly modified content on
+  to the browser by passing it to the Apache request object's
+  <tt>print()</tt> method. Lastly, we return a status code of OK to
+  inform Apache that we handled the transaction successfully.</p>
+
+  <p>The <tt>block_ad()</tt> subroutine, beginning on line 64, is
+  short and sweet. Its job is to take an image in any of several
+  possible formats and replace it with a custom GIF of exactly the
+  same dimensions. The GIF will be transparent, allowing the page
+  background color to show through, and will have the words
+  "Blocked Ad" printed in large friendly letters in the upper
+  left-hand corner.</p>
+
+  <p>To get the width and height of the image we call
+  <tt>imgsize()</tt>, a function imported from the Image::Size
+  module. <tt>imgsize()</tt> recognizes most web image formats,
+  including GIF, JPEG, XBM, and PNG. Using these values, we create
+  a new blank <tt>GD::Image</tt> object and store it in a variable
+  named <tt>$im</tt>. We call the image object's
+  <tt>colorAllocate()</tt> method three times to allocate color
+  table entries for white, black and red, and declare that the
+  white color is transparent, using the <tt>transparent()</tt>
+  method. The routine calls the <tt>string()</tt> method to draw
+  the message starting at coordinates (5,5), and finally frames the
+  whole image with a black rectangle. The custom image is now
+  converted into GIF format with the <tt>gif()</tt> method, and
+  copied into <tt>$$data</tt>, overwriting whatever was there
+  before.</p>
+
+  <p>This ends the module. The only remaining step is to tell
+  Apache about it. You do this by placing the following directive
+  in one of Apache's configuration files:</p>
+  <pre>
+PerlTransHandler Apache::AdBlocker
+</pre>
+
+  <p>Apache::AdBlocker's <tt>handler()</tt> subroutine will now be
+  invoked to inspect all incoming requests.</p>
+
+  <p>If you'd like to try this module out for yourself and your LAN
+  configuration doesn't already require you to use a proxy, you
+  will find the module running at <a href="http://www.modperl.com/"
+  target="resource window">http://www.modperl.com/</a>. Open up
+  your browser's proxy configuration settings, and set HTTP
+  requests to proxy through www.modperl.com using port 80. Now
+  browse the Internet, and see how different things look without
+  all the flashing banner ads! After you're finished be sure to set
+  your browser's proxy settings back to their original values. The
+  modperl server is a lowly 90 MHz Pentium and performance will
+  suffer if too many people decide to use the Ad blocker on a
+  permanent basis.</p>
+
+  <p>__END__</p>
+  <hr>
+  <i>Lincoln D. Stein wrote CGI.pm.</i> <!-- end of article -->
+   <!-- end of file -->
+</body>
+</html>

@@ -1,0 +1,1202 @@
+<HTML>
+<META NAME="year" CONTENT="1989">
+<HEAD>
+
+<TITLE>APR89: SWAP</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>SWAP<a name="00bc_0003"><a name="00bc_0003"></h1><P>
+<h2><a name="00bc_0001"><a name="00bc_0000">An application-independent method for one MS-DOS application to run another</h2><P>
+<h3>Nico Mak</h3><P>
+<p><i><a name="00bc_0002"><a name="00bc_0000">Nico Mak is a software developer for Mansfield Software Group in Storrs, Conn.  He can be reached at 70056,241 on CompuServe, or as Nico_Mak on BIX.</i></p><hr><P>
+Many application programs have &quot;shell-to-DOS&quot; capabilities that let you run applications or execute DOS commands from within your resident (current) program.  The problem with many of these programs, however, is that once you've enabled the shell-to-DOS capabilities, you often don't have enough memory left to run the additional programs you need.  In this article I'll present a program that provides an application-independent method for one MS-DOS application to run another, even if both programs would normally not fit in memory at the same time.  The program, which I've named SWAP (see <a href="8904d.htm#00bc_000c">Listing One</A> , page 72), eliminates the need for an application to have its own memory management routines.  A typical use is to temporarily swap out a text editor so that you can run memory-hungry compilers, linkers, or even debuggers without losing your place in an editing session.  The box on page 46 discusses some typical uses of SWAP.  The amount of extra memory you gain by using SWAP can be significant, but it depends on the size of the application that is swapped out.  When run from dBase III Plus, for example, SWAP frees approximately 220K of memory.<P>
+SWAP works by copying conventional memory used by the currently running application to expanded memory or to a disk file, thereby freeing conventional memory used by the application.  SWAP then runs the desired program before restoring the original environment.<P>
+For convenience sake, I refer to the program that shells to DOS and gets swapped out as the swappee.  Expanded memory and EMS refer to memory that conforms to Version 3.2 or later of the Lotus/Intel/Microsoft Expanded Memory Specification.  Numbers suffixed by an H are in hexadecimal notation (for example, 21H).<P>
+SWAP is compatible with most MS-DOS programs.  I've tested it with many popular programs, including dBase III Plus, Lotus 1-2-3, and Mansfield Software Group's KEDIT.  Before relying on it, however, you should test SWAP with your own configuration in case of conflicts with terminate-and-stay-resident (TSR) software and other programs.<P>
+The program is most likely to fail when used with multitasking software such as DESQview and Windows.  This is because these programs, like SWAP, modify DOS memory control blocks. However, because they have their own facilities for overcoming memory constraints, you generally would not use SWAP with these products.<P>
+Though SWAP is coded in 8088 assembly language, you don't need to know assembly language to understand how it works.  The description provided here will make more sense, however, if you have had some experience with the IBM PC interrupt system and some of the more common DOS (interrupt 21H) functions.<P>
+<h3><a name="00bc_0004">Using the SWAP Program<a name="00bc_0004"></h3><P>
+The SWAP command (see <a href="8904d.htm#00bc_0005">Figure 1</A> for the command syntax) can be entered at the DOS prompt, or it can be part of the command string that your application sends to DOS to run another program.  When the -C option is used, SWAP copies everything written to the standard output device (stdout) to the console before it is written to stdout.  This option is useful when standard output is redirected.  It can save considerable time in certain situations --for example, when a long-running program goes astray, you normally don't find out about the problem until the program completes and you view the file containing the redirected output.  The -C option gives you an opportunity to abort the program immediately by pressing Ctrl-Break because output is displayed on the console at the same time as it is written to stdout.<P>
+<h4><a name="00bc_0005"><a name="00bc_0005"><B>Figure 1:</B> SWAP's command syntax</h4><P>
+<pre>
+  SWAP [options] command [command-parameters] [ &gt; fileid]
+  Brackets indicate optional parameters.
+  Valid SWAP options are:
+
+  -C  Copy redirected output to the console
+  -D  Disk file C:\SWAP.DAT is used instead of expanded memory.
+  -F  Forces SWAP to continue even if an interrupt vector points to the Swappee.
+  -Q  Quiet operation.  Informational messages are not displayed.
+
+  Command is any command that can be issued at the DOS
+  prompt.  command-parameters are parameters or options for the
+  command.  fileid is a DOS file or device to which output from the
+  command can be directed.</pre><P>
+<P>
+The -C option is particularly useful when compiling programs from inside an editor.  I use an editor macro that redirects compiler output to a disk file, examines the output for error messages, and automatically locates any source lines that generated compiler errors (similar macros are available for most editors).  Occasionally, a simple mistake confuses a compiler enough so that every source line generates an error.  If the program is large, it can be a while before the compiler and editor macro run to completion.  Because SWAP copies each error message to the console as it is generated, I can terminate a long compile immediately rather than waiting for unnecessary and lengthy processing by the compiler and editor macro.<P>
+Normally, SWAP will not operate on a program that it thinks has taken control of any of the machine's interrupt vectors.  Because removing interrupt-handling code would probably result in a crashed machine.  Examples of programs that take control of interrupt vectors are SideKick, The Norton Guides, and many communications products.<P>
+To determine whether the swappee has hooked an interrupt vector, SWAP issues the Get Vector function (interrupt 21H, function 35H) to obtain the addresses of the interrupt handlers for interrupts 0 through 80H.  If one of the addresses points to memory owned by the swappee, SWAP assumes that the program deliberately took control of the interrupt vector.<P>
+Because stray unused vectors might, by chance, point at the program you want to swap out, the -F option is provided to override this default behavior.  This option should be used only if you are sure that the Swappee does not hook interrupt vectors.<P>
+<h3><a name="00bc_0006">MCBs, PSPs, and PIDs<a name="00bc_0006"></h3><P>
+Before going into a step-by-step description of SWAP's operation, I should discuss three aspects of DOS internals that are not covered by the IBM and Microsoftdocumentation -- memorycontrol blocks (MCBs), the program segment prefix (PSP), and process identifiers (PIDs).<P>
+SWAP's operation depends on modifying DOS MCBs.  Although the following information is not documented by Microsoft or IBM, it is consistent in DOS Versions 2.0 through 4.0.  Two references for information on MCBs are the &quot;16-Bit Software Toolbox&quot; columns in the October 1986 and February 1987 issues of DDJ.<P>
+An MCB immediately precedes each block of memory allocated by DOS or by a user program. MCBs are one paragraph (16 bytes) long, but only the first 5 bytes are used.  (See <a href="198900be.htm">Figure 2</A> for the format of an MCB.)  The id field contains a hex 5A for the MCB describing the last block of memory in the system and hex 4D for all other MCBs.  The owner field contains the address of the program segment prefix (PSP) of the program that allocated the memory or for which DOS allocated the memory.  A 0 in this field indicates that the memory is free, and an 8 in this field marks memory allocated before the first user program is loaded.  The length field contains the number of paragraphs in the block of memory (note that this field does not include the length of the MCB itself).<P>
+DOS allocates two MCBs when it runs a program: one for the program's environment and one for the program itself.  Additional MCBs are built whenever a program allocates memory with interrupt 21H function 48H.<P>
+In the simplest case, when SWAP is started, the system will contain MCBs for the following blocks of memory: DOS system memory (owner address 8), the copy of COMMAND.COM loaded during DOS initialization (three MCBs), the swappee environment, the swappee's PSP and code, the copy of COMMAND.COM loaded by the swappee (three MCBs), SWAP's environment, SWAP's PSP and code, and unallocated memory (owner address 0).<P>
+Note that this list includes three MCBs for each copy of COMMAND.COM.  DOS builds two MCBs when it loads COMMAND.COM, just as when any other program is loaded.  The third MCB is for memory allocated by COMMAND.COM for an additional (larger) copy of the environment.  There may be additional MCBs for any TSR programs.  MCBs may not be in this order if memory is fragmented.<P>
+Most of the PSP is well documented in the DOS Technical Reference, but several useful fields are described as &quot;reserved&quot; in IBM and Microsoft manuals.  See <a href="198900bf.htm">Figure 3</A> for the location and lengths of these fields.<P>
+In DOS Versions 2.0 through 4.0, the parent pointer contains the segment address of the program's parent.  COMMAND.COM is always its own parent, so this field is also useful in determining whether a PSP belongs to COMMAND.COM.<P>
+The fields related to the file handle array are valid only in DOS Versions 3.0 through 4.0. The file handle array contains 20 1-byte entries, one for each possible file handle.  For example, the entry at offset 0 into the file handle array corresponds to file handle 0. Entries are indexes into another table DOS uses internally to keep track of file handles.  An entry of hex FF indicates that the corresponding file handle is not open.  The file-handle-array pointer holds the address of the file handle array.  The handle array size field contains the number of entries in the file handle array.<P>
+A program can enlarge the file handle array by changing the pointer and handle array size fields and by copying the original file handle array.  In this case the default file handle array is no longer used.  Under DOS Versions 3.3 and 4.0, applications can use interrupt 21Hfunction 67Hto perform this function.  You can read more about the file-handle-array-related fields in the &quot;16-Bit Software Toolbox&quot; columns in the May 1986, September 1986, and December 1986 issues of DDJ.<P>
+The process ID (PID) for a program running under DOS Versions 3.0 through 4.0 is the address of its PSP.  When a program asks DOS to perform functions that use fields in the PSP, DOS uses the PID to locate the current PSP.  The undocumented interrupt 21H functions 51H and 52H respectively get and set the current PID.  See the &quot;16-Bit Software Toolbox&quot; column in the May 1986 issue of DDJ for more on these functions.<P>
+SWAP uses the Get/Set PID functions in two places: the interrupt 21H handling routine and the subroutines that are copied on top of the Swappee.  These routines are described in detail in the following sections.<P>
+<h3><a name="00bc_0007">How SWAP Works<a name="00bc_0007"></h3><P>
+SWAP performs miscellaneous initialization, including displaying the copyright notice and checking the command-line options.  It checks the parent pointer field in its PSP to verify that its parent is COMMAND.COM.  It then builds a table containing the relevant information from all MCBs, identifies the MCB for its own PSP, and works backward through the table of MCBs to determine how much memory can be swapped out.  This memory consists of its own environment, memory belonging to the parent COMMAND.COM, and memory allocated in all MCBs belonging to the swappee (except the MCB for the swappee's environment).<P>
+SWAP verifies that no interrupt vectors point to memory allocated to the Swappee.  It copies memory used by itself, COMMAND.COM, and the swappee to expanded memory or to a disk file.  The program copies the necessary subroutines to the first few kilobytes of memory allocated to the swappee, thereby overlaying the swappee.  It also overlays the swappee's file handle array with its own file handle array and ensures that the file-handle-array pointer in the swappee's PSP points to this new file handle array.<P>
+SWAP reduces the amount of memory allocated to the Swappee by altering the length field in the MCB for the swappee's PSP, building an MCB for the remainder of the storage it swapped out, and marking this new MCB as unallocated.  SWAP then transfers control to the code that overlaid the swappee.  This subroutine uses the Set PID function to set the current PID to the swappee's PSP.  Then it runs COMMAND.COM to execute the user's command.  When the user's command completes, all but the first 16K that was swapped out is swapped back in (the first 16K can't be swapped in at this point because it would overlay the code for this step).  SWAP then transfers control back to the area of memory in which it was first run.<P>
+SWAP issues the Set PID function to reset the process ID.  The first 16K of the Swappee are swapped in, thus restoring the machine to the previous state.  SWAP then releases its EMS handle, or if the -D option was used, erases the work file.<P>
+<h3><a name="00bc_0008">Interrupt 21H Handler<a name="00bc_0008"></h3><P>
+When the -C option is used, SWAP installs an interrupt 21H handler to copy everything written to the standard output device to the console.  Standard output is presumably redirected away from the console, so SWAP also opens another file handle for the console device.  Every time an interrupt 21H occurs, the interrupt handler checks for functions that write to standard output.  When one of these functions is used, SWAP copies the data headed for standard output to the console.  These functions are:<P>
+<ul>
+<li>02H --Display Output (outputs the character in DL)</li>
+<li>06H --Direct Console I/O (unless DL = hex FF, same as function 02H)</li>
+<li>09H --Print String (outputs a dollar-sign-delimited string)</li>
+<li>40H --Write to a File or Handle (if writing to stdout)</li>
+</ul>
+<P>
+Output written to any file handle is copied if the file-handle-array entry for that handle is the same as the entry for standard output.<P>
+<a href="8904d.htm#00bc_000a">More Details.</A><P>
+When the interrupt 21H handler determines it should copy data to the console, it issues the Get PID function to save the caller's PID, then issues the Set PID function specifying the interrupt 21H handler's PSP.  This is done so that DOS uses the appropriate file handle array to write a copy of the data to the handle opened for the console device.  SWAP then issues the Set PID function to restore the caller's PID and jumps to the original interrupt 21H handler. Note that the original interrupt 21H handler does not know that SWAP has &quot;front-ended&quot; the interrupt.<P>
+<h3><a name="00bc_0009">Conclusion<a name="00bc_0009"></h3><P>
+You'll like SWAP if you've ever tried to run one application from within another and got the message &quot;Program too big to fit in memory.&quot;  SWAP is particularly useful to programmers because it can be used as the basis for an integrated environment that makes it easy to compile, link, correct errors, and even debug without leaving your editor.<P>
+If you make enhancements to SWAP, I encourage you to upload the modified code to the DDJ Forum on CompuServe.  I have already posted a version that makes it easier to use SWAP from Mansfield Software Group's Personal REXX interpreter.  Comments and suggestions are welcome. I can be reached at 70056,241 on CompuServe, or as Nico_Mak on Bix.<P>
+<h3><a name="00bc_000a"><a name="00bc_000a"><a name="00bc_000b">Typical Uses of SWAP<a name="00bc_000b"></h3><P>
+To understand how SWAP can be used, assume for the moment that you have entered DOS from within your editor in order to assemble a program.  If the command you normally use to assemble your program is:<P>
+<pre>
+  MASM filename;
+</pre><P>
+then the command to run your assembler with SWAP becomes:<P>
+<pre>
+  SWAP MASM filename;
+</pre><P>
+If you typically redirect the assembler output to a disk file, you can still see a copy of the assembler output on the screen using:<P>
+<pre>
+  SWAP -C MASM filename; &gt; output.fil
+</pre><P>
+Of course, you would do this in your editor's macro language or from a .BAT file.<P>
+<pre></pre><P>
+To use SWAP to swap out dBase and load your favorite editor, you could enter the dBase command:<P>
+<pre>
+  RUN SWAP KEDIT filename
+</pre><P>
+Alternatively, you could add the following line to your CONFIG.DB file:<P>
+<pre>
+  TEDIT = SWAP.COM -F KEDIT.EXE
+</pre><P>
+and subsequently enter the following dBase command to edit a file:<P>
+<pre>
+  MODIFY COMMAND filename
+
+--NM</pre><P>
+<P>
+
+_SWAP_
+by Nico Mak
+
+<a name="00bc_000c"><a name="00bc_000c">
+<a name="00bc_000d"></pre><B>[LISTING ONE]</B><pre><a name="00bc_000d">
+
+
+; SWAP - (c) Copyright 1988 Nico Mak and Mansfield Software Group
+; All rights reserved
+;
+; To rebuild SWAP.COM use the following instructions:
+;   masm swap;
+;   link swap;
+;   exe2bin swap swap.com
+;
+cr              equ     13
+lf              equ     10
+
+error   macro   message                 ;; macro to display an error message
+        local   around, msg, msglen     ;; and to jump to error_exit routine
+        jmp     around
+msg     db      &amp;message,cr,lf          ;; define error message
+msglen  equ     $-msg
+around:
+        mov     dx,offset msg           ;; get address of error message
+        mov     cx,msglen               ;; get length
+        jmp     error_exit              ;; jump to error exit routine
+        endm
+
+; -------------------------------------------------------------------
+; the following is copied over the swappee
+; -------------------------------------------------------------------
+code    segment 'code'
+        assume  cs:code,ds:code
+        org     100h                    ; org past psp
+swap    proc    near
+        jmp     begin
+                db      20 dup('STACK')
+stack           equ     $
+
+flag            db      0       ; option flag
+flag_copy       equ     80h     ; copy stdout to 'con'
+flag_force      equ     40h     ; swap even if vector points to swappee
+flag_quiet      equ     20h     ; don't print hello message
+flag_disk       equ     10h     ; swap to disk
+
+emsg_ems        db      &quot;SWAP EMS Error &quot;
+ems_rc          db      'xx function '
+ems_func        db      'xx',cr,lf
+emsg_ems_len    equ     $-emsg_ems
+
+my_psp          dw      ?       ; segment of SWAP's original psp
+swappee_psp     dw      ?       ; segment of swappee's psp
+
+; variables used when swapping to expanded memory
+ems_handle      dw      ?       ; emm handle
+swap_pages      dw      ?       ; number of pages for ems_handle
+ems_frame       dw      ?       ; ems page frame
+last_ems_func   db      ?       ; last emm function issued by swap
+
+; variables used when swapping to disk
+swap_fid        db      &quot;c:\swap.dat&quot;,0 ; asciiz string to open swap file
+swap_handle     dw      ?       ; handle while swap file is open
+
+; fields for int 21 function 4b (exec)
+commandcom_addr dd      ?       ; address of program to exec (command.com)
+exec_sp         dw      ?       ; save area for reg clobbered by exec function
+command_line    db      ?,&quot;/c&quot;          ; command line for command.com
+command_text    db      130 dup (0)     ; command line continued
+blank_fcb       db      36 dup (0)      ; dummy fcb for exec function
+exec_parm_block equ     $               ; exec parameter block
+exec_env        dw      ?               ; segment addr of environment
+cmdline_addr    dw      offset command_line     ; address of command line
+cmdline_seg     dw      ?
+                dw      offset blank_fcb        ; address of fcb
+fcb1_seg        dw      ?
+                dw      offset blank_fcb        ; address of fcb
+fcb2_seg        dw      ?
+
+; fields used by int 21 handler
+save_pid        dw      ?       ; pid at time int 21 handler received control
+int21_vector    dd      ?       ; original int 21 vector owner
+con             db      &quot;con&quot;,0 ; asciiz string to open console
+handle          dw      ?       ; handle while &quot;con&quot; is open
+char_buf        db      ?       ; buffer for int 21 function 2 and 6 handlers
+save_ax         dw      ?       ; register save areas for int 21 handler
+save_bx         dw      ?
+save_cx         dw      ?
+save_dx         dw      ?
+save_ds         dw      ?
+
+; -------------------------------------------------------------------
+; run_command - the following code is copied over the swappee
+; -------------------------------------------------------------------
+run_command:
+        call    copy_start              ; start copying stdout to the console
+        call    exec_user_cmd           ; execute the user's command
+        call    copy_stop               ; stop copying stdout to the console
+        call    swap_in                 ; swap in all but first 16k
+        retf
+
+; -------------------------------------------------------------------
+; subroutines for run_command follow
+; -------------------------------------------------------------------
+
+; -----
+; copy_start - if -c option specified, open handle for console and hook int 21
+; -----
+copy_start:
+        test    flag,flag_copy          ; will we copy stdout to display?
+        jz      copy_start_ret          ; no
+; ----- open a handle that points to &quot;con&quot;
+        mov     dx,offset con           ; address of asciiz file name
+        mov     ax,3d01h                ; code to open handle for writing
+        int     21h                     ; open the file
+        mov     handle,ax               ; remember handle
+        jnc     open_worked             ; did open succeed?
+        and     flag,255-flag_copy      ; no, then we won't copy stdout ...
+        jmp     short copy_start_ret    ; ... and won't hook int 21
+open_worked:
+; ----- hook int 21 vector
+        mov     ax,3521h                ; code to get interrupt 21 vector
+        int     21h                     ; ask dos for address in vector
+        mov     word ptr int21_vector,bx; save offset
+        mov     word ptr int21_vector[2],es ; save segment
+        mov     dx,offset int21_handler ; address of our int 21 handler
+        mov     ax,2521h                ; code to set interrupt 21 address
+        int     21h                     ; tell dos to set int 21 vector
+; ----- ensure that standard error is redirected and copied
+        mov     al,cs:[19h]             ; get stdout file handle array entry
+        mov     cs:[1ah],al             ; use stdout entry for stderr entry
+copy_start_ret:
+        ret
+
+; -----
+; exec_user_cmd - set up and issue the int 21 function 4b (exec)
+; -----
+exec_user_cmd:
+        mov     cs:exec_sp,sp           ; save register
+        mov     ax,cs:[2ch]             ; pass address of our environment
+        mov     exec_env,ax             ; to exec function
+        mov     word ptr cmdline_seg,ds ; address of command line
+        mov     word ptr fcb1_seg,ds    ; fill in segments for fcbs
+        mov     word ptr fcb2_seg,ds
+        push    cs
+        pop     es
+        mov     bx,offset exec_parm_block       ; bx = exec parameter block
+        lds     dx,commandcom_addr      ; es:bx = asciiz string of command.com
+        mov     ax,4b00h                ; code to load and execute a program
+        int     21h                     ; tell dos to execute the user's program
+        mov     ds,cs:swappee_psp       ; restore ds addressability
+        cli                             ; turn off interrupts
+        mov     ss,swappee_psp          ; restore stack
+        mov     sp,exec_sp
+        sti                             ; allow interrupts
+        ret
+
+; -----
+; copy_stop - close handle and restore original int 21 vector
+; -----
+copy_stop:
+        test    cs:flag,flag_copy       ; did we copy stdout to display?
+        jz      copy_stop_ret           ; no
+; ----- close handle for console
+        mov     bx,handle               ; close handle for 'con'
+        mov     ah,3eh                  ; dos function = close handle
+        int     21h                     ; tell dos to close 'con'
+; ----- restore original int 21 vector
+        push    ds                      ; ds gets clobbered, so save it
+        lds     dx,int21_vector         ; get address of old int 21 vector
+        mov     ax,2521h                ; code to set interrupt 21 address
+        int     21h                     ; tell dos to change it
+        pop     ds                      ; restore ds addressability
+copy_stop_ret:
+        ret
+
+; -----
+; swap_in - swap in all but the first page of swappee
+; -----
+swap_in:
+        mov     bx,cs                   ; bx = swappee's psp
+        add     bx,3ffh                 ; first page to swap in over
+        mov     es,bx
+        test    flag,flag_disk
+        jnz     swap_in_disk
+; ----- swap in from expanded memory
+        mov     cx,1                    ; start with second logical page
+        cld
+swap_in_page:                           ; loop to swap 16K
+        mov     bx,cx                   ; logical page
+        call    map_page
+        push    ds                      ; save ds
+        mov     ds,ems_frame            ; ds = where to swap from
+        mov     si,0
+        mov     di,0
+        push    cx
+        mov     cx,4000h                ; copy 16K
+        rep     movsb
+        pop     cx
+        pop     ds                      ; restore ds
+        mov     bx,es
+        add     bx,400h
+        mov     es,bx                   ; es = next place to swap to
+        inc     cx
+        cmp     cx,swap_pages
+        jl      swap_in_page
+        ret
+; ----- swap in from disk
+swap_in_disk:                           ; es = first page to swap over
+        call    open_swap_file          ; open the swap file
+        mov     cx,0                    ; high order part of offset
+        mov     dx,4000h                ; file pointer to start + 16k
+        mov     bx,swap_handle          ; get swap file handle
+        mov     ax,4201h                ; code to lseek from current location
+        int     21h                     ; tell dos to lseek to 2nd page
+        jnc     lseek_done
+        error   &quot;LSEEK on swap file failed&quot;
+lseek_done:
+        mov     cx,1                    ; start with second logical page
+swap_in_disk_page:                      ; loop to swap 16K
+        call    read_swap_file          ; read 16k from swap file
+        mov     bx,es
+        add     bx,400h
+        mov     es,bx                   ; es = next place to swap to
+        inc     cx
+        cmp     cx,swap_pages
+        jl      swap_in_disk_page
+        call    close_swap_file
+        ret
+
+; -------------------------------------------------------------------
+; int_21_handler and its subroutines follow
+; -------------------------------------------------------------------
+        assume  ds:nothing
+int21_handler:
+; ----- decide whether we will front-end this int 21 function
+        cmp     ah,02h
+        je      func02
+        cmp     ah,06h
+        je      func06
+        cmp     ah,09h
+        je      func09
+        cmp     ah,40h
+        je      func40
+; ----- call the original int 21 vector owner
+do_real_thing:
+        jmp     cs:int21_vector
+
+; -----
+; handle int 21 function 9 (print dollar-sign delimited string)
+; -----
+func09:
+        call    front_start
+        push    di
+        push    es
+        mov     di,dx
+        mov     es,save_ds              ; address of string at es:di
+        mov     al,'$'                  ; scan for $
+        mov     cx,-1                   ; max bytes to scan
+        cld                             ; scan in forward direction
+        repne   scasb                   ; find the $
+        sub     di,dx
+        mov     cx,di                   ; length to write
+        dec     cx                      ; don't write the $
+        pop     es
+        pop     di
+        mov     ds,save_ds              ; ds addressability is blown
+        call    write_to_con            ; write buffer to display
+        mov     ds,cs:swappee_psp       ; restore ds addressability
+        jmp     front_done
+
+; -----
+; handle int 21 function 6 (direct console i/o)
+; -----
+func06:
+        cmp     dl,0ffh                 ; get input characters?
+        je      do_real_thing           ; yes, then there is no output to copy
+
+; -----
+; handle int 21 function 2 (display character in dl register)
+; -----
+func02:
+        call    front_start
+        mov     char_buf,dl             ; put character to write in buffer
+        mov     dx,offset char_buf      ; get address of buffer
+        mov     cx,1                    ; get length
+        call    write_to_con            ; write buffer to display
+        jmp     front_done
+
+; -----
+; handle int 21 function 40 (write to file handle)
+; -----
+func40:
+        call    front_start
+; ----- verify that file handle array entry for this handle == stdout entry
+        push    di
+        push    es
+        mov     bx,save_bx              ; get caller's handle
+        mov     es,save_pid             ; psp for process issuing int 21
+        les     di,es:34h               ; address of caller's file handle array
+        mov     ah,es:[di+1]            ; file handle array entry for stdout
+        cmp     ah,es:[di+bx]           ; does handle entry == stdout entry?
+        pop     es
+        pop     di
+        jne     func40_done             ; no, don't copy to console
+; ----- call real int 21 handler with handle opened for 'con'
+        mov     ds,save_ds              ; ds addressability blown
+        call    write_to_con            ; write buffer to display
+        mov     ds,cs:swappee_psp       ; restore ds addressability
+func40_done:
+        jmp     front_done
+
+; -----
+; front_start - start front-ending int 21
+; -----
+front_start:
+        assume  ds:nothing
+; ----- establish ds addressability and save registers
+        mov     save_ds,ds
+        mov     ds,cs:swappee_psp       ; establish ds addressability
+        assume  ds:code                 ; tell assembler
+        mov     save_ax,ax              ; save registers
+        mov     save_bx,bx
+        mov     save_cx,cx
+        mov     save_dx,dx
+; ----- remember caller's pid
+        mov     ah,51h                  ; dos function = get pid
+        int     21h                     ; tell dos to get pid
+        mov     save_pid,bx             ; remember pid
+; ----- set pid so our file handle array is used
+        mov     bx,cs                   ; pid = my cs register
+        mov     ah,50h                  ; dos function = set pid
+        int     21h                     ; tell dos to set pid
+        ret
+
+; -----
+; write_to_con - call original int 21H handler to write buffer to display
+; -----
+write_to_con:
+        assume  ds:nothing
+        mov     bx,cs:handle            ; handle opened for 'con'
+        mov     ah,40h                  ; dos function = write to handle
+        pushf
+        call    dword ptr cs:int21_vector       ; call dos
+        ret
+
+; -----
+; front_done - almost done front-ending int 21
+; -----
+front_done:
+        assume  ds:code
+; ----- restore caller's pid
+        mov     bx,save_pid             ; get pid of process that issued int 21
+        mov     ah,50h                  ; dos function = set pid
+        int     21h                     ; set pid
+; ----- restore registers &amp; go jump to previous int 21 handler
+        mov     ax,save_ax
+        mov     bx,save_bx
+        mov     cx,save_cx
+        mov     dx,save_dx
+        mov     ds,save_ds              ; ds addressability blown
+        jmp     do_real_thing
+
+; -------------------------------------------------------------------
+; the following routines are used by both parts of the program
+; -------------------------------------------------------------------
+
+; -----
+; emm - remember emm function in case of error and issue int 67
+; -----
+emm:
+        mov     last_ems_func,ah
+        int     67h                     ; call expanded memory manager
+        or      ah,ah
+        ret
+
+; -----
+; ems_error - handle ems errors
+; -----
+ems_error:
+        mov     di,offset ems_rc
+        call    hex_to_ascii            ; make ems error code printable
+        mov     ah,last_ems_func
+        mov     di,offset ems_func
+        call    hex_to_ascii            ; make last ems function printable
+        mov     cx,emsg_ems_len
+        mov     dx,offset emsg_ems
+        jmp     error_exit              ; go display error message and exit
+
+; ------
+; hex_to_ascii - convert ah register contents to ascii hexadecimal at ds:di
+; ------
+hex_to_ascii:
+        mov     dl,ah
+        mov     cx,2
+hex_char:
+        push    cx
+        mov     cl,4
+        rol     dl,cl
+        mov     al,dl
+        and     al,00fh
+        daa
+        add     al,0f0h
+        adc     al,040h
+        mov     [di],al
+        inc     di
+        pop     cx
+        loop    hex_char
+        ret
+
+; -----
+; error_exit - display error message and exit
+; ds:dx point to error message, cx has the length
+; -----
+error_exit:
+        push    cx
+        push    dx
+        mov     dx,offset emsg_start
+        mov     cx,emsg_start_len
+        mov     bx,2                    ; handle for stderr
+        mov     ah,40h                  ; dos function = handle write
+        int     21h                     ; output error message to stderr
+        pop     dx
+        pop     cx
+        mov     bx,2                    ; handle for stderr
+        mov     ah,40h                  ; dos function = handle write
+        int     21h                     ; output error message to stderr
+        jmp     return
+
+; -----
+; routines to open, read from, and close the swap file
+; -----
+open_swap_file:
+        mov     dx,offset swap_fid      ; address of fileid to open
+        mov     ax,3d00h                ; open file in read-only mode
+        int     21h
+        jnc     open_exit
+        error   &quot;Could not open swap file&quot;
+open_exit:
+        mov     swap_handle,ax
+        ret
+
+; read_swap_file - read 16K from swap file to address in es:0
+; saves cx
+read_swap_file:
+        push    cx
+        mov     bx,swap_handle          ; get swap file handle
+        mov     cx,4000h                ; read 16k
+        mov     dx,0                    ; buffer offset
+        push    ds
+        push    es
+        pop     ds                      ; buffer segment
+        mov     ah,3fh                  ; dos function = handle read
+        int     21h
+        pop     ds
+        pop     cx
+        jnc     read_exit
+        error   &quot;Error reading swap file&quot;
+read_exit:
+        ret
+
+close_swap_file:
+        mov     bx,swap_handle          ; get swap file handle
+        mov     ah,3eh                  ; dos function = close file
+        int     21h
+        ret
+
+; -----
+; return - return to DOS
+; -----
+return:
+        mov     ax,4c00h                ; dos function to terminate
+        int     21h                     ; back to dos
+
+; -----
+; map_page - map EMS logical page in bx into physical page 0
+; -----
+map_page:
+        mov     al,0                    ; physical page
+        mov     dx,ems_handle           ; ems handle
+        mov     ah,44h                  ; map handle page
+        call    emm
+        jz      map_page_exit
+        jmp     ems_error
+map_page_exit:
+        ret
+
+lowend  equ     $                       ; end of code copied to lower memory
+
+; -------------------------------------------------------------------
+; the following is *not* copied on top of the swappee
+; -------------------------------------------------------------------
+
+hello           db      &quot;SWAP Version 1.0 (c) Copyright 1988 Nico Mak&quot;
+                db      &quot; and Mansfield Software Group&quot;, cr, lf
+hello_len       equ     $-hello
+emsg_start      db      &quot;SWAP Error: &quot;
+emsg_start_len  equ     $-emsg_start
+run_addr        dw      offset run_command     ; offset of run_command
+run_seg         dw      ?                      ; segment of run_command
+swappee_mcb     dw      ?               ; segment of mcb for swappee psp
+swappee_end     dw      ?               ; segment of mcb after swappee
+my_mcb_size     dw      ?
+next_mcb        dw      ?               ; address of next mcb
+next_code       db      ?               ; M/Z code in next MCB
+next_owner      dw      ?               ; etc
+next_size       dw      ?               ;
+ems_device_name db      &quot;EMMXXXX0&quot;,0    ; expanded memory manager signature
+comspec         db      'COMSPEC='      ; environment variable name
+comspec_len     equ     $-comspec
+
+mcb_info        struc                   ; important memory control block info
+addr            dw      ?               ; address of mcb
+owner           dw      ?               ; psp of owner
+len             dw      ?               ; length of mcb
+mcb_info        ends
+
+max_mcbs        equ     100
+mcbs            mcb_info &lt;&gt;
+mcb_length      equ     $-mcbs
+                db      (max_mcbs-1)*mcb_length dup (?)
+
+; -------------------------------------------------------------------
+; mainline code run from system prompt
+; -------------------------------------------------------------------
+begin:
+        assume  ds:code,es:code
+        mov     sp,offset stack         ; set up new stack pointer
+        call    process_cmdline         ; check options, set up 'exec' cmdline
+        call    say_hello               ; print copyright message
+        call    check_dos_version       ; ensure we have dos 3.0 or later
+        call    find_comspec            ; find comspec= in environment
+        call    shrink_ourself          ; free unneeded memory
+        call    get_mcb_info            ; get relevant info about mcbs
+        call    check_mcbs              ; ensure mcbs are in expected order
+        call    vector_check            ; ensure swappee has not hooked vectors
+        call    figure_pages            ; determine how many ems pages we need
+        call    init_ems                ; ems initialization, allocation, etc
+        call    swap_out                ; swap out swappee, command.com, and us
+        call    muck_with_memory        ; copy swap over swappee &amp; set up mcbs
+        mov     ss,swappee_psp          ; switch to stack in low memory
+        call    run_user_command        ; go call run_command rtn in low memory
+        mov     ss,my_psp               ; switch back to original stack
+        call    swap_first              ; swap in first 16K
+        call    clean_up                ; restore original environment
+exit:
+        jmp     return                  ; leave SWAP
+
+; -------------------------------------------------------------------
+; subroutines for code that is not copied to low memory follow
+; -------------------------------------------------------------------
+
+; -----
+; process_cmdline - process options, set up command line for exec function
+; -----
+process_cmdline:
+        mov     bx,80h
+option_check:
+        inc     bx
+        cmp     byte ptr [bx],cr        ; carriage return?
+        jne     option_check2           ; no
+        error   &quot;No command to execute&quot;
+option_check2:
+        cmp     byte ptr [bx],' '       ; blank?
+        je      option_check
+        cmp     byte ptr [bx],'/'       ; option signal?
+        je      got_option
+        cmp     byte ptr [bx],'-'       ; option signal?
+        jne     copy_command_line
+got_option:
+        mov     byte ptr [bx],' '       ; blank out character on command line
+        inc     bx                      ; point at option
+        mov     al,byte ptr [bx]        ; get option
+        mov     byte ptr [bx],' '       ; blank out character on command line
+        or      al,' '                  ; convert option to lower case
+        cmp     al,'c'                  ; option 'c'?
+        jne     check_option_q
+        or      flag,flag_copy
+        jmp     option_check
+check_option_q:
+        cmp     al,'q'                  ; option 'q'?
+        jne     check_option_f
+        or      flag,flag_quiet
+        jmp     option_check
+check_option_f:
+        cmp     al,'f'                  ; option 'f'?
+        jne     check_option_d
+        or      flag,flag_force
+        jmp     option_check
+check_option_d:
+        cmp     al,'d'                  ; option 'd'?
+        jne     bad_option
+        or      flag,flag_disk
+        jmp     option_check
+bad_option:
+        error   &quot;Invalid option&quot;
+; ----- copy remainder of our command line to command line for command.com
+copy_command_line:
+        mov     cl,ds:[80h]             ; length of my command line
+        inc     cl                      ; add one for cr
+        mov     si,81h                  ; address of my command line
+        mov     di,offset command_text  ; address of where to put it
+        xor     ch,ch                   ; zero uninitialized part of count
+        cld                             ; scan in forward direction
+        rep     movsb                   ; copy command line
+; set length of new command line
+        mov     cl,ds:[80h]             ; length of my command line
+        add     cl,2                    ; add 2 for &quot;/c&quot;
+        mov     command_line,cl         ; save new length
+        ret
+
+; -----
+; say_hello - print hello message
+; -----
+say_hello:
+        test    flag,flag_quiet         ; was -q option used?
+        jnz     say_hello_exit          ; yes, skip this
+        mov     dx,offset hello         ; get address of message
+        mov     cx,hello_len            ; get length of message
+        mov     bx,2                    ; handle for stderr
+        mov     ah,40h                  ; dos function = write to handle
+        int     21h                     ; write copyright message
+say_hello_exit:
+        ret
+
+; -----
+; check_dos_version - be sure this is dos 3.0 or higher
+; -----
+check_dos_version:
+        mov     ah,30h                  ; dos function = get version
+        int     21h                     ; get dos version
+        cmp     al,3                    ; ok?
+        jae     dos_version_ret
+        error   &quot;DOS version must be 3.0 or higher&quot;
+dos_version_ret:
+        ret
+
+; -----
+; find_comspec - find fileid for exec function
+; -----
+find_comspec:
+        mov     es,es:2ch               ; es = environment segment
+        xor     di,di                   ; point to start of env in es:di
+        cld                             ; scan in forward direction
+; ----- loop thru environment strings one by one, beginning here
+find_string:
+        test    byte ptr es:[di],-1     ; end of environment?
+        jnz     check_string            ; nope, continue
+        error   &quot;Could not find COMSPEC= in environment&quot; ; very unlikely
+; ----- compare current env string to 'COMSPEC='
+check_string:
+        mov     si,offset comspec       ; point to 'COMSPEC=' string
+        mov     bx,di                   ; save ptr to start of env string
+        mov     cx,comspec_len          ; length of 'COMSPEC='
+        repe    cmpsb                   ; compare
+        je      found_comspec           ; found it
+        mov     di,bx                   ; restore ptr to start of env string
+        xor     al,al                   ; scan for end of string
+        mov     cx,-1
+        repne   scasb
+        jmp     find_string             ; go back for next string
+; ----- found COMSPEC=
+found_comspec:
+        mov     word ptr commandcom_addr[0],di  ; remember address of ...
+        mov     word ptr commandcom_addr[2],es  ; ... asciiz &quot;command.com&quot;
+        ret
+
+; -----
+; shrink_ourself - release unneeded memory
+; -----
+shrink_ourself:
+        push    cs
+        pop     es                      ; address of start of SWAP memory
+        mov     bx,offset endcode+15    ; address of end of SWAP code
+        mov     cl,4
+        shr     bx,cl                   ; convert to paragraphs
+        mov     ah,4ah                  ; dos function = SETBLOCK
+        int     21h                     ; shrink ourselves
+        ret
+
+; -----
+; get_mcb_info - get relevant info from mcb chain
+; -----
+get_mcb_info:
+        mov     my_psp,cs               ; remember address of our PSP
+        mov     ah,52h                  ; undocumented function
+        int     21h                     ; get base of memory chain
+        mov     es,es:[bx]-2            ; this is it
+        mov     bx,offset mcbs
+        mov     dx,0                    ; count of MCBs
+mem_loop:
+        mov     [bx].addr,es
+        mov     cx,word ptr es:1        ; owner of mcb
+        mov     [bx].owner,cx
+        mov     cx,word ptr es:3        ; length of mcb
+        mov     [bx].len,cx
+        inc     dx                      ; increment count of MCBs
+        cmp     dx,max_mcbs
+        jle     mem_loop1
+        error   &quot;Over 100 Memory Control Blocks in system&quot;
+mem_loop1:
+        cmp     byte ptr es:0,'Z'       ; last memory block?
+        jne     mem_next
+        error   &quot;Could not find SWAP's PSP&quot;
+mem_next:
+        mov     cx,es                   ; copy seg addr of mcb
+        inc     cx                      ; next paragraph
+        cmp     cx,my_psp               ; is this our psp?
+        je      found_our_psp           ; yes
+        add     cx,[bx].len             ; add length of this mcb
+        mov     es,cx                   ; this is next memory block
+        add     bx,mcb_length           ; where next mcb goes
+        jmp     mem_loop                ; proceed
+found_our_psp:                          ; have found our psp
+        mov     dx,[bx].len
+        mov     my_mcb_size,dx          ; remember length of our mcb
+        add     cx,[bx].len             ; add length of memory
+        mov     next_mcb,cx             ; this is next memory block
+; ----- remember information about the next mcb
+        mov     es,cx
+        mov     dl,es:0
+        mov     next_code,dl
+        mov     dx,es:1
+        mov     next_owner,dx
+        mov     dx,es:3
+        mov     next_size,dx
+        ret
+
+; -----
+; check_mcbs - ensure mcbs are in expected order
+; verify that our parent is command.com, find swappee psp, etc.
+; -----
+check_mcbs:
+        mov     cx,cs:16h               ; our parent's address
+        mov     es,cx
+        mov     ax,es:16h               ; and our grandparent's address
+        cmp     ax,cx                   ; better be equal
+        jne     unknown_parent
+        mov     ax,cs:10h               ; our ctrl-break handler
+        cmp     ax,cx                   ; better equal our parent's address
+        je      skip_our_env
+unknown_parent:
+        error   &quot;SWAP not directly run from COMMAND.COM&quot;
+; ----- back up to find swappee's mcb.  bx still points at entry for our mcb
+skip_our_env:
+        mov     cx,cs
+        call    prev_mcb
+        cmp     [bx].owner,cx           ; is this mcb for our environment?
+        jne     skip_command
+        call    prev_mcb
+; ----- back up over all mcb's owned by command.com (es == command.com psp)
+skip_command:
+        mov     cx,es                   ; address of command.com psp
+        cmp     [bx].owner,cx           ; is this mcb owned by command.com?
+        je      command_loop            ; yes
+        error   &quot;COMMAND.COM must immediately precede SWAP in memory&quot;
+command_loop:
+        mov     dx,[bx].addr            ; remember address of mcb in case
+        mov     swappee_end,dx          ;   it is the one above swappee
+        call    prev_mcb                ; back up one mcb
+        cmp     [bx].owner,cx           ; is this mcb owned by command.com?
+        je      command_loop            ; yes, skip it
+; ----- assume we have one of swappee's mcbs
+;       back up over all it's mcb's till we reach psp
+        mov     cx,[bx].owner           ; cx = swappee's psp
+find_swappee_psp:
+        mov     dx,[bx].addr            ; address of this mcb
+        inc     dx                      ; address of memory
+        cmp     dx,cx                   ; is this swappee's psp?
+        je      found_swappee_psp       ; yes
+        call    prev_mcb                ; check previous psp
+        cmp     [bx].owner,cx           ; still owned by swappee?
+        je      find_swappee_psp        ; yes continue
+        error   &quot;Unexpected MCB while looking for PSP of swappee&quot;
+; ----- we've found swappee's psp - bx points at mcb entry for swappee
+found_swappee_psp:
+        mov     es,[bx].owner           ; es = swappee's psp
+        mov     swappee_psp,es          ; remember swappee's psp
+        cmp     word ptr es:2ch,0       ; swappee must have an environment
+        jne     check_mcbs_ret
+        error   &quot;Swappee does not have an environment&quot;
+check_mcbs_ret:
+        ret
+
+; -----
+; unless the -f option was specified, check whether vectors point at swappee
+; note: only interrupts 1-79h (inclusive) are checked
+; -----
+vector_check:
+        test    flag,flag_force
+        jnz     vector_check_ret
+        mov     cx,0                    ; start at the beginning
+next_vector:
+        inc     cx                      ; next vector
+        cmp     cx,80h                  ; all done?
+        jae     vector_check_ret        ; yes, no vectors hooked
+        mov     ah,35h                  ; get vector function
+        mov     al,cl                   ; vector number
+        int     21h                     ; call dos to get vector address
+        mov     dx,es                   ; get segment addr
+        push    cx
+        mov     cl,4                    ; shift count
+        add     bx,15                   ; round up
+        shr     bx,cl                   ; divide offset by 16
+        pop     cx
+        add     dx,bx                   ; compute segment
+        cmp     swappee_psp,dx          ; compare to start of swappee
+        jae     next_vector             ; no problem, keep looking
+        cmp     dx,swappee_end          ; compare to end of swappee
+        jae     next_vector             ; no problem either
+        error   &quot;Swappee has hooked an interrupt vector&quot;
+vector_check_ret:
+        ret
+
+; -----
+; figure_pages - figure how many 16K pages of EMS we need
+; -----
+figure_pages:
+        mov     cx,swappee_psp
+        dec     cx                      ; cx = swappee's mcb
+        mov     swappee_mcb,cx          ; remember address of mcb
+        mov     dx,next_mcb             ; dx = mcb after swap.com
+        sub     dx,cx                   ; dx = difference in paragraphs
+        mov     cx,10
+        shr     dx,cl                   ; convert paragraphs to 16k pages
+        or      dx,dx
+        jnz     figure2
+        error   &quot;Less than 16K to swap&quot;
+figure2:
+        inc     dx
+        mov     swap_pages,dx
+        ret
+
+; -----
+; init_ems - ensure ems is up to par, allocate pages, and save page map
+; -----
+init_ems:
+        test    flag,flag_disk
+        jz      find_emm
+        jmp     init_ems_exit
+; ----- determine whether ems is installed
+find_emm:
+        mov     ax,3567h                ; code to get int 67 handler address
+        int     21h                     ; get interrupt vector
+        mov     di,0ah                  ; offset to name string
+        mov     si,offset ems_device_name ; correct ems name
+        mov     cx,8                    ; length of name
+        cld                             ; scan in forward direction
+        repe    cmpsb                   ; do the compare
+        jz      test_status             ; ems not loaded
+        error   &quot;Could not find Expanded Memory Manager&quot;
+; ----- test ems status
+test_status:
+        mov     ah,40h                  ; code to test status
+        call    emm
+        jz      check_ems_version
+        jmp     ems_error
+; ----- ensure that we have ems version 3.2 or later
+check_ems_version:
+        mov     ah,46h                  ; get version
+        call    emm
+        jz      got_ems_version
+        jmp     ems_error
+got_ems_version:
+        cmp     al,32h
+        jnb     get_page_frame
+        error   &quot;Expanded Memory Manager version must be 3.2 or higher&quot;
+; ----- get page frame address
+get_page_frame:
+        mov     ah,41h                  ; code to get page frame addr
+        call    emm
+        mov     ems_frame,bx            ; where ems memory starts
+        jz      alloc_pages
+        jmp     ems_error
+; ----- allocate ems pages
+alloc_pages:
+        mov     ah,43h
+        mov     bx,swap_pages
+        call    emm
+        mov     ems_handle,dx
+        jz      save_page_map
+        error   &quot;Not enough free expanded memory&quot;
+; ----- save ems page map
+save_page_map:
+        mov     ah,47h                  ; save page map
+        mov     dx,ems_handle
+        call    emm
+        jz      init_ems_exit
+        jmp     ems_error
+init_ems_exit:
+        ret
+
+; -----
+; swap_out - swap out swappee, command.com, and ourself
+; -----
+swap_out:
+        mov     es,swappee_mcb
+        test    flag,flag_disk          ; swap to disk?
+        jnz     swap_out_disk           ; yes
+; ----- swap out to expanded memory
+        mov     cx,0
+        cld
+swap_out_page:                          ; loop to swap 16K
+        mov     bx,cx                   ; logical page = loop count
+        call    map_page
+        mov     bx,ems_frame
+        assume  ds:nothing
+        push    es
+        pop     ds                      ; ds = where to swap from
+        mov     es,bx                   ; es = ems_frame
+        mov     si,0
+        mov     di,0
+        push    cx
+        mov     cx,4000h                ; copy 16K
+        rep     movsb
+        pop     cx
+        mov     bx,ds                   ; where to swap from
+        add     bx,400h                 ; add 16K
+        mov     es,bx                   ; es = next place to swap from
+        push    cs
+        pop     ds
+        assume  ds:code
+        inc     cx
+        cmp     cx,swap_pages           ; done swapping?
+        jl      swap_out_page           ; no, swap the next page
+        ret
+; ----- swap out to disk
+swap_out_disk:                          ; es = swappee's mcb
+        mov     cx,0                    ; attribute
+        mov     dx,offset swap_fid
+        mov     ah,3ch                  ; dos function = create a file
+        int     21h
+        jnc     create_done
+        error   &quot;Could not create swap file&quot;
+create_done:
+        mov     swap_handle,ax
+        mov     cx,0                    ; number of pages swapped
+swap_out_disk_page:                     ; loop to swap 16K
+        push    cx                      ; remember number pages swapped
+        mov     bx,swap_handle          ; handle to write to
+        mov     cx,04000h               ; write 16k
+        xor     dx,dx                   ; offset to write from
+        push    ds
+        push    es
+        pop     ds                      ; segment to write from
+        mov     ah,40h                  ; dos function = write to handle
+        int     21h
+        pop     ds
+        jnc     write_worked1
+        error   &quot;Error writing to swap file&quot;
+write_worked1:
+        mov     bx,es                   ; where to swap from
+        add     bx,400h                 ; add 16K
+        mov     es,bx                   ; es = next place to swap from
+        pop     cx                      ; remember number of pages swapped
+        inc     cx                      ; now we've swapped one more page
+        cmp     cx,swap_pages           ; done swapping?
+        jl      swap_out_disk_page      ; no, swap the next page
+        call    close_swap_file
+        ret
+
+; -----
+; muck_with_memory - copy part of SWAP over swappee's psp, set up mcbs, etc
+; -----
+muck_with_memory:
+        mov     es,swappee_psp
+; ----- copy code over swappee's psp
+        cld                             ; copy in forward direction
+        mov     cx,offset lowend        ; length of code to copy
+        mov     si,100h                 ; start copying after psp
+        mov     di,100h                 ; where to copy
+        rep     movsb                   ; copy code over swappee's psp
+; ----- copy our file handle array down to swappee's psp
+        mov     cx,20                   ; length of file handle table
+        mov     si,18h                  ; address of our file handle table
+        mov     di,18h                  ; where to put file handle table
+        rep     movsb                   ; copy file handle table to swappee psp
+; ----- set the file handle array size and offset in swappee's psp
+        mov     word ptr es:32h,20      ; length of file handle table
+        mov     word ptr es:34h,18h     ; offset of file handle table
+        mov     word ptr es:36h,es      ; segment of file handle table
+; ----- now fix up the swappee's mcb (still has an M)
+        mov     es,swappee_mcb          ; address of swappee's mcb
+        mov     dx,offset lowend+15     ; offset to end of SWAP code
+        mov     cx,4
+        shr     dx,cl                   ; convert to paragraphs
+        mov     word ptr es:3,dx        ; put result in swappee's mcb
+; ----- find address of mcb for memory that was freed up
+        mov     bx,swappee_psp          ; address of swappee's psp
+        add     bx,dx                   ; add paragraphs in swappee's mcb
+        mov     es,bx                   ; this is where mcb for free mem goes
+; ----- fill in new mcb
+        mov     dx,next_mcb             ; address of mcb after original swap
+        sub     dx,bx                   ; compute paragraphs of free space
+        add     dx,next_size            ; add paragraphs for next mcb
+        mov     word ptr es:3,dx        ; fill in size
+        mov     dl,next_code            ; get id from next mcb
+        mov     byte ptr es:0,dl        ; copy id (M or Z)
+        mov     word ptr es:1,0         ; mark block as free
+        ret
+
+; -----
+; run_user_command - call run_command routine in low memory
+; -----
+run_user_command:
+; ----- put swappee segment address into pointer to run_command
+        mov     bx,swappee_psp
+        mov     word ptr run_seg,bx     ; segment of swappee psp
+; ----- set pid to address of swappee psp
+        mov     ah,50h                  ; dos function = set pid
+        int     21h                     ; set process id
+; ----- call run_command in low memory
+        mov     ds,bx
+        assume  ds:nothing
+        call    dword ptr cs:run_addr   ; call run_command
+        mov     ds,cs:my_psp
+        assume  ds:code
+; ----- restore pid to SWAP's psp
+        mov     bx,cs                   ; pid = my cs register
+        mov     ah,50h                  ; code to set pid
+        int     21h
+        ret
+
+; -----
+; swap_first - swap in first page that was swapped out
+; -----
+swap_first:
+        mov     es,swappee_mcb
+        test    flag,flag_disk          ; swapping in from disk?
+        jnz     swap_first_disk         ; yes
+; ----- swap in from expanded memory
+        mov     bx,0                    ; logical page = 0
+        call    map_page
+        push    ds                      ; save ds
+        mov     ds,ems_frame            ; ds = where to swap from
+        mov     si,0
+        mov     di,0
+        mov     cx,4000h                ; copy 16K
+        cld
+        rep     movsb
+        pop     ds                      ; restore ds
+        ret
+; ----- swap in from disk
+swap_first_disk:
+        call    open_swap_file
+        call    read_swap_file
+        call    close_swap_file
+        ret
+
+; -----
+; clean_up - restore ems or delete swap file
+; -----
+clean_up:
+        test    flag,flag_disk
+        jnz     clean_up_disk
+; ----- restore ems page map
+        mov     ah,48h                  ; restore page map
+        mov     dx,ems_handle
+        call    emm
+        jz      deallocate
+        jmp     ems_error
+; ----- deallocate the ems pages
+deallocate:
+        mov     ah,45h                  ; deallocate pages
+        mov     dx,ems_handle
+        call    emm
+        jz      clean_up_exit
+        jmp     ems_error
+; ----- delete swap disk file
+clean_up_disk:
+        mov     dx,offset swap_fid      ; file handle for swap file
+        mov     ah,41h                  ; code to delete a file
+        int     21h
+clean_up_exit:
+        ret
+
+; -----
+; prev_mcb - back up one entry in table of MCBs
+; -----
+prev_mcb:
+        sub     bx,mcb_length
+        cmp     bx,offset mcbs
+        jae     prev_mcb_ret
+        error   &quot;Memory Control Blocks not in expected order&quot;
+prev_mcb_ret:
+        ret
+
+endcode equ   $
+        align   16
+        db      16 dup(0)               ; so that at least on mcb follows swap
+swap    endp
+code    ends
+        end   swap
+
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1989, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

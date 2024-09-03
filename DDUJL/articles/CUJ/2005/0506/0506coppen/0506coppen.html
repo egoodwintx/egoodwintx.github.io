@@ -1,0 +1,125 @@
+
+
+
+<html>
+<head>
+<title>June, 2005: Optimizing C/C++ with  Inline Assembly Programming</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>Optimizing C/C++ with  Inline Assembly Programming</h1>
+<p><i>C/C++ Users Journal</i> June, 2005</p>
+<h2>When it comes to performance, there's always room  for improvement</h2>
+
+
+<h3>By Scott W. Coppen</h3>
+
+
+<I>Scott Coppen, a Ph.D. candidate in Mechanical Engineering at Tufts University, is president and principal engineer of Blue Sail Software. He can be contacted at scott@ bluesailsoftware.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Assembly programming can be likened to "working without a net" where only the strong dare to venture because many of the tools familiar to C/C++ programmers&#151;such as debuggers and memory tracers&#151;suddenly become near worthless. Fortunately, you can dip your toes into assembly by utilizing assembler instructions.</p>
+
+<p>In nearly every instance, the reason for resorting to assembly programming is to increase processing performance. But before you even open your processor opcodes manual, the first question to ask is simple: How fast does the code need to execute? Obviously, there is an upper limit on how fast a particular algorithm or function will execute. Once you determine that the larger work (to which this smaller element is a part of) benefits from a performance boost, it is important to quantify the theoretical limit. Although it varies between processor architectures, the key elements are clock rate and quantity of data. Things get more involved in refining this estimation with today's long pipeline, branch-predicting, and multiple execution-unit processors, so the input from an experienced architecture guru would be worthwhile.</p>
+
+<p>Once a typical theoretical limit is established, a quick measurement of the current processing speed can be quantified using some simple <b>clock_gettime()</b> or analogous calls that bracket the code. Typical ratios between these two values can vary wildly depending on the code in question, but a ratio of 10:1 is not uncommon. Once it is determined that it is worthwhile to pursue further performance increases and every other source-level optimization has been exhausted, the development of custom assembly code is prescribed.</p>
+
+<p>Again, it is worth noting that assembly-level programming should be the last resort for increasing performance. Although the optimization benefits can be quite large, the overall flexibility of the source will be compromised because architecture-specific elements tend to decrease the future flexibility of the code. From this point forward, I assume that you are aware of this and mostly interested in "as fast as possible."</p>
+<h3>Why Assembly Level? </h3>
+
+<p>Granted, many C/C++ programmers rely on the assumption that compilers are "good enough" and that hand tweaking of assembly-level code is not worth the time. In many instances, these assumptions are correct, but it is the instances where compilers can be improved upon that is most beneficial. Furthermore, there are instances where the compiler does a good job, but just observing the assembly code it produces reveals more areas for optimization that might not even be possible with any compiler settings. </p>
+
+<p>This is best illustrated by using a straightforward example of casting a floating-point value to an integer:</p>
+
+<pre>
+inline int Intify( float val )
+{
+  return ( int )val;
+}
+
+</pre>
+
+<p>Of course, it does not make sense to create a dedicated routine that performs such a trivial function, but imagine a routine that contains one or more casts of a <b>float</b> to an <b>integer</b> such as interpolation of image data. By compiling this function with the <b>-S</b> directive, which instructs GCC to stop after compilation proper and dump the assembler output, the following assembly construction of the <b>Intify()</b> function is produced (assuming you are restricted to producing i586-compatible code):</p>
+
+<pre>
+Intify:
+	subl	$8, %esp
+	flds	12(%esp)
+	fnstcw	6(%esp)
+	movzwl	6(%esp), %eax
+	orw	$3072, %ax
+	movw	%ax, 4(%esp)
+	fldcw	4(%esp)
+	fistpl	(%esp)
+	fldcw	6(%esp)
+	movl	(%esp), %eax
+	addl	$8, %esp
+	ret
+
+</pre>
+
+<p>If you're not used to seeing assembler code, the first thing that comes to mind is "All that just to cast a <b>float</b> to an <b>int</b>?" Omitting the stack pointer adjustment instructions, the operations performed are: push <b>val</b> onto the FPU stack, modify the FPU control word rounding mode, round the top of the FPU stack and pop, restore the FPU control word, and move the answer to the return register. This sounds like a lot of operations to perform for such a trivial function, but the compiler has to play it safe and make sure the FPU control word is set properly, otherwise the result would be incorrect.</p>
+
+<p>This example is ripe with areas for assembly-level optimization. Most notably, if <b>Intify()</b> is called within a <b>for</b> loop, a preloop modification of the FPU control word coupled with a postloop restore and just a simple <b>fistpl</b> instruction inside the loop, the performance dramatically improves. Not only does this type of optimization yield less instructions per loop, the pipeline stalls produced by manipulating the control word register are avoided per loop. In this particular example, it is impossible to instruct GCC to move the control word manipulations without using assembly coding because the compiler must maintain the integrity of the function so that it operates properly from any caller. Newer generations of x86-compatible CPUs that support the SSE instructions have thankfully alleviated this x87 relic by adding a new instruction <b>cvttss2si</b>, which performs the same truncation operation without stalling the pipeline.</p>
+
+<p>Clearly, it takes a trained eye to not only understand assembly code, but to know how much potential benefit there may be in hand-coding assembler instructions. The nice part is that you can start with C/C++ code and utilize the compiler to produce assembler instructions that can be studied and improved before being assembled to object form. For a more complete introduction to x86 assembly programming, see "Paul Hsieh's x86 Assembly Language Page" (http://www.azillionmonkeys.com/qed/asm.html).</p>
+<h3>Inline Assembly Programming</h3>
+
+<p>Inline assembly programming can be best described as using the <b>asm() </b>function to insert assembler instructions in between C/C++ instructions. The benefit is that you can interface C-style variables directly to the assembly instructions without having to worry about the physical register or memory address from which they are referenced. Using the previous example of casting a <b>float</b> to an <b>int</b> and assuming you are targeting an SSE-compatible CPU, this code uses inline assembly to perform this operation:</p>
+
+<pre>
+inline int Intify( float val )
+{
+  int rc;
+  asm( "cvttss2si	%1, %0"
+       : "=r" ( rc )
+       : "m" ( val ) );
+  return( rc );
+}
+
+</pre>
+
+<p>The format of the <b>asm()</b> is straightforward. First are the assembler instructions that are declared within double quotes and reference the C expression operands specified by number (the <b>%0</b> refers to <b>rc</b> and <b>%1</b> refers to <b>val</b> since this is the order in which they are specified).</p>
+
+<p>Immediately after the assembler instructions, the output and input C operands are declared with type and constraint character codes for each (<b>r</b> refers to a general-purpose register and <b>m</b> refers to a memory location operand). The colon character delimits the grouping of the operands where the first grouping are the outputs and second grouping are the inputs. Since the <b>rc</b> operand is an output, the <b>=</b> constraint is used to denote this. A complete listing of the operand specification and constraint characters can be found in the GCC documentation.</p>
+
+<p>The most important aspect to remember when first starting inline assembly programming is that the syntax is only parsed for consistency and errors. Unlike C/C++ compilers that generate warnings, maintain the stacks, and deal with quirky architecture-specifics behind the scenes, programming at the assembly level provides you with many ways to crash your process (and no high-level debugger to find out where you messed up). Special attention must be paid to the constraints that are appended to each operand specification since this instructs the compiler how to properly assign registers for use in the assembler instructions.</p>
+
+<p>Programming at the assembly level can be considered a tedious art form as there are usually numerous combinations of assembler instructions to complete a given function. Close attention must be paid to instruction ordering and other subtleties to achieve optimal performance, especially when programming for today's complex, late-generation x86-compatible processors.</p>
+
+<p>A typical set of instructions that offer a potentially large performance benefit are the single-instruction, multiple-data (SIMD) series of instructions, which operate on multiple values per operation. In scientific programming, the SSE/SSE2 instructions present in today's x86-compatible processors utilize eight 128-bit registers to process data in small, parallel chunks. These processors are able to execute four simultaneous operations for single-precision floating-point data and two simultaneous operations for double-precision floating-point data.</p>
+<h3>Optimization Example</h3>
+
+<p>As a simple example, suppose that you would like the function in <a href="0506coppenl1.html" target="_BLANK">Listing 1</a> that computes the scalar-product of two arrays to run as fast as possible. For this application, also suppose that the lengths of the arrays are typically 1000 elements in length. To benchmark the code, a simple and effective method is to execute the function many times with the same data over and over again to achieve full processor scheduling priority. In addition, this methodology maximizes the likelihood that the data is located in the processors L1-cache, which minimizes other performance factors that are not directly related to the algorithm, such as memory bandwidth. On an AMD AthlonXP 2000+ processor, this function operates at a maximum of approximately 800 MFLOPS when compiled with the compiler flags <b>-O3 -march=athlon-xp -mfpmath=sse -funroll-loops</b>. Theoretical figures for this particular processor computing a scalar product of two distinct vectors is approximately 1700 MFLOPS using x87 instructions and 3350 MFLOPS using SSE instructions. This is a straightforward computation and we should be able to get close to theoretical numbers, so I will attempt to improve the performance.</p>
+
+<p>Before jumping into assembly programming, there are some C programming enhancements that you can make use of, including loop stretching (<a href="0506coppenl2.html" target="_BLANK">Listing 2</a>). This technique can be thought of as partial loop unrolling in that the primary performance increase comes from the slightly longer, but much less frequent, conditional jumps when processing the loop. On the same machine as before, this function operates at approximately 1600 MFLOPS, which is fairly close to the estimated 1700 MFLOPS for x87 operations.</p>
+
+<p>When appending the <b>-mfpmath=sse</b>, however, the performance drops to only 1200 MFLOPS. This is far from our theoretical estimate of 3400 MFLOPS when using SSE and is partly due to GCC's inability to fully utilize the <b>packed</b> data format instructions that can really boost application performance. This can be seen by examining the assembler code output when adding the <b>-S</b> compiler flag and noticing that all of the innerloop instructions are of the form <b>movss</b>, <b>mulss</b>, and <b>addss</b> (the "<b>ss</b>" suffix is used to denote "scalar single").</p>
+
+<p><a href="0506coppenl3.html" target="_BLANK">Listing 3</a> is an optimized version of <b>ScalarProduct()</b> using "packed single" SSE instructions. The format of the <b>asm()</b> statements are similar to those previously mentioned, except that newline and tab characters are appended to multiline assembler instructions as this coincides with the GNU assembler formatting. The prefix of the "<b>+</b>" character on the assembler operands for the array pointers denotes that they are input/output operands because their values are modified. <b>asm()</b> statements that explicitly use or modify certain system resources (such as registers specified by name) are required to append a list of these resources in the "clobbered" section. Again, because GCC does not know what you are doing in an <b>asm()</b> statement, you must tell it that you will be modifying a register directly so that it will not use it across your instruction. This implementation of <b>ScalarProduct()</b> operates at nearly 1800 MFLOPS on my test hardware, which is a definite improvement over the original 1200 score that was previously achieved and even better than the theoretical limit of the x87 FPUs for this architecture.</p>
+
+<p>There is still more room for improving the performance of <b>ScalarProduct()</b>. One particular prerequisite for achieving maximum performance is to use 16-byte aligned memory allocations when using these SIMD instructions since these instructions operate on 128-bit registers. Although this requires more memory per allocation for padding to an even 16-byte offset, the consequence is near negligible when working with large arrays of data. Unfortunately, because only the pointer address is passed to the function, there is extra overhead of processing required to determine the alignment of the memory and implement the different instruction combinations.</p>
+<h3>Assembly Optimizations in C++</h3>
+
+<p>C++ is a perfect language to implement inline assembly optimizations. By taking more of an object-centric approach, you can use a class container for 16-byte aligned memory allocations as illustrated by <a href="0506coppenl4.html" target="_BLANK">Listing 4</a>. Since C++ mangles functions by namespace and argument types, optimizations that vary by type using assembly coding integrate well with template specializations. This way, you always have the C++ source code for nonoptimized types and each specialization can be utilized or not based on compile-time preprocessing directives that vary between each target architecture.</p>
+
+<p>This packed single version of <b>ScalarProduct()</b> operates at approximately 3000 MFLOPS, which is a large improvement over the 1800 MFLOPS previously scored when using the <b>movups</b> instructions and is near the 3350 MFLOPS theoretical maximum. In comparison to the original 800 MFLOPS that was obtained without special attention to optimizations, this represents a 275 percent increase in performance. (A test program is available at http://www.cuj.com/code/.)</p>
+<h3>Conclusion</h3>
+
+<p>The possibility for large performance increases when using assembly coding not only justifies this technique, but it is practically a mandatory method for pushing performance to the theoretical limit. The requirement for performance in scientific programming is expanding into other fields, such as game programming, and the need for assembly-level expertise is still of great importance.</p>
+
+<p>Compilers are getting more complex as newer architectures with an ever increasing number of instructions are created. Consequently, the need for assembly coding to achieve the highest level of performance will extend into the foreseeable future. </p>
+
+
+
+
+
+</body>
+</html>

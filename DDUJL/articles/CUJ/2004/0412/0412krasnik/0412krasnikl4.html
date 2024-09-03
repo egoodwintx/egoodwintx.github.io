@@ -1,0 +1,236 @@
+<html>
+<head>
+<title>December, 2004: Building GIS Applications</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+
+
+
+
+
+<h4>Listing 4</h4>
+<pre>
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;math.h&gt;
+
+/* glg specific include files */
+#include "GlgApi.h"
+#include "GlgMain.h"
+
+/* coordinate conversion utility */
+#define RadToDeg( angle )   ( ( angle ) / M_PI * 180. )
+
+void Input( GlgObject, GlgAnyType, GlgAnyType );
+GlgBoolean UpdatePlane( GlgAnyType data );
+void PositionPlane();
+
+GlgObject viewport; /* the primary object displayed in the window */
+GlgObject GISObject; /* an integrated GIS object displayed on screen */
+GlgAppContext AppContext;
+long 
+  UseGrid = False,
+  UpdateInterval = 30; /* update the drawing every 30 milliseconds */
+/* the structure used to position and display the plane on screen */
+typedef struct _plane_t
+{
+  GlgPoint start; /* start lat/lon coordinates */
+  GlgPoint destination; /* end lat/lon coordinates */
+  GlgPoint lat_lon; /* the current lat/lon coordinates */
+  GlgPoint last_lat_lon;
+  GlgObject graphics; /* the actual plane object in the drawing */
+  double path_position; /* the percentage of the trajectory completed */
+  double speed;
+  GlgPoint xyz; /* the current object coordinates corresponding to lat_lon */
+  double angle; /* the plane's angle, in radians */
+} plane_t;
+
+plane_t Plane;
+
+int GlgMain( argc, argv, InitAppContext )
+     int argc;
+     char *argv[];
+     GlgAppContext InitAppContext;
+{
+  AppContext = GlgInit( False, InitAppContext, argc, argv );
+
+  /* load the drawing from a file and exit if not found */
+  viewport = GlgLoadWidgetFromFile( "drawing.g" );
+  if( !viewport )
+    exit( 1 ); 
+  /* add a callback that will handle all button click events */
+  GlgAddCallback( viewport, GLG_INPUT_CB,  (GlgCallbackProc)Input,  0 );
+  /* sets the size of the viewport on the screen */
+  GlgSetGResource( viewport, "Point1", -700., -700., 0. );
+  GlgSetGResource( viewport, "Point2", 700., 700., 0. );
+  /* sets the name of the viewport that will be drawn on the title bar */
+  GlgSetSResource( viewport, "ScreenName", "Map Server Demo" );
+
+  /* set GIS zoom mode, so that all zooming and panning in viewport with the 
+     GIS object zooms the GIS object itself instead of just scaling image */
+  GISObject = GlgGetResourceObject( viewport, "WorldMap" );
+  GlgSetGISZoom( viewport, "MapViewport", GISObject );
+
+  /* draw the viewport for the first time */
+  GlgInitialDraw( viewport );
+
+  /* initialize a plane flying from London to San Francisco */
+  Plane.speed = 0.005;
+  Plane.start.x = -0.13;
+  Plane.start.y = 51.50;
+  Plane.lat_lon = Plane.start;
+  Plane.destination.x = -122.55;
+  Plane.destination.y = 37.79;
+  Plane.path_position = 0.;
+  Plane.last_lat_lon = Plane.lat_lon;
+
+  /* the actual plane is the object named "Plane" in the drawing */
+  Plane.graphics = GlgGetResourceObject( viewport, "Plane" );
+  
+  /* start the main loop to process events and handle updates */
+  GlgAddTimeOut( AppContext, UpdateInterval,(GlgTimerProc)UpdatePlane, NULL );
+  return GlgMainLoop( AppContext );
+}
+/* Input callback function handles clicking of all buttons in drawing. It uses
+   GLG integrated pan and zoom functions to pan and zoom around the map */
+void Input( GlgObject viewport, GlgAnyType client_data, GlgAnyType call_data )
+{
+   GlgObject
+     message_obj;
+   char
+     * format,
+     * action,
+     * origin,
+     * full_origin,
+     * sub_action;
+   message_obj = (GlgObject) call_data;
+   /* message object received has 5 S resources which describe the event */
+   GlgGetSResource( message_obj, "Format", &amp;format );
+   GlgGetSResource( message_obj, "Action", &amp;action );
+   GlgGetSResource( message_obj, "Origin", &amp;origin );
+   GlgGetSResource( message_obj, "FullOrigin", &amp;full_origin );
+   GlgGetSResource( message_obj, "SubAction", &amp;sub_action );
+
+   /* if we get a window close event, exit the application */
+   if( strcmp( format, "Window" ) == 0 )
+     {
+       if( strcmp( action, "DeleteWindow" ) == 0 )
+      exit(0);
+     }
+   /* if we get a button click event, handle it appropriately */
+   else if( strcmp( format, "Button" ) == 
+                                  0 &amp;&amp; strcmp( action, "Activate" ) == 0 )
+     {
+       if( strcmp( origin, "QuitButton" ) == 0 )
+      exit(0);
+       else if( strcmp( origin, "ZoomInButton" ) == 0 )
+         GlgSetZoom( viewport, "MapViewport", 'i', 2. );
+       else if( strcmp( origin, "ZoomOutButton" ) == 0 )
+         GlgSetZoom( viewport, "MapViewport", 'o', 2. );
+       else if( strcmp( origin, "ZoomToButton" ) == 0 )
+         GlgSetZoom( viewport, "MapViewport", 't', 0. );
+       else if( strcmp( origin, "ResetZoomButton" ) == 0 )
+         {
+           /* reset the center and extent of the GIS object
+              to what they originally were in the drawing */
+           GlgSetGResource( GISObject, "GISCenter", -70., 40., 0. );
+           GlgSetGResource( GISObject, "GISExtent",14000000.,14000000., 0. );
+         }
+       else if( strcmp( origin, "PanRightButton" ) == 0 )
+         GlgSetZoom( viewport, "MapViewport", 'r', 0.4 );
+       else if( strcmp( origin, "PanLeftButton" ) == 0 )
+         GlgSetZoom( viewport, "MapViewport", 'l', 0.4 );
+       else if( strcmp( origin, "ToggleGridButton" ) == 0 )
+         {
+           char * layers;
+           /* toggle the use of the grid by changing the 
+             layers which are used in the GIS object */
+           if( !UseGrid )
+             layers = "default,grid";
+           else
+             layers = "default";
+           GlgSetSResource( GISObject, "GISLayers", layers );
+           UseGrid = !UseGrid;
+         }
+     }
+   /* update the viewport to make all changes visible */
+   PositionPlane();
+   GlgUpdate( viewport );
+}
+/* a periodically called function that updates the plane's position */
+GlgBoolean UpdatePlane( GlgAnyType data )
+{
+  /* restart the plane if it has reached its destination */
+  if( Plane.path_position &gt;= 1. )
+    {
+      Plane.path_position = 0.;
+      Plane.lat_lon = Plane.start;
+      Plane.last_lat_lon = Plane.start;
+    }
+  else
+    {
+      Plane.last_lat_lon = Plane.lat_lon;
+      Plane.path_position += Plane.speed;
+    }
+  /* get plane's lat/lon coordinates given its position on its trajectory */
+  Plane.lat_lon.x = ( Plane.destination.x - Plane.start.x ) * 
+                                     Plane.path_position + Plane.start.x;
+  Plane.lat_lon.y = ( Plane.destination.y - Plane.start.y ) * 
+                                     Plane.path_position + Plane.start.y;
+  /* reposition the plane on the map */
+  PositionPlane();
+
+  /* update the viewport to reflect the changes made */
+  GlgUpdate( viewport );
+  GlgSync( viewport );    /* Improves interactive response */
+  GlgAddTimeOut( AppContext, UpdateInterval, (GlgTimerProc)UpdatePlane, 
+           NULL ); /* add a time out to re-enter this function later */
+  return False;
+}
+void PositionPlane()
+{
+  GlgPoint last_xyz;
+  double length, angle;
+  /* convert from the plane's lat and lon coordinates to object coordinates */
+  GlgGISConvert( GISObject, NULL, GLG_OBJECT_COORD,
+           /* Lat/Lon to XY */ False,
+           &amp;(Plane.lat_lon), &amp;(Plane.xyz) );
+  /* if the plane is invisible, don't show it */
+  if( Plane.xyz.z &lt; 0 ||
+      Plane.xyz.x &lt; -1000. ||
+      Plane.xyz.y &lt; -1000. ||
+      Plane.xyz.x &gt;  1000. ||
+      Plane.xyz.y &gt;  1000. || 
+      Plane.path_position == 0. )
+    {
+      GlgSetDResource( Plane.graphics, "Visibility", 0. );
+      return;
+    }
+  /* get the plane's angle */
+  GlgGISConvert( GISObject, NULL, GLG_OBJECT_COORD,
+                 /* Lat/Lon to XY */ False,
+                 &amp;(Plane.last_lat_lon), &amp;last_xyz );
+  length = sqrt(( Plane.xyz.x - last_xyz.x ) * ( Plane.xyz.x - last_xyz.x ) +
+                ( Plane.xyz.y - last_xyz.y ) * ( Plane.xyz.y - last_xyz.y ) );
+  if( length == 0. )
+    angle = 0.;
+  else
+    {
+       angle = acos( (  Plane.xyz.x - last_xyz.x ) / length );
+       if( Plane.xyz.y - last_xyz.y &lt; 0. )
+         angle = -angle;
+    }
+  /* make the plane visible and set its position and angle */
+  GlgSetDResource( Plane.graphics, "Visibility", 1. );
+  GlgSetGResource( Plane.graphics, "Position", Plane.xyz.x, Plane.xyz.y, 0. );
+  GlgSetDResource( Plane.graphics, "Angle", RadToDeg( angle ) );
+}
+</pre>
+
+
+
+</body>
+</html>

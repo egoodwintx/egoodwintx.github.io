@@ -1,0 +1,394 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+  <title>Using Databases with DBI: What Not To Do - The Perl Journal, Summer 1999</title>
+  <meta name="generator" content=
+  "HTML Tidy for Linux/x86 (vers 12 April 2005), see www.w3.org">
+  <meta name="vscategory" content="Perl">
+  <meta name="vsisbn" content="">
+  <meta name="vstitle" content=
+  "Using Databases with DBI: What Not To Do">
+  <meta name="vsauthor" content="Thomas Akin">
+  <meta name="searchdescription" content=
+  "Perl's DBI module allows you to use Perl with database engines. It's one of the most popular Perl utilities, and I have dozens of clients who make extensive use of DBI for their daily production needs. Some clients use DBI much more effectively than others, and in this article we'll see how.">
+  <meta name="vspublisher" content="Earthweb">
+  <meta name="vspubdate" content="Summer 1999">
+
+</head>
+
+<body bgcolor="#FFFFFF">
+  <!-- end head -->
+  <font face="verdana" size="1">Issue 14, Summer 1999</font>
+
+  <h2 align="center">Using Databases with DBI: What Not To Do</h2>
+
+  <h4>Thomas Akin</h4>
+
+  <p>Perl's DBI module allows you to use Perl with database
+  engines. It's one of the most popular Perl utilities, and I have
+  dozens of clients who make extensive use of DBI for their daily
+  production needs. Some clients use DBI much more effectively than
+  others, and in this article we'll see how.</p>
+
+  <h3>DBI and loops</h3>
+
+  <p>DBI statements are often used within loops that store or fetch
+  data from a database. You might insert the contents of a text
+  file into a database line by line, or read and parse multiple
+  lines of output from a database query. I often see code like the
+  following from new DBI programmers:</p>
+  <pre>
+foreach $line (&lt;FILE&gt;) {
+  chomp $line;
+  ($alpha, $beta, $charlie, $delta) = split(/,/,$line);  
+  $sql = qq{ 
+      insert into $table (col_a, col_b, col_c, col_d)
+      values($alpha,$beta,$charlie,$delta)
+  };
+&#13;  $dbh = DBI-&gt;connect($dsn,'login','password');
+  $sth = $dbh-&gt;prepare($sql);
+  $sth-&gt;execute;
+  $dbh-&gt;disconnect;
+}
+</pre>
+
+  <p>This code works, but not very efficiently. With the above code
+  it took an hour to insert 200,000 rows into a MySQL database --
+  and MySQL is pretty fast! It might take half a day with
+  Oracle.</p>
+
+  <p>There are lots of improvements we can make. The first is just
+  common sense: Never put anything in a loop that doesn't
+  absolutely have to be there. For each of our 200,000 insertions,
+  we connect to the database, prepare our SQL statement, execute
+  it, and disconnect from the database. However, we only need to
+  connect and disconnect once. We simply have to move our
+  <tt>connect()</tt> and <tt>disconnect()</tt> outside the loop to
+  drastically improve our performance:</p>
+  <pre>
+$dbh = DBI-&gt;connect($dsn,'login','password');
+&#13;foreach $line (&lt;FILE&gt;) {
+  chomp $line;
+  ($alpha, $beta, $charlie, $delta) = split(/,/,$line);
+  $sql = qq{
+      insert into $table (col_a, col_b, col_c, col_d)
+      values($alpha,$beta,$charlie,$delta)
+  };
+&#13;  $sth = $dbh-&gt;prepare($sql);
+  $sth-&gt;execute;
+}
+&#13;$dbh-&gt;disconnect;
+</pre>
+
+  <p>This reduces our run time to half an hour, doubling our
+  speed.</p>
+
+  <h3>Placeholders</h3>
+
+  <p>DBI allows us to further improve our code by using
+  placeholders. We now connect and disconnect the database only
+  once, but we still prepare and execute our SQL statement 200,000
+  times. The statement we prepare doesn't change much; all that
+  changes is the insertion value. We can create a generic statement
+  that we prepare only once, outside the loop. With this generic
+  statement we can specify the insertion values at execution time.
+  DBI uses a <tt>?</tt> to define a placeholder, so our new SQL
+  statement looks like this:</p>
+  <pre>
+$sql = qq{
+  insert into $table (col_a, col_b, col_c, col_d)
+  values(?, ?, ?, ?)
+};
+</pre>
+
+  <p>The statement is prepared the same as before:</p>
+  <pre>
+$sth = $dbh-&gt;prepare($sql);
+</pre>
+
+  <p>Now we can fill in each <tt>?</tt> at execution time, once we
+  fill in the <tt>?</tt> values. There are two ways to do this.
+  First, we can use the <tt>bind_param()</tt> subroutine to
+  indicate what values to use:</p>
+  <pre>
+$sql = qq{
+  insert into $table (col_a, col_b, col_c, col_d)
+  values(?, ?, ?, ?)
+};
+&#13;$sth = $dbh-&gt;prepare($sql);
+&#13;foreach $line (&lt;FILE&gt;) {
+  chomp $line;
+  ($alpha, $beta, $charlie, $delta) = split(/,/,$line);
+  $sth-&gt;bind_param(1, $alpha);
+  $sth-&gt;bind_param(2, $beta);
+  $sth-&gt;bind_param(3, $charlie);
+  $sth-&gt;bind_param(4, $delta);
+  $sth-&gt;execute;
+}
+</pre>
+
+  <p>The <tt>bind_param()</tt> subroutine allows a data type as a
+  third argument. Normally, this is used to tell the driver whether
+  the placeholder is a number or a string:</p>
+  <pre>
+$sth-&gt;bind_param(1, $alpha, SQL_INTEGER);
+</pre>
+
+  <p>or</p>
+  <pre>
+$sth-&gt;bind_param(2, $beta, SQL_VARCHAR);
+</pre>
+
+  <p>The second way to specify values at execution time is to pass
+  them directly as arguments to the <tt>execute</tt> statement:</p>
+  <pre>
+$sth-&gt;execute($alpha, $beta, $charlie, $delta);
+</pre>
+
+  <p>Using this method our code simplifies to:</p>
+  <pre>
+$dbh = DBI-&gt;connect($dsn,'login','password');
+$sql = qq{
+    insert into $table (col_a, col_b, col_c, col_d)
+    values(?, ?, ?, ?)
+}
+&#13;$sth = $dbh-&gt;prepare($sql);
+&#13;foreach $line (&lt;FILE&gt;) {
+    chomp $line;
+    ($alpha, $beta, $charlie, $delta) = split(/,/,$line);
+    $sth-&gt;execute($alpha, $beta, $charlie, $delta);
+}
+&#13;$dbh-&gt;disconnect;
+</pre>
+
+  <p>Our code now takes twenty minutes to run. We achieved this
+  improvement despite the fact that the MySQL database driver only
+  emulates placeholders. Had this been a database that
+  <i>directly</i> supports placeholders, such as Oracle, the
+  improvement would have been even more dramatic. Placeholders are
+  any easy way to improve your DBI coding, but there are a few
+  gotchas that beginners need to avoid. First, notice that
+  placeholders don't have quotes. This is correct:</p>
+  <pre>
+$sql = qq{
+        insert into $table (col_a, col_b, col_c, col_d)
+        values(?, ?, ?, ?)
+};
+</pre>
+
+  <p>This is not correct:</p>
+  <pre>
+$sql = qq{
+        insert into $table (col_a, col_b, col_c, col_d)
+        values('?', '?', '?', '?')
+};
+</pre>
+
+  <p>Placeholders cannot be used for column names or table names.
+  This <i>won't</i> work:</p>
+  <pre>
+$sql = qq{
+         select alpha, ? from table
+};
+</pre>
+
+  <p>Nor will this:</p>
+  <pre>
+$sql = qq{
+         select alpha, beta from ?
+};
+</pre>
+
+  <p>Or even this:</p>
+  <pre>
+$sql = qq{
+          select alpha, beta from table where ? &gt; 200
+};
+</pre>
+
+  <p>However, you can use Perl variables for column and table
+  names:</p>
+  <pre>
+$sql = qq{
+        select alpha, beta from $table where $col &gt; 200
+};
+</pre>
+
+  <p>You'll have to re-<tt>prepare</tt> this statement whenever you
+  want to change the values of <tt>$table</tt> or
+  <tt>$col</tt>.</p>
+
+  <h3>Fetches</h3>
+
+  <p>We've dealt mostly with inserting data into a database, so now
+  we'll look at the ways DBI provides to get data out. Most of
+  those ways follow the same basic format:</p>
+  <pre>
+$dbh = DBI-&gt;connect($dsn, 'login', 'passwd');
+&#13;$sql = qq{
+    select * from $table
+};
+&#13;$sth = $dbh-&gt;prepare($sql);
+$sth-&gt;execute;
+&#13;while (@row = $sth-&gt;fetchrow_array) {
+    print "@row\n";
+}
+&#13;$dbh-&gt;disconnect;
+      The most efficient of these is fetchrow_arrayref():
+&#13;while ($row = $sth-&gt;fetchrow_arrayref) {
+    print "@$row\n";
+}
+</pre>
+
+  <p>There's also <tt>fetchrow_hashref()</tt>, which stores the
+  keys and values of the database into a hash:</p>
+  <pre>
+while ($ref = $sth-&gt;fetchrow_hashref) {
+    foreach $key (keys %{$ref}) {
+       print "$ref-&gt;{$key}, ";
+    }
+    print "\n";
+}
+</pre>
+
+  <h3>Bind Columns</h3>
+
+  <p>Database fetches can be made even more efficient and elegant
+  with the use of <i>bind columns</i>. Bind columns allow you to
+  bind a variable to each column of a table, so that whenever a
+  fetch is performed the bound variables are automatically
+  updated:</p>
+  <pre>
+$sth-&gt;bind_columns(\%attr,@references_to_variables_to_bind);
+</pre>
+
+  <p>We can use it like this:</p>
+  <pre>
+$sql = qq{
+     select alpha, beta, delta from table
+};
+&#13;$sth-&gt;prepare($sql);
+$sth-&gt;execute;
+&#13;my ($alpha, $beta, $delta);
+$sth-&gt;bind_columns(undef, \$alpha, \$beta, \$delta);
+&#13;while ($sth-&gt;fetch) {
+    print "$alpha - $beta - $delta\n";
+}
+</pre>
+
+  <p>Here, the <tt>fetch()</tt> subroutine is synonymous with
+  <tt>fetchrow_arrayref()</tt>. This subroutine, combined with
+  <tt>bind_columns()</tt>, is <i>the</i> fastest way to fetch data
+  with DBI.</p>
+
+  <h3>Error Checking</h3>
+
+  <p>There's a big problem with all of code snippets you've seen in
+  this article: We never check the return values of DBI methods. We
+  simply assume that every DBI call was successful. The obvious
+  solution is to add an <tt>or die</tt> clause after every DBI
+  method call:</p>
+  <pre>
+$dbh = DBI-&gt;connect($dsn,'login','passwd') 
+             || die $DBI::errstr;
+$sth = $dbh-&gt;prepare($sql) || die $dbh-&gt;errstr;
+$sth-&gt;execute || die $sth-&gt;errstr;
+</pre>
+
+  <p>However, there is a cleaner solution. Each DBI handle has a
+  boolean attribute called <tt>RaiseError</tt>. If we set this to
+  true, any errors triggered by that handle cause the script to die
+  with an appropriate error message, saving us from having to check
+  every DBI call we make. <tt>RaiseError</tt> can be set via the
+  <tt>connect</tt> statement:</p>
+  <pre>
+$dbh = DBI-&gt;connect($dsn,'login','passwd', 
+            { RaiseError =&gt; 1 });
+</pre>
+
+  <p>We can also call it after a connection is already made:</p>
+  <pre>
+$dbh-&gt;{RaiseError} = 1; 
+</pre>
+
+  <h3>Transactions</h3>
+
+  <p>I've found that many administrators shy away from using
+  <i>transactions</i> with DBI. For those unfamiliar, transactions
+  provide a way to group multiple SQL statements together so that
+  database changes are only made if <i>every</i> statement is
+  successful. For example, a transaction for updating a customer
+  order database might include statements to update inventory,
+  update accounts payable, and update shipping manifests. All
+  updates must succeed; otherwise, we don't want to perform any of
+  them. If only some of the updates succeeded, we might bill a
+  customer for an order not shipped, or ship an order to a customer
+  without billing them.</p>
+
+  <h3>Many administrators shy away from using DBI
+  transactions.</h3>
+
+  <p>By default, DBI commits each statement as it's performed. To
+  use transactions, we need to disable this behavior with the
+  <tt>AutoCommit</tt> variable:</p>
+  <pre>
+$dbh = DBI-&gt;connect($dsn,'login','passwd', {
+	      RaiseError =&gt; 1,
+	      AutoCommit =&gt; 0,
+});
+</pre>
+
+  <p>We can also just say:</p>
+  <pre>
+   $dbh-&gt;{AutoCommit} = 0;
+</pre>
+
+  <p>With <tt>AutoCommit</tt> off, changes are revocable until
+  <tt>commit()</tt> is called. Uncommitted statements can be undone
+  with <tt>rollback()</tt>.</p>
+
+  <p>Next, we need a way to group our statements that lets us test
+  whether any failed. The easiest and most robust way to do this is
+  to set <tt>RaiseError</tt> and wrap the statements in an
+  <tt>eval</tt> block:</p>
+  <pre>
+  $dbh-&gt;{RaiseError} = 1;
+        eval {
+           $sth_1-&gt;execute;    # Update Inventory
+           $sth_2-&gt;execute;    # Update Accounts Payable
+           $sth_3-&gt;execute;    # Update Shipping
+        };
+        if ($@) 
+           $dbh-&gt;rollback; 
+        } else { 
+           $dbh-&gt;commit; 
+        }
+</pre>
+
+  <p>If any statement in the <tt>eval</tt> block fails, <tt>$@</tt>
+  is set and we revoke all three statements.</p>
+
+  <p>Don't forget to commit your statements. If you do forget, what
+  happens next depends on the database. Some databases
+  automatically commit them; others roll them back.</p>
+
+  <h3>References</h3>
+
+  <p>The material for this article came from personal experience, a
+  thousand or so readings of the DBI documentation and FAQ, and a
+  generous review by DBI guru Tim Bunce. You can find the DBI
+  module and its related documentation at <a href=
+  "http://www.symbolstone.org/technology/perl/DBI" target=
+  "resource window">http://www.symbolstone.org/technology/perl/
+  DBI</a>.</p>
+
+  <p>__END__</p>
+  <hr>
+
+  <p><i>Thomas Akin is President &amp; CEO of CrossRealm
+  Consulting, Inc. in Atlanta, Georgia. He spends his spare time
+  teaching, writing, and as a Perl evangelist. He can be reached at
+  <a href=
+  "mailto:takin@crossrealm.com">takin@crossrealm.com</a>.</i></p>
+</body>
+</html>

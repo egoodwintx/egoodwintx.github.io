@@ -1,0 +1,300 @@
+<html>
+<head>
+<title>Writing a Generalized  Concurrent Queue</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> November 2008</p>
+
+<h1>Writing a Generalized  Concurrent Queue</h1>
+<h2>A two-lock queue with pretty good concurrency</h2>
+
+
+<h3>By Herb Sutter</h3>
+
+
+<I>Herb is a software development consultant, a software  architect at Microsoft, and chair of the ISO C++ Standards committee. He can be contacted at www.gotw.ca.</I>
+
+<hr>
+
+
+
+
+<p>Last month [1], I showed code for a lock-free queue that supported the limited case of exactly two threads&#151;one producer, and one consumer. That's useful, but maybe not as exciting now that our first rush of lock-free coding glee has worn off. This month, let's tackle the general problem of supporting multiple producers and multiple consumers with as much concurrency as possible. The code in this article uses four main design techniques:</p>
+
+<p>First, we'll use (the equivalent of) two locks: One for the head end of the queue to regulate concurrent consumers, and one for the tail to regulate concurrent producers. We'll use ordered atomic variables (C++0x <i>atomic&lt;&gt;</i>, Java/.NET <i>volatile</i>) directly instead of prefabricated mutexes, but functionally we're still writing spinlocks; we're just writing them by hand. Although this means it's not a purely "lock-free" or nonblocking algorithm, it's still quite concurrent because we'll arrange the code to still let multiple consumers and multiple producers make progress at the same time by arranging to do as much work as possible outside the small critical code region that updates the head and tail, respectively.</p>
+
+<p>Second, we'll have the nodes allocate the contained <i>T</i> object on the heap and hold it by pointer instead of by value. [2] To experienced parallel programmers this might seem like a bad idea at first, because it means that when we allocate each node we'll also need to perform an extra heap allocation, and heap allocations are notorious scalability busters on many of today's memory allocators. It turns out that, even on a system with a nonscalable allocator, the benefits typically outweigh the advantages: Holding the <i>T</i> object by pointer let us get greater concurrency and scalability among the consumer threads, because we can take the work of actually copying the <i>T</i> value out of the critical section of code that updates the shared data structure.</p>
+
+<p>Third, we don't want to have the producer be responsible for lazily removing the nodes consumed since the last call to <i>Produce</i>, because this is bad for performance: It adds contention on the queue's head end, and it needlessly delays reclaiming consumed nodes. Instead, we'll let each consumer be responsible for trimming the node it consumed, which it was touching anyway and so gives better locality.</p>
+
+<p>Fourth, we want to follow the advice that "if variables <i>A</i> and <i>B</i> are not protected by the same mutex and are liable to be used by two different threads, keep them on separate cache lines" to avoid false sharing or "ping-ponging" which limits scalability. [3] In this case, we want to add padding to ensure that different nodes (notably the first and last nodes), the <i>first</i> and <i>last</i> pointers into the list, and the <i>producerLock</i> and <i>consumerLock</i> variables are all on different cache lines.</p>
+
+
+
+
+
+
+
+
+
+
+
+<h3>A Two-Lock Multiproducer/Consumer Queue</h3>
+
+<p>The queue data structure itself is a singly linked list. To make the code simpler for the empty-queue boundary case, the list always contains a dummy node at the head, and so the <i>first</i> element logically in the queue is the one contained in the node after first. Figure 1 shows the layout of an empty queue, and Figure 2 shows a queue that holds some objects.</p>
+
+<p>Each node holds the <i>T</i> object by pointer and adds padding:</p>
+
+<pre class="code">
+
+template &lt;typename T&gt;
+struct LowLockQueue {
+private:
+  struct Node {
+    Node( T* val ) : value(val), next(nullptr) { }
+    T* value;
+    <font color="#FF0000">atomic&lt;Node*&gt;</font> next;
+    char pad[CACHE_LINE_SIZE - sizeof(T*)- sizeof(atomic&lt;Node*&gt;)];
+  };
+
+
+</pre>
+<p>Like any shared variable, the <i>next</i> pointer needs to be protected by a mutex or, as here, declared as an ordered atomic type (C++0x <i>atomic&lt;&gt; </i>or Java/.NET <i>volatile</i>). The padding here is to ensure that two <i>Node</i> objects won't occupy the same cache line; in particular, in a nonempty queue, having the first and last nodes in the same cache line would penalize performance by causing invisible contention between the producer and consumer. Note that the amount of padding shown here and later on errs on the side of being too conservative: Each <i>Node</i> will be allocated on the heap, and a heap allocator may add its own extra overhead to each allocated block for alignment and housekeeping information, which effectively adds extra padding. If so, and if we know how much that will be, we could reduce our internal padding proportionately to make a heap-allocated <i>Node</i> exactly fill one cache line.</p>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="081001hs01_f1.gif" style="width:400">
+
+<div class="caption" style="width:402">
+Figure 1: Structure of an empty queue.
+</div>
+</div>
+
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="081001hs01_f2.gif" onclick = "popimage(this,'www.ddj.com - Writing a Generalized  Concurrent Queue - Figure 2')">
+
+<div class="caption">
+Figure 2: A queue containing four T objectsempty queue.
+</div>
+</div>
+
+
+
+
+<p>Next, here are our queue control variables:</p>
+
+<pre class="code">
+
+    char pad0[CACHE_LINE_SIZE];
+ 
+  // for one consumer at a time
+  Node* first;
+ 
+  char pad1[CACHE_LINE_SIZE
+           - sizeof(Node*)];
+ 
+  // shared among consumers
+  <font color="#FF0000">atomic&lt;bool&gt;</font> consumerLock;
+ 
+  char pad2[CACHE_LINE_SIZE 
+           - sizeof(atomic&lt;bool&gt;)];
+ 
+  // for one producer at a time
+  Node* last; 
+ 
+  char pad3[CACHE_LINE_SIZE 
+           - sizeof(Node*)];
+ 
+  // shared among producers
+  <font color="#FF0000">atomic&lt;bool&gt;</font> producerLock;
+ 
+  char pad4[CACHE_LINE_SIZE 
+           - sizeof(atomic&lt;bool&gt;)];
+
+
+</pre>
+<p>Again, we add padding to make sure hat data used by different threads stay physically separate in memory and cache. Clearly, we want the consumer-end data and the producer-end data to be on separate cache lines; but even though only one producer and one consumer will be active at a time, we want to keep the locking variable separate so that waiting consumers spinning on <i>consumerLock</i> won't contend on the cache line that contains <i>first</i> which the active consumer is updating, and that waiting producers spinning on <i>producerLock</i> won't slow down the active producer who is updating <i>last</i>.</p>
+
+<p>The constructor just sets up the initial empty state, and the destructor (in .NET or Java, this would be the disposer) just walks the internal list and tears it down:</p>
+
+<pre class="code">
+
+public:
+  LowLockQueue() {
+    first = last = new Node( nullptr );
+    producerLock = consumerLock = false;
+  }
+  ~LowLockQueue() {
+    while( first != nullptr ) {   		// release the list
+      Node* tmp = first;
+      first = tmp-&gt;next;
+      delete tmp-&gt;value; 		// no-op if null
+      delete tmp;
+    }
+  }
+
+
+</pre>
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>Produce</h3>
+
+<p>Now let's look at the first of the two key methods: <i>Produce</i>. The goal is to allow multiple producers, and to let them run as concurrently as possible:</p>
+
+<pre class="code">
+
+  void Produce( const T&amp; t ) {
+    Node* tmp = new Node( new T(t) );
+    while( <font color="#FF0000">producerLock</font>.exchange(true) )
+      { } 	// acquire exclusivity
+    last-&gt;<font color="#FF0000">next</font> = tmp;		 		// publish to consumers
+    last = tmp;		 		// swing last forward
+    <font color="#FF0000">producerLock</font> = false; 		// release exclusivity
+  }
+
+
+</pre>
+<p>First, we want to do as much work as possible outside the critical section of code that actually updates the queue. In this case, we can do all of the allocation and construction of the new node and its value concurrently with any number of other producers and consumers.</p>
+
+<p>Second, we "commit" the change by getting exclusive access to the tail of the queue. The <i>while</i> loop keeps trying to set the <i>producerLock</i> to true until the old value was false because while the old value was true, it means someone else already has exclusivity. The way to read this <i>while</i> loop is, "until I get to be the one to change <i>producerLock</i> from false to true," which means that this thread has acquired exclusivity. Then we can update <i>last-&gt;next</i> and <i>last</i> itself, which are two separate writes and cannot be done as a single atomic operation on most processors without some sort of lock. Finally, we release exclusivity on the tail of the queue by setting <i>producerLock</i> to false.</p>
+
+
+<h3>Consume</h3>
+
+<p>Likewise, we want to support any number of threads calling <i>Consume</i>, and let them run as concurrently as possible. First, we get exclusivity, this time on the head end of the queue:</p>
+
+<pre class="code">
+
+
+  bool Consume( T&amp; result ) {
+    while( <font color="#FF0000">consumerLock</font>.exchange(true) ) 
+      { }	 // acquire exclusivity
+
+</pre>
+<p>Next, we read the head node's <i>next</i> pointer. If it's not null, we need to take out the first value but we want to do as little work as possible here inside the exclusive critical section:</p>
+
+<pre class="code">
+
+    Node* theFirst = first;
+    Node* theNext = first-&gt;<font color="#FF0000">next</font>;
+    if( theNext != nullptr ) { 		// if queue is nonempty
+      T* val = theNext-&gt;value;	 	       	// take it out
+      theNext-&gt;value = nullptr; 	       	// of the Node
+      first = theNext;		 	       	// swing first forward
+      <font color="#FF0000">consumerLock</font> = false; 	       	// release exclusivity
+
+
+</pre>
+<p>Now we're done touching the list, and other consumers can make progress while we do the remaining copying and cleanup work off to the side:</p>
+
+<pre class="code">
+
+
+      result = *val;  		// now copy it back
+      delete val;  		// clean up the value
+      delete theFirst;  		// and the old dummy
+      return true;	 		// and report success
+    }
+
+
+</pre>
+<p>Otherwise, if <i>theNext</i> was null, the list was empty and we can immediately release exclusion and return that status:</p>
+
+<pre class="code">
+    <font color="#FF0000">consumerLock</font> = false;                	// release exclusivity
+    return false; 	// report queue was empty
+  }
+};
+
+</pre>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>Fully Nonblocking  Multiproducer/Consumer Queues</h3>
+
+<p>The above code still uses two locks, albeit sparingly. How might we eliminate the producer and consumer locks for a fully nonblocking queue implementation that allows multiple concurrent producers and consumers? If that intrigues you, and you're up for some down-and-dirty details, here are two key papers you'll be interested in reading.</p>
+
+<p>In 1996, Michael and Scott published a paper that presented two alternatives for writing an internally synchronized queue. [4] One alternative really is nonblocking; the other uses a producer lock and a consumer lock, much like the examples in this article. In 2003, Herlihy, Luchango and Moir pointed out scalability limitations in Michael and Scott's approach, and presented their own obstruction-free queue implementation. [5]</p>
+
+<p>Both of these papers featured approaches that require a double-width compare-and-swap operations (also known as "DCAS") that can treat a pointer plus an integer counter together as a single atomic unit. That is problematic because not all platforms have a DCAS operation, especially mainstream processors in 64-bit mode which would essentially require a 128-bit CAS. [6] One also requires a special free list allocator to work properly.</p>
+<h3></h3>
+<h3>Coming Up</h3>
+
+<p>We applied four techniques: </p>
+
+
+
+<ol>
+  <li>Having two locks, one for each end of the queue.</li>
+  <li>Allocating objects on the heap to let us make consumers more concurrent. </li>
+  <li>Having consumers remove consumed nodes one at a time for better locality, less contention at the head, and more immediate cleanup than having producers lazily clean up consumed nodes. </li>
+  <li>Adding padding to keep data used by different threads on different cache lines, avoiding memory performance penalties due to false sharing or "ping-pong."</li>
+  </ol>
+
+<p>But just how much did each of those help, and how much did each help depending on the size of the queued objects? Next month, I'll break down the four techniques by analyzing the successive performance impact of each of these techniques with some pretty graphs. Stay tuned.</p>
+
+
+<h3>Notes</h3>
+
+<p>[1] H. Sutter. "Lock-Free Code: A False Sense of Security" (<i>DDJ,</i> June 2008). Available online at http://ddj.com/architect/208200273.</p>
+
+<p>[2] Note that this happens naturally in Java and .NET for reference types, which are always held indirectly via a pointer (which is called an object reference in those environments).</p>
+
+<p>[3] H. Sutter. "Maximize Locality, Minimize Contention" (<i>DDJ, </i>September 2008). Available online at http://ddj.com/architect/208200273.</p>
+
+<p>[4] M. Michael and M. Scott. "Simple, Fast, and Practical Non-Blocking and Blocking Concurrent Queue Algorithms" (<i>Proceedings of the 15th ACM Symposium on Principles of Distributed Computing, </i>1996)</p>
+
+<p>[5] M. Herlihy, V. Luchango and M. Moir. "Obstruction-Free Synchronization: Double-Ended Queues As an Example" (<i>Proceedings of the 23rd International Conference on Distributed Computing Systems,</i> 2003).</p>
+
+<p>[6] You could try to make it work in 64 bits via heroic efforts to steal from the 64-bit address space, taking ruthless advantage of the knowledge that on mainstream systems today the operating system usually doesn't actually use all 64 bits of addresses and might not notice if you use a few or even a dozen for your own ends. However, that's inherently brittle and nonportable, and a lot of other people (including probably your OS's developers) have had the same idea and tried to grab those bits too in the frenzied 64-bit land rush already in progress. In reality, you generally only get to play this kind of trick if you're the operating system or its close friend.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

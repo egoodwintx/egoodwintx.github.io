@@ -1,0 +1,793 @@
+<HTML>
+<META NAME="year" CONTENT="1990">
+<HEAD>
+
+<TITLE>FEB90: STALKING GENERAL PROTECTION FAULTS: PART II</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>STALKING GENERAL PROTECTION FAULTS: PART II<a name="006f_0003"><a name="006f_0003"></h1><P>
+<h2><a name="006f_0001"><a name="006f_0000">The hunt continues</h2><P>
+<h3>Andrew Schulman</h3><P>
+<p><i><a name="006f_0002"><a name="006f_0000">Andrew is a software engineer in Cambridge, Mass., where he is writing a network CD-ROM server.  Andrew can be reached at 32 Andrew St., Cambridge, MA 02139.</i></p><hr><P>
+Conventional wisdom says that when a protected-mode program commits a general-protection (GP fault) violation, it is &quot;evidence that the program's logic is incorrect, and therefore it cannot be expected to fix itself or trusted to notify the user of its ill health.&quot;  This is a quote from OS/2's principal architect, Gordon Letwin.  In Part I of this article I tried to show that this statement is false.  For a large class of programs, which execute some form of &quot;user code&quot; or script (a programmable data base or a Basic interpreter with PEEK and POKE commands, for example), GP faults are caused by the user code, not the program itself.  An extra module should be written to catch GP faults when such programs are ported to protected mode (either through a DOS extender or OS/2).<P>
+In Part I of this article, I showed how to catch GP faults under a 286-based DOS extender such as Rational Systems's DOS/16M.  I used a rather silly &quot;GP fault interpreter,&quot; a program that allows the user to commit GP faults.  In this article, I will show how to do the same thing using 32-bit C compilers and 386 | DOS-Extender.  Then I will show how GP faults can be caught under the OS/2 operating system on 16-bit machines.  It is often said that GP faults can't be caught under OS/2, but they can (and must!).<P>
+<h3><a name="006f_0004">32-bit MS-DOS<a name="006f_0004"></h3><P>
+Like a 16-bit DOS extender, Phar Lap Software's 386|DOS-Extender runs code in protected mode, occasionally switching back to real mode to call MS-DOS or some other real-mode service.  In many ways, programming for this 32-bit environment is similar to 16-bit protected-mode programming.<P>
+There are important differences, however.  In a 32-bit C compiler, such as MetaWare High C v. 1.5 for MS-DOS 386 or Watcom C 7.0/386, an int is a 4-byte quantity.  A near pointer is also a 4-byte quantity.  This means the programmer almost never have to deal with far pointers.  When a segment takes a 4-byte offset, a program only needs one segment for all its data, and another segment for code.  Once loaded, DS and CS stay constant.  In effect, this is a linear address space.<P>
+Though it is no longer needed for data and code, segmentation is still essential for sharing and to enforce protection.  In a DOS extender, segmentation is also needed for communicating with real-mode services.  On those occasions, when both a segment and an offset are needed, a far pointer is a 6-byte quantity (an FWORD).<P>
+The basic difference between working in 32-bit versus 16-bit mode is that there are fewer restrictions.  It takes longer for an int to overflow, the registers (EAX, EBX, and so on) are twice as wide, there are more registers (FS, GS), and offsets can be so large that they are full-fledged addresses.  All these quantitative differences add up to a major qualitative change.  Some of the flavor of 386 protected-mode programming appears in a sample session with a 32-bit version of the GP fault interpreter, compiled with Watcom C 7.0/386, and running under 386|DOS-Extender, as shown in <a href="9002h.htm#006f_0005">Figure 1</A>.<P>
+<h4><a name="006f_0005"><a name="006f_0005">Figure 1: A sample session with a 32-bit version of the GP fault interpreter</h4><P>
+<pre>
+  C:_PHARLAP&gt;run386 gpf386
+  'Q' to quit, '!' to reinstall default GP fault handler
+  0014:000038a4 is a legal address to poke
+  0014:000038a0 is not a legal address to poke
+  $ 1234:00005678 66666666
+  Protection violation at 000C:00000111!
+  Error code 1234
+  &lt;DS 0014&gt; &lt;ES 000C&gt; &lt;FS 0014&gt;             &lt;GS 0014&gt;
+  &lt;EDI 00003CC0&gt; &lt;ESI 66666666&gt;             &lt;FLAGS 00010297&gt;
+  &lt;EAX 00005678&gt; &lt;EBX 00005678&gt;             &lt;ECX 00001234&gt; &lt;EDX 00001234&gt;
+  $ 000c:00000111 66666666
+  Protection violation at 000C:00000127!
+  &lt;DS 0014&gt; &lt;ES 000C&gt; &lt;FS 000C&gt;             &lt;GS 0014&gt;
+  &lt;EDI 0000000C&gt; &lt;ESI 66666666&gt;             &lt;FLAGS 00010212&gt;
+  &lt;EAX 00000019&gt; &lt;EBX 00000111&gt;             &lt;ECX 0000000C&gt; &lt;EDX 0000000C&gt;
+  $ 0034:000b80a0 70217021
+  poked 0034:000b80a0 with 70217021
+</pre><P>
+<P>
+Except for the extra 386 registers, <a href="9002h.htm#006f_0005">Figure 1</A> resembles the DOS/16M GP Fault interpreter shown in Part I.  As in the 16-bit version, trying to poke at segment 1234 failed, though this time the faulting instruction (EIP=00000111) was:<P>
+<pre>mov fs,dx</pre><P>
+Trying to write into the program's code space also failed.  The faulting instruction at EIP=00000127 was:<P>
+<pre>mov fs:[ebx], esi</pre><P>
+The last POKE command in <a href="9002h.htm#006f_0005">Figure 1</A> succeeded, though.  In 386 | DOS-Extender, 0x34 is a writeable data segment that maps the entire first megabyte of memory. The entire MS-DOS address space occupies a tiny portion of one 386 protected-mode segment! Thus, 0034:000B80A0 is equivalent to the real-mode address B800:00A0, and points into video display memory.  Poking the integer 0x70217021 into this address, after GPF386.EXP scrolls the screen, leaves two reverse video (attribute 0x70) exclamation marks (char 0x21) in the upper-left corner of the screen.<P>
+<a href="9002h.htm#006f_000f">Listing Four</A>, page 112, is the Watcom C version of GPF386.C.  <a href="9002h.htm#006f_0011">Listing Five</A>, page 112, is the MetaWare High C version.  The object file produced by the compiler is passed to Phar Lap's 386LINK.  As the example shows, the resulting file, GPF386.EXP, runs under RUN386.  Those who purchase a redistribution package from Phar Lap can bind RUN386 into a protected-mode application, thus producing the stand-alone executable file GPF386.EXE.  The process is similar in DOS/16M.<P>
+386|DOS-Extender requires Set Vector to handle 32-bit offsets; placing the address of a protected-mode interrupt handler in DS:EDX, or using EBX to hold the entire address of a real-mode handler.  MS-DOS INT 21 function 25 won't work here, so Phar Lap provides its own.<P>
+Phar Lap makes INT 21 function 25, the gateway for all 386|DOS-Extender system calls.  For example, AX=2504 is used to set a protected-mode interrupt vector and AX=2505 is used to set a real-mode interrupt vector.  Other 386|DOS-Extender system calls let the programmer call a real-mode procedure, issue a real-mode interrupt, alias a segment, change the attributes for a segment, and so on.<P>
+Phar Lap provides several different system calls for setting interrupt handlers.  The most useful one for catching GP faults is the &quot;Set Interrupt to Always Gain Control in Protected Mode&quot; call (AX=2506).  Because this call expects the address of a protected-mode handler in DS:EDX, this is one of those times that DS has to temporarily change.  The function setvect( ), shown in <a href="9002h.htm#006f_000f">Listings Four</A> and <a href="9002h.htm#006f_0011">Five</A>, demonstrates this process.<P>
+High C provides a C interface file, msdos.cf, with declarations for calldos( ) and for a global Registers structure.  This is similar to using intdosx( ) and union REGS *r when accessing DOS from a Microsoft C or Turbo C program.<P>
+Watcom C7.0/386 goes further.  Watcom C is a 32-bit compiler that is highly compatible with the Microsoft C 16-bit standard.  Watcom C's dos.h #include file contains functions such as _dos_ getvect( ) and _dos_setvect( ).  These functions invoke Phar Lap system calls for protected-mode handlers.  Such as their Microsoft C equivalents, they use far pointers, except that a far pointer in Watcom C is 48 bits.  Like the standard C library MS-DOS interfaces, Watcom C7.0/386 includes the intdosx( ) function and union REGS * declaration, but these manipulate the 32-bit registers expected by 386|DOS-Extender.<P>
+I didn't use these functions for the program shown in <a href="9002h.htm#006f_000f">Listing Four</A>.  Instead, I used Watcom's #pragma aux, a high-level facility for inline machine code.  It is different from other machine-code facilities, such as Turbo Pascal's dreaded inline( ), which returns programmers to the days before there were even assemblers.  One way #pragma aux can be used is to specify how a function takes its parameters, and how it returns a value to its caller.  John Dlugosz discusses this facility in his September 1989 DDJ review of Watcom C7.0.  I will be discussing it some more in a forthcoming DDJ review of Watcom's 7.0/386 compiler. <a href="9002h.htm#006f_000f">Listing Four</A> gives an extended example.<P>
+For the GP Fault interpreter, a segment and an offset must be merged into a far pointer. Because C does not have any built-in FWORD data types, it is tricky to write a 386 version of the MK_FP( ) macro.  In High C, I set the segment and offset portions of the far pointer separately, using the FP_SEG( ) and FP_OFF( ) macros in GPFAULT.H (see <a href="19900045.htm#0045_000f">Listing Two</A> in Part I).  Watcom C7.0 386 uses the #pragma aux facility to provide a 48-bit MD_FP( ) that is analogous to the 32-bit MK_FP( ) macro provided in Turbo C.<P>
+There is one more area where Watcom C made it a lot easier to port the GP Fault interpreter to the 386 than did High C.  While both Watcom C and High C have facilities to write interrupt handlers, Watcom C pushes FS and GS onto the stack of a 386 interrupt handler.<P>
+<h3><a name="006f_0006">Catching OS/2 Faults with DosPTrace<a name="006f_0006"></h3><P>
+Because it runs in protected mode, OS/2 has some resemblances to 16-bit DOS extenders.  Except for system calls, code that runs in a DOS extender such as DOS/16M also runs under OS/2.  Many features of OS/2 have nothing to do with Microsoft, IBM, or OS/2 per se.  They are features of Intel's 286.  OS/2 is very much a 286 operating system, even when running on a 386 machine. Programming for OS/2 has more in common with programming for DOS/16M that does programming for 386|DOS-Extender.<P>
+There are, however, crucial differences between OS/2 and a DOS extender.  A DOS extender is only a front-end to MS-DOS, whereas OS/2 is a full-fledged operating system.  Because they made a clean break from DOS, rather than extending it, OS/2's designers were able to junk the INT 21 interface.  OS/2 system calls are invoked by putting arguments on the stack, and doing a far CALL.  No more stuffing registers.<P>
+With DOS extenders, INT 0D handlers are installed with INT 21, function 25.  In OS/2, interrupt handlers are installed by calling the DosSetVec( ) function.  There is a problem, however: DosSetVec( ) only allows certain exceptions, and the GP fault isn't one of the Another function, DosSetSigHandler( ) might be expected to work for SIGSEG~ but it doesn't. Even though Microsoft C for OS/2 includes SIGSEGV in &lt;signal.h&gt;, it doesn't do anything.<P>
+This is not an OS/2 bug or oversigt but a conscious design decision an~ some feel, an important design fla~ In his book Inside OS/2, Gordon Letwin Microsoft's chief architect for system software, flatly states, &quot;Applications can not intercept general protection failure errors. . . .  The OS/2 design does allocate almost any other error on the part of an application to be detected and handled by that application.  For example 'Illegal filename' is an error caused by user input, not by the application.&quot;<P>
+This overlooks applications in which illegal memory access is as easy for the user as illegal file access.  This is particularly ironic because, in other respects, OS/2 invites one to write such programming-on-the-fly environment.  I have heard that in the 386 version of OS/2 (OS/3?), DosSetVect( ) will allow installation of a normal interrupt handler for INT 0D. This is just a rumor and, in any case, OS/3 won't be available for some time.<P>
+In the meantime, there must be some mechanism in OS/2 to catch GP faults.  In fact, there is such a mechanism and if you've ever used protected-mode Code View (CVP), you've probably seen it in operation.  Take a buggy application such as the one at the beginning of this article and run it under CVP.  Instead of OS/2 displaying its familiar GP fault register dump, CVP displays the message &quot;Segmentation violation.&quot;  You can reassemble the faulting instruction, or move different values into the registers, and resume execution.<P>
+If CodeView can catch GP faults, why can't we?  I asked this question on CompuServe about a year and a half ago, when I was porting David Betz's XLISP to OS/2.  Ray Duncan and Charles Petzold supplied the answer: Anything that CVP can do, including catching GP faults, other OS/2 applications can also do.  CVP is built on top of an OS/2 kernel function, DosPTrace( ), and this function -- the CodeView engine -- is available to all OS/2 programs.  There are better OS/2 debuggers than CVP, but these too are undoubtedly written using DosPTrace.<P>
+Unix programmers will recognize that DosPTrace is process trace (ptrace( )), used to implement breakpoint debuggers such as sdb.  In the &quot;bad old days&quot; of the $3000 OS/2 SDK, when developers asked for information on DosPTrace, Microsoft referred them to ptrace( ) in the Unix manual.  Even today, while DosPTrace does appear in the OS/2 programmer's reference, the best source of information about it is an untitled Microsoft document, PTRACE.DOC, which is available on a number of bulletin boards.<P>
+A process (usually a debugger) uses DosPTrace to trace another process.  To write a program that can catch its own GP faults, though, I will use DosPTrace in a control/event loop.  Using a technique devised by Ray Duncan, the GP Fault interpreter will run itself under DosPTrace. Unfortunately, one thread of a process running DosPTrace cannot trace another thread in the same process, so the program is split into two processes.  OS2TRACE.C appears in <a href="9002h.htm#006f_0013">Listing Six</A>, page 114.<P>
+DosPTrace takes one parameter, a pointer to a PTRACEBUF.  This structure is declared in an OS/2 header file, and is available if INCL_DOSTRACE appears in a #define directive before the #include os2.h statement.  A PTRACEBUF contains fields for all the 286 registers, fields to specify the process ID and thread ID and, most importantly, a field used to issue DosPTrace commands and get back DosPTrace event notifications.  Symbolic names for these commands and events are in PTRACE.H (<a href="9002h.htm#006f_0015">Listing Seven</A>, page 115).<P>
+There are many DosPTrace commands, including SINGLE_STEP, WRITE_I_SPACE (write instruction space, that is, make code), WRITE_D_SPACE (write data space), and so on; the one used here, GO, simply runs the child process.  All threads of the child process run until something &quot;interesting&quot; happens.  At that point, DosPTrace returns and the caller can see what event took place.  In <a href="9002h.htm#006f_0013">Listing Six</A>, naturally, I am mainly interested in EVENT_ GP_FAULT.<P>
+There is very little performance overhead when a program is run under DosPTrace using the GO command (using SINGLE_STEP, the debugger would run as slowly as molasses).  A GP fault, though, is a very expensive operation.  In one test under OS/2, I could only commit about 200 GP faults per second.  This is acceptable, because GP faults should take place infrequently.<P>
+When a user runs OS2TRACE, the program execs another instance of itself under DosPTrace and, using a command-line argument, tells this second process that it is the second OS2TRACE process and therefore should run the GP fault interpreter rather than the DosPTrace loop.  If the user causes the interpreter to fault, DosPTrace returns EVENT_GP_FAULT, and the process running DosPTrace detects that the interpreter process has GP faulted.<P>
+The DosPTrace process must communicate this fault back to the interpreter process, so that the interpreter can resume execution at a different CS:IP.  When the trace process detects a GP fault, it uses the DosPTrace WRITE_REGISTERS command to alter the CS:IP of the interpreter process.  When the tracer next tells the interpreter to GO, the interpreter resumes at a new location.<P>
+Where should the interpreter jump?  In C, it is difficult to get the address of an arbitrary line of code.  Because there is no equivalent to the $ location counter used in MASM and other assemblers, OS2TRACE.C uses the address of a parameterless function.  This one-liner long-jmps to the interpreter's top-level input loop.  The trace process does not call this function in the interpreter process.  The tracer tells the interpreter to call (goto) this function.<P>
+Even though the two processes share the same code, they are different processes.  The tracer knows the address of this function in the interpreter's address space because of OS/2's &quot;disjoint LDT space&quot; -- the code segment containing this function is mapped to the same slot in each process's Local Descriptor Table.<P>
+Despite this, in the program shown in <a href="9002h.htm#006f_0013">Listing Six</A> I decided to use still another DosPTrace command, SEG_NUM_TO_SELECTOR.  Given a logical segment number (such as that found in a .MAP file) and a process ID, this operation returns the actual segment selector for the process.  I know that the function catch_sig_segv( ) is in segment #1.  In the trace process, the function send_sig_segv( ) first calls selector_from_segment( ) to get the new CS for the interpreter process, and then calls set_csip( ) to change the interpreter's registers.<P>
+Being able to catch GP faults under OS/2 is still important even for developing applications that do not run user code.  Even for normal applications where a GP fault is the sign of an internal bug, OS/2's GP fault register dump is unattractive, makes little sense to most users, and can't be redirected to a file.  The code in <a href="9002h.htm#006f_0013">Listing Six</A> can be modified to have the GP fault handler dump the register state to a file instead of attempting recovery.  The DosPTrace READ_I_SPACE command can be used to disassemble the faulting instruction at CS:IP.  Then, if the program ever GP faults, it could ask the user to please send you this &quot;core dump&quot; file.<P>
+<h3><a name="006f_0007">Faulting Inside OS/2 DLLs<a name="006f_0007"></h3><P>
+Because OS/2 is a far richer and more complicated environment than a DOS extender, simple peeks and pokes are not an adequate test for catching GP faults.  What happens if the user of an OS/2 interpreter uses an illegal address while calling a routine in a dynamic link library (DLL), or while making a DosXxx( ) call to the OS/2 kernel?  Lugaru's Epsilon EMACS editor, OS2XLISP, UR/Forth, and the mini-interpreter I built in the November 1989 DDJ (&quot;Linking While the Program Is Running&quot;), are all OS/2 programs that let the user call DLL routines at run time, and all can fall prey to the protected-mode interpreter problem.<P>
+In the OS/2 GP fault interpreter in <a href="9002h.htm#006f_0013">Listing Six</A>, instead of poking at addresses, the user types in a number from 0 to 7.  Each corresponds to a different line of bad code.  <a href="9002h.htm#006f_0008">Figure 2</A> shows a sample session, with the lines of code appended as comments.<P>
+<h4><a name="006f_0008"><a name="006f_0008">Figure 2: A sample session using the OS/2 GP fault interpreter</h4><P>
+<pre>
+  C:_OS2\PTRACE&gt;os2trace -v
+  $ 0     ;;x = *((int far*) 0L);
+  GP fault (error 0000) at 0047:01C0
+  AX=0030     BX=0000  CX=0000  DX=0087  SI=0087  DI=0001  BP=0CBE
+  DS=0087     ES=0000  IP=01C0  CS=0047  FL=2246  SP=0C5A  SS=0087
+  General Protection violation!
+  $ 1     ;;x = *((int far*)-1L);
+  GP fault (error FFFC) at 0047:01BE
+  AX=0031     BX=FFFF  CX=0000  DX=0087  SI=0087  DI=0001  BP=0CBE
+  DS=0087     ES=0087  IP=01BE  CS=0047  FL=2202  SP=0C5A  SS=0087
+  General Protection violation!
+  $ 2     ;;*((char*) main)='x';
+  Executed statement 2
+  $ 3     ;;x = VioWrtTTY(0L, 100, 0);
+  GP fault (error 0000) at 00D7:27F1
+  AX=0000     BX=02C4  CX=0051  DX=0000  SI=0087  DI=0051  BP=0C34
+  DS=00DF     ES=0000  IP=27F1  CS=00D7  FL=2246  SP=0C26  SS=0087
+  Faulted inside DLL code
+  General Protection vxolation!
+  $ 7     ;;x = DosGetInfoSeg(1L, 2L);
+  Thread 1 dying
+  Process 79 dying
+  C:\OS2\PTRACE&gt;
+</pre><P>
+<P>
+The first two pieces of bad code hold few surprises.  In the first case, the NIL pointer ((int far *) 0L) was loaded into ES:BX, but trying to dereference it caused a GP fault.  In the second case, trying to peek at ((int far *) -1L) faulted earlier: The processor refused to load ES with FFFF.  The error code is FFFC, not FFFF, because while one of these processor error codes looks like a segment selector, the bottom two bits are used for other purposes.<P>
+The next piece of bad code does not cause a GP fault.  I wanted this code to illustrate an attempt to poke the code segment.  However, I coded the example incorrectly so that instead of faulting, it successfully pokes an &quot;x&quot; somewhere in the data space.  Strings that go first, and for the rest of this session, the word &quot;violation&quot; is printed out as &quot;vxolation&quot; This illustrates the limits of protection.  The Intel processor was powerless to stop this &quot;vxolation&quot; of data space.<P>
+In the next example, a bad pointer is passed to VioWrtTTY( ).  OS2TRACE detects that the fault took place inside DLL code.  DLL code uses its own data segment, but uses its caller's stack.  Looking at the function set_csip( ) in <a href="9002h.htm#006f_0013">Listing Six</A>.  If, at the time of a GP fault, the interpreter process' does not equal SS, it means this small program was using someone else's DS.  This means DS must be reset to a proper value before resuming execution of the interpreter.  longjmp( ) can't be relied on to restore DS, because the jmp_buf itself resides in the process's data segment.  Before the interpreter can run again, DS must be pointed back to the correct data segment.  This small program did this by using SS, but in a larger program with multiple data segments, the trace process probably would have to keep a list of valid data segments.<P>
+In the final example, bad pointers are passed to an OS/2 kernel routine, DosGetInfoSeg( ). A GP fault is generated, but in this case OS2TRACE is not able to catch it.  This is a limitation of DosPTrace( ), not OS2TRACE.  If this same code is run under CVP, CVP won't catch the fault either.  Instead, OS/2 displays a somewhat different message than its normal GP fault dump, as shown in <a href="9002h.htm#006f_0009">Figure 3</A>.  All CVP can do is display the message &quot;Thread terminated normally (13).&quot;  The thread returns 0x0D to indicate that it has GP faulted.  It's a shame that OS2TRACE can't catch this fault, but it is somewhat consoling that CVP can't either.  This is a limitation of DosPTrace.  Any OS/2 debugger (such as Logitech's MultiScope) will undoubtedly have the same limitation.<P>
+<h4><a name="006f_0009"><a name="006f_0009">Figure 3: An OS/2 message, different from a normal GP fault dump</h4><P>
+<pre>
+  Session Title: CVP app OS2TRACE.EXE
+     The system detected a general protection
+     fault (trap D) in a system call.
+     CS=0047 IP=0237 S=0087 SP=0C5A
+     ERRCD=0000 ERLIM=**** ERACC=**
+     Arguments used in system call (high to low):
+     0000 0001 0000 0002
+        End the program
+</pre><P>
+<P>
+One line of bad code in OS2TRACE was not executed in the sample session.  VioWrtTTY(0L), in which I accidentally left off the last two arguments to VioWrtTTY, doesn't GP fault.  Instead, it hangs OS/2!  I have only found one way to make this fault inside VioWrtTT~ without hanging the machine, and tha~ is to single-step through the code i~ CVP.  In that case, OS/2 detects INT 0C~ the stack exception, as shown in <a href="9002h.htm#006f_000a">Figure 4</A>.  CodeView prints out &quot;Threa~ terminated normally (12).&quot;<P>
+<h4><a name="006f_000a"><a name="006f_000a">Figure 4: Detecting INT 0C under OS/2</h4><P>
+<pre>
+  SYS1942: A program attempted to reference storage
+  outside the limits of a stack segment.  The program   was ended.
+  TRAP 000C
+</pre><P>
+<P>
+<a href="9002h.htm#006f_000d">More Details.</A><P>
+<h3><a name="006f_000b">ON ERROR and ESTAE<a name="006f_000b"></h3><P>
+Having figured out how to use DosPTrace to catch most GP faults in OS/2, it becomes clear that DosPTrace is a powerful part of OS/2 and could probably be used for all sorts of tricky programming.  On the other hand, why is it so much more difficult to catch GP faults in OS/2 than when using a DOS extender?  Part of the reason is that OS/2 is a far more ambitious undertaking than a DOS extender.  A DOS extender doesn't have to worry about GP faulting inside a dynamic-link library, because DOS extenders don't provide dynamic linking.<P>
+The major reason for the difficulty, however, is that OS/2 does not provide much support for exception handling by applications.  This is surprising for two reasons.  First, with Microsoft's predilection for Basic, one might have expected the company to at least provide OS/2 with something such as one of Basic's most powerful features, ON ERROR (from the ON statement in PL/I).  Second, and more important, if anything from IBM was going to rub off on Microsoft and OS/2, it should have been the strong emphasis on error handling, exception handling, and fault recovery found in large IBM operating systems.  (See the sidebar, &quot;Lessons from History,&quot; for a brief discussion of the ESTAE and FRR error-handling facilities in IBM's MVS.)<P>
+<h3><a name="006f_000c">In Conclusion<a name="006f_000c"></h3><P>
+Having spent so much time talking about interrupts, errors, faults, traps, and exceptions, by now the reader must feel that protected mode is &quot;The Promised Land of Error&quot; (the subtitle of a book that has nothing to do with Intel processors).  Nonetheless, this discussion of catching GP faults has only scratched the surface of protected-mode interrupt handling.  For example, this article never explained the difference between an exception and an interrupt. In addition to the standard Intel literature, three good books for more information on protected-mode programming are John H. Crawford and Patrick P. Gelsinger's Programming the 80386 (Sybex, 1987), Edmund Strauss's Inside the 80286 (Prentice-Hall, 1986), and Phillip Robinson's Dr. Dobb's Toolbook of 80286/80386 Programming (M&amp;T Publishing, 1988).<P>
+Errors, exceptions, and faults are an extremely important part of programming.  One author distinguished between &quot;good&quot; exceptions and &quot;bad&quot; exceptions, saying that with good exceptions, &quot;the corrective actions you perform are an integral part of your system&quot; and that good exceptions &quot;are the ones you expect to occur,&quot; whereas bad exceptions indicate a program bug (Strauss, Inside the 80286).  Using this definition, I hope I have shown that the GP fault can be a &quot;good&quot; exception, that many systems should expect it to occur, and that catching and recovering from it should be an integral part of many (but by no means all) systems.<P>
+Flexible, extensible systems don't need more error checking.  They need error handling.  The more flexible the system, the less it knows about the types it operates on, and the less upfront checking it can do.  Extensible systems need to be able to react to, and recover from errors after they happen, or after some underlying system has detected them.  Protected mode is such an underlying system, and we should take advantage of it.<P>
+<h3><a name="006f_000d"><a name="006f_000d"><a name="006f_000e">Lessons from History: IBM Mainframe Error Handling<a name="006f_000e"></h3><P>
+Gordon Letwin's assumption, that a GP fault is evidence that the program's logic is incorrect, is, according to Karl Finkemeyer of IBM ASD, the same mistake the early OS/360 designers made.  It ignores the fact that there are situations where risking a fault condition is definitely preferable to checking each and every pointer before using it.  So when PL/I came along, and with it pointers in a high-level language, OS/360 had to add a facility for the PL/I run-time environment to clean up after a user program bombed with a stray pointer.  The only alternative would have been to do validity checking of every pointer before every usage, and that was intolerable performance wise.<P>
+So OS/360 first extended the existing SPIE macro (SPecify Interruption Exit) which originally was only meant for arithmetic errors (divide underflow, floating point significance check, and so on.).  When SPIE became more and more unwieldy because it had to handle more and more error conditions, the non-arithmetic error conditions were taken out again and put into the new STAE (Specify Task Abnormal termination Exit) macro in MVT (Multiprogramming with a Variable number of Tasks, introduced in 1967).  Abnormal termination of a task can be intercepted through the use of STAE.<P>
+The syntax ON ERROR could have originated in PL/I under MVT.  The PL/I compiler under MVT translated the ON into a simple STAE exit routine.  So STAE and ON ERROR probably are not just similar; they may turn out to be the same.<P>
+In IBM's MVS (Multiple Virtual Storage operating system, introduced in mid-1974, for the larger System 370 model, and their followons such as the 3090s), STAE was extended, so it became the ESTAE macro.  Inside an ESTAE exit routine, you can do nearly everything you want (even restart the task) as long as you don't bump into another abnormal termination condition.  So this makes it easy for a program to try dangerous things, clean up after the fact if something went wrong, and continue.<P>
+Because ESTAE is too unwieldy for high-performance system code, another mechanism was introduced there: FRRs (Functional Recovery Routines) that can be used only inside the MVS kernel, mainly because they use fixed control blocks so that the overhead of activating and deactivating them remains small.  By now, every MVS routine is either associated with an FRR or is covered by its caller's FRR.<P>
+According to A.L. Scherr (&quot;IBM Systems Journal,&quot; Vol. 12, No. 4), &quot;An interesting footnote to this design is that now a system failure can usually be considered to be the result of two program errors: The first, in the program that started the problem; the second, in the recovery routine that could not protect the system.&quot;  If a system module bombs and the FRR runs into problems and none of the more general FRRs higher up on the FRR stack can resolve the problem, only then MVS crashes.  The result of this architecture is MVS's &quot;continuous operation:&quot; There are many installations where MVS just keeps running (even when one or more of the processors die, and are restarted after repair) until it is taken down for applying maintenance.<P>
+<P>
+
+_STALKING GENERAL PROTECTION FAULTS: PART II_
+by Andrew Schulman
+
+NOTE: LISTINGS ONE THROUGH THREE WERE PUBLISHED IN THE JANUARY
+1990 ISSUE OF DDJ AND ON-LINE LISTINGS CAN BE FOUND IN THAT AREA
+
+<a name="006f_000f"><a name="006f_000f">
+<a name="006f_0010"></pre><B>[LISTING FOUR]</B><pre><a name="006f_0010">
+
+/* GPF386.C -- for Phar Lap 386|DOS-Extender and Watcom C 386 7.0
+wcl386 -DPROT_MODE -3r -mf -Ox -s gpf386
+wdisasm gpf386 &gt; gpf386.asm
+run386 gpf386
+NOTE!  To keep this example short, most of the precautions taken
+in Listing 3 are not repeated here.  Refer to Listing 3 (GPFAULT.C)
+for how the interrupt handler should really be written. */
+
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;ctype.h&gt;
+#include &lt;setjmp.h&gt;
+#include &lt;dos.h&gt;
+#include &quot;gpfault.h&quot;
+
+void reset_pharlap(void);
+void prot_far *getvect_prot(short intno);
+void real_far *getvect_real(short intno);
+BOOL setvect_prot(short intno, void prot_far *handler);
+BOOL setvect_real(short intno, void real_far *handler);
+BOOL setvect(short intno, void prot_far *handler);
+BOOL set2vect(short intno, void prot_far *phandler, void real_far *rhandler);
+void revert(void);          // reinstall default handler
+void interrupt far int13handler(REG_PARAMS r);
+unsigned xtoi(char *s);
+
+void prot_far *old_int13handler_prot;
+void real_far *old_int13handler_real;
+jmp_buf toplevel;
+unsigned legal = 0;         // just a legal address to bang on
+BOOL in_user_code = FALSE;
+
+#define USE16           0x66
+#define INT             0xcd
+#define PUSH_DS         0x1e
+#define POP_DS          0x1f
+#define MOV_AX          USE16 0xb8
+#define MOV_DS_ES       0x8c 0xc0 0x8e 0xd8      // MOV AX,ES/MOV DS,AX
+#define XOR_AL          0x34
+#define MOV_AX_CARRYFL  0x9c 0x58 XOR_AL 0x01   // PUSHF/POP AX/XOR AL,1
+#define STI             0xfb
+
+/* directives for compiler to generate inline code */
+#pragma aux reset_pharlap = MOV_AX 0x01 0x25 /* 0x2501 */ INT 0x21 ;
+#pragma aux getvect_prot = MOV_AX 0x02 0x25 /* 0x2502 */ INT 0x21 \
+    parm [cl] value [ebx es] ;
+ /*
+    explanation of #pragma aux:  the preceding says that getvect_prot()
+    takes one parameter in CL register, and returns value in ES:EBX.
+    The &quot;function&quot; itself sets AX to 0x2502 and does an INT 0x21.
+    When called: old_int13handler_prot = getvect_prot(0x0D);
+    the compiler generates:
+        mov cl, 0dh
+        mov ax, 2502h
+        int 21h
+        mov old_int13handler_prot+4, es
+        mov old_int13handler_prot, ebx
+*/
+
+#pragma aux getvect_real = MOV_AX 0x03 0x25 /* 0x2503 */ INT 0x21 \
+    parm [cl] value [ebx] ;
+#pragma aux setvect_real = \
+    MOV_AX 0x05 0x25 /* 0x2505 */ \
+    INT 0x21 \
+    MOV_AX_CARRYFL \
+    parm [cl] [ebx] value ;
+#pragma aux setvect_prot = \
+    PUSH_DS \
+    MOV_DS_ES \
+    MOV_AX 0x04 0x25 /* 0x2504 */ \
+    INT 0x21 \
+    POP_DS \
+    MOV_AX_CARRYFL \
+    parm [cl] [es edx] value ;
+#pragma aux setvect = \
+    PUSH_DS \
+    MOV_DS_ES \
+    MOV_AX 0x06 0x25 /* 0x2506 */ \
+    INT 0x21 \
+    POP_DS \
+    MOV_AX_CARRYFL \
+    parm [cl] [es edx] value ;
+#pragma aux set2vect = \
+    PUSH_DS \
+    MOV_DS_ES \
+    MOV_AX 0x07 0x25 /* 0x2507 */ \
+    INT 0x21 \
+    POP_DS \
+    MOV_AX_CARRYFL \
+    parm [cl] [es edx] [ebx] value ;
+
+main()
+{
+    char buf[255];
+    unsigned prot_far *fp;
+    unsigned short seg;
+    unsigned off, data;
+
+    old_int13handler_real = getvect_real(0x0D);
+    old_int13handler_prot = getvect_prot(0x0D);
+    setvect(0x0D, (void prot_far *) int13handler);
+
+    printf(&quot;'Q' to quit, '!' to reinstall default GP Fault handler\n&quot;);
+    printf(&quot;%Fp is a legal address to poke\n&quot;, (void far *) &amp;legal);
+    printf(&quot;%Fp is not a legal address to poke\n&quot;, (void far *) (&amp;legal-1));
+
+    setjmp(toplevel);
+
+    for (;;)
+    {
+        printf(&quot;$ &quot;);
+        *buf = '\0';
+        gets(buf);
+        if (toupper(*buf) == 'Q')
+            break;
+        else if (*buf == '!')
+        {
+            revert();
+            continue;
+        }
+        // got bored of using sscanf()
+        seg = xtoi(strtok(buf, &quot;: \t&quot;));
+        off = xtoi(strtok(0, &quot; \t&quot;));
+        data = xtoi(strtok(0, &quot; \t&quot;));
+        in_user_code = TRUE;
+        fp = MK_FP(seg, off);       // is this really user code?
+        *fp = data;
+        printf(&quot;poked %Fp with %x\n&quot;, fp, *fp);
+        in_user_code = FALSE;
+    }
+    revert();
+    printf(&quot;Bye\n&quot;);
+    return 0;
+}
+void revert(void)
+{
+    if (! set2vect(0x0d, old_int13handler_prot, old_int13handler_real))
+        printf(&quot;Can't revert!\n&quot;);
+}
+void interrupt far int13handler(REG_PARAMS r)
+{
+    _enable();
+    reset_pharlap();
+    if (in_user_code)
+    {
+        in_user_code = FALSE;
+        printf(&quot;\nProtection violation at %04X:%08X\n&quot;,
+            r.cs, r.ip);
+        if (r.err_code)
+            printf(&quot;Error code %04X\n&quot;, r.err_code);
+        printf(&quot;&lt;DS %04X&gt; &lt;ES %04X&gt; &lt;FS %04X&gt; &lt;GS %04X&gt;\n&quot;,
+            r.ds, r.es, r.fs, r.gs);
+        printf(&quot;&lt;EDI %08X&gt; &lt;ESI %08X&gt; &lt;FLAGS %08X&gt;\n&quot;,
+            r.di, r.si, r.flags);
+        printf(&quot;&lt;EAX %08X&gt; &lt;EBX %08X&gt; &lt;ECX %08X&gt; &lt;EDX %08X&gt;\n&quot;,
+            r.ax, r.bx, r.cx, r.dx);
+        longjmp(toplevel, -1);
+        /*NOTREACHED*/
+    }
+    else
+    {
+        printf(&quot;An internal error has occurred at %04X:%08X\n&quot;,
+            r.cs, r.ip);
+        revert();
+        _chain_intr(old_int13handler_prot);
+        /*NOTREACHED*/
+    }
+}
+// convert ASCIIZ hex string to integer
+unsigned xtoi(char *s)
+{
+    unsigned i =0, t;
+    while (*s == ' ' || *s == '\t') s++;
+    for (;;)
+    {
+        char c = *s;
+        if      (c &gt;= '0' &amp;&amp; c &lt;= '9') t = 48;
+        else if (c &gt;= 'A' &amp;&amp; c &lt;= 'F') t = 55;
+        else if (c &gt;= 'a' &amp;&amp; c &lt;= 'f') t = 87;
+        else break;
+        i = (i &lt;&lt; 4) + (c - t);
+        s++;
+    }
+    return i;
+}
+
+
+
+
+<a name="006f_0011"><a name="006f_0011">
+<a name="006f_0012"></pre><B>[LISTING FIVE]</B><pre><a name="006f_0012">
+
+/* GPF386.C -- for Phar Lap 386|DOS-Extender and MetaWare High C for 386 MS-DOS
+set ipath=\c386\inc\
+\c386\hc386 gpfault -define PROT_MODE
+\pharlap\fastlink gpfault -lib small\hce.lib
+\pharlap\run386 gpfault
+NOTE!  To keep this example short, most of the precautions taken
+in Listing 3 are not repeated here.  Refer to Listing 3 (GPFAULT.C)
+for how the interrupt handler should really be written.
+*/
+
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;ctype.h&gt;
+#include &lt;setjmp.h&gt;
+#include &quot;msdos.cf&quot;
+#include &quot;interrup.cf&quot;
+#include &quot;gpfault.h&quot;
+
+BOOL call_pharlap(unsigned short ax, unsigned short cl);
+void reset_pharlap(void);
+IPROC getvect_prot(short intno);
+void real_far *getvect_real(short intno);
+BOOL setvect_prot(short intno, void prot_far *handler);
+BOOL setvect_real(short intno, void real_far *handler);
+BOOL setvect(short intno, IPROC handler);
+BOOL set2vect(short intno, IPROC phandler, void real_far *rhandler);
+void revert(void);  /* install old handlers */
+
+#pragma Calling_convention(C_interrupt | _FAR_CALL);
+void int13handler(REG_PARAMS r);
+#pragma Calling_convention();
+
+IPROC old_int13handler_prot;
+void real_far *old_int13handler_real;
+jmp_buf toplevel;
+REG_PARAMS r2 = {0};
+BOOL in_user_code = FALSE;
+
+main()
+{
+    char buf[255];
+    unsigned prot_far *fp;
+    unsigned short seg;
+    unsigned off, data;
+
+    old_int13handler_real = getvect_real(0x0D);
+    old_int13handler_prot = getvect_prot(0x0D);
+    setvect(INT_GPFAULT, int13handler);
+
+    printf(&quot;'Q' to quit, '!' to reinstall default GP Fault handler\n&quot;);
+
+    if (setjmp(toplevel) == -1)
+    {
+        printf(&quot;Protection violation at %04X:%08X\n&quot;,
+            r2.cs, r2.ip);
+        if (r2.err_code)
+            printf(&quot;Error code %04X\n&quot;, r2.err_code);
+        printf(&quot;&lt;ES %04X&gt; &lt;DS %04X&gt; &lt;EDI %08X&gt; &lt;ESI %08X&gt; &lt;FLAGS %08X&gt;\n&quot;,
+            r2.es, r2.ds, r2.di, r2.si, r2.flags);
+        printf(&quot;&lt;EAX %08X&gt; &lt;EBX %08X&gt; &lt;ECX %08X&gt; &lt;EDX %08X&gt;\n&quot;,
+            r2.ax, r2.bx, r2.cx, r2.dx);
+    }
+    for (;;)
+    {
+        printf(&quot;$ &quot;);
+        *buf = '\0';
+        gets(buf);
+
+        if (toupper(*buf) == 'Q')
+            break;
+        else if (*buf == '!')
+        {
+            revert();
+            continue;
+        }
+        sscanf(buf, &quot;%04X:%08X %x&quot;, &amp;seg, &amp;off, &amp;data);
+        FP_SEG(fp) = seg;
+        FP_OFF(fp) = off;
+        in_user_code = TRUE;
+        *fp = data;
+        printf(&quot;poked %p with %x\n&quot;, fp, *fp);
+        in_user_code = FALSE;
+    }
+    revert();
+    printf(&quot;Bye\n&quot;);
+    return 0;
+}
+void revert(void)
+{
+    set2vect(0x0d, old_int13handler_prot, old_int13handler_real);
+}
+#pragma Calling_convention(C_interrupt | _FAR_CALL);
+void int13handler(REG_PARAMS r)
+{
+    if (in_user_code)
+    {
+        in_user_code = FALSE;
+        r2 = r;
+        reset_pharlap();
+        STI;    // _inline(0xFB):  reenable interrupts
+        longjmp(toplevel, -1);
+    }
+    else
+    {
+        printf(&quot;Internal error at %04X:%08X\n&quot;, r.cs, r.ip);
+        revert();
+        return;     // let the fault happen again  (no _chain_intr)
+    }
+    /*NOTREACHED*/
+}
+#pragma Calling_convention();
+BOOL call_pharlap(unsigned short ax, unsigned short cl)
+{
+    Registers.AX.W = ax;
+    Registers.CX.LH.L = cl;
+    calldos();
+    return !(Registers.Flags &amp; 1);
+}
+void reset_pharlap(void)
+{
+    call_pharlap(0x2501, 0);
+}
+IPROC getvect_prot(short intno)
+{
+    IPROC handler;
+    call_pharlap(0x2502, intno);
+    /* no MK_FP for High C 386 */
+    FP_SEG(handler) = Registers.ES.W;
+    FP_OFF(handler) = Registers.BX.R;
+    return handler;
+}
+void real_far *getvect_real(short intno)
+{
+    call_pharlap(0x2503, intno);
+    return (void real_far *) Registers.BX.R;
+}
+BOOL setvect_prot(short intno, void prot_far *handler)
+{
+    Registers.DS.W = FP_SEG(handler);
+    Registers.DX.R = FP_OFF(handler);
+    return call_pharlap(0x2504, intno);
+}
+BOOL setvect_real(short intno, void real_far *handler)
+{
+    Registers.BX.R = (unsigned) handler;
+    return call_pharlap(0x2505, intno);
+}
+BOOL setvect(short intno, IPROC handler)
+{
+    Registers.DS.W = FP_SEG(handler);
+    Registers.DX.R = FP_OFF(handler);
+    return call_pharlap(0x2506, intno);
+}
+BOOL set2vect(short intno, IPROC phandler, void real_far *rhandler)
+{
+    Registers.DS.W = FP_SEG(phandler);
+    Registers.DX.R = FP_OFF(phandler);
+    Registers.BX.R = (unsigned) rhandler;
+    return call_pharlap(0x2507, intno);
+}
+
+
+
+
+<a name="006f_0013"><a name="006f_0013">
+<a name="006f_0014"></pre><B>[LISTING SIX]</B><pre><a name="006f_0014">
+
+/* OS2TRACE.C -- catching GP faults in OS/2, using DosPTrace()
+compile with:
+    cl -Lp os2trace.c
+to make tiny (less than 3K) .EXE with C run-time DLL, compile with:
+    cl -AL -c -Gs2 -Ox -Lp -I\msc\inc\mt os2trace.c
+    link /nod/noi crtexe.obj os2trace,os2trace,,crtlib.lib \os2\lib\os2.lib;
+*/
+
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;process.h&gt;
+#include &lt;signal.h&gt;
+#include &lt;setjmp.h&gt;
+
+#define INCL_DOS
+#define INCL_DOSTRACE
+#define INCL_VIO
+#include &quot;os2.h&quot;
+#include &quot;ptrace.h&quot;
+
+#define LOCAL static
+typedef unsigned WORD;
+
+LOCAL VOID NEAR print_regs(void);
+LOCAL VOID NEAR send_sig_segv(void);
+LOCAL VOID NEAR catch_sig_segv(void);
+LOCAL WORD NEAR trace(int argc, char *argv[], BOOL verbose);
+LOCAL VOID NEAR start_trace(char *prog, char *cmdline);
+LOCAL char *progname(char *s);
+LOCAL char *cmdline(int argc, char *argv[]);
+LOCAL WORD NEAR selector_from_segment(WORD seg);
+LOCAL VOID NEAR set_csip(WORD cs, WORD ip);
+LOCAL int break_handler(void);
+
+PTRACEBUF ptb;
+jmp_buf toplevel;
+
+#define FP_OFF(fp)      ((unsigned) (fp))
+
+#define JMP_GPFAULT     -1
+#define JMP_BREAK       -2
+
+main(int argc, char *argv[])
+{
+    char buf[80];
+    BOOL do_trace = TRUE;
+    BOOL verbose = FALSE;
+    WORD x;
+    int i;
+    for (i=1; i&lt;argc; i++)
+        if (argv[i][0] == '-')
+            switch(argv[i][1])
+            {
+                case 'x': do_trace = FALSE; break;
+                case 'v': verbose = TRUE;   break;
+            }
+    signal(SIGINT, break_handler);  // doesn't work with CRTLIB.DLL
+    if (do_trace)
+        return trace(argc, argv, verbose);
+    // if (! do_trace) run interpreter
+    switch (setjmp(toplevel))   // used to catch multiple events
+    {
+        case JMP_GPFAULT:
+            printf(&quot;General Protection violation!\n&quot;);
+            break;
+        case JMP_BREAK:
+            printf(&quot;break\n&quot;);
+            signal(SIGINT, break_handler);
+            // what if this is trace process??
+            break;
+    }
+    for (;;)
+    {
+        printf(&quot;$ &quot;);
+        gets(buf);
+        if (toupper(*buf) == 'Q')
+            break;
+        // cause one of a number of different GP faults
+        switch (*buf)
+        {
+            case '0': x = *((int far *) 0L);        break;  // GP fault
+            case '1': x = *((int far *) -1L);       break;  // GP fault
+            case '2': *((char *) main) = 'x';       break;  // bashes data!
+            case '3': x = VioWrtTTY(0L, 100, 0);    break;  // GP fault in DLL
+            case '4': x = VioWrtTTY(-1L, 100, 0);   break;  // GP fault in DLL
+            case '5': x = VioWrtTTY(0L);            break;  // boom!
+            case '6': x = puts(-1L);                break;  // GP fault
+            case '7': x = DosGetInfoSeg(1L, 2L);    break;  // thread dies
+        }
+        printf(&quot;Executed statement %c\n&quot;, *buf);
+    }
+    return 0;
+}
+/*  case 2 is important because, though the operation is illegal, it does
+    not generate a GP fault.  Consequently, the operation is successful.
+    Depending on how OS2TRACE.C is compiled, sometimes a string gets bashed
+    so that string prints out &quot;General protection vixlation,&quot; sometimes
+    something else gets bashed so that when we exit, C run-time puts up
+    message about null pointer assignment.
+*/
+LOCAL WORD NEAR trace(int argc, char *argv[], BOOL verbose)
+{
+    start_trace(progname(argv[0]), cmdline(argc, argv));
+    /* DosPTrace event loop */
+    for (;;)
+    {
+        ptb.tid = 0;
+        ptb.cmd = GO;
+        DosPTrace(&amp;ptb);
+        switch (ptb.cmd)
+        {
+            case EVENT_GP_FAULT:
+               if (verbose)
+               {
+                   printf(&quot;GP fault (error %04X) at %04X:%04X\n&quot;,
+                        ptb.value, ptb.segv, ptb.offv);
+                   print_regs();
+               }
+               send_sig_segv();
+               break;
+           case EVENT_THREAD_DEAD:
+               if (verbose)
+                    printf(&quot;Thread %u dying\n&quot;, ptb.tid);
+               break;
+           case EVENT_DYING:
+               if (verbose)
+                   printf(&quot;Process %u dying\n&quot;, ptb.pid);
+               return 0;
+        }
+    }
+    /*NOTREACHED*/
+}
+LOCAL VOID NEAR print_regs(void)
+{
+     ptb.cmd = READ_REGISTERS;
+     DosPTrace(&amp;ptb);
+     printf(&quot;AX=%04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X BP=%04X\n&quot;,
+         ptb.rAX, ptb.rBX, ptb.rCX, ptb.rDX, ptb.rSI, ptb.rDI, ptb.rBP);
+     printf(&quot;DS=%04X ES=%04X IP=%04X CS=%04X FL=%04X SP=%04X SS=%04X\n&quot;,
+         ptb.rDS, ptb.rES, ptb.rIP, ptb.rCS, ptb.rF,  ptb.rSP, ptb.rSS);
+}
+LOCAL VOID NEAR send_sig_segv(void)
+{
+    /* because of OS/2 &quot;disjoint LDT space,&quot; we could just as easily say:
+        WORD cs = FP_SEG((void far *) catch_sig_segv);
+    it will be mapped to same selector in both processes
+    */
+    WORD cs = selector_from_segment(1);     // catch_sig_segv() in seg 1
+    WORD ip = FP_OFF((void far *) catch_sig_segv);
+    set_csip(cs, ip);
+}
+LOCAL WORD NEAR selector_from_segment(WORD seg)
+{
+    ptb.value = seg;
+    ptb.cmd = SEG_NUM_TO_SELECTOR;
+    DosPTrace(&amp;ptb);
+    return (ptb.cmd == EVENT_ERROR) ? 0 : ptb.value;
+}
+LOCAL VOID NEAR set_csip(WORD cs, WORD ip)
+{
+    ptb.cmd = READ_REGISTERS;
+    DosPTrace(&amp;ptb);
+    ptb.rCS = cs;
+    ptb.rIP = ip;
+    if (ptb.rDS != ptb.rSS)
+    {
+        printf(&quot;Faulted inside DLL code\n&quot;);
+        ptb.rDS = ptb.rSS;  // very important!
+    }
+    ptb.cmd = WRITE_REGISTERS;
+    DosPTrace(&amp;ptb);
+}
+LOCAL VOID NEAR catch_sig_segv(void)
+{
+    longjmp(toplevel, JMP_GPFAULT);
+}
+// shared by debugger and debuggee processes
+LOCAL int break_handler(void)
+{
+    signal(SIGINT, SIG_IGN);
+    longjmp(toplevel, JMP_BREAK);
+}
+LOCAL VOID NEAR start_trace(char *prog, char *cmdline)
+{
+    RESULTCODES resc;
+    if (DosExecPgm(NULL, 0, EXEC_TRACE, cmdline, NULL, &amp;resc, prog) != 0)
+        return;
+    ptb.pid = resc.codeTerminate;
+    ptb.tid = 0;
+}
+// tacks .EXE after program name
+LOCAL char *progname(char *s)
+{
+    static char str[128];
+    strcpy(str, s);
+    strcat(str, &quot;.EXE&quot;);
+    return str;
+}
+// undoes all argc/argv work, appends -x switch
+LOCAL char *cmdline(int argc, char *argv[])
+{
+    static char str[128], *t = str;
+    char *s = argv[0];
+    register int arg = 0;
+    while (arg &lt; argc)
+    {
+        while (*s)
+            *t++ = *s++;
+        *t++ = (arg) ? ' ' : '\0';  // '\0' after program name
+        s = argv[++arg];
+    }
+    *t++ = '-'; *t++ = 'x';         // append -x switch
+    *t = '\0';
+    return str;
+}
+
+
+
+
+<a name="006f_0015"><a name="006f_0015">
+<a name="006f_0016"></pre><B>[LISTING SEVEN]</B><pre><a name="006f_0016">
+
+// ptrace.h
+
+// DosPTrace commands
+#define READ_I_SPACE            0x0001
+#define READ_D_SPACE            0x0002
+#define READ_REGISTERS          0x0003
+#define WRITE_I_SPACE           0x0004
+#define WRITE_D_SPACE           0x0005
+#define WRITE_REGISTERS         0x0006
+#define GO                      0x0007
+#define TERMINATE_CHILD         0x0008
+#define SINGLE_STEP             0x0009
+#define STOP_CHILD              0x000A
+#define FREEZE_CHILD            0x000B
+#define RESUME_CHILD            0x000C
+#define SEG_NUM_TO_SELECTOR     0x000D
+#define GET_FLOATINGPT_REGS     0x000E
+#define SET_FLOATINGPT_REGS     0x000F
+#define GET_DLL_NAME            0x0010
+#define THREAD_STATUS           0x0011   // new
+#define MAP_READONLY_ALIAS      0x0012
+#define MAP_READWRITE_ALIAS     0x0013
+#define UNMAP_ALIAS             0x0014
+
+// DosPTrace events
+#define EVENT_SUCCESS           0
+#define EVENT_ERROR             -1
+#define EVENT_SIGNAL            -2
+#define EVENT_SINGLESTEP        -3
+#define EVENT_BREAKPOINT        -4
+#define EVENT_PARITYERROR       -5
+#define EVENT_DYING             -6
+#define EVENT_GP_FAULT          -7
+#define EVENT_LOAD_DLL          -8
+#define EVENT_FLOATPT_ERROR     -9
+#define EVENT_THREAD_DEAD       -10
+#define EVENT_ASYNC_STOP        -11
+#define EVENT_NEW_PROCESS       -12
+#define EVENT_ALIAS_FREE        -13
+
+// DosPTrace error types
+#define ERROR_BAD_COMMAND       1
+#define ERROR_CHILD_NOTFOUND    2
+#define ERROR_UNTRACEABLE       5
+
+// Thread states
+#define THREAD_RUNNABLE         0
+#define THREAD_SUSPENDED        1
+#define THREAD_BLOCKED          2
+#define THREAD_CRITSEC          3
+
+// Thread debug states
+#define THREAD_THAWED           0
+#define THREAD_FROZEN           1
+
+
+
+
+<P>
+</pre></BODY></HTML>

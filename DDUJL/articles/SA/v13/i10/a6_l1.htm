@@ -1,0 +1,596 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v13, i10: Listing 1 tSmoke.pl</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a6.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a6_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink">Listing 1</span></td>
+		<td><a href="../../../../source/SA/2004/oct2004.tar"><b class=codeListing>oct2004.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h2><B>Listing 1 </B><I>tSmoke.pl</i></h2>
+            <p> 
+            <pre>
+#!/usr/bin/perl
+#
+#-----------------------------------------------
+# tSmoke.pl
+# Dan McGinn-Combs, Sep 2003
+#-----------------------------------------------
+#
+# 1) This program is run via CRON or the command line
+# 2) It extracts RRD information from a smokeping config file
+# 3) It pulls data from RRD files to determine if anything is offline, that 
+#    is returning 0 PINGs
+# 4) tSmoke reports status via an SMTP alert
+# 5) tSmoke also generates an SMTP mail showing historical view of availability
+#
+# Many thanks to the following people for their help and guidance:
+# Jim Horwath of Agere Systems Inc. for his examples and pointers to 
+# Spreadsheet::WriteExcel
+# Frank Harper the author of SLAMon, a tool for tracking Service Level Agreements
+# Tobias Oeticker, or course, the author of Smokeping, RRDTool and MRTG
+#
+use strict;
+
+# We need to use
+# -- Smokeping libraries
+# -- RRDTool
+# -- Getopt::Long
+#
+# Point the lib variables to your implementation
+use lib "/usr/local/smokeping/lib";
+use lib "/usr/local/rrdtool-1.0.39/lib/perl";
+use Smokeping;
+use Net::SMTP;
+use ISG::ParseConfig;
+use Getopt::Long;
+use Pod::Usage;
+use RRDs;
+
+# Point to your Smokeping config file
+my $cfgfile = "/usr/local/smokeping/etc/config";
+
+# global variables
+my $cfg;
+
+#this is designed to work on IPv4 only
+my $havegetaddrinfo = 0;
+
+# we want opts everywhere
+my %opt;
+
+#Hashes for the data
+my (%Daily,%Weekly,%Monthly,%Quarterly);        # the entries
+my (%DailyC,%WeeklyC,%MonthlyC,%QuarterlyC);    # a count of the entries
+
+######################
+### Moving Average ###
+######################
+# Just a reminder of how to do a moving average if you ever want to
+# PREV,UN,&lt;DS&gt;,UN,1,&lt;DS&gt;,IF,PREV,IF,&lt;DS&gt;,UN,1,&lt;DS&gt;,IF,-,&lt;WEIGHT&gt;,*,A,UN,1,A,IF,+
+
+# Change Log:
+# DMC - Added Quarterly Status
+# DMC - Added HTML mail reporting and consolidated functions
+# DMC = Added an external HTML mail template, tMail
+my $RCS_VERSION = '$id: tSmoke.v 0.3 2004/03 McGinn-Combs';
+
+sub test_mail($) {
+    my $cfg = shift;
+    print "Mail will be sent to $cfg-&gt;{Alerts}{to}\n";
+    print "Mail will be sent from $cfg-&gt;{Alerts}{from}\n";
+};
+
+sub sendmail ($$$$){
+    my $from = shift;
+    my $to = shift;
+    my $subject = shift;
+    my $body = shift;
+    if ($cfg-&gt;{General}{mailhost}){
+    my $smtp = Net::SMTP-&gt;new($cfg-&gt;{General}{mailhost});
+    $smtp-&gt;mail($from);
+    $smtp-&gt;to($to);
+    $smtp-&gt;data();
+    $smtp-&gt;datasend("Subject: $subject\n");
+        $smtp-&gt;datasend("To: $to\n");
+    $smtp-&gt;datasend($body);
+    $smtp-&gt;dataend();
+    $smtp-&gt;quit;
+    } elsif ($cfg-&gt;{General}{sendmail} or -f "/usr/lib/sendmail"){
+    open (M, "|-") || exec (($cfg-&gt;{General}{sendmail} || \
+      "/usr/lib/sendmail"),"-f",$from,$to);
+        print M "Subject: $subject\n";
+    print M $body;
+    close M;
+    }
+}
+
+sub morning_update($) {
+    # Send out a morning summary of devices that are down
+    my $cfg = shift;
+    my $Body = "";
+    my $TmpBody = "";
+    my $To = "";
+    if ( $opt{to} ) { $To = $opt{to}; } else { $To = $cfg-&gt;{Alerts}{to}; }
+    
+    # Get a list of the existing RRD Files
+    my @rrds = split ( /\n/,list_rrds($cfg-&gt;{Targets},"","") );
+    my $Count = $#rrds + 1;
+    my $Down = 0;
+    
+    foreach my $target (@rrds) {
+        my $Loss = 0;
+        my ($start,$step,$names,$data) = \
+          RRDs::fetch "$target","AVERAGE","--start","-300";
+        my $ERR=RRDs::error;
+        die "ERROR while reading $_: $ERR\n" if $ERR;
+        foreach my $line (@$data) {
+            $Loss += $$line[3];
+        }
+        $Down += 1 if $Loss == 0;
+        $target =~ s/^([a-zA-Z0-9]*\/)*//;
+        $target =~ s/.rrd//;
+        $TmpBody .= "$target\n" if $Loss == 0;
+    }
+    $Body = "Of $Count Hosts, $Down Down:\n" . $TmpBody;
+    sendmail $cfg-&gt;{Alerts}{from},$To,"Of $Count Hosts, $Down Down",$Body;
+}
+
+sub weekly_update($) {
+    # Send out a formatted HTML Table of the
+    # Previous Day, Week, Month and Quarter Availability
+    # Get a list of the existing RRD Files
+    my @rrds = split ( /\n/,list_rrds($cfg-&gt;{Targets},"","") );
+
+        my $To = "";
+    if ( $opt{to} ) { $To = $opt{to}; } else { $To = $cfg-&gt;{Alerts}{to}; }
+
+        my $Body ='';
+        
+# Calculations Based on the following:
+# RRDs::graph "fake.png",
+#       '--start','-86400',
+#       '-end','-300',
+#    "DEF:loss=${rrd}:loss:AVERAGE",
+#    "CDEF:avail=loss,0,100,IF", or more precisely "CDEF:avail=loss,2,GE,0,100,IF"
+#       and adding in the check for unknown for systems just coming on line 
+#       "CDEF:avail=loss,UN,0,loss,IF,$pings,GE,0,100,IF"
+    # Arbitrarily a loss of 10% of Pings means the system was down
+    my $pings = $cfg-&gt;{Database}{pings} * .1;
+
+    foreach my $target (@rrds) {
+        # Get an average Availability for each RRD file
+        my $ERR;
+        
+        my ($DAverage,$Dxsize,$Dysize) = RRDs::graph "fake.png",
+                  "--start","-86400",
+                  "--end","-600",
+                  "--step","1008",
+                  "DEF:loss=$target:loss:AVERAGE",
+                  "CDEF:avail=loss,UN,0,loss,IF,$pings,GE,0,100,IF",
+                  "PRINT:avail:AVERAGE:%.2lf";
+                $ERR=RRDs::error;
+        die "ERROR while reading $_: $ERR\n" if $ERR;
+
+        my ($WAverage,$Wxsize,$Wysize) = RRDs::graph "fake.png",
+                  "--start","-604800",
+                  "--end","-600",
+                  "--step","4320",
+                  "DEF:loss=$target:loss:AVERAGE",
+                  "CDEF:avail=loss,UN,0,loss,IF,$pings,GE,0,100,IF",
+                  "PRINT:avail:AVERAGE:%.2lf";
+                $ERR=RRDs::error;
+        die "ERROR while reading $_: $ERR\n" if $ERR;
+
+        my ($MAverage,$Mxsize,$Mysize) = RRDs::graph "fake.png",
+                  "--start","-2592000",
+                  "--end","-600",
+                  "--step","4320",
+                  "DEF:loss=$target:loss:AVERAGE",
+                  "CDEF:avail=loss,UN,0,loss,IF,$pings,GE,0,100,IF",
+                  "PRINT:avail:AVERAGE:%.2lf";
+                $ERR=RRDs::error;
+        die "ERROR while reading $_: $ERR\n" if $ERR;
+
+        my ($QAverage,$Qxsize,$Qysize) = RRDs::graph "fake.png",
+                  "--start","-7776000",
+                  "--end","-600",
+                  "--step","4320",
+                  "DEF:loss=$target:loss:AVERAGE",
+                  "CDEF:avail=loss,UN,0,loss,IF,$pings,GE,0,100,IF",
+                  "PRINT:avail:AVERAGE:%.2lf";
+                $ERR=RRDs::error;
+        die "ERROR while reading $_: $ERR\n" if $ERR;
+
+        $target =~ s/$cfg-&gt;{General}{datadir}\///;
+        $target =~ s/.rrd//;
+        my @Path;
+        push @Path,split/\//,$target;
+        update_stats ( \@Path, @$DAverage[0], @$WAverage[0], \
+          @$MAverage[0], @$QAverage[0]);
+    }
+
+        # Prepare the e-mail message
+        open tSMOKE, $cfg-&gt;{General}{tmail} or die "ERROR: can't read \
+          $cfg-&gt;{General}{tmail}\n";
+        while (&lt;tSMOKE&gt;){
+                my $Summary = Summary_Sheet();
+                s/&lt;##SUMMARY##&gt;/$Summary/ig;
+                my $Daily = DetailSheet(86400);
+        s/&lt;##DAYDETAIL##&gt;/$Daily/ig;
+                my $Weekly = DetailSheet(604800);
+        s/&lt;##WEEKDETAIL##&gt;/$Weekly/ig;
+                my $Monthly = DetailSheet(2592000);
+                s/&lt;##MONTHDETAIL##&gt;/$Monthly/ig;                
+                my $Quarterly = DetailSheet(7776000);
+                s/&lt;##QUARTERDETAIL##&gt;/$Quarterly/ig;
+        $Body .= $_;
+        }
+        close tSMOKE;
+        sendmail ( $cfg-&gt;{Alerts}{from}, $To, "IT System Availability", $Body );
+}
+
+sub update_stats($$$$$);
+sub update_stats($$$$$) {
+    # Update the uptime percentages in the Hash Arrays
+    my $Path = shift;
+    my $DAverage = shift;
+        my $WAverage = shift;
+        my $MAverage = shift;
+        my $QAverage = shift;
+    
+    #Enter everything once as it exists
+    #Trim off the rightmost component (hostname) and reenter the code
+    #If there is only one component, this is the final level
+    #This is an average of averages
+
+    my $Ticket = join ( ".",@$Path);
+    $Daily { $Ticket } += $DAverage;
+        $Weekly { $Ticket } += $WAverage;
+        $Monthly { $Ticket } += $MAverage;
+        $Quarterly {$Ticket } += $QAverage;
+    $DailyC { $Ticket }++;
+        $WeeklyC { $Ticket }++;
+        $MonthlyC { $Ticket }++;
+        $QuarterlyC { $Ticket }++;
+    my $Length = @$Path;
+    @$Path = @$Path [ 0 .. $Length - 2 ];
+    update_stats(\@$Path,$DAverage,$WAverage,$MAverage,$QAverage) if $Length &gt; 1;
+}
+    
+sub Summary_Sheet() {
+  my $Body = '';
+
+  $Body .= "&lt;table border='1' bordercolor=#111111&gt;\n";
+  $Body .= "&lt;tr&gt;\n";
+  $Body .= "&lt;td class ='appHeader' colspan='5'&gt;IT Network Systems \
+           Availability Summary&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;tr&gt;\n";
+  $Body .= "&lt;td class ='appHeader' colspan='5'&gt;Compiled: ". \
+           scalar(localtime) . "&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;tr&gt;\n";
+  $Body .= "&lt;td class = 'subhead' width='20%'&gt;Service&lt;/td&gt;
+            &lt;td class = 'subhead' witdh='20%'&gt;Past Quarter&lt;/td&gt;
+            &lt;td class = 'subhead' width='20%'&gt;Past Month&lt;/td&gt;
+            &lt;td class = 'subhead' width='20%'&gt;Past Week&lt;/td&gt;
+            &lt;td class = 'subhead' width='20%'&gt;Past Day&lt;/td&gt;&lt;/tr&gt;\n";
+  foreach (sort { $a cmp $b } keys %Monthly) {
+    next if ( $_ =~ /\./ );
+    # this is a major section heading
+    $Body .= "&lt;tr&gt;\n";
+    $Body .= "&lt;td class = 'SubHead'&gt;$_&lt;/td&gt;";
+    $Body .= "&lt;td class = 'Up99'&gt;" . sprintf('%.2f',$Quarterly{$_}/$QuarterlyC{$_}) . "%&lt;/td&gt;"
+      if $Quarterly{$_}/$QuarterlyC{$_} &gt;= 99 ;
+    $Body .= "&lt;td class = 'Up95'&gt;" . sprintf('%.2f',$Quarterly{$_}/$QuarterlyC{$_}) . "%&lt;/td&gt;"
+      if $Quarterly{$_}/$QuarterlyC{$_} &gt; 95 and $Quarterly{$_}/$QuarterlyC{$_} &lt; 99 ;
+    $Body .= "&lt;td class = 'Up90'&gt;" . sprintf('%.2f',$Quarterly{$_}/$QuarterlyC{$_}) . "%&lt;/td&gt;"
+      if $Quarterly{$_}/$QuarterlyC{$_} &gt; 90 and $Quarterly{$_}/$QuarterlyC{$_} &lt; 95 ;
+    $Body .= "&lt;td class = 'UpNo'&gt;" . sprintf('%.2f',$Quarterly{$_}/$QuarterlyC{$_}) . "%&lt;/td&gt;"
+      if $Quarterly{$_}/$QuarterlyC{$_} &lt; 90 ;
+    $Body .= "&lt;td class = 'Up99'&gt;" . sprintf('%.2f',$Monthly{$_}/$MonthlyC{$_}) . "%&lt;/td&gt;"
+      if $Monthly{$_}/$MonthlyC{$_} &gt;= 99 ;
+    $Body .= "&lt;td class = 'Up95'&gt;" . sprintf('%.2f',$Monthly{$_}/$MonthlyC{$_}) . "%&lt;/td&gt;"
+      if $Monthly{$_}/$MonthlyC{$_} &gt; 95 and $Monthly{$_}/$MonthlyC{$_} &lt; 99 ;
+    $Body .= "&lt;td class = 'Up90'&gt;" . sprintf('%.2f',$Monthly{$_}/$MonthlyC{$_}) . "%&lt;/td&gt;"
+      if $Monthly{$_}/$MonthlyC{$_} &gt; 90 and $Monthly{$_}/$MonthlyC{$_} &lt; 95 ;
+    $Body .= "&lt;td class = 'UpNo'&gt;" . sprintf('%.2f',$Monthly{$_}/$MonthlyC{$_}) . "%&lt;/td&gt;"
+      if $Monthly{$_}/$MonthlyC{$_} &lt; 90 ;
+    $Body .= "&lt;td class = 'Up99'&gt;" . sprintf('%.2f',$Weekly{$_}/$WeeklyC{$_}) . "%&lt;/td&gt;"
+      if $Weekly{$_}/$WeeklyC{$_} &gt;= 99;
+    $Body .= "&lt;td class = 'Up95'&gt;" . \
+             sprintf('%.2f',$Weekly{$_}/$WeeklyC{$_}) . "%&lt;/td&gt;"
+      if $Weekly{$_}/$WeeklyC{$_} &gt; 95 and $Weekly{$_}/$WeeklyC{$_} &lt; 99 ;
+    $Body .= "&lt;td class = 'Up90'&gt;" . \
+             sprintf('%.2f',$Weekly{$_}/$WeeklyC{$_}) . "%&lt;/td&gt;"
+      if $Weekly{$_}/$WeeklyC{$_} &gt; 90 and $Weekly{$_}/$WeeklyC{$_} &lt; 95 ;
+    $Body .= "&lt;td class = 'UpNo'&gt;" . \
+             sprintf('%.2f',$Weekly{$_}/$WeeklyC{$_}) . "%&lt;/td&gt;"
+      if $Weekly{$_}/$WeeklyC{$_} &lt; 90 ;
+    $Body .= "&lt;td class = 'Up99'&gt;" . \
+             sprintf('%.2f',$Daily{$_}/$DailyC{$_}) . "%&lt;/td&gt;"
+      if $Daily{$_}/$DailyC{$_} &gt;= 99;
+    $Body .= "&lt;td class = 'Up95'&gt;" . sprintf('%.2f',$Daily{$_}/$DailyC{$_}) \
+             . "%&lt;/td&gt;"
+      if $Daily{$_}/$DailyC{$_} &gt; 95 and $Daily{$_}/$DailyC{$_} &lt; 99 ;
+    $Body .= "&lt;td class = 'Up90'&gt;" . sprintf('%.2f',$Daily{$_}/$DailyC{$_}) \
+             . "%&lt;/td&gt;"
+      if $Daily{$_}/$DailyC{$_} &gt; 90 and $Daily{$_}/$DailyC{$_} &lt; 95 ;
+    $Body .= "&lt;td class = 'UpNo'&gt;" . sprintf('%.2f',$Daily{$_}/$DailyC{$_}) \
+             . "%&lt;/td&gt;"
+      if $Daily{$_}/$DailyC{$_} &lt; 90 ;
+    $Body .= "&lt;/tr&gt;\n";
+  }
+  $Body .= "&lt;/table&gt;";
+  $Body .= "&lt;P&gt;&lt;P&gt;&lt;P&gt;\n";
+  $Body .= "&lt;table border='1' bordercolor=#111111&gt;&lt;tr&gt;&lt;td class \
+           ='appHeader'&gt;Legend:&lt;/td&gt;\n";
+  $Body .= "&lt;tr&gt;&lt;td class = 'Up99'&gt;if uptime &gt; 99% then GREEN&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;tr&gt;&lt;td class = 'Up95'&gt;if uptime &gt; 95% but &lt; 99% then \
+           BLUE&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;tr&gt;&lt;td class = 'Up90'&gt;if uptime &gt; 90% but &lt; 95% then \
+           YELLOW&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;tr&gt;&lt;td class = 'UpNo'&gt;if uptime &lt; 90% then RED&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;/table&gt;\n";
+  return $Body;
+}
+
+sub NumDots($) {
+  # Count the number of dots in a string
+  # There's probably a better way to do this
+  my $DNA = shift;
+  my $a = 0;
+  while($DNA =~ /\./ig){$a++}
+  return $a
+}
+
+sub DetailSheet($) {
+  # Populate the table with details depending on the value of %opts{detail}
+  my $Seconds = shift;
+  my $Body = '';
+
+  return '' unless $opt{detail};
+
+  # Monthly/Weekly/Daily
+  $Body .= "&lt;table border='1' bordercolor=#111111&gt;\n";
+  $Body .= "&lt;tr&gt;\n";
+  $Body .= "&lt;td class ='appHeader' colspan='3'&gt;IT Network Systems \
+           Availability Previous " . $Seconds/86400 . " Day(s)&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;tr&gt;\n";
+  $Body .= "&lt;td class ='appHeader' colspan='3'&gt;Compiled: ". \
+           scalar(localtime) . "&lt;/td&gt;&lt;/tr&gt;\n";
+  $Body .= "&lt;tr&gt;\n";
+  $Body .= "&lt;td class = 'SubHead' width='40%'&gt;Service&lt;/td&gt;
+            &lt;td class = 'SubHead' width='30%'&gt;Seconds&lt;/td&gt;
+            &lt;td class = 'SubHead' width='30%'&gt;Percent&lt;/td&gt;&lt;/tr&gt;\n";
+
+  my %CornBeef;
+  my %CornBeefC;
+  
+  CASE: {
+    %CornBeef = %Daily, %CornBeefC = %DailyC, print "Doing Daily\n", \
+                last CASE if $Seconds == 86400;
+    %CornBeef = %Weekly, %CornBeefC = %WeeklyC, print "Doing Weekly\n", \
+                last CASE if $Seconds == 604800;
+    %CornBeef = %Monthly, %CornBeefC = %MonthlyC, print "Doing Monthly\n", \
+                last CASE if $Seconds == 2592000;
+    %CornBeef = %Quarterly, %CornBeefC = %QuarterlyC, print "Doing \
+                Quarterly\n", last CASE if $Seconds == 7776000;
+  } # end of CASE block
+  
+  foreach (sort { $a cmp $b } keys %CornBeef ) {
+    next if NumDots ($_) &gt; $opt{detail};
+    if ( $_ =~ /\./ ) {
+      #this is a sub section
+      $Body .= "&lt;tr&gt;\n";
+      $Body .= "&lt;td class = 'SubSubHead'&gt;$_&lt;/td&gt;\n";
+      $Body .= "&lt;td class = 'SubDetail'&gt;" . sprintf('%.0f',(100 - \
+               $CornBeef{$_} / $CornBeefC{$_}) * ($Seconds/100)) . "&lt;/td&gt;\n";
+      $Body .= "&lt;td class = 'SubDetail'&gt;" . sprintf('%.2f',$CornBeef{$_} / \
+               $CornBeefC{$_}) . "%&lt;/td&gt;\n";
+      $Body .= "&lt;/tr&gt;\n";
+    } else {
+      # this is a non-sub section
+      $Body .= "&lt;tr&gt;\n";
+      $Body .= "&lt;td class = 'SubHead'&gt;" . $_ . "&lt;/td&gt;\n";
+      $Body .= "&lt;td class = 'SubDetail'&gt;" . sprintf('%.0f',(100 - \
+               $CornBeef{$_} / $CornBeefC{$_}) * ($Seconds/100)) . "&lt;/td&gt;\n";
+      $Body .= "&lt;td class = 'SubDetail'&gt;" . sprintf('%.2f',$CornBeef{$_} / \
+               $CornBeefC{$_}) . "%&lt;/td&gt;\n";
+      $Body .= "&lt;/tr&gt;";
+      }
+    }
+  $Body .= "&lt;/table&gt;\n";
+  return $Body;
+  }
+
+sub list_rrds($$$);
+sub list_rrds($$$) {
+    # List the RRD's used by this configuration
+    my $tree = shift;
+    my $path = shift;
+    my $print = shift;
+    my $prline;
+    foreach my $rrds (keys %{$tree}) {
+        next if $rrds eq "PROBE_CONF";
+        if (ref $tree-&gt;{$rrds} eq 'HASH'){
+            $prline .= list_rrds( $tree-&gt;{$rrds}, $path."/$rrds", $print );
+        } 
+        if ($rrds eq 'host') {
+            $prline .= "$cfg-&gt;{General}{datadir}$path".".rrd\n";
+        }
+    }
+    return $prline;
+}
+
+sub load_cfg ($) { 
+    my $cfgfile = shift;
+#    my $parser = get_parser;
+    my $parser = Smokeping::get_parser;
+    $cfg = Smokeping::get_config $parser, $cfgfile;
+}
+
+###########################################################################
+# The Main Program 
+###########################################################################
+
+sub main($);
+main($cfgfile);
+
+sub main ($) {
+    umask 022;
+    my $cfgfile = shift;
+    my $sendto;
+    GetOptions(\%opt, 'quiet','version','testmail','listrrds','to=s','detail=n','morning', \
+  'weekly','help','man') or pod2usage(2);
+    if($opt{version})  { print "$RCS_VERSION\n"; exit(0) };
+    if($opt{help})     {  pod2usage(-verbose =&gt; 1); exit 0 };
+    if($opt{man})      {  pod2usage(-verbose =&gt; 2); exit 0 };
+    load_cfg $cfgfile;
+    print "tSmoke for network managed by $cfg-&gt;{General}{owner}\nat \
+      $cfg-&gt;{General}{contact}\n(c) 2003 Dan McGinn-Combs\n" unless $opt{quiet};
+    if($opt{testmail}) { test_mail($cfg) };
+    if($opt{listrrds}) {     print "List of Round Robin Databases used by \
+                                    this implementation\n";
+                            my @rrds = split ( /\n/,list_rrds($cfg- \
+                                       &gt;{Targets},"","") );
+                            foreach (@rrds) {
+                                print "RRD: $_\n"; };
+                            }
+    if($opt{morning})  { morning_update($cfg) };
+    if($opt{weekly})   { weekly_update($cfg) };
+    exit 0;
+}
+
+=head1 NAME
+
+tSmoke - Commandline tool for sending SmokePing information
+
+=head1 SYNOPSIS
+
+B&lt;tSmoke.pl&gt; [ B&lt;--testmail&gt; | B&lt;--morning&gt; | B&lt;--weekly&gt; | B&lt;--version&gt; | \
+  B&lt;--help&gt; | B&lt;--man&gt;]
+
+ Options:
+
+ --man      Show the manpage
+ --help     Help :-)
+ --version  Show SmokePing Version
+ --testmail Send a test message
+ --listrrds List the RRDs used by this Smokeping
+ --morning  Send a morning synopsis
+ --weekly   Send a weekly status report
+ --to       E-mail address to send message (i.e. '--to=xyz@company.com'
+ --detail   How much detail to send in weekly report (i.e. '--detail=1')
+ --quiet    Do not print welcome
+ 
+=head1 DESCRIPTION
+
+The B&lt;tSmoke&gt; tool is a commandline tool which iterfaces with the SmokePing 
+system. Its main function is to send a message indicating the current status 
+of the systems being monitored by Smokeping or an HTML mail file containing 
+the status over the past day, past week and past month including an overview.
+
+Typical crontab used to invoke this are
+# Quick morning alert to see what's down
+0 6 * * * /usr/local/smokeping/bin/tSmoke.pl --q --to=mobilephone@att.net \
+  --morning
+# Weekly report on the percent availability of network systems with no detail
+0 8 * * * /usr/local/smokeping/bin/tSmoke.pl --q --to=mailbox@company.com \
+  --weekly --detail=0
+
+=head1 SETUP
+
+When installing tSmoke, some variables must be adjusted to fit your local system.
+
+We need to use the following B&lt;libraries&gt;:
+# -- Smokeping
+# -- RRDTool Perl bindings
+# -- Getopt::Long
+
+# Set up your libraries
+use lib "/usr/local/smokeping/lib";
+use lib "/usr/local/rrdtool-1.0.39/lib/perl";
+
+# Add the B&lt;use&gt; statements
+use Smokeping;
+use Net::SMTP;
+use ISG::ParseConfig;
+use Pod::Usage;
+use RRDs;
+
+# Point to your Smokeping B&lt;config&gt; file
+my $cfgfile = "/usr/local/smokeping/etc/config";
+
+# Modify the config file to include a path for tmail
+tmail = /usr/local/smokeping/etc/tmail
+
+# Modify the General section of get_parser in Smokeping.pm to find the tmail file
+[ qw(owner imgcache imgurl datadir piddir sendmail smokemail cgiurl mailhost \
+  contact syslogfacility syslogpriority tmail) ]
+
+=head1 COPYRIGHT
+
+Copyright (c) 2003 by Dan McGinn-Combs. All right reserved.
+
+=head1 LICENSE
+
+This program is free software; you can redistribute it
+and/or modify it under the terms of the GNU General Public
+License as published by the Free Software Foundation; either
+version 2 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be
+useful, but WITHOUT ANY WARRANTY; without even the implied
+warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
+PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public
+License along with this program; if not, write to the Free
+Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
+
+=head1 AUTHOR
+
+Dan McGinn-Combs E&lt;lt&gt;dan.mcginn-combs@geac.comE&lt;gt&gt;
+
+=cut
+
+</pre></table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

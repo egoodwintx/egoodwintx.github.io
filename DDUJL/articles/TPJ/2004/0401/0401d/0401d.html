@@ -1,0 +1,405 @@
+
+<html>
+<head>
+<title>January, 2004: Lessons Learned Converting Java to Perl</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Lessons Learned Converting Java to Perl</h1>
+<p><i>The Perl Journal</i> January, 2004</p>
+<h2></h2>
+
+
+<h3>By Simon Cozens</h3>
+
+
+<I>Simon is a freelance programmer and author, whose titles include Beginning Perl (Wrox Press, 2000) and Extending and Embedding Perl (Manning Publications, 2002). He's the creator of over 30 CPAN modules and a former Parrot pumpking. Simon can be reached at simon@ simon-cozens.org.</I>
+
+<hr>
+
+
+
+
+
+<p>With all the horror stories I've heard over the past few years of Perl projects being packed up and replaced wholesale with Java projects, I recently had the happy opportunity to get back in some small way.</p>
+
+<p>Jakarta Lucene is a Java-based framework for embedding search engines into an application. It provides a simple search engine with analyzers, index writers, index readers, an optimizer, a query parser, and several query processors and scorers. Lucene is steadily being ported to other languages; <i>Dr Dobb's Journal</i> recently reported on a C# version, and lupy, the Python version, and ruby-lucene are both in the works.</p>
+
+<p>An application we were working on needed a search engine, and Lucene looked like the best of breed, so we decided to use it in conjunction with the <i>Inline::Java</i> module to glue the Perl and Java parts together. However, there were certain problems with this approach.</p>
+
+<p>First, it was extremely complicated&#151;the Java-to-Perl bridge wasn't ideally suited to being used for multiple users and concurrent access. And it was too complicated in terms of architecture&#151;it just didn't feel like a neat design.</p>
+
+<p>Also, we wanted to be able to extend the search in arbitrary ways, including having the ability to dive into the index and pick out indexed terms, and so on. We couldn't really do this in Java as flexibly as we'd liked, not least because only few of us knew enough Java.</p>
+
+<p>But we knew a lot of Perl, and hey, it's only code. I took one and a half man-months to attack the 13,790 lines of Java code in Lucene 1.2, and produced Plucene. It's not quite ready for prime-time at the time of writing, so don't ask me for it yet, but it's rapidly getting there.</p>
+
+<p>However, you can't work for a month on something absolutely new without learning some lessons, can you? So this month, I hope to share with you some of the lessons I've learned over the past month as part of this Java-to-Perl translation project.</p>
+<h3>Estimating the Job</h3>
+
+<p>The first lesson has absolutely nothing to do with the specific technology but everything to do with project management. The conversion took much longer than I was anticipating, and that's because my estimation was completely off.</p>
+
+<p>When you're converting code, it isn't appropriate to just try converting a few files and making an estimate based on how long that took and how much a percentage it was of the total source. In this case, I started by converting the textual analysis classes and completed about 10 or 15 in a morning. However, these were very simple ancillary classes, many of which abstract classes override in only one or two methods.</p>
+
+<p>When I began messing with the two index writer classes, I found that each one was going to take at least one day to fully understand, and another day to code up. Suddenly, my estimates were laughable.</p>
+
+<p>So the first lesson is, if nothing else, have an understanding of the project as a gestalt before making any estimates. Simply chipping away at a corner of it and then extrapolating will put you in danger of racing through the simple cases and becoming stuck on the actual meat of the project.</p>
+
+<p>There's a particular hacker fallacy that says you should spend your hacking time hacking, since that's what you're good at. That's very often the best solution if the problem is clearly defined, but in my case, I would have benefited from stepping back and taking two days to really understand the intricacies of the task ahead. It's easy to see two days like that as wasted, but time spent planning should not be seen as wasted, but as an investment.</p>
+
+<p>It seems so easy when glibly put like that, but there is an undeniable "urge to hack." If nothing else, thinking time gives you nothing to show to your boss, while hacking does. But on the other hand, as Brian Kernighan and Rob Pike put it in their <i>Practice of Programming </i>(Addison-Wesley, 1999): "Resist the urge to start typing; thinking is a worthwhile alternative."</p>
+
+<p>Another important concept to remember when translating existing code is that the vast majority of the code that's there is there for a reason. Our initial port of Lucene was going to be "just enough" to work, and so I estimated that we wouldn't need to port about 20 percent of the Java. But while there were some classes that could be left alone for the moment&#151;for instance, Lucene allows queries that specify that one word should appear "near" another word, but that's not critical to its functionality&#151;most of the classes were there because they were actually useful.</p>
+
+<p>This is another one of those things that should not be a surprise. People don't put code into a project for the fun of it. They put it there because it's used by other code. But it's sometimes tempting to account for pieces of code that we "don't need to do yet." You do need to do them, and if you'd spent a couple of days analyzing in advance, you'd know this.</p>
+<h3>Use Available Tools</h3>
+
+<p>How do we do our analysis? Well, there are almost always useful tools to do some kind of static analysis for us. In the case of Java, I picked up the lovely JAnalyzer (http://www.bodden.de/projects/ janalyzer/), which can perform static analysis and tell you where methods are being called and which methods they in turn call.</p>
+
+<p>This was particularly useful when I had to do something about the Java tendency toward method overloading. For instance, we have the two methods:</p>
+
+<blockquote>
+<pre>
+public void seek(Term term) throws IOException { ... };
+void seek(TermInfo ti) throws IOException { ... };
+
+</pre>
+</blockquote>
+
+<p>Both are called <i>seek</i>, and which one gets called depends on the type of the argument. Of course, there's a naturally Perlish way to do this:</p>
+
+<blockquote>
+<pre>
+sub seek {
+    my ($self, $t) = @_:
+    if ($t-&gt;isa("Plucene::Index::Term")) {
+        # seek version 1
+    } else {
+        # seek version 2
+    }
+}
+
+</pre>
+</blockquote>
+
+<p>However, this suffers from muddled thinking&#151;it's certainly not the Perl way to have a subroutine do one thing if it's called with one type of argument and a completely different thing if it's called with another type. Since Java has this kind of method overloading built into the language, it's much more natural to see it in Java; but Perl does not, and so it is not.</p>
+
+<p>Instead, the best way to do this is to identify what's really going on&#151;the <i>TermInfo</i> version does all the work, and the <i>Term</i> one is a front end that turns the <i>Term</i> into a <i>TermInfo</i>. So we'll call one <i>seek</i> and the other <i>seek_ti</i>. Now we need to work out where the two different methods are actually called, and rename appropriately; this is where our analyzer comes in.</p>
+
+<p>With a decent set of analysis tools, this is a simple process&#151;click on the method, you get a list of places where it was called, and you track them down in your ported version. Without analysis tools, it's down to grep, checking the context of each returned line, and painstakingly looking through each one. It's worth taking the time out to see what tools are available to play with the code.</p>
+<h3>The Joy of Tests</h3>
+
+<p>Another thing that held me back and could have been done better was the identification of distinct subprojects. Once you've identified the major components of the program, you can treat them as individual, isolated parts, port across the relevant files, test, rinse, and repeat.</p>
+
+<p>Did I mention tests? Tests are your friend. Really, they are. It took me many years to realize this, but tests are not just a tedious thing you do after writing the code to make it look professional. Once you've properly componentized your task, you can use unit tests to ensure each component is doing what you think it ought to be doing.</p>
+
+<p>I'm not one of those people who believes that you should write your tests first, watch them fail, and then build your code until they pass; and yes, I have heard all the arguments for it, thank you very much. However, I have far too many moments of enlightenment just after staring at the code and just prior to uttering, "Wait, does this actually do anything right at all?"</p>
+
+<p>That's where unit tests come in, and there's been a lot of work put in to make unit tests really quite easy in Perl. My favorite testing module is <i>Test::More</i>, which provides, among others, the <i>ok</i>, <i>is</i>, <i>isa_ok</i>, and <i>is_deeply</i> routines. For instance, here's a portion of Plucene's test suite:</p>
+
+<blockquote>
+<pre>
+my $size = -s DIRECTORY . "/words.tis";
+ok($size, "Wrote index of $size bytes");
+
+</pre>
+</blockquote>
+
+<p>First, we check that the index writer produced a nonzero sized index. <i>ok </i>takes an argument and prints "ok" if it is a True value and "not ok" if it is not. It also, like all the other <i>Test::More</i> routines, takes an optional comment to identify the test.</p>
+
+<blockquote>
+<pre>
+my $reader = Plucene::Index::TermInfosReader-&gt;new(DIRECTORY, "words", $fis);
+isa_ok($reader, "Plucene::Index::TermInfosReader", "Got reader");
+my $enum = $reader-&gt;terms;
+isa_ok($enum, "Plucene::Index::SegmentTermEnum", "Got term enum");
+
+</pre>
+</blockquote>
+
+<p><i>isa_ok</i> is used to ensure that a value is the type we expect it to be.</p>
+
+<blockquote>
+<pre>
+for my $i (0 .. $#keys) {
+    $enum-&gt;next;
+    my $key = $keys[$i];
+    is_deeply($enum-&gt;term, $key, "Key $i matches");
+
+</pre>
+</blockquote>
+
+<p><i>is_deeply</i> compares two structures recursively, reporting on where they differ.</p>
+
+<blockquote>
+<pre>
+    my $ti = $enum-&gt;term_info;
+    is($ti-&gt;doc_freq, $doc_freqs[$i], "Doc frequency at $i matches");
+}
+
+</pre>
+</blockquote>
+
+<p>And <i>is</i> compares two scalar values, reporting a difference. That's essentially all there is to testing in Perl, so unfortunately, there's hardly any excuse for not doing it.</p>
+<h3>Asserting Your Rights</h3>
+
+<p>Even once you've got all your code ported across and your unit tests in place, there will be bugs. You can't avoid it. And these will not be friendly bugs, which are easy to diagnose. They will be bugs you don't understand, that will take you a day to work out where they're coming from. They will be bugs that manifest themselves somewhere completely different in the program, and say things like:</p>
+
+<blockquote>
+<pre>
+Can't take log of 0 at blib/lib/Plucene/Search/Similarity.pm line 61
+
+</pre>
+</blockquote>
+
+
+
+<p>And that means that you didn't pass in the appropriate parameter to a method 10 frames up the call stack. Of course.</p>
+
+<p>How are we supposed to know this? Because when we find something like this, where there's obviously a parameter gone adrift somewhere, we take the relevant subroutine:</p>
+
+<blockquote>
+<pre>
+sub idf {
+    my ($self, $tf, $docs) = @_;
+    my ($x, $y) = ($docs-&gt;doc_freq($tf), $docs-&gt;max_doc);
+    return 1 + log($y / (1 + $x));
+}
+
+</pre>
+</blockquote>
+
+<p>and just before the failing line, we inject the following code:</p>
+
+<blockquote>
+<pre>
+use Carp qw(confess);
+confess("No documents for that term?")
+    unless $x;
+
+</pre>
+</blockquote>
+
+<p>or some similarly informational message. This time, instead of a single cryptic error message, you'll get something like:</p>
+
+<blockquote>
+<pre>
+No documents for that term? at Plucene/Search/Similarity.pm line 62
+Plucene::Search::Similarity::idf('Plucene::Search::Similarity','Plucene::Index::Term=HASH(0x942054)','Plucene::Search::IndexSearcher=HASH(0x940890)') called at Plucene/Search/TermQuery.pm line 64
+Plucene::Search::TermQuery::sum_squared_weights('Plucene::Search::TermQuery=HASH(0x9423c0)','Plucene::Search::IndexSearcher=HASH(0x940890)') called at Plucene/Search/Query.pm line 78
+Plucene::Search::Query::scorer('Plucene::Search::Query','Plucene::Search::TermQuery=HASH(0x9423c0)','Plucene::Search::IndexSearcher=HASH(0x940890)','Plucene::Index::SegmentsReader=HASH(0x93d6d0)') called at Plucene/Search/IndexSearcher.pm line 138
+Plucene::Search::IndexSearcher::_search_hc('Plucene::Search::IndexSearcher=HASH(0x940890)','Plucene::Search::TermQuery=HASH(0x9423c0)','undef','Plucene::Search::HitCollector=HASH(0x8cfd84)') called at Plucene/Search/Searcher.pm line 67
+Plucene::Search::Searcher::search_hc('Plucene::Search::IndexSearcher=HASH(0x940890)','Plucene::Search::TermQuery=HASH(0x9423c0)','Plucene::Search::HitCollector=HASH(0x8cfd84)') called at Plucene/Simple.pm line 114
+
+</pre>
+</blockquote>
+
+<p>Now we know what we're doing and how we got to where we are. This saves us a lot of tedious tracing through the program and trying to find out where it's getting itself in a knot. Because it shows us the arguments to each subroutine, sometimes this trace is enough to spot a stray <i>undef</i> or wrongly typed parameter. Other times, you need to crawl through the values of the arguments; <i>Data::Dumper</i> is an excellent way to do this.</p>
+
+<p>In this case, temporarily adding in:</p>
+
+<blockquote>
+<pre>
+use Data::Dumper;
+print Dumper($docs);
+
+</pre>
+</blockquote>
+
+<p>would show me that there's something wrong with the data in the <i>IndexSearcher</i>.</p>
+
+<p>The key point here, though, is that once you've worked out what the bug is, and you've written a handy test case to stop it from coming back again, you don't necessarily have to remove your <i>confess</i> assertions. They'll be helpful for catching similar bugs and things that shouldn't be able to happen in the future.</p>
+
+<p>One particularly good way to turn your bug tracing into assertions is to use the <i>Carp::Assert</i> module. This provides a number of functions, the most useful being <i>assert</i>. For instance, given this code, to read a string from a network socket:</p>
+
+<blockquote>
+<pre>
+my $length = read_string_length($socket);
+my $string = " " x $length;
+$socket-&gt;read($string, $length);
+
+</pre>
+</blockquote>
+
+<p>You could ensure that the first thing read, the string's length, is a sensible value, like so:</p>
+
+<blockquote>
+<pre>
+my $length = read_string_length($socket);
+assert($length &gt;= 0);
+
+my $string = " " x $length;
+$socket-&gt;read($string, $length);
+
+</pre>
+</blockquote>
+
+<p>By peppering your code with these assertions, you can be confident that your data is what you think it should be at each stage of your program's operation. If the length returned is negative, you'll get an error, and also a stack trace just like the one we saw earlier. But, surely, it takes up a lot of time to constantly check these assertions, and what happens when you want to go into production?</p>
+
+<p><i>Carp::Assert</i> also provides the symbolic constant DEBUG, which it sets to 1 on import. This allows you to say:</p>
+
+<blockquote>
+<pre>
+my $length = read_string_length($socket);
+assert($length &gt;= 0) if DEBUG;
+
+</pre>
+</blockquote>
+
+<p>and the condition will be tested just like before. However, when you want to go into production and need to get rid of these assertions, just change <i>use Carp::Assert</i> to <i>no Carp::Assert</i>. This sets the DEBUG constant to 0, and Perl is smart enough to know that code followed by 0 never needs to run and optimizes it away.</p>
+
+<p>This is particularly useful for testing the interfaces to internal API functions in the absence of strict type checking. In Java, you can declare that a subroutine takes a <i>Plucene::Index::Reader</i> and the compiler can tell at compile time if you've passed it a value that's not going to be a <i>Plucene::Index::Reader</i>.</p>
+
+<p>In Perl, however, variables can contain any kind of scalar, so they can't easily be type checked at compile time. However, we can use <i>Carp::Assert</i> to check them at runtime, which is the next best thing, and saves even more obscure errors later:</p>
+
+<blockquote>
+<pre>
+sub add {
+    my ($self, $reader) = shift;
+    assert($reader-&gt;isa("Plucene::Index::Reader"));
+    ...
+}
+
+</pre>
+</blockquote>
+<h3>Mind Your Interfaces</h3>
+
+<p>Why is this important? The final lesson to learn is that interface consistency is a massive help to avoiding bugs in a large project. For instance, let's consider two things: first, styles of passing parameters. Java and the C-related languages have only one style: You pass a list of typed parameters in a defined order:</p>
+
+<blockquote>
+<pre>
+public IndexWriter(String path, Analyzer a, boolean create)
+
+</pre>
+</blockquote>
+
+
+
+<p>But Perl has several different styles that are in common use. There's the C-like style:</p>
+
+<blockquote>
+<pre>
+IndexWriter-&gt;new($path, $analyzer, $create)
+
+</pre>
+</blockquote>
+
+
+
+<p>Or there's the named parameter style:</p>
+
+<blockquote>
+<pre>
+
+IndexWriter-&gt;new(path =&gt; $p, analyzer =&gt; $a, create =&gt; $c)
+
+</pre>
+</blockquote>
+
+
+
+<p>Or sometimes the hash reference style:</p>
+
+<blockquote>
+<pre>
+
+IndexWriter-&gt;new({path =&gt; $p, analyzer =&gt; $a, create =&gt; $c})
+
+</pre>
+</blockquote>
+
+<p>The second thing to consider is that Java has a rather neat way of creating constructors for a class and accessors to its members. You simply declare the accessors as variables inside the class, and create a function with the same name as the class:</p>
+
+<blockquote>
+<pre>
+final class TermInfo {
+ 
+  int docFreq = 0;
+  long freqPointer = 0;
+  long proxPointer = 0;
+
+  TermInfo() {}
+
+}
+
+</pre>
+</blockquote>
+
+<p>This creates a very simple, data-only class with a constructor and three accessors, with default values, in very little code at all.</p>
+
+<p>The <i>Class::Accessor</i> Perl module gives us very much the same sort of thing:</p>
+
+<blockquote>
+<pre>
+package TermInfo;
+use base 'Class::Accessor';
+TermInfo-&gt;mk_accessors(qw/ doc_freq freq_pointer prox_pointer);
+
+</pre>
+</blockquote>
+
+<p>This gives us a new method that takes parameters in the hashref style above, and three methods to get or set the values of the appropriate data members. (Did you notice, incidentally, how we changed the names of the members from the usual Java camel-case style to the Perl lower-case-and-underscore style?) Now we can say:</p>
+
+<blockquote>
+<pre>
+my $ti = TermInfo-&gt;new({
+            doc_freq     =&gt; 2, 
+            freq_pointer =&gt; 12,
+            prox_pointer =&gt; 28
+         });
+
+$ti-&gt;doc_freq(3);
+...
+
+</pre>
+</blockquote>
+
+<p>Now I came to a dilemma. I wanted to use <i>Class::Accessor</i> to get this rapid development and clean access to data members, but I was also trying to emulate the Lucene API and wanted to keep the arguments roughly the same. This led to a mix of styles in the same program. This is, of course, very bad.</p>
+
+<p>The reason this is particularly bad is that the interfaces between functions are the best place to spot erroneous parameters being passed around, and that's where <i>Carp::Assert</i> comes in handy.</p>
+
+<p>Wouldn't it be nice, I thought, if there was some way to mix <i>Class::Accessor</i> with <i>Carp::Assert</i> to ensure that the values that you give to your constructor and accessors are what you expect? After quite a lot of struggling with the intricacies of <i>Class::Accessor</i>, I produced <i>Class::Accessor::Assert</i>.</p>
+
+<p>This extends <i>Class::Accessor</i> with a tiny smattering of syntax: If you add a + before the name of a data member, it will be marked as required, and the constructor will fail if it is not present:</p>
+
+<blockquote>
+<pre>
+package Person;
+use base 'Class::Accessor::Assert';
+__PACKAGE__-&gt;mk_accessors(qw/ +name address date_of_birth /)
+
+my $x = Person-&gt;new({ name =&gt; "Joel" }); # OK
+my $y = Person-&gt;new({}); # Dies with backtrace
+
+</pre>
+</blockquote>
+
+<p>Additionally, if you add <i>=Some::Class</i> to the end of a member's name, it will ensure that that member is always an object of that class:</p>
+
+<blockquote>
+<pre>
+package Plucene::Index::Writer;
+use base 'Class::Accessor::Assert';
+__PACKAGE__-&gt;mk_accessors(qw/ +path create
+                              +analyzer=Plucene::Analysis::Analyzer /);
+
+my $x = Plucene::Index::Writer-&gt;new({ path =&gt; "/tmp/index/",
+    analyzer =&gt; Plucene::Analysis::SimpleAnalyzer-&gt;new() });
+
+$x-&gt;analyzer(undef); # OK
+$x-&gt;analyzer(1);     # Dies with backtrace - not an ::Analyzer    
+
+</pre>
+</blockquote>
+
+<p>Unfortunately, of course, I wrote the module after all of the more heinous interface incompatibility bugs in Plucene had been worked out, but it's something I'll be sure to use next time I'm ever converting code in a typed language into Perl...</p>
+
+
+<p><b>TPJ</b></p>
+
+
+
+
+</body>
+</html>

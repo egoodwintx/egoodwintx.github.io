@@ -1,0 +1,182 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal December 1997: CodeStore and Incremental C++ </title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>CodeStore and Incremental C++ </h1>
+
+<p><i>Dr. Dobb's Journal</i> December 1997
+</p>
+<h2>Why wait for slow builds?</h2>
+
+<h3>By Lee R. Nackman</h3>
+
+<I>Lee is a researcher at IBM's Thomas J. Watson Research Center. He can be contacted at lrn@watson.ibm.com.</I>
+
+<hr>
+
+<p>C++ programmers often complain about slow builds. The main reason for the time it takes to compile and link programs is that, although compilers have become faster, we're still stuck with a 20-year-old separate compilation scheme managed by the make utility. To address this bottleneck, several of us at IBM's Thomas J. Watson Research Center began work to improve "build" technology. Over time, we realized that big improvements would require big changes in C++ compilers and programming environments. We therefore teamed up with our compiler-writing colleagues in IBM's Toronto laboratory to build a C++ development system that became the basis for the edit-compile-debug-browse cycle in an upcoming version of IBM's VisualAge for C++.</p>
+
+<p>The system we developed provides fast builds. An "initial" build, which takes only source code and produces target .EXE and .DLL files, corresponds to a UNIX "make clean all," or Visual C++ "build all." On the other hand, an "incremental" build takes source code, the previous build's target files, and any other state the system chooses to save, then produces the desired target files. </p>
+
+<p>For an initial build, fast means that the total build time is comparable to or better than the best of the current compilers. For incremental builds, build time should be proportional to the impact of the source code changed since the last build. Changing a declaration in a header file should only require compiling affected functions (as opposed to all functions in all source files that include the header file). Changing the body of a noninline function should only require compiling that function; changing the body of an inline function should require compiling all of the function's callers. This kind of behavior would be a major win in moderate to large size projects, where most source files (.cpp files, for instance) tend to include header files.</p>
+
+<p>There is drudgery in C++: typing and maintaining multiple copies of essentially the same declaration; organizing header files; arranging header file inclusion to avoid circularities; organizing header files to minimize recompilation; and so forth. Although <a name="rl1"><a href="9712k.htm#l1">Listing One</A> for example, follows the usual rules-of-thumb for organizing code into files, it doesn't compile. You can fix it by adding forward declarations (class <i>A</i> in B.h, for instance) and moving the inline function definitions into separate header files. But this is a pain, especially in large projects. </p>
+
+<p>Most of this work involves the programmer having to sort declarations for the compiler. This is backwards: Computers can sort. We want to eliminate this drudgery by providing orderless programming: You organize top-level declarations into files in any order. Even the concept that one declaration appears "before" or "after" another declaration is meaningless. You don't need to declare a function before it can be called or define a class before it is used. The code of <a href="9712k.htm#l1">Listing One</A> can be organized as in <a name="rl2"><a href="9712k.htm#l2">Listing Two</A>. There are no forward declarations, no macro guards, and no <i>#include</i>s.</p>
+
+<p>Writing and maintaining compilation dependencies for make and keeping them correct is another kind of drudgery. Although automatic dependency generators exist, they are too slow to use all the time. We eliminate the problem by using a configuration file to specify what to build and letting the system figure out how to build it. <a name="rl3"><a href="9712k.htm#l3">Listing Three</A> is a simple configuration file, which specifies compiling and linking C++ source to produce an executable file. We don't say that vehicle.obj depends on vehicle.cpp, vehicle.hpp, and so on. In fact, we make no distinction between header and source files, and the system produces no object files because the target is an executable file.</p>
+
+<h3>Conventional Compilation Architecture</h3>
+
+<p>An unconventional architecture was required to achieve our goals. A conventional compiler compiles a single C++ source file (that is, a .cpp file) into a single object file (an .obj file). When a source file is compiled, the preprocessor produces a stream of tokens from both the source file and the included header files. Successive stages of the compiler transform and process these tokens, ultimately producing machine code, which is written into the object file. If you enable debugging, the compiler gathers symbol information and stores it in the object file. If you enable browsing, the compiler also produces one or more browse files that contain additional information such as class hierarchy and variable uses. The browsing tools of the programming environment use this information to help you navigate through your code. </p>
+
+<p>This compilation process is repeated once per source file to produce one object file per source file. Then the linker combines the resulting object files to produce the target file. This scheme is inefficient for several reasons:</p>
+
+<ul>
+<li>Header files included by multiple source files are processed repeatedly. We need an architecture that avoids repeated processing of header files, without requiring large compilations for simple changes.  <li>Changing any code in a header file usually causes many source files to be recompiled because make recompiles all files that include the modified header file. We need a finer-grained analysis.
+  <li>While using debuggers and browsers, programmers typically access only a fraction of the symbol information the compiler produces. Yet the compiler must write to files all information that you might potentially access, which is inefficient in both compile time and disk space. We need an architecture that allows full access to the information needed for debugging and browsing, without the cost of saving information that is never used.
+  <li>Template instantiation is currently either expensive or awkward. We need an architecture that can manage template instantiation on a project-wide basis, while avoiding the expense of creating the same template instance multiple times.
+</ul>
+
+<h3>Development System Architecture</h3>
+
+<p>The fundamental problems with the conventional architecture are that individual source files are processed independently and the file-level granularity of recompilation is too coarse. We addressed these problems with a project-wide program representation, through which all components of our system access and store information about the user's code; see <a name="rf1"><a href="9712kf1.htm">Figure 1</A>. You can think of the program representation, which we call the "CodeStore," as a symbol table shared by all of the system's components.</p>
+
+<p>Despite its name, the CodeStore does not hold the user's source code. Source code is held in files and the system is responsible for keeping the CodeStore synchronized with the source files, including errors. This is a crucial design point: It means that you can use your existing infrastructure for managing source files -- your favorite editor, source code control system (RCS, PVCS, and the like), search tool (such as grep), and so on. The synchronization process is called "incorporation" because changes in the source files are incorporated into the CodeStore. In fact, you can think of the CodeStore as a cache -- it enables fast processing, but the system can reconstruct the CodeStore's contents from the source files. The CodeStore also persists when you shut down the system. </p>
+
+<p>The information in the CodeStore subsumes the precompiled headers used in many conventional compilers. Moreover, the CodeStore works at declaration granularity, not header-file granularity. With precompiled headers, any change in any header that has been precompiled invalidates the precompiled header; with the CodeStore, only the declarations that are actually changed (and declarations affected by the changes) are invalidated. This means that our system is effective even when headers are undergoing frequent change, as is typical during a development project. Also, the CodeStore does not impose any ordering requirement on the inclusion of header files.</p>
+
+<p>The CodeStore also solves the template instantiation problems prevalent with conventional compilers. Since the CodeStore contains information about the entire target (.EXE or .DLL) being generated, it is relatively straightforward for the system to know which templates need to be instantiated, to instantiate them only once, and to update the instantiations automatically when changes affect the instantiations.</p>
+
+<p>Incorporation is the fundamental process of the system, subsuming make, compilation, and linking. It is the incremental build process. A work queue drives incorporation: The entire process consists of processing items on the queue. The first step of incorporating the code in <a name="re1"><a href="9712ke1.htm">Example 1</A> (the text refers to the numeric superscript labels) is to put the configuration file (not shown) on the work queue. The configuration file is processed to determine which source files participate in the project, and each file is placed on the work queue. In this example, there is only one source file. As each source file is taken off the queue, its time stamp is checked to see if it has changed since the last build. If it has, the source file is macro processed and partitioned by brace matching into source regions that roughly correspond to top-level declarations. The tokens of each source region are stored in the CodeStore and the source regions are put on the work queue. </p>
+
+<p>Processing continues by removing the first item -- source region 1 -- from the work queue and attempting to parse it. At position 1, <i>A</i> is recognized as a class and is entered into the CodeStore. When the parse reaches position 2, it fails because <i>B</i> is not known in the CodeStore. The parse is abandoned and source region 1 is put back on the queue. Then, source region 2 is parsed. When position 3 is reached, <i>B</i> is entered into the CodeStore. The declaration of <i>B::f(A</i>&amp;<i>)</i> succeeds at position 4 because <i>A</i> is already known. At position 5, the parse of <i>B</i> is complete and its CodeStore entry is marked as a complete class definition. Next, source region 3 is parsed. The parse fails because <i>NotThere</i> is unknown in the CodeStore, and source region 3 is put back on the queue.</p>
+
+<p>At this point, we have attempted to parse the three source regions. Two of the parses failed, but we made progress since new entries were made in the CodeStore. Therefore, we again attempt to process items on the work queue, starting with source region 1. At position 6, the parser again attempts to add <i>A</i> to the CodeStore as a class; <i>A</i> is already there and from the same source location, so this is not a duplicate definition error. The parse continues with <i>A::f(B</i>&amp;<i>),</i> and this time, it succeeds because <i>B</i> is known in the CodeStore. <i>A::f(B</i>&amp;<i>)</i> is entered in the CodeStore when position 7 is reached and <i>A</i> is marked complete at position 8. We again try to parse source region 3 and it again fails. Incorporation continues until either all items on the queue have been processed successfully or until a complete pass over the queue results in no changes to the CodeStore. In this example, incorporation terminates with an error that <i>NotThere</i> is undeclared.</p>
+
+<p>After all source regions are parsed, the usual semantic analysis and code generation can proceed. The unconventional aspect is that these activities are done one function at a time, resulting in code generation incrementally linked into the target. </p>
+
+<h3>Automatic Dependency Management</h3>
+
+<p>When a source region is parsed, the system has to determine how that source region has changed (such as a new member added to a class), and how those changes will affect the other parts of the project. The former is the reconciler's<b> </b>job and the latter is the change propagator's job.</p>
+
+<p>The CodeStore contains a dependency graph. Nodes of the graph correspond to entities in the CodeStore like declarations and source regions; a graph arc indicates that one entity depends in some way on another. Suppose the code in <a name="rt1"><a href="9712kt1.htm">Table 1</A> has been previously incorporated and that the user removes the comment, adding a declaration of <i>B::f(X).</i> Source region 3 will be reparsed because it has changed. When the reconciler determines that <i>B::f(X)</i> has been added, the change propagator will observe that <i>B::f(X)</i> hides <i>A::f(X).</i> Therefore, any nodes that depend on <i>A::f(X)</i> and from which <i>B</i> is visible must be processed. Looking at the dependency graph, the change propagator will put <i>g(B</i>&amp;<i>)</i> on the work queue for processing.</p>
+
+<p>More generally, putting dependency graph nodes on the work queue drives incorporation. When a node of the dependency graph becomes marked "invalid," all of the nodes that depend on the invalid node are put on the queue for reprocessing. For efficiency, the actual dependency graph expresses many different kinds of dependencies (size, layout, call, and so on) and there are many different kinds of processing. </p>
+
+<p>Efficiency demands that a project-wide program representation like the CodeStore be small. Fortunately, our incremental build scheme makes it possible to discard information and compute it again later. For example, our system does not store parse trees in the CodeStore. A (small) function can be parsed quickly to obtain the parse tree, since there is no need for preprocessing the function's source or processing header files. For example, the IDE provides a "find uses" feature that searches for all uses  of a selected declaration in a project. This semantic search uses the dependency graph to find relevant function declarations and parses on the fly to find the desired statements. </p>
+
+<h3>Integrated Development Environment</h3>
+
+<p>The CodeStore contains information about your program. The Integrated Development Environment (IDE), which uses a workbook metaphor, is organized into sections. Each section consists of one or more pages, each of which consists of one or more panes. Each pane provides a view, and each view consists of objects, which can be selected. <a name="rf2"><a href="9712kf2.htm">Figure 2</A> shows the Classes Overview page of the project section for a small example project. The essential concept is that an object flows into each pane and a pane then shows a view of that object. The Carlot project flows into the upper-left pane, which provides a Classes view of a project; that is, it lists all of the classes in a project. We've selected the <i>Pickup</i> class from the list of classes and that selected object flows into the top-right and bottom-left panes. The Class Hierarchy view shows the portion of the class hierarchy that contains <i>Pickup</i>. The Details view lists <i>Pickup</i>'s bases and members. You can recursively look at the base's details. Here, we've selected the <i>Pickup::price()</i> member function, which flows into the bottom-right pane (again, notice price in the pane's title bar). Since that pane is showing a source view, we see the source code for the selected function.</p>
+
+<p>There are several views of each kind of object. For a class there is a Details view that shows bases and members, a Visible Members view that adds to the Details view inherited members, and a Class Hierarchy view that shows the relevant portion of the class hierarchy. The interface is object oriented, in the sense that the pull-down menu lets you choose any view that makes sense for the kind of object the pane is showing. This paradigm applies everywhere. For example, to understand virtual function overriding, select the Overrides view on a pane that is viewing a function.</p>
+
+<p>The IDE is configurable so you can divide a page into any number of panes, can link the panes together to control the flow of objects, and can select among the views for any kind of object. You can save page configurations, and there are predefined pages for common tasks. Each view presents information either obtained from or computed on the CodeStore. </p>
+
+<h3>Acknowledgments</h3>
+
+<p>Many people from IBM labs have made essential contributions to the system described here. This was a team effort and it would be inappropriate to acknowledge individually any subset of the team. I thank Mary Anne Buttigieg, Michael Karasick, Kevin Stoodley, David Streeter, and Mike Wulkan for feedback on this article.</p>
+<HR>
+<H4><a name="l1">Listing One </H4>
+
+<pre>/* A.h */ #ifndef A_H
+#define A_H
+#include "B.h"
+class A : public B 
+{
+public:
+  B* f() { return new B; }
+};
+#endif
+<p></p>
+/* B.h */
+#ifndef B_H
+#define B_H
+#include "A.h"
+class B 
+{
+public:
+  A* g() { return new A; }
+};
+#endif
+<p></p>
+/* main.cpp */
+#include "B.h"
+int main()
+{
+  B b;
+  return 0;
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>/* A.h */class A : public B 
+{
+public:
+  B* f() { return new B; }
+};
+<p></p>
+/* B.h */
+class B 
+{
+public:
+  A* g() { return new A; }
+};
+<p></p>
+/* main.cpp */
+int main()
+{
+  B b;
+  return 0;
+}
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three</H4>
+
+<pre>optionlink(linkwithmultithreadlib),         // Use multi-threaded library
+link(linkwithsharedlib)               // Use shared library
+   {
+   target "carlot.exe"                // Produce an executable
+      {
+      option
+      lang(offsetofnonpodclasses),    // Backward compatibility for old code
+      lang(digraph, no),
+      includepath("."),
+      define("_System", ""),
+      lang(nokeyword, "true"),
+      lang(nokeyword, "false")
+         {
+         source type(cpp) "carlot.cpp"  // List of C++ sources
+         source type(cpp) "car.hpp"
+         source type(cpp) "car.cpp"
+         source type(cpp) "truck.hpp"
+         source type(cpp) "truck.cpp"
+         source type(cpp) "vehicle.hpp"
+         source type(cpp) "vehicle.cpp"
+         source type(cpp) "vlist.hpp"
+         source type(cpp) "vlist.cpp"
+         }
+      }
+   }
+</pre>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+
+<p><b>DDJ</b></p>
+
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

@@ -1,0 +1,427 @@
+
+<html>
+<head>
+<title>January, 2005: Extending Python</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Extending Python</h1>
+<p><i>Dr. Dobb's Journal</i> January, 2005</p>
+<h2>Simplifying project maintenance</h2>
+
+
+<h3>By Greg Smith</h3>
+
+
+<I>Greg is a senior DSP engineer at Silicon Optix. He uses Python for prototyping and verification of ASIC circuitry. He can be contacted at gsmith@siliconoptix.com.</I>
+
+<hr>
+
+
+
+
+
+<p>One of Python's greatest strengths is that you can extend it with modules written in C or C++. By creating extensions, you can make existing C facilities available to Python programs; for example, the data compression facilities of the standard zlib library are available to Python programmers by means of the zlib module, which is simply a Python extension acting as a wrapper around the zlib API. </p>
+
+<p>The process of creating such a module is well documented in the "Extending and Embedding" section of the Python manual (http://www.python.org/doc/current/ext/ext.html). It is also possible to implement new Python data types in C/C++ extensions. In this article, I only address C, but the concepts are equally applicable to C++.</p>
+
+<p>There are three main reasons to write Python extension modules (as opposed to, say, solving the problem entirely in Python): </p>
+
+
+
+<ul>
+  <li>You need the higher execution speed of C.</li>
+  <li>You have an existing C module that you want to make available for Python applications.</li>
+  <li>The C module may be your primary project, and you want to give it a Python API, allowing the testing and verification framework to be in Python. I've found myself in this situation fairly often. For example, when debugging and verifying a C module, I don't want to spend a lot of time writing and debugging a test framework. By quickly implementing a Python wrapper, I can move on to writing complex test frameworks in Python with much less overall effort than would be required for an "all-C" approach.</li>
+</ul>
+
+
+
+<p>When writing a Python-to-C adapter, most of the work usually involves converting Python data (the parameters to functions) into the basic data types required by the C function, then converting the return value, if any, to a Python object. The Python/C API provides many handy functions to help with these conversions. For instance, the <i>PyArg_ParseTuple</i> function (which is rather like <i>scanf</i>, but reading Python data types instead of strings) is useful for converting Python parameters into C data, while simultaneously checking the types.</p>
+
+<p>However, there are many cases where the data conversion you'd really like requires a fair bit of code.</p>
+<h3>A Simple Example</h3>
+
+<p><a name="rl1"></a><a href="#l1">Listing One</a> (stats.c) is a simple C module that implements a function, which finds the mean and variance of an array of floats (the stats.h file contains just a function prototype and is not shown). <a name="rl2"></a><a href="#l2">Listing Two</a> is statsmodule.c, a Python extension module based on stats.c.</p>
+
+<p>Since the <i>find_variance</i> function accepts a variable-sized input array, its Python parameter list cannot be directly handled by <i>PyArg_ParseTuple</i>. The interface function has been written to accept a list of floats; in fact, to be more "Pythonic," it accepts any sequence of objects that can be converted to floats. </p>
+
+<p>Refer to the function <i>stats_find_variance</i> in <a name="rl2"></a><a href="#l2">Listing Two</a>. To perform the conversion, the C code must:</p>
+
+
+
+<ul>
+  <li>Verify that there is only one parameter, and that it is a sequence.</li>
+  <li>Obtain the length of the sequence and verify that it is nonzero (since the C function to be called requires that).</li>
+  <li>Allocate an array of floats to hold the data.</li>
+  <li>Retrieve each element of the sequence, and if it is not a Python <i>float</i>, convert it to a <i>float</i> while checking for an error in the conversion; then, store the result in the array.</li>
+</ul>
+
+<p>If all of these operations succeed, the code calls the <i>find_variance</i> function in the stats.c module, and then converts the results (two doubles) back into Python floats. In addition, the code must carefully maintain the reference counts on Python objects to avoid memory leaks or similar problems.</p>
+
+<p>As you can see, the code to perform this conversion amounts to more than half of the program. In fact, I wrote most of the rest of this module by simply pasting the examples from the Python documentation, then changing "spam" into "stats." In addition to the <i>find_variance</i> function, the module contains a table of pointers to functions, which is used by the Python internals to find the entry points; and an initialization routine, initstats, makes this table available to Python.</p>
+
+<p>Usually, I finish writing the C/Python interface quickly, and move on to something else. This means avoiding the kind of code that can be seen in <a name="rl2"></a><a href="#l2">Listing Two</a>, which is fairly involved. It needs to check for several error conditions, even for a simple case such as this.</p>
+<h3>Using a Python Wrapper Layer</h3>
+
+<p>The solution is to do the work in Python. Since the underlying C function needs a pointer to an array of floats, why not require the Python code to supply a contiguous chunk of memory containing that array? The data could be contained in a Python string, for instance. There are several ways to do this, but it puts you in an odd position if, to obtain statistics on a set of floating-point numbers, they must be first converted to a binary string format.</p>
+
+<p>To fix that problem, add a layer of Python to do the work. <a name="rl3"></a><a href="#l3">Listing Three</a> is statsimodule.c, a new extension module that is the same as statsmodule.c, except that the <i>find_variance</i> function accepts a string instead of a sequence of floats. The function is simpler&#151;it can now use <i>PyArg_ParseTuple</i> to obtain the address and length of the supplied string data (while checking that the parameter is of suitable type). It then performs a simple length check and calls the <i>find_variance</i> function, passing it a pointer to the data supplied by the caller.</p>
+
+<p>The Python wrapper code, stats2.py (<a name="rl4"></a><a href="#l4">Listing Four</a>), contains a function <i>find_variance</i> that does the conversion and passes the result to the built-in function in the statsi module (a Python function implemented in C is referred to as "built-in," even when it is in an extension module). To convert the parameter to a string, it creates an instance of the Python type <i>array.array</i> with typecode <i>'f'</i>; that operation packs the data internally into machine floats, exactly as desired. It is then possible to convert the array to a string. Instead, I pass the array directly to the built-in<i> find_variance</i> function. This works because <i>array.array</i> implements the <i>buffer</i> interface&#151;it is based on a memory buffer, and can identify the location and length of that buffer via the standard buffer protocol.</p>
+
+<p>So, both of these code snippets give the same result:</p>
+
+<blockquote>
+&gt;&gt;&gt; import stats<br>
+&gt;&gt;&gt; print stats.find_variance( [ 1.0, 1.5, 1.8, 2.12 ] )<br>
+(0.17007496588230353, 1.6049999594688416)<br>
+<br>
+&gt;&gt;&gt; import stats2<br>
+&gt;&gt;&gt; print stats2.find_variance( [ 1.0, 1.5, 1.8, 2.12 ] )<br>
+(0.17007496588230353, 1.6049999594688416)<br>
+
+</blockquote>
+
+<p>However, the stats module is all C, including a fairly complex conversion routine, while the stats2 module is split into two layers. Also, I've removed the <i>docstring</i> from<i> find_variance</i> in statsimodule, instead placing it in stats2.py where it is visible at the upper layer.</p>
+
+<p>Splitting code up like this is a popular approach; for instance, the socket module in the standard Python library is written in Python and uses a lower level C module, <i>_socket</i>. However, the socket module is not just a wrapper. It provides additional higher level functions.</p>
+
+<p>I find that splitting the code up like this can create a maintenance problem; there is now an interface between stats2.py and statsimodule.c, and it is rather an odd interface. In fact, this is the whole point of the exercise: to use an unusual (some might just say crude) interface to make the C programming easier, but to supply a conversion layer so that Python programmers don't need to use that unusual interface. If I have to maintain that interface (which could mean documenting it somewhere other than in the comments of the source, or taking steps to make sure that both files are always updated together) then I've made extra work, which is what I've been trying to avoid in the first place. Code used as part of a test framework is frequently modified and run during development. Changes to the Python code generally take effect immediately, while changes to the C module do not take effect until it is rebuilt. So the potential risk of problems arising from incompatible versions is higher than usual.</p>
+<h3>Combining the Wrapper Layer with The Extension Module</h3>
+
+<p>Version incompatibility problems can be avoided by putting the C code and the Python code in the same file. Fans of the Obfuscated C contest are, no doubt, now scribbling down <i>#if 0</i> and figuring out how to make the same file acceptable to both C and Python. This is pretty easy, actually, but it's not what I meant.</p>
+
+<p>Built-in Python modules (including those based on C extensions) are of exactly the same basic Python type as modules created from pure Python code. Both types have a dictionary attached, which contains the global namespace of the module; the difference lies only in the kinds of function objects that are placed in this namespace when the module is constructed. So rather than putting the wrapper function in a separate Python file, you can include it in the C module.</p>
+
+<p>The program stats3module.c (available electronically; see "Resource Center," page 5) is identical to statsimodule.c, except that the entry point is called <i>_find_variance</i> instead of <i>find_variance</i>. This lets you introduce <i>find_variance</i> later. Also, there are a few lines of Python code in a <i>char[]</i> variable called <i>py_code_string</i> and some extra code in the module initialization function.</p>
+
+<p>The extra code simply obtains the namespace dictionary for the module and calls <i>PyRun_String</i> to execute the Python code. The module dictionary is supplied as the context for the execution, which means that all <i>global</i> values defined in the Python code wind up in the module's namespace. It also means that any Python functions defined by this operation will have, as their global namespace, the module's namespace.</p>
+
+<p>So, referring to the contents of <i>py_code_string</i>, it looks a lot like stats2.py, except that it doesn't need to import a lower level module, and it refers to the lower level function directly as <i>_find_variance</i>, rather than as <i>statsi.find_variance</i>.</p>
+
+<p>There is another step performed during the module initialization: Before calling <i>PyRun_String</i>, I obtain a reference to the <i>__builtins__</i> module and place this reference into the <i>stats3</i> module namespace. This module is part of the namespace of any pure-Python module; without it, all the built-in objects and functions (<i>None</i>, <i>abs</i>, <i>len</i>, <i>range</i>, <i>open</i>, to name a few) are unavailable. In fact, without this entry, you can't even execute an <i>import</i> statement because that is hooked through the <i>__import__</i> function in <i>__builtins__</i>.</p>
+
+<p>Another little detail: The Python code in <i>py_code_string</i> imports array as <i>_array</i>, to keep it from being included when "from stats3 import *" is done. This statement includes all names not starting with an underscore; in the case of <i>stats3</i>, that means just<i> find_variance</i>.</p>
+
+<p>So, <i>stats3</i> looks just like <i>stats</i> and <i>stats2</i>, from the Python side; like <i>stats</i>, it's implemented as a standalone C extension, but, like <i>stats2</i>, it includes a Python wrapper layer.</p>
+
+<p>When initially creating and debugging such a module, I sometimes replace the entire <i>py_code_string</i> contents temporarily with the single statement</p>
+
+<blockquote>
+execfile('mycode.py')<br>
+
+</blockquote>
+
+<p>This lets me compile the extension just once, and debug the contained Python code by changing the contents of the file mycode.py. When it's working, I can just paste it back into the C string.</p>
+<h3>A Note on Type Conversions</h3>
+
+<p>There is an interesting difference between stats (implemented in statsmodule.c) and the other two implementations:</p>
+
+<blockquote>
+&gt;&gt;&gt; import stats<br>
+&gt;&gt;&gt; stats.find_variance( [ 10.0, 11, "12"] )<br>
+(0.66666666666666663, 11.0)<br>
+
+</blockquote>
+
+<p>If you try this with the other modules, it raises an exception. statsmodule.c simply looks at each of the elements in the supplied sequence, and if the element is not a<i> float</i>, it tries to convert it to one. The string "12" can be converted to a <i>float</i>, 12.0. This is rather more implicit type conversion than most Python programmers are used to. Here is a more dangerous example:</p>
+
+<blockquote>
+&gt;&gt;&gt; stats.find_variance( ("1234",) )<br>
+(0.0, 1234.0)<br>
+&gt;&gt;&gt; stats.find_variance( ("1234") )<br>
+(1.25, 2.5)<br>
+
+</blockquote>
+
+<p>The first example shows a tuple of strings&#151;just one string&#151;being passed to the function, so the mean is 1234.0 and the variance is zero. The second example shows a string being passed to the function&#151;the parentheses without the comma have no effect. The string is, according to Python type conventions, a sequence of one-character strings, each being a single digit. So the second example finds the mean and variance of the four values 1.0, 2.0, 3.0, 4.0. This is a hazard of having too many automatic type conversions&#151;a simple programming error may result in behavior different from what was expected, where you would rather get an exception.</p>
+
+<p>If you actually want the other modules to have this behavior, it's easy to add, since you can do it in the Python layer. Just change this:</p>
+
+<blockquote>
+if type(fltlist) is not list:<br>
+   fltlist = list(fltlist)<br>
+
+</blockquote>
+
+<p>to:</p>
+
+<blockquote>
+fltlist= map(float, fltlist)<br>
+
+</blockquote>
+
+<p>This breaks the supplied sequence into its components, explicitly converts each one to a Python <i>float,</i> and builds a list of the results. Making a similar kind of change to C code could require substantially more work.</p>
+<h3>Calling Python Code from C</h3>
+
+<p>stats4module.c (available electronically) implements the <i>find_variance</i> function directly in C again; but this time it takes its parameter and passes it to a pure Python function attached to the module, and lets that do all the work of the conversion. That function, <i>_flts_to_array</i>, converts whatever is passed to <i>find_array</i> into an <i>array.array</i> of C floats, and returns that. It enforces the minimum length of one element and returns the result inside a tuple, so that the C code can pass it directly to <i>PyArg_ParseTuple</i> to get its address and length. The <i>args</i> parameter, passed to the C function <i>stats4_find_variance</i>, is a reference to a Python tuple containing all of the parameters passed to the function. The same protocol is used when calling an arbitrary Python object from C, using <i>PyObject_CallObject</i>; the first parameter is the object to call, while the second is a tuple of the parameters. If someone improperly calls<i> find_variance</i> with zero parameters, or more than one, then an error will occur when <i>PyObject_CallObject</i> attempts to call <i>_flts_to_array</i> with the same parameter set. It is possible to catch this error in the Python code, and to provide more detailed error descriptions for other conditions, if desired.</p>
+
+<p>If your C module uses callback functions, your wrapper needs to implement these C functions; the callback function generally needs to manipulate Python data. Calling Python code from these C functions is often the easiest way to handle this.</p>
+<h3>Reporting Errors</h3>
+
+<p>It is fairly easy to check the parameters in such a way that an exception is raised when there is a problem&#151;many of the possible error conditions cause the normal conversions to throw exceptions.</p>
+
+<p>It is generally more work to make sure that the exception messages are detailed and directly meaningful to API programmers. In the previous example, if the parameter count to <i>find_variance</i> is incorrect, the exception indicates that the number of parameters passed to the internal function <i>_flts_to_array</i> is incorrect, which may certainly be confusing. This issue is fairly common in Python; it is convenient to allow lower levels of code to check for problems and raise exceptions. The drawback is that you end up with possibly confusing error messages; you need to look at each line on the stack traceback to find where the problem really originated. With extra work, you can either check these conditions at a level closer to the API, or catch exceptions thrown by lower level code and restate them in better terms.</p>
+
+<p>As I mentioned, I often write Python-C interfaces in order to create test frameworks in Python. I don't need to be too concerned about API users being confused by error messages, because this code does not wander very far from my desk. It is, however, important that the type and range checking is thorough. If, during testing, the application throws a segmentation fault, I want to be sure that this did not occur simply because the test framework actually passed bad data through the Python API. In other words, it should not be possible to cause memory corruption simply by writing incorrect Python code. This principle should be applied to all C/Python interfaces; much of the convenience of using Python is lost if you need to use C-language debugging techniques to find problems in your Python code.</p>
+<h3>User-Defined Python Types</h3>
+
+<p>If your C extension implements a Python data type, the interface between the Python wrapper and the C code can become more complex, and these techniques can be even more useful. For instance, the Python wrapper can define a Python class, which is based on the type defined in the C module, and supply implementations for methods that are more easily coded in Python. The methods of the base class, being written in C, could use the Python/C API calls to ensure that when member functions written in C are overridden in a derived class, the correct function is called even from C code. It is useful to be able to split such an implementation into a C layer and a Python layer, but it may be cumbersome to have these in separate source files.</p>
+<h3>The Downside</h3>
+
+<p>There are only two real drawbacks to this approach: The Python source code must appear in quoted strings in the C file, making it inconvenient to maintain, and the Python layer is "compiled" to Python byte-code every time the module is loaded. In a conventional approach, with a separate .py file, Python compiles the code once, and save the results in a .pyc file for later use. So, the technique is mainly applicable when the Python code is quite short. This is not unusual because significant data conversions can be performed in a few lines of Python.</p>
+<p><b></b></p>
+<p><b></b></p>
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>/* ---------- stats.c --------------
+ * simple example of a C module
+ */
+#include &lt;math.h&gt;
+#include "stats.h"
+/* given a set of pointers to 'n' floats (&gt;=1), find the mean and variance. 
+ * The variance is returned directly; the mean via a pointer.
+ */
+double
+find_variance( float const *data, int npts, double *mean_p)
+{
+    int i;
+   double sum = 0;
+    double sumsq = 0;
+    double mean;
+    /*
+     * there are more numerically stable ways to do this, but
+     * that's a different article...
+     */
+    for( i = 0; i &lt; npts; ++ i ){
+        double x= data[i];
+        sum += x;
+        sumsq += x*x;
+    }
+    mean = sum/npts;
+    *mean_p = mean;
+    return ( sumsq - mean*sum )/npts ;
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>/* ---------- statsmodule.c -------------- */
+/* python extension based on stats.c       */
+
+#include &lt;Python.h&gt;
+#include "stats.h"
+
+static char stats_find_variance_doc[] = 
+"Given a sequence of floats, find the standard deviation and mean";
+
+static PyObject *
+stats_find_variance(PyObject *self, PyObject *args)
+{
+    double mean, var;
+    PyObject * flt_list;
+    PyObject * lst_element;
+    int n,i;
+    float *tmp_arr;
+    /* must be a single parameter which is a sequence of floats. */
+    if( PySequence_Size(args)!=1 ){
+        flt_list = 0;
+    }else{
+        flt_list = PySequence_GetItem(args,0);
+    }
+    /* at this point either flt_list is NULL, or
+     * it's the param and we own a reference to it
+     */
+    if( flt_list ==0  || !PySequence_Check(flt_list)){
+        PyErr_SetString( PyExc_TypeError, 
+                "find_variance accepts a list of floats");
+        Py_XDECREF(flt_list);
+        return 0;
+   }
+    /* we know it's a sequence. Get its length, and allocate an
+     * array of floats. Length of 0 is an error.
+     */
+    n = PySequence_Size( flt_list );
+    if( n &lt; 1 ){
+        PyErr_SetString( PyExc_ValueError,"find_variance: empty list");
+        Py_XDECREF(flt_list);
+        return 0;
+    }
+    tmp_arr= PyMem_Malloc( n * sizeof(float));
+
+    if( !tmp_arr ){
+        PyErr_SetString( PyExc_MemoryError, "out of memory");
+        Py_DECREF(flt_list);
+        return 0;
+    }
+    /* now fill in all the floats. If any operation fails, we have to free 
+     * everything. The code is structured so that if something returns NULL, 
+     * it will drop down to the single error test. We don't need to
+     * set the exception, since the failed operation will do it.
+     */
+    for( i = 0; i &lt; n ; i++ ){
+        lst_element = PySequence_GetItem( flt_list, i );
+
+        if( lst_element != 0 &amp;&amp; !PyFloat_Check(lst_element)){
+            /* succeeded, but not a float - convert it */
+            PyObject *new_obj= PyNumber_Float( lst_element );
+            Py_DECREF(lst_element); 
+            lst_element = new_obj;  /* may be 0 */
+        }
+        if( lst_element != 0 ){
+            tmp_arr[i] = (float)PyFloat_AsDouble(lst_element);
+            Py_DECREF(lst_element);
+        }else{
+            Py_DECREF(flt_list);
+            PyMem_Free(tmp_arr);
+            return 0;
+        }
+    }
+    Py_DECREF(flt_list);    /* don't need that any more */
+    /* call the actual C routine with all the floats */
+    var = find_variance( tmp_arr, n , &amp; mean );
+    /* free our tmp array and return results */
+    PyMem_Free(tmp_arr);
+    return Py_BuildValue("dd", var, mean);
+}
+/* table of module methods. If the module has multiple
+ * Python-callable functions, they are all listed here.
+ */
+static PyMethodDef StatsMethods[] = {
+{"find_variance",  stats_find_variance,
+    METH_VARARGS,  stats_find_variance_doc},
+    {NULL, NULL, 0, NULL}        /* Sentinel */
+};
+/* The module initialization function */
+PyMODINIT_FUNC
+initstats(void)
+{
+    Py_InitModule("stats", StatsMethods);
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>/* ---------- statsimodule.c ----------------- */
+
+#include &lt;Python.h&gt;
+#include "stats.h"
+/*
+ * This is an extension implementing the 'stats'
+ * module which is intended to be wrapped by a
+ * python module; it provides a simple internal
+ * interface.
+ *
+ * the 'find_variance' entry point accepts
+ * a single parameter, which is expected to
+ * be a read-only buffer of floats (at least one)
+ */
+static PyObject *
+statsi_find_variance(PyObject *self, PyObject *args)
+{
+     double mean, var;
+     char *data_ptr;
+     int nbytes,n;
+
+     /*
+      * expect a single parameter, which is a string
+      * or buffer, containing value in native order.
+      * The API call below gets us the address and len
+      * of the string, or fails.
+      */
+    if (!PyArg_ParseTuple(args, "s#", &amp;data_ptr, &amp;nbytes))
+        return NULL;
+     /*
+      * check the len - it must be a multiple of sizeof(float)
+      */
+     n = nbytes/sizeof(float);
+     if( n &lt;= 0 || n*sizeof(float) != nbytes ){
+          PyErr_SetString( PyExc_ValueError,
+                     "find_variance: bad length");
+          return 0;
+     }
+          
+     /*
+      * call the actual C routine with all the floats.
+      * Note: there is a risk here that the data will not
+      * be aligned on a suitable boundary for floats. This
+      * is not an issue on X86 hardware; also, the Python
+      * wrapper can guarantee this, if needed, by using 
+      * array.array type instead of a string.
+      */
+     var = find_variance( (float const*) data_ptr, n , &amp; mean );
+     /*
+      * return results
+      */
+    return Py_BuildValue("dd", var, mean);
+}
+/*
+ * table of module methods. If the module has multiple
+ * Python-callable functions, they are all listed here.
+ */
+static PyMethodDef StatsiMethods[] = {
+{"find_variance",  statsi_find_variance,
+     METH_VARARGS,  ""},
+    {NULL, NULL, 0, NULL}        /* Sentinel */
+};
+/*
+ * The module initialization function
+ */
+PyMODINIT_FUNC
+initstatsi(void)
+{
+    Py_InitModule("statsi", StatsiMethods);
+}</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l4"></a>Listing Four</b><br>
+<pre>#---- stats2.py ----
+# same as 'stats', but done as a wrapper around a C
+# extension (statsi)
+#
+import statsi
+import array
+
+def find_variance( fltlist ):
+    "Given a sequence of floats, find the "\
+        "standard deviation and mean"
+    try:
+        if type(fltlist) is not list:
+            fltlist = list(fltlist)
+        data = array.array( 'f', fltlist)
+    except (TypeError,ValueError):
+        raise ValueError, 'bad parameter to find_variance'
+    return statsi.find_variance(data)
+
+#
+# don't export array and statsi
+#
+__all__ = ['find_variance']</pre>
+<a href="#rl4">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

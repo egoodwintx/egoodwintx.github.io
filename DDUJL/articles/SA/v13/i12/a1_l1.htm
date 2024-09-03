@@ -1,0 +1,428 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v13, i12: Listing 1 vxfsnap</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a1.htm">Article</a></span></td>
+		<td><span class="navbarLink">Listing 1</span></td>
+		<td><a href="../../../../source/SA/2004/dec2004.tar"><b class=codeListing>dec2004.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h2><B>Listing 1 </B><I>vxfsnap</i></h2>
+            <p> 
+            <pre>
+#!/bin/bash
+# Script that defines functions for:
+# Making a snapshot of a volume, spliting the diskgroup and deporting it
+# Importing a diskgroup and mounting the volume
+# Unmounting the volume and deporting the diskgroup
+# Joining the volume back to the original diskgroup and reastablishing 
+# the snapshot
+# All actions are based on the command line options supplied to the script
+# All errors are logged to syslog. Priority and facility are defined in the 
+# log() function
+# Script relies on SSH and availability of the same script in the same
+# location on REMOTE HOST for remote execution
+# The following variables are used for the Veritas process:
+# DISKGROUP, VOLUME, SNAP_VOLUME, SNAP_DISKGROUP
+
+# Global variables and locations
+
+ME="/usr/local/vxfsnap/vxfsnap"
+LOGGER="/usr/bin/logger"
+VXDG="/sbin/vxdg"
+VXVOL="/usr/sbin/vxvol"
+VXASSIST="/usr/sbin/vxassist"
+VXPRINT="/usr/sbin/vxprint"
+VXRECOVER="/usr/sbin/vxrecover"
+FSCK="/usr/sbin/fsck"
+MOUNT="/sbin/mount"
+UMOUNT="/sbin/umount"
+REMOTEUSER="root"
+SSH="/usr/local/vxfsnap/ssh"
+SSHKEY="/usr/local/vxfsnap/id_vxfsnap"
+IWFREEZE="/apps/iw-home/bin/iwfreeze"
+IWTIME=1200
+
+
+# Define a function for logging errors to SYSLOG
+
+log() {
+  $LOGGER -p local4.warn $1 
+}
+
+# Function to perform the snapshot operations as well as the split
+
+split() {
+
+if [ "yes" = "$REMOTE" ]; then
+  sshcheck
+  $SSH -i $SSHKEY root@${HOST} "$ME -g $DISKGROUP -v $VOLUME \
+          -G $SNAP_DISKGROUP -V $SNAP_VOLUME -e $EXECUTE" 
+  if [ $? -ne 0 ]; then
+    exit 1
+  fi
+else
+
+# Make sure DG and VOL exist
+   if ! $VXPRINT -g $DISKGROUP &gt; /dev/null 2&gt;&amp;1 ; then
+        log "SNAPSHOT ALERT: Disk group does not exist"
+        exit 1
+   fi
+
+   if ! $VXPRINT -g $DISKGROUP $VOLUME &gt; /dev/null 2&gt;&amp;1 ; then
+        log "SNAPSHOT ALERT: Volume does not exist"
+        exit 1
+   fi
+
+# Check if there is a volume in a SNAPDONE state
+   if ! $VXPRINT -g $DISKGROUP -f -v -p | grep -w SNAPDONE &gt; /dev/null 2&gt;&amp;1; then
+        log "SNAPSHOT ALERT: Snapshot not done or not avaialable"
+        exit 1
+   fi
+
+# Make the snapshot    
+   if ! $VXASSIST -g $DISKGROUP snapshot $VOLUME $SNAP_VOLUME ; then
+      log "SNAPSHOT ALERT: Snapshot was not successful"
+      exit 1
+   fi
+
+# Split the diskgroup   
+   if ! $VXDG split $DISKGROUP $SNAP_DISKGROUP $SNAP_VOLUME ; then
+      log "SNAPSHOT ALERT: Disksplit was not successful"
+      exit 1
+   fi
+
+# Deport the split piece of the dskgroup   
+   if ! $VXDG deport $SNAP_DISKGROUP ; then
+      log "SNAPSHOT ALERT: Deport was not successful"
+      exit 1
+   fi
+   
+fi
+}
+
+# Function to import a diskgroup and mount a volume
+
+import () {
+
+if [ "yes" = "$REMOTE" ]; then
+   sshcheck
+   $SSH -i $SSHKEY root@${HOST} "$ME -G $SNAP_DISKGROUP -V $SNAP_VOLUME \
+           -m $MOUNT_POINT -e $EXECUTE"
+  if [ $? -ne 0 ]; then
+    exit 1
+  fi
+else
+
+# Import the diskgroup
+   if ! $VXDG import $SNAP_DISKGROUP ; then
+      log "SNAPSHOT ALERT: Import of diskgroup not succesful"
+      exit 1
+   fi
+
+# Recover the volume 
+   if ! $VXRECOVER -g $SNAP_DISKGROUP -m $SNAP_VOLUME ; then
+      log "SNAPSHOT ALERT: Vxrecover was not successful"
+      exit 1
+   fi
+
+# Start the volume   
+   if ! $VXVOL -g $SNAP_DISKGROUP start $SNAP_VOLUME ; then
+      log "SNAPSHOT ALERT: Volume start was unsuccessful"
+      exit 1
+   fi
+  
+# Filesystem sanity check 
+   if ! $FSCK -m -F vxfs /dev/vx/rdsk/${SNAP_DISKGROUP}/${SNAP_VOLUME} ; then
+      log "SNAPSHOT ALERT: Filesystem check (FSCK) failed"
+      exit 1
+   fi
+
+# Make the mount   
+   if ! $MOUNT -F vxfs /dev/vx/dsk/${SNAP_DISKGROUP}/${SNAP_VOLUME} \
+     $MOUNT_POINT ; then
+      log "SNAPSHOT ALERT: Mount operation was unsuccessful"
+      exit 1
+   fi
+
+fi
+}
+
+# Function to unmount a volume and deport the diskgroup
+
+deport () {
+
+if [ "yes" = "$REMOTE" ]; then
+   sshcheck
+   $SSH -i $SSHKEY root@${HOST} "$ME -G $SNAP_DISKGROUP -V $SNAP_VOLUME \
+           -m $MOUNT_POINT -e $EXECUTE"
+  if [ $? -ne 0 ]; then
+    exit 1
+  fi
+else
+
+# Force an unmount
+   if ! $UMOUNT -f $MOUNT_POINT ; then
+      log "SNAPSHOT ALERT: Unmount operation was not successful"
+      exit 1
+   fi
+
+# Stop the volume
+   if ! $VXVOL -g $SNAP_DISKGROUP stop $SNAP_VOLUME ; then
+      log "SNAPSHOT ALERT: Volume did not stop successfully"
+      exit 1
+   fi
+
+# Deport the diskgroup
+   if ! $VXDG deport $SNAP_DISKGROUP ; then
+      log "SNAPSHOT ALERT: Deport was not successful"
+      exit 1
+   fi
+
+fi
+}
+
+# Function to import and join a diskgroup and re-establish snapshot
+
+join () {
+
+if [ "yes" = "$REMOTE" ]; then
+   sshcheck
+   if [ "yes" = "$FREEZEIW" ]; then
+      $SSH -i $SSHKEY root@${HOST} "$ME -g $DISKGROUP -v $VOLUME -G \
+               $SNAP_DISKGROUP -V $SNAP_VOLUME -e $EXECUTE -f"
+     if [ $? -ne 0 ]; then
+        exit 1
+     fi
+   else 
+      $SSH -i $SSHKEY root@${HOST} "$ME -g $DISKGROUP -v $VOLUME \
+              -G $SNAP_DISKGROUP -V $SNAP_VOLUME -e $EXECUTE"
+     if [ $? -ne 0 ]; then
+        exit 1
+     fi
+   fi
+else
+
+# Import the diskgroup
+   if ! $VXDG import $SNAP_DISKGROUP ; then
+      log "SNAPSHOT ALERT: Import was not successful"
+      exit 1
+   fi
+
+# Join the diskgroup   
+   if ! $VXDG join $SNAP_DISKGROUP $DISKGROUP ; then
+      log "SNAPSHOT ALERT: Diskgroup join was not successful"
+      exit 1
+   fi
+
+# Recover the volume   
+   if ! $VXRECOVER -g $DISKGROUP -m $SNAP_VOLUME ; then
+      log "SNAPSHOT ALERT: Vxrecover was not successful"
+      exit 1
+   fi
+
+# Freeze Interwoven for the snapback operation
+   if [ "yes" = "$FREEZEIW" ]; then
+      iw freeze
+   fi
+
+# Re-establish the snapshot   
+   if ! $VXASSIST -g $DISKGROUP snapback $SNAP_VOLUME ; then
+      log "SNAPSHOT ALERT: Snapback was not successful"
+      exit 1
+   fi
+
+# Unfreeze Interwoven
+   if [ "yes" = "$FREEZEIW" ]; then
+      iw unfreeze
+   fi
+
+fi
+}
+
+# Function to freeze Interwoven TeamSite
+
+iw() {
+ACTION=$1
+ 
+if [ "freeze" = "$ACTION" ]; then
+
+  if [ -x $IWFREEZE ]; then
+
+     if ! $IWFREEZE +$IWTIME ; then
+        log "SNAPSHOT ALERT: Interwoven could not be frozen"
+        exit 1
+     fi
+  fi
+
+elif [ "unfreeze" = "$ACTION" ]; then
+
+  if [ -x $IWFREEZE ]; then
+
+     if ! $IWFREEZE -- ; then
+        log "SNAPSHOT ALERT: Interwoven could not be unfrozen"
+     fi
+  fi
+
+else
+  log "SNAPSHOT ALERT: Interwoven ACTION not defined"
+fi
+}
+
+# Make an initial check and make sure variables are defined properly
+
+icheck() {
+
+# Make sure EXECUTE is defined to something useful
+if [ "snap" = "$EXECUTE" -o "import" = "$EXECUTE" \
+      -o "deport" = "$EXECUTE" -o "join" = "$EXECUTE" ]; then
+      # EXECUTE is defined
+      /bin/true 
+else
+      usage
+      exit 1
+fi
+
+# Make sure all VARS for the operation are defined
+case $EXECUTE in
+  snap|join)  [ -z "$DISKGROUP" -o -z "$VOLUME" -o -z "$SNAP_DISKGROUP" \
+                -o -z "$SNAP_VOLUME" ] &amp;&amp; usage &amp;&amp; exit 1
+          ;;
+  deport|import)  [ -z "$SNAP_DISKGROUP" -o -z "$MOUNT_POINT" \
+                -o -z "$SNAP_VOLUME" ] &amp;&amp; usage &amp;&amp; exit 1
+          ;; 
+esac
+
+# If the action is REMOTE then HOST needs to be defined
+if [ "yes" = "$REMOTE" ]; then
+   if [ -z "$HOST" ]; then
+      usage
+      exit 1
+   fi
+fi
+}
+
+# Function to verify SSH connectivity
+
+sshcheck() {
+
+eval $SSH -i $SSHKEY -o BatchMode=yes -l $REMOTEUSER $HOST "echo" &gt; /dev/null 2&gt;&amp;1
+
+if [ $? -ne 0 ] ; then
+    log "SNAPSHOT ALERT: Hostbased authentication error(SSH)"
+    exit 1
+fi
+} 
+
+# Help function
+
+usage() {
+
+echo "Usage: vxfsnap [ -r ] [ -h HOST ] [ -g DiskGroup ] [ -v Volume ] \
+  -G Snapshot DiskGroup -V Snapshot Volume [ -m Moint Point ] -e \
+  [snap|join|import|deport]"
+echo "    -r execute the command on the remote host specified by the -h option"
+echo "    -h execute the command on host HOST " 
+echo "    -g Volume for the snapshot is in diskgroup DiskGroup  "
+echo "    -v Volume for the snapshot is called Volume " 
+echo "    -G Snapshot volume will be placed in diskgroup Snapshot DiskGroup "
+echo "    -V Snapshot volume will be called Snapshot Volume " 
+echo "    -m Snapshot volume will be mounted under Mount Point  "
+echo "    -f During the snapback operation freeze IW TeamSite  "
+echo "    -e Execute the vxfsnap tool in the following mode: split|join|import|deport "
+echo "Note: When doing a remote or local import/deport operation you should \
+      work with the snapshot diskgroup and volume ( -G and -V )."
+echo "Examples: "
+echo " To take a snapshot of volume VOL which is in the DG diskgroup on"
+echo " LOCALHOST:"
+echo "  vxfsnap -g DG -v VOL -G SNAP_DG -V SNAP_VOL -e snap"
+echo " To mount the snapshot on remote host REMOTE under /BACKUP:"
+echo "  vxfsnap -r -h REMOTE -G SNAP_DG -V SNAP_VOL -m /BACKUP -e import"
+echo " To unmount the snapshot from remote host REMOTE:"
+echo "  vxfsnap -r -h REMOTE -G SNAP_DG -V SNAP_VOL -m /BACKUP -e deport"
+echo " To add the snapshot back to volume VOL in the DG diskgroup on "
+echo " LOCALHOST freezing IW TeamSite:"
+echo "  vxfsnap -g DG -v VOL -G SNAP_DG -V SNAP_VOL -e join -f"
+}
+
+# Processing starts here
+# Assign values according to command line options
+
+while getopts ':g:v:G:V:h:rfm:e:' opt; do
+   case $opt in
+    g) DISKGROUP=$OPTARG
+     ;;
+    v) VOLUME=$OPTARG
+     ;;
+    G) SNAP_DISKGROUP=$OPTARG
+     ;;
+    V) SNAP_VOLUME=$OPTARG
+     ;;
+    h) HOST=$OPTARG
+     ;;
+    r) REMOTE="yes"
+     ;;
+    m) MOUNT_POINT=$OPTARG
+     ;;
+    f) FREEZEIW="yes"
+     ;;
+    e) EXECUTE=$OPTARG
+     ;;
+    \?) echo "ERROR: $OPTARG is not a valid option"
+         usage
+     exit 1
+     ;;
+esac
+done
+
+icheck
+
+case $EXECUTE in
+    snap) split
+          ;;
+    join) join
+          ;;
+  import) import
+          ;;
+  deport) deport
+          ;;
+       *) usage
+          ;;
+esac</pre></table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

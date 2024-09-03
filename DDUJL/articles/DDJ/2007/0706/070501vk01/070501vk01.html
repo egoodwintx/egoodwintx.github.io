@@ -1,0 +1,352 @@
+<html>
+<head>
+<title>Developing a Lightweight, Statically Initializable C++ Mutex</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> June 2007</p>
+
+<h1>Developing a Lightweight, Statically Initializable C++ Mutex</h1>
+<h2>Threadsafe initialization of Singletons</h2>
+
+
+<h3>By Vladimir Kliatchko</h3>
+
+
+<I>Vladimir is a senior architect and head of application infrastructure at Bloomberg LP. He can be contacted at vkliatchko@bloomberg.net.</I>
+
+<hr>
+
+
+
+
+<p>While working on a solution for a fairly narrow and specific problem, I discovered a new synchronization mechanism. This mechanism not only provided a novel and effective solution to my problem, but turns out to have a number of properties making it useful for a wide range of important applications.</p>
+
+<p>My original problem had to do with the implementation of Singletons. The issues with Singletons involve the order and time of their initialization and destruction, as well as the thread safety of these operations. Despite the multitude of techniques developed to deal with these issues, there does not seem to be one universal solution&#151;let alone a simple one.</p>
+
+<p>The particular Singleton I was working on had to be located in a low-level library, which was used by many applications and other libraries. This constraint ruled out the use of a C++ file-scope variable as a mechanism for initializing the Singleton because there is no way to ensure that initialization of such an object is done properly before its first use. To avoid the active collaboration that would result from explicit initialization, I concluded that the Singleton had to be initialized on first access. The Meyers Singleton pattern (Listing One) fits this requirement. When this pattern is employed, the Singleton is initialized the first time it is used, and automatically destroyed when the process terminates. A word of caution: It is sometimes necessary not only to ensure that a Singleton is destroyed at process termination, but also to establish a particular relative order; for my Singleton, such was not the case.</p>
+
+	
+
+<pre class="code">
+class Singleton {
+    Singleton();
+    ~Singleton();
+  public:
+    static Singleton&amp; instance();
+};
+
+Singleton&amp; Singleton::instance() {
+    static Singleton singleton;
+    return singleton;
+}</pre>
+<div class="caption">
+   Listing One
+</div>	
+	
+
+<p>This implementation of a Singleton leaves the issue of thread safety unresolved. If multiple threads enter the <i>instance</i> routine simultaneously and if this routine has never been executed before, various problems may occur, depending on the compiler and platform. For example, the constructor of my Singleton may be executed multiple times or not at all. Alternatively, the constructor may be executed exactly once, which is correct, but one of the <i>instance</i> routines may return before the construction is completed&#151;again, leading to unpredictable and hard-to-debug failures. As you'd expect, you can eliminate this race condition by using one of a number of various synchronization mechanisms. Listing Two, for example, employs a mutex. In Listing Two, I did not show how the mutex variable is initialized. The mutex itself is a Singleton! If this mutex has a nontrivial constructor or destructor, we have a chicken-and-egg problem.</p>
+
+
+<pre class="code">
+class Singleton {
+    Singleton();
+    ~Singleton();
+    static Singleton *s_singleton;
+    static void init();
+  public:
+    static Singleton&amp; instance();
+};
+Singleton *Singleton::s_singleton = 0;
+void Singleton::init() {
+    static Singleton singleton;
+    s_singleton = &amp;singleton;
+}
+Singleton&amp; Singleton::instance() {
+    lock(&amp;mutex);
+    if (!s_singleton) {
+        init();
+    }
+    unlock(&amp;mutex);
+    return *s_singleton;
+}
+
+</pre>
+<div class="caption">
+   Listing Two
+</div>	
+	
+
+
+
+
+
+
+
+<h3>UNIX: pthread Solutions</h3>
+
+<p>Solving the problem of initializing the mutex on UNIX platforms isn't difficult. The pthread library available on these platforms provides a mutex that is a Plain Old Data (POD) type requiring only static (nonruntime) initialization, as in Listing Three. Additionally, the pthread library provides a mechanism called "<i>once</i> routines" that can also be used to solve this initialization problem (Listing Four).</p>
+
+
+<pre class="code">
+Singleton&amp; Singleton::instance() {
+    static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&amp;mutex);
+    if (!s_singleton) {
+        init();
+    }
+    pthread_mutex_unlock(&amp;mutex);
+    return *s_singleton;
+}
+
+</pre>
+<div class="caption">
+   Listing Three
+</div>	
+	
+
+<pre class="code">
+Singleton&amp; Singleton::instance() {
+    static pthread_once_t once_control = PTHREAD_ONCE_INIT;
+    pthread_once(&amp;once_control, &amp;Singleton::init);
+    return *s_singleton;
+}</pre>
+<div class="caption">
+   Listing Four
+</div>	
+	
+
+
+
+
+
+
+
+<h3>Windows: Spin-Lock Solution</h3>
+
+<p>Unfortunately, the Singleton I was implementing had to support Windows. That's where the main complication arose. Even critical sections, which are the simplest synchronization mechanism available on Windows applicable for my Singleton, do not support static initialization; a call to <i>InitializeCriticalSection</i> is required. As for <i>once</i> routines, there is no support for them in the Win32 API.</p>
+
+<p>Of course, I could have implemented a simple spin-lock using the <i>Interlocked</i> family of routines and the <i>Sleep</i> function, as in Listing Five.</p>
+
+
+
+<pre class="code">
+Singleton&amp; Singleton::instance() {
+    static volatile LONG lock = 0;
+    while (InterlockedExchange(&amp;lock, 1) != 0) {
+        Sleep(1);
+    }
+    if (!s_singleton) {
+        init();
+    }
+    InterlockedExchange(&amp;lock, 0);
+    return *s_singleton;
+}</pre>
+<div class="caption">
+   Listing Five
+</div>	
+	
+	
+	
+
+<p>Listing Five can be further optimized in two important ways. First, you can replace the <i>lock</i> variable with a three-state control variable (Listing Six). </p>
+
+
+<pre class="code">
+Singleton&amp; Singleton::instance() {
+    static volatile LONG control = 0;
+    while (1) {
+        LONG prev = InterlockedCompareExchange(&amp;control, 1, 0);
+        if (2 == prev) {
+            // The singleton has been initialized.
+            return *s_singleton;
+        }
+        elsif (0 == prev) {
+            // got the lock
+            break;
+        }
+        else {
+            // Another thread is initializing the singleton:
+            // must wait.
+            assert(1 == prev);
+            Sleep(1); // sleep 1 millisecond
+        }
+    }
+    if (!s_singleton) {
+        init();
+    }
+    InterlockedExchange(&amp;control, 2);
+    return *s_singleton;
+}</pre>
+<div class="caption">
+   Listing Six
+</div>	
+
+
+<ul>
+  <li>No threads have yet attempted to initialize the Singleton. (This is the initial state.)</li>
+  <li>The Singleton is in the process of being initialized. (Any thread, except the first thread that sets the control variable to this value, must wait for the initialization to be completed.)</li>
+  <li>The initialization has been completed.</li>
+</ul>
+
+
+
+<p>Introducing these three states ensures that, once the initialization is completed, no spinning is necessary, even if multiple threads enter the <i>Singleton::instance</i> routine simultaneously.</p>
+
+<p>The second optimization lets the sleep interval adjust dynamically using exponential backoff (Listing Seven; available electronically; see "Resource Center," page 5). If the initialization of the Singleton (the constructor of our <i>Singleton</i> class) takes a relatively long time or if there are many spinning threads, choosing small sleep intervals may create considerable overhead. Moreover, this problem is exacerbated whenever spinning threads delay the progress of the thread performing the initialization. On systems with less sophisticated thread scheduling (Windows 98, for instance), this deficiency may even bring the entire system to a halt.</p>
+
+<p>On the other hand, if the initialization of the Singleton is relatively quick, choosing a large sleep interval causes an unnecessary delay. Although adjusting the sleep interval dynamically does not solve these problems completely, it does reduce their likelihood.</p>
+
+<p>With these substantial optimizations, the spin-lock approach, though inelegant, is acceptable for many applications. Nonetheless, because I was looking for a generic solution that I planned to implement in a low-level library used by a wide range of applications and for a variety of Singleton objects, the spin-lock approach did not appeal to me.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Windows: Named-Mutex Solution </h3>
+
+<p>In search of a better solution, I decided to look at how two open-source libraries&#151;Boost.Threads (boost.org/doc/html/threads.html) and Pthreads-w32 (sourceware.org/pthreads-win32/)&#151;deal with this problem. Although neither library is directly concerned with Singletons, each has code that implements <i>once</i>-routine support on Windows. Boost.Threads provides a portable set of handy MT-related primitives to C++ programmers. Naturally, the platforms supported by this library include Windows. Pthreads-w32, on the other hand, implements a pthread-compatible layer, including <i>pthread_once</i>, on top of the Windows API, thus simplifying the porting of MT programs from UNIX to Windows. I reasoned that whatever technique these libraries use to implement once routines on Windows, it should be possible to use that same technique to implement my Singleton.</p>
+
+<p>The technique I discovered in Boost.Threads (libs/thread/src/once.cpp under the Boost source tree) relied on a special Windows feature that lets a name be associated with a mutex. If a thread (not necessarily within the same process) creates a mutex with a name that already exists, instead of creating a new mutex, the system returns a handle to the existing one. The system also makes sure that the mutex is not destroyed as long as there are any open handles to it. Finally, the system guarantees that creating a mutex and closing a mutex handle are atomic operations. Listing Eight (available electronically) shows how a named mutex can be used to implement our Singleton.</p>
+
+<p>The name of the mutex is designed to be unique. If you don't think the string "<i>Singleton::instance</i>" provides sufficient guarantee from collisions, you can use a random string generated by your favorite method (the string actually used in the Boost code is "<i>2AC1A572DB6944B0A65C38C4140AF2F4</i>"). Also, note that this code uses the Double-Checked-Lock optimization (www.cs.wustl.edu/~schmidt/PDF/DC-Locking.pdf). To avoid the various problems with na&iuml;ve implementations of this optimization (www.aristeia.com/Papers/DDJ_Jul_Aug_2004_revised.pdf), we make sure that all access to the flag is done through Windows interlocked routines, which incorporate all the necessary memory barriers. The <i>InterlockedExchangeAdd(&amp;flag, 0)</i> call&#151;a no-op incrementing the flag by 0&#151;is just a way of using interlocked routines for reading the flag. (The same effect can be achieved more efficiently with some inlined assembler.)</p>
+
+<p>Although a clever technique from the Boost.Threads library lets you improve upon the previous implementation by removing the inherent unpredictability of spinning, the solution suffers from several inefficiencies. To begin with, named mutexes are intended to be used for synchronization across process boundaries rather than among threads within the same process. Manipulating, and creating such "interprocess" mutexes is expensive&#151;substantially more so than those used to synchronize threads. Moreover, with this heavy approach, a named mutex has to be created at least once, even when there is absolutely no contention&#151;even if the application using this Singleton is singlethreaded! Finally, generating a unique mutex name from a pointer is artificial and rather inelegant. Given these drawbacks, this solution, although acceptable in many applications, did not satisfy the needs of my high-performance reusable infrastructure library.</p>
+
+
+
+
+
+
+
+
+
+<h3>Developing Class QLock</h3>
+
+<p>Next, I looked at the Pthread-w32 library. The code I discovered in that library's implementation of <i>pthread_once</i> (pthread_once.c, CVS version 1.16) used an approach radically different from either of the two techniques just discussed: If multiple threads enter <i>pthread_once</i> simultaneously, the first thread that has to wait (the second thread overall) creates a synchronization object (a Windows event object, in this case). The last thread to leave the routine destroys the object. An atomic reference count keeps track of the number of threads involved. All of the problems of the previous two approaches seemed to be avoided. Unfortunately, a closer examination of the code uncovered a race condition. After a few attempts at fixing the problem (see pthread-w32 mailing list archive if you are interested in the details; sources.redhat.com/ml/pthreads-win32/), it became clear that this general approach is fundamentally flawed and cannot be fixed.</p>
+
+<p>Although reference counting used by the <i>pthread_once</i> implementation did not work, trying to fix it gave me some ideas. What if each thread that had to be suspended (waiting for another thread to complete the initialization of a Singleton), created and then destroyed its own synchronization object? For instance, I knew how the MCS implementation of spin-locks, to reduce contention, makes each thread wait spinning on its own flag. Could I use a similar technique, but instead of spinning, make each thread wait on its own semaphore or event object? It turned out that it was not only possible to make such a technique work, but the resulting code was fairly simple, too. Listing Nine (available electronically) uses this specialized waiting technique to implement my Singleton.</p>
+
+<p>The central idea of this new approach is encapsulated in class <i>QLock</i>. Each instance of this class represents a lock held on the mutex that was passed as a constructor argument. A mutex itself, which is represented by the <i>QLock::Mutex</i> type, is just a pointer, which is set to zero when the mutex is not locked. When the mutex is locked, it points to the tail of the queue of threads waiting on this mutex. Each thread in the queue is represented by the instance of class <i>QLock</i> that the thread created to obtain the lock. In other words, the mutex is a pointer to the <i>QLock</i> instance created by the last thread waiting in the queue. This <i>QLock</i> instance is linked to another <i>QLock</i> instance, which was created by the previous thread in the queue, and so on. The <i>QLock</i> instance at the head of the queue corresponds to the thread that currently holds the lock.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>A Closer Look at QLock</h3>
+
+<p>Table 1 lists the <i>QLock</i> class data members, while Table 2 lists the values that <i>d_readyFlag</i> and <i>d_nextFlag</i> may have. The constructor <i>QLock::QLock</i> atomically exchanges the mutex pointer for this. If the mutex pointer was 0 prior to the exchange, the lock is obtained and the constructor completes. If the mutex pointer was not zero, this instance of <i>QLock</i> has to join the queue and wait for the ready flag.</p>
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+  <tr>
+    <td></td>
+  </tr>
+  <tr>
+    <td>Data Member</td>
+    <td>Description</td>
+  </tr>
+  <tr>
+    <td>d_mutex</td>
+    <td>Pointer to the mutex locked by this QLock instance.</td>
+  </tr>
+  <tr>
+    <td>d_next</td>
+    <td>Pointer to the next instance of QLock in queue waiting to obtain the lock.</td>
+  </tr>
+  <tr>
+    <td>d_readyFlag</td>
+    <td>Flag used to indicate that the lock has been released by the predecessor.</td>
+  </tr>
+  <tr>
+    <td>d_nextFlag</td>
+    <td>Flag used to indicate that the next pointer (d_next) has been set by a successor.</td>
+  </tr>
+</table>
+
+<div class="caption">
+Table 1: QLock class data members.
+</div>
+</div>
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+  <tr>
+    <td></td>
+  </tr>
+  <tr>
+    <td>Value</td>
+    <td>Description</td>
+  </tr>
+  <tr>
+    <td>0</td>
+    <td>Initial value indicating that the flag is not set.</td>
+  </tr>
+  <tr>
+    <td>-1</td>
+    <td>Indicates that the flag was set before an event object had been installed into the flag.</td>
+  </tr>
+  <tr>
+    <td>Neither 0 nor -1</td>
+    <td>Indicates that an event object has been installed into the flag, which now holds the handle of the event object.</td>
+  </tr>
+</table>
+
+<div class="caption">
+Table 2: Values that d_readyFlag and d_nextFlag may have.
+</div>
+</div>
+
+
+<p>The destructor <i>QLock::~QLock</i>, using one atomic compare-and-exchange operation, checks if the mutex pointer contains the value of this pointer. If it does, it resets the mutex pointer to zero, thus releasing the mutex. If the mutex no longer contains the value of this pointer, the queue has been formed, and the destructor must pass the lock to the next instance in the queue. The destructor first waits on the <i>d_nextFlag</i> to make sure that the next pointer has been set, then sets the <i>d_readyFlag</i>.</p>
+
+<p>The algorithms used in <i>QLock</i>'s constructor/destructor are basically the same as those used to lock/unlock MCS spin-locks. The <i>setFlag</i> and <i>waitOnFlag</i> methods are where we make our important deviation from MCS locks. Instead of spinning (as is appropriate for a spin-lock), the <i>waitOnFlag</i> routine: </p>
+
+
+
+<ol>
+  <li>Creates an event object.</li>
+  <li>Atomically checks that the flag has not yet been set and installs the event object's handle into the flag.</li>
+  <li>Proceeds to wait on the event object.</li>
+</ol>
+
+
+
+<p>Now compare our <i>QLock</i>-based solution for the Singleton problem with the two previous solutions (spin-lock-based and named-mutex-based). Similar to the named-mutex-based solution, you avoid the unpredictable behavior of the spin-lock: Instead of spinning, waiting threads are suspended by the kernel, and resumed as soon as the mutex is available. Additionally, you avoid the problems with the named mutex: Event objects used for synchronization are process local, do not require artificial names, and are created only when threads need to be suspended due to contention. When there is no contention (when only one thread enters the <i>Singleton::instance</i> method at the time of initialization), no synchronization objects are created: The overhead is simply that of a few atomic operations.</p>
+
+
+
+
+
+
+
+
+
+<h3>Observations</h3>
+
+<p>After using the synchronization mechanisms implemented by the <i>QLock</i> class to solve the Singleton problem on Windows (and more generally, the problem with the static initialization of mutexes on Windows), I discovered that <i>QLock</i> has some other important properties that made it attractive for other applications (including on UNIX). <i>QLock::Mutex</i> has a small memory footprint (one pointer), and a small initialization cost (that of initializing a pointer with 0). Additionally, when there is no contention, <i>QLock</i> is fast. If no wait is necessary, locking a <i>QLock</i> requires just one atomic instruction and no system calls. If there are no waiting threads, unlocking is also just one atomic instruction.</p>
+
+<p>Furthermore, when there is contention, the cost of constructing event objects (or semaphores on UNIX) can be virtually eliminated by using a lock-free pool of allocated event objects. This pool works particularly well because the number of event objects required never exceeds the number of waiting threads&#151;an inherently small number.</p>
+
+<p>One common scenario in which <i>QLock</i> appears to be of great use is when you have a large collection of some kind of items that are accessed from multiple threads. To increase concurrency, it may be logically possible and desirable to maintain a mutex per item of the collection (instead of maintaining a single mutex for the entire collection). It is often the case, though, that the memory footprint and the initialization cost of a standard mutex or critical section would be prohibitive due to the (sometimes very large) size of the collection. <i>QLock</i>, because of its small size and negligible initialization cost, may be able to provide a viable solution to fine-grain locking. </p>
+
+
+</body>
+</html>

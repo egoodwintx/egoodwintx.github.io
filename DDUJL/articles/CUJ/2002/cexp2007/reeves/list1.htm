@@ -1,0 +1,509 @@
+<HTML><HEAD>
+<TITLE>July 2002/The (B)Leading Edge/Listing 1</TITLE></HEAD>
+
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+
+<h4><A NAME="heading1">Listing 1: Class IndexedFile definition</A></h4>
+<pre>
+#ifndef UTIL_INDEXED_FILE_H
+#define UTIL_INDEXED_FILE_H
+
+// XDR Stream headers
+#include &quot;Util/XDRStream.h&quot;
+#include &quot;Util/XIO.h&quot;
+
+// Standard C++ headers
+#include &lt;functional&gt;
+#include &lt;string&gt;
+#include &lt;ios&gt;
+#include &lt;list&gt;
+
+namespace Util {
+
+template &lt;typename Item&gt;
+struct XDR_Traits {
+      typedef      XIOFileStream           xio_type;
+      static oXDR_Stream&amp; encode(oXDR_Stream&amp; oxs, const Item&amp; val)
+            { return oxs &lt;&lt; val; }
+      static iXDR_Stream&amp; decode(iXDR_Stream&amp; ixs, Item&amp; val)
+            { return ixs &gt;&gt; val; }
+};
+
+
+//
+// BtreeIndex --
+//
+template&lt;typename Key,
+       typename Compare = std::less&lt;Key&gt;,
+       typename KeyTraits = XDR_Traits&lt;Key&gt;,
+       size_t PageSize = 4096&gt;
+class BtreeIndex {
+public:
+      // public types
+
+      // forward declartions
+      class StreamposProxy;
+      class Iterator;
+      class PageCache;
+      class Page;
+      class RootPage;
+      class XIODataStreambuf;
+      class XInDataBuf;
+      class XoutDataBuf;
+
+      typedef Key                               key_type;
+      typedef std::pair&lt;const Key, size_t&gt;                 value_type;
+      typedef Compare                           key_compare;
+      typedef Iterator                          iterator;
+      typedef size_t                                  size_type;
+      typedef ptrdiff_t                         difference_type;
+
+      enum DeleteStrategy { None, Compact, Shuffle };
+      enum UpdateStrategy { Unsafe, MostlySafe, Safe };
+
+//
+// class BtreeIndex::Iterator --
+//
+class StreamposProxy {
+      friend class BtreeIndex;
+      // data
+      size_t                  _link;
+      BtreeIndex*       _btree;
+      size_t                  _page;
+      size_t                  _slot;
+public:
+      // LWC - default copy and destroy Ok
+      // conversion
+      operator size_t();
+      // assignment
+      void operator=(size_t newlink);
+private:
+      StreamposProxy(size_t link, 
+             BtreeIndex* btree, 
+             size_t page, 
+             size_t slot);
+};
+
+class Iterator : public std::iterator&lt;
+            std::bidirectional_iterator_tag, 
+            std::pair&lt;
+                  const Key,
+                  BtreeIndex_StreamposProxy&lt;Key,Compare,KeyTraits,PageSize&gt;
+                  &gt;
+            &gt; {
+      friend class BtreeIndex;
+      // data
+      BtreeIndex*             _btree;
+      size_t                        _page;
+      size_t                        _slot;
+public:
+      Iterator()  {}
+
+      std::pair&lt;const Key, StreamposProxy&gt; operator*();
+      Iterator&amp;                     operator++();
+      Iterator                      operator++(int);
+      Iterator&amp;                     operator--();
+      Iterator                      operator--(int);
+
+      bool operator==(const Iterator&amp; rhs) const;
+      bool operator!=(const Iterator&amp; rhs) const;
+private:
+      Iterator(BtreeIndex* btree, size_t page, size_t slot);
+};
+
+
+class PageCache {
+      // types
+      typedef std::list&lt;Page*&gt; PageList;
+
+      // data
+      XDR_Stream&amp;      _xstream;
+      size_t            _minSize;
+      size_t            _maxSize;
+      PageList      _pageList;
+public:
+      PageCache(XDR_Stream&amp;);
+      ~PageCache();
+
+      Page*       get_page(size_t page);
+      void        add_page(Page* p); // puts a new page into the cache
+      void        reset();    // deletes any excess pages
+      void        clear();    // deletes all pages
+      void        flush();    // writes any dirty pages out
+
+      void        min_size(size_t size) { _minSize = size; }
+      int         max_size()        { return _maxSize; }
+      void        max_size(size_t size) { _minSize = size; }
+}; //&gt; BtreeIndex::PageCache
+
+//
+// BtreeIndex::Page
+//
+class Page {
+public:
+      struct KeyInfo {
+            Key         key;
+            size_t            link;
+            short       xlen;      // length of encoded &lt;key,link&gt; in data area
+            KeyInfo(Key k, size_t l, short xl) : key(k), link(l), xlen(xl) {}
+            KeyInfo() {}
+      };
+      typedef std::list&lt;KeyInfo&gt;      KeyList;
+
+protected:
+      // data
+      const size_t       _pageId;
+      size_t            _dataLen;
+      size_t            _prevPage;
+      size_t            _nextPage;
+      bool        _dirty;           // set when changed; cleared by encode
+      KeyList           _keyList;
+
+      static const int HeaderSize = 16;
+public:
+      Page(size_t pageId);
+      virtual ~Page();
+
+      // access
+      size_t            page_id() const         { return _pageId; }
+      size_t            data_len() const        { return _dataLen; }
+      size_t            prev_page() const       { return _prevPage; }
+      size_t            next_page() const       { return _nextPage; }
+      bool        is_dirty() const        { return _dirty; }
+      size_t            num_keys() const        { return _keyList.size(); }
+
+      // update
+      KeyList&amp;      key_list()              { return _keyList; }
+
+      void        data_len(size_t len)  { _dataLen = len; _dirty = true; }
+      void        prev_page(size_t pid)  { _prevPage = pid; _dirty = true; }
+      void        next_page(size_t pid)  { _nextPage = pid; _dirty = true; }
+
+      // test
+      bool        must_split() const;
+
+      // access / update the key list 
+      size_t            add_key(BtreeIndex&amp;, const std::pair&lt;const Key, size_t&gt;&amp;); 
+
+      bool        remove_key(int slot);
+      void        update_key(size_t slot, size_t link);
+
+      void        insert_page_link(KeyList::iterator kit, Page* p);
+      void        update_page_link(Page* p);
+      bool        remove_page_link(Page* p);
+
+      // virtual functions
+      virtual Page*           split(BtreeIndex&amp;);
+      virtual Page*           consolidate(BtreeIndex&amp;);
+      virtual Page*           shuffle(BtreeIndex&amp;);   
+      virtual oXDR_Stream&amp;       encode(oXDR_Stream&amp;);
+      virtual iXDR_Stream&amp;       decode(iXDR_Stream&amp;);
+private:
+      Page(const Page&amp;);
+      Page&amp; operator=(const Page&amp;);
+}; //&gt; BtreeIndex::Page
+
+
+//
+// BtreeIndex::RootPage
+//
+class RootPage : public Page {
+public:
+      // data
+      size_t            _totalKeys;
+      short       _depth;
+      bool        _dirtyTotal;
+public:
+      RootPage();
+      virtual ~RootPage();
+
+      // access
+      size_t            total_keys() const            { return _totalKeys; }
+      short       depth() const                 { return _depth; }
+      size_t            next_free_page() const       { return _nextPage; }
+      bool        is_total_dirty() const       { return _dirtyTotal; }
+
+      // update
+      void        incr_total()      { ++_totalKeys; _dirtyTotal = true; }
+      void        decr_total()      { --_totalKeys; _dirtyTotal = true; }
+      void        add_free_page(Page* p)  { 
+p-&gt;next_page(next_page()); 
+next_page(p-&gt;page_id()); }
+      void        rem_free_page(Page* p)  { next_page(p-&gt;next_page()); }
+
+      // virtual functions
+      virtual Page*           split(BtreeIndex&amp;);
+      virtual Page*           consolidate(BtreeIndex&amp;);
+      virtual oXDR_Stream&amp;       encode(oXDR_Stream&amp;);
+      virtual iXDR_Stream&amp;       decode(iXDR_Stream&amp;);
+}; //&gt; BtreeIndex::RootPage
+
+
+// class which handles read/write to/from an externally specified memory area
+class XIODataStreambuf : public XDR_Streambuf {
+      // data
+      XDR_Char*         _buf;
+      size_t                  _size;
+      size_t                  _len;
+public:
+      XIODataStreambuf(char* buf, size_t size, size_t len = 0);
+      ~XIODataStreambuf();
+
+      virtual pos_type seekoff(off_type off, 
+                             std::ios_base::seekdir dir, 
+                         std::ios_base::openmode which);
+      virtual pos_type seekpos(pos_type pos, std::ios_base::openmode which);
+};
+
+
+class XOutDataBuf : public oXDR_Stream {
+      // data
+      oXDR_Stream&amp;            _refstrm;
+      XIODataStreambuf      _xstreambuf;
+
+public:
+      XOutDataBuf(oXDR_Stream&amp;, char* buf, size_t size);
+      ~XOutDataBuf();
+};
+
+
+class XInDataBuf : public iXDR_Stream {
+      // data
+      iXDR_Stream&amp;            _refstrm;
+      XIODataStreambuf      _xstreambuf;
+
+public:
+      XInDataBuf(iXDR_Stream&amp;, char* buf, size_t len);
+      ~XInDataBuf();
+};
+
+
+      // construct / destroy
+      explicit BtreeIndex(Compare comp = Compare());
+
+
+explicit BtreeIndex(const std::string&amp; name, 
+            std::ios_base::openmode mode = std::ios_base::in|std::ios_base::out,
+            Compare comp = Compare());
+      ~BtreeIndex();
+
+      // open/close/test state
+      bool              is_open();
+      void              open(
+const std::string&amp; name, 
+std::ios_base::openmode mode = std::ios_base::in|std::ios_base::out);
+      void              close();
+      void              flush();
+      operator void*() const;
+      bool operator!() const;
+
+      // iterators
+      iterator          begin();
+      iterator          end();
+
+      // capacity
+      bool              empty();
+      size_type         size();
+
+      // modifiers
+      iterator          insert(const value_type&amp; x);
+      iterator          insert(const Key&amp; k);
+      template&lt;typename InputIterator&gt;
+      void              insert(InputIterator first, InputIterator last);
+
+      void              erase(Iterator pos);
+      size_type         erase(const Key&amp; x);
+      void              erase(iterator first, iterator last);
+      void              clear();
+
+      // observers
+      key_compare       key_comp() const;
+      size_type         page_size() const;
+      XDR_Stream&amp;       xdrstream();
+
+      // operations
+      iterator          find(const Key&amp; x);
+      size_type         count(const Key&amp; x);
+
+      iterator          lower_bound(const Key&amp; x);
+      iterator          upper_bound(const Key&amp; x);
+      std::pair&lt;iterator, iterator&gt;
+                        equal_range(const Key&amp; x);
+
+      // utilities
+      void              reindex();
+      DeleteStrategy          set_delete_strategy(DeleteStrategy strategy);
+      UpdateStrategy          set_update_strategy(UpdateStrategy strategy);
+      int               set_cache_size(int size);
+
+private:
+      // friends
+      friend class Iterator;
+      friend class StreamposProxy;
+      friend class Page;
+      friend class RootPage;
+
+      // data
+      Compare                       _comp;
+      KeyTraits::xio_type           _xstream;
+      RootPage*               _root;
+      PageCache               _pageCache;
+      DeleteStrategy                _dStrategy;
+      UpdateStrategy                _uStrategy;
+
+      // Iterator utility functions - used by friends
+      std::pair&lt;const Key, StreamposProxy&gt;
+                        get_value(size_t page, size_t slot);
+      void              prev_iter(Iterator&amp; it);
+      void              next_iter(Iterator&amp; it);
+
+      // StreamposProxy utility functions - used by friends
+      void              update_link(size_t page, size_t offset, size_t link);
+
+      // BtreeIndex utility functions
+      Page*             get_page(size_t pageId);
+      Page*             get_free_page();
+      void              add_free_page(Page* p);
+      iterator          lower_bound(Page* p, int depth, const Key&amp; k);
+      iterator          upper_bound(Page* p, int depth, const Key&amp; k);
+      iterator          insert(Page*, int depth, const value_type&amp; x);
+      std::pair&lt;bool,bool&gt;       erase(Page* p, int depth, const Key&amp; k, iterator pos);
+
+      void              flush(UpdateStrategy s);
+}; //&gt; BtreeIndex
+
+
+//
+// Class IndexedFile
+//
+template&lt;typename Key,
+         typename Item,
+       typename Compare = std::less&lt;Key&gt;,
+       typename KeyTraits = XDR_Traits&lt;Key&gt;,
+       typename ItemTraits = XDR_Traits&lt;Item&gt;,
+       size_t PageSize = 4096&gt;
+class IndexedFile {
+public:
+      // types
+      class ItemProxy;
+      class Iterator;
+
+      typedef Key                   key_type;
+      typedef std::pair&lt;const Key, Item&gt;      value_type;
+      typedef Compare               key_compare;
+      typedef Iterator              iterator;
+      typedef size_t                      size_type;
+      typedef ptrdiff_t             difference_type;
+      typedef BtreeIndex&lt;Key, Compare, KeyTraits, PageSize&gt; index_type;
+
+      class ItemProxy {
+            friend Iterator;
+            // data
+            IndexedFile*                  _ifile;
+            index_type::StreamposProxy      _posProxy;
+      public:
+            // conversion
+            operator Item()               { return _ifile-&gt;read( _posProxy ); }
+            // assignment
+            void operator=(const Item&amp; item)       { _posProxy = _ifile-&gt;write(item); }
+      private:
+            ItemProxy(IndexedFile* ifile, index_type::StreamposProxy posProxy)
+                        : _ifile(ifile), _posProxy(posProxy) {}
+      };
+
+      class Iterator : public std::iterator&lt;
+std::bidirectional_iterator_tag,
+                         std::pair&lt;const Key, ItemProxy&gt; &gt; {
+            friend IndexedFile;
+
+            // data
+            IndexedFile*                  _ifile;
+            index_type::iterator          _base;
+
+      public:
+            Iterator()  {}
+            std::pair&lt;const Key, ItemProxy&gt;      operator*();
+            Iterator&amp;                     operator++();
+            Iterator                      operator++(int);
+            Iterator&amp;                     operator--();
+            Iterator                      operator--(int);
+            index_type::iterator                base();
+            bool operator==(const Iterator&amp; x) const;
+            bool operator!=(const Iterator&amp; x) const;
+      private:
+            Iterator(IndexedFile* ifile, index_type::iterator base)
+                        : _ifile(ifile), _base(base) {}
+      };
+
+      // construct / destroy
+      explicit IndexedFile(Compare comp = Compare());
+      explicit IndexedFile(
+const std::string&amp; name, 
+            std::ios_base::openmode mode = std::ios_base::in|std::ios_base::out, 
+            Compare comp = Compare());
+      ~IndexedFile();
+
+      // open/close
+      bool              is_open();
+      void              open(
+const std::string&amp; name, 
+std::ios_base::openmode mode = std::ios_base::in|std::ios_base::out);
+      void              close();
+      void              flush();
+      operator void*() const;
+      bool operator!() const;
+
+      // iterators
+      Iterator          begin();
+      Iterator          end();
+
+      // capacity
+      bool              empty();
+      size_type         size();
+
+      // modifiers
+      Iterator          insert(const value_type&amp; x);
+      template&lt;typename InputIterator&gt;
+      void              insert(InputIterator first, InputIterator last);
+
+      void              erase(Iterator pos);
+      size_type         erase(const Key&amp; x);
+      void              erase(Iterator first, Iterator last);
+      void              clear();
+
+      // observers
+      Compare                 key_comp() const;
+      size_t                  page_size() const;
+      index_type&amp;       index();
+      XDR_Stream&amp;       xdrstream();
+
+      // operations
+      Iterator          find(const Key&amp; x);
+      size_type         count(const Key&amp; x);
+
+      Iterator          lower_bound(const Key&amp; x);
+      Iterator          upper_bound(const Key&amp; x);
+      std::pair&lt;Iterator, Iterator&gt;
+                              equal_range(const Key&amp; x);
+
+      // utilities
+
+
+void              compact();
+      Item              read(size_t pos); // decodes and returns the Item at pos
+
+private:
+      //
+data
+      index_type        _index;
+      ItemTraits::xio_type      _xstream;
+
+      // friendly utilities
+      size_t                  write(const Item&amp; item); // returns the streampos
+};
+
+} //&gt; namespace
+
+#endif
+</pre>
+</body></html>

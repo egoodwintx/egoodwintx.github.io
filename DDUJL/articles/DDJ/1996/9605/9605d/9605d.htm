@@ -1,0 +1,525 @@
+<HTML>
+<META NAME="year" CONTENT="1996">
+<HEAD>
+<!-- This document was built using HyperWriter Professional by NTERGAID Inc. -->
+<TITLE>MAY96: Building a DOS Serial Network</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>Building a DOS Serial Network<a name="01aa_008e"><a name="01aa_008e"><a name="01aa_008c"><a name="01aa_0000"></h1><P>
+
+<h2>More functionality than DOS's Interlnk</h2><P>
+
+<h3>Kyle York</h3><P>
+
+<P>
+<i><a name="01aa_008d"><a name="01aa_0000">Kyle is a programmer for TGV and can be contacted at noesis@ucscb.ucsc.edu.</i></p><hr><P>
+
+MS-DOS 6's Interlnk program enables simple resource sharing by allowing you to connect two PCs--a client and a server--via their serial or parallel ports. In this way, you can use one PC to run programs and access data that resides on another. Unfortunately, the server PC must be dedicated, cannot run Windows, and does not allow remote access via the modem. Consequently, I ended up building my own client/server MS-DOS resource-sharing package that supports remote logins, security, and other features. Only three pieces of software are needed to build this utility--a serial port driver, basic networking, and an MS-DOS communication layer--all of which are available in various forms. Once I brought these pieces together, my job was relatively easy.<P>
+
+Still, the package (available electronically in both source and executable form; see &quot;Availability,&quot; page 3) is approximately 6000 lines of C and 3000 lines of assembly code. I wrote most of this package in C for readability. However, there are certain functions that are simply easier to write in assembly stubs. Chaining to another interrupt is easily accomplished in assembly, for instance, and is much faster than any C function. Also, the CRC32 routine was written in assembly for speed: A 4.77-MHz 8088 can process 25K/sec in the assembly-language CRC routine. This was a five-fold increase over my best effort in straight C. The code/algorithms were adapted from information gleaned from the comp.compression FAQ. The original algorithm is attributed to Rob Warnock (rpw3@ sgi.com).<P>
+
+<h3><a name="01aa_008f">MS-DOS Internals<a name="01aa_008f"></h3><P>
+
+For all of its shortcomings, MS-DOS is not horribly laid out. Specifically, all important data and structures are contained in an area of contiguous data, roughly 2KB long, known as the &quot;swappable data area&quot; (SDA). This area contains information such as the process ID of the currently running process, any errors encountered, the current disk-transfer address, and so on. This layout is good because all you need to do to change the context of MS-DOS is swap the contents of this area for each active task, making MS-DOS reentrant and multitasking. Luckily, only a handful of data is needed to successfully multitask and run the installable file system. These are all noted in the dosdata.c module of my package.<P>
+
+This SDA has remained basically unchanged since MS-DOS 3.2, with the exception of MS-DOS 4.x, where Microsoft attempted to build multitasking into the MS-DOS kernel. Because of bugs and incompatibilities, this kernel was abandoned with the release of MS-DOS 5.0. This is only worth mentioning because my DOSRIFS CLIENT module (and the multitasking version of the SERVER module) is not compatible with MS-DOS 4.x.<P>
+
+Since MS-DOS was not designed to be reentrant or multitasking, there are a few precautions you must take before swapping the SDA. Certain functions of the BIOS must be protected; for instance, you don't want to interrupt a pending disk operation. The file _server.asm provides all of the necessary checks to keep MS-DOS and BIOS functioning correctly during a task switch.<P>
+
+<h3><a name="01aa_0090">MS-DOS Redirector Interface<a name="01aa_0090"></h3><P>
+
+The most difficult part of the project involved communicating with MS-DOS. MS-DOS 3.1 included the network-redirector interface attached to Int 0x2f, function 0x11. Although this is often referred to as the MSCDEX API and associated with CD-ROMs, it is actually an installable file-system API that can be used as a translation layer to allow access to any foreign file system. Using the network redirector requires knowledge of many of the MS-DOS internals: the list of lists (LOL), SDA (also known as the &quot;MS-DOS data segment&quot;), current directory structure (CDS), and system file table (SFT). All of the necessary information can be found in Ralf Brown's interrupt list (available from all major MS-DOS FTP sites) and in the book, <I>Undocumented DOS</I>, by Andrew Schulman et al. (Addison-Wesley, 1993). The 22 installable file system (IFS) functions are laid out in a seemingly random order. To simplify things, I grouped them (see <a href="9605d.htm#01aa_009b">Table 1</A>).<P>
+
+Also note that there is no single way to determine whether a particular call should be intercepted. All loaded drivers in the chain receive all requests. If a driver doesn't process a request, it is supposed to chain to the next driver. The logical drives (A:, B:, C:, and so on) are processed by the last driver in the chain. To determine that a call should be intercepted, you need to follow two rules:<P>
+<ul>
+<li>For maintenance commands, the MS-DOS CDS pointer will point to the drive for which the maintenance is to be performed, so the driver need only check the first three characters in the path name for <I>x</I>:\ where <I>x</I> is the drive you are intercepting.</li>
+<li>For file I/O commands, ES:DI points to the file information in the system file table. The device on which the file was opened is in the low 6 bits of the <I>dev_info</I> field, numbered 1...26.</li>
+</ul>
+<h3><a name="01aa_0091">Client Module<a name="01aa_0091"></h3><P>
+
+All IFS dispatching occurs in <I>clientDispatch</I>. The functions in <I>_dispatchTable</I> are laid out based on the subfunction number. The table contains the address of the function that handles this request, the type of check necessary to determine if the request is for a RIFS device, and the RIFS function number (for the server).<P>
+
+If a function does not exist in the table (Null entry), or the call is not directed to a RIFS device, the driver restores the state of all the registers and chains to the next driver.<P>
+
+To conserve memory, each packet is retrieved from a common packet queue. If a packet cannot be found within 30 seconds, a General Failure error is returned. If the packet is found, the necessary fields are initialized, and the packet is sent to the correct function for further processing.<P>
+
+Each function packages the required parameters (<a href="9605d.htm#01aa_009c">Table 2</A>), transmits the request, and waits for a reply. To enable retrying a command, the client module maintains two active packets: one send and one receive.<P>
+
+The most complex functions are <I>file read </I>and <I>file write</I>, because the length of the requested operation can exceed the packet size. To circumvent this, I simply break all requests into 1024-byte (or smaller) pieces and process them one at a time.<P>
+
+Finally, any active packets are released, and the correct status information is returned to MS-DOS.<P>
+
+<h3><a name="01aa_0092">Packeting<a name="01aa_0092"></h3><P>
+
+Packet processing is carried out in dispatch.c (see <a href="9605d.htm#01aa_00a0">Listing One</A>). This makes it easy to change the algorithms and protocols without looking at any other code. The two packeting functions are <I>Transmit</I> and <I>Receive</I>. A packet contains the following packet-specific fields:<P>
+<ul>
+<li>ID, two bytes identifying the destination. I used AY to identify packets headed for the server, and LY to identify packets headed toward the client.</li>
+<li><I>length</I>, the total number of bytes in the packet, including the header.</li>
+<li><I>notLength</I>, the 1's complement of the length, for error checking</li>
+<li>CRC32, the CRC 32 value calculated across all data, plus the header (for the calculation, the CRC32 field is set to 0).</li>
+</ul>
+The remainder of the fields are data fields. To transmit a packet, you supply a packet, with the <I>length</I> field set to just the length of the variable-sized data buffer. The <I>Transmit</I> function adds the length of the header, calculates the <I>notLength</I> and CRC32 fields, and sends the packet.<P>
+
+<I>Receive</I> is somewhat more interesting as it is done byte-by-byte, using a simple state machine; see <a href="9605d.htm#01aa_009d">Table 3</A>. If any state fails the validity check, the process begins again. The packets are assumed to come in blocks. If any byte is not received within about half a second after the last byte, the state times out and returns to 0.<P>
+
+After a full packet is received, it is submitted to either the client or the server for further processing.<P>
+
+<h3><a name="01aa_0093">Server Module<a name="01aa_0093"></h3><P>
+
+The server module is easier to implement than the client, and it can also be made portable to any environment (OS/2, Window NT, Windows 95, UNIX, and so on) with a little effort.<P>
+
+All server processing occurs in <I>_serverDispatch</I>, which is called by the assembly routine <I>_serverTest</I> in _SERVER.ASM. The <I>_serverTest</I> checks for the following conditions: DOS can be interrupted; the program is not trying to interrupt itself; BIOS can be interrupted; and at least one server request is pending.<P>
+
+Once at <I>_serverDispatch</I>, the MS-DOS data area is swapped with the saved version, and the various interrupts are set to prevent accidental interruption: Ctrl-Break handling is simply ignored, and the Abort, Retry, Fail? command is set to always return Fail.<P>
+
+Next, a check is made that a valid function number was used and a valid connection exists. Again, the connection can fail without warning or a correct connection might never have been made (invalid password given during login).<P>
+
+Finally, the packet is sent off for processing, and transmitted back to the client. The server never resends a packet, so the same one is reused when packaging the result.<P>
+
+When running under MS-DOS, the server runs in the background, interrupting only when necessary to process a packet. Unfortunately, this makes the server very system (and version) dependent.<P>
+
+<h3><a name="01aa_0094">Security<a name="01aa_0094"></h3><P>
+
+I've implemented two levels of security, login and share. When a client first establishes a connection with the server, it sends a password. If the password matches with the server, a user validation code is returned to the client with a result code of 0; otherwise, the result code ACCESS_ DENIED is returned and the port is reset. This user-validation code must be present in all packets sent to the server.<P>
+
+In addition, there is share-level security. When a drive is shared by the server,  the following security flags are allowed in addition to a password: directory search, directory create, directory remove, file create, file remove, file read, and file write. To connect to a shared drive, the client sends an IFS_SHAREREQUEST message with the share name and password. If the server validates the password, it returns a verification number along with a result code of 0. This verification number must be present in the <I>shareValidation</I> field for any request to the shared drive, or the result code will be set to ACCESS_DENIED.<P>
+
+<h3><a name="01aa_0095">Parallel-Port Sharing<a name="01aa_0095"></h3><P>
+
+Port sharing is accomplished by intercepting interrupt 0x17 (the parallel port I/O) and routing the requests to the server. Due to packet overhead, sending one byte at a time is inefficient, so a packet is sent only when it becomes full (1024 bytes), a time-out is reached, or function <I>0x01</I> (&quot;initialize parallel port&quot;) is called. All of these functions return a status of printer on line and printer not busy.<P>
+
+When the server receives a packet to be routed to a port, it sends the data to the printer using a simple loop. For this reason, you should run a print spooler on any server that shares its parallel ports.<P>
+
+Serial ports are currently not shareable. The interface exists, but since the BIOS routines do single-character I/O, the overhead would quickly eat up any savings. The data could be buffered in both directions, but I have not implemented it.<P>
+
+<h3><a name="01aa_0096">Communication<a name="01aa_0096"></h3><P>
+
+The communications interface is handled through the IO_BASE structure. This allows a very generic interface from which the specialized device drivers can be derived. Currently, only three such drivers are provided:<P>
+<ul>
+<li>IO_LOOP, the debugging driver that simply echoes all characters received at the <I>Receive(...)</I> function in dispatch.c. Since this guarantees no communication errors, it is useful for debugging the packeting and packet-processing functions. It also sets a baseline from which the speed of connections can be measured.</li>
+<li>IO_SERIAL, derived from a simple asynchronous library, provides serial port I/O with a throughput of up to 115,200 bps when using a null modem and a 16550a UART. Since interrupt-driven serial processing has been discussed at great length, I will not go into detail here. The code is fairly well documented and complete. I had no luck getting the transmitting code to work reliably in an interrupt-driven state, so sending packets is done in a loop, pumping out data as fast as the UART will accept it. Since the packet size is around 1060 bytes, this loop will require a maximum of less than 1 second at 14.4 Kbits/sec. (or about 8 seconds at 1200 bps). Most modems have built-in buffers for compression and error correction, so I would not expect any noticeable delay to occur in the server, even on slow machines.</li>
+<li>IO_PARALLEL, which provides a parallel-port interface with a maximum throughput of around 512 Kbits/sec. The parallel driver is interrupt driven, but because of the high overhead of interrupting for each character, the characters are sent in packet buffers of less than 2KB, preceded by a length and check code.</li>
+</ul>
+<h3><a name="01aa_0097">Configuration<a name="01aa_0097"></h3><P>
+
+The configuration files are simple ASCII text files that list various variables and values to associate with them.<P>
+
+<h3><a name="01aa_0098">Stubs<a name="01aa_0098"></h3><P>
+
+The stub files clstub and svrstub eliminate the client and server code, respectively. This is useful for machines that do not want or need to share resources and for machines running non-MS-DOS operating systems (where the server does not run in the background, but rather in a loop).<P>
+
+<h3><a name="01aa_0099">Running the Driver<a name="01aa_0099"></h3><P>
+
+<a href="9605d.htm#01aa_009e">Table 4</A> lists the functions available via the user interrupt. A sample application (pmap, available electronically in both source and executable format) exercises all of the user functions via a simple command-line interface.<P>
+
+<h3><a name="01aa_009a">Endless Possibilities<a name="01aa_009a"></h3><P>
+
+The exploration into basic client/server packaging will come in handy in future products. While the following tips are common knowledge to most professional programmers, it is good to occasionally be reminded of them:<P>
+<ul>
+<li>Develop the client and server simultaneously. This is immensely important in testing because the communication layer is eliminated as a source of errors.</li>
+<li>Begin with a well-defined, robust, and expandable messaging system. Attention to the details of each function is vitally important here, because any change must be propagated through both the client and server.</li>
+<li>Keep the transmit/receive mechanism completely independent of all other code.</li>
+</ul>
+Now that I have a working IFS stub, I will be able to port my encrypted file system to DOS. Actually, with this stub, it is possible to port any file system to DOS, allowing endless possibilities. It is surprising that in the past 15 years, no one has mass marketed an encrypted file system for DOS. The code for encryption is freely available, as is the code for several different file systems, and now at least one fully functional IFS for MS-DOS is available. With all the concern about security, encrypted file systems will probably become commonplace in the future.<P>
+
+<h4><a name="01aa_009b"><B>Table 1:</B> IFS functions.<a name="01aa_009b"></h4><P>
+
+     Directory Maintenance<P>
+
+<pre>     
+     0x01     Remove Directory
+     0x03     Make Directory
+     0x05     Change Directory</pre>
+
+     Directory Searching<P>
+
+<pre>     
+     0x1b     Find first
+     0x1c     Find next</pre>
+
+     File Maintenance<P>
+
+<pre>     
+     0x0e     set file attributes
+     0x0f     get file attributes
+     0x11     rename
+     0x13     delete
+     0x16     open existing
+     0x17     create/truncate
+     0x2e     extended open</pre>
+
+     File I/O<P>
+
+<pre>     
+     0x06     close
+     0x07     commit
+     0x08     read
+     0x09     write
+     0x0a     lock
+     0x0b     unlock
+     0x21     seek from end</pre>
+
+     Miscellaneous<P>
+
+<pre>     
+     0x0c     get disk space
+     0x20     flush all disk buffers
+     0x23     process termination</pre>
+
+<h4><a name="01aa_009c"><B>Table 2:</B> IFS messages.<a name="01aa_009c"></h4><P>
+<pre>
+IFS Messages     Request                            Response
+
+IFS_RMDIR        ASCIIz fully qualified directory   Error returned by DOS
+                 to remove
+IFS_MKDIR        ASCIIz fully qualified directory   Error returned by DOS
+                 to create
+IFS_CHDIR:       ASCIIz fully qualified directory   Error returned by DOS
+                 to change to
+IFS_FINDFIRST    WORD -- attribute                  Error returned by DOS
+                 ASCIIz -- file mask                struct ffblk
+IFS_FINDNEXT     struct ffblk (from findfirst)      Error returned by DOS
+                                                    struct ffblk
+IFS_SETATTR      WORD -- new file attribute         Error returned by DOS
+                 ASCIIz-- fully qualified file name
+IFS_GETATTR      ASCIIz-- fully qualified file name Error returned by DOS
+                                                    WORD-- file attributes
+                                                    DWORD-- file length
+IFS_RENAMEFILE   ASCIIz-- old filename              Error returned by DOS
+                 ASCIIz-- new filename
+IFS_DELETEFILE   ASCIIz-- filename to delete        Error returned by DOS
+IFS_OPENFILE     WORD-- open mode                   Error returned by DOS
+                 ASCIIz-- file name                 WORD-- handle
+                                                    WORD-- attribute
+                                                    WORD-- file time
+                                                    WORD-- file date
+                                                    DWORD-- file length
+IFS_CREATEFILE   WORD-- create mode                 Error returned by DOS
+                 ASCIIz-- file name                 WORD-- handle
+                                                    WORD-- attribute
+                                                    WORD-- file time
+                                                    WORD-- file date
+                                                    DWORD-- file length
+IFS_EXTOPEN      WORD-- action                      Error returned by DOS
+                 WORD-- open mode                   WORD-- handle
+                 WORD-- create attributes           WORD-- status
+                                                    (0=opened,
+                                                    1=created,
+                                                    2=replaced)
+                 ASCIIz-- filename                  WORD-- file time
+                                                    WORD-- file date
+                                                    DWORD-- file length
+IFS_CLOSEFILE:   WORD-- handle of file to close     Error returned by DOS
+                                                    struct ftime-- time
+                                                    from client SFT
+IFS_COMMITFILE   WORD-- handle of file to commit    0
+IFS_READFILE     WORD-- handle of file from which
+                        to read                     Error returned by DOS
+                 DWORD-- offset into file from      WORD-- number of
+                         which to begin             bytes read
+                 WORD-- number of bytes to read     BYTE[]-- bytes read
+IFS_WRITEFILE    WORD-- handle of file to which to
+                 write                              Error returned by DOS
+                 DWORD-- offset into file from      WORD-- number of bytes
+                 which to begin                     written
+                 WORD-- number of bytes to write
+                 BYTES[]-- data
+IFS_LOCKFILE     WORD-- handle of file to lock or
+                 unlock                             Error returned by DOS
+                 WORD-- function (0=lock, 1=unlock)
+                 DWORD-- offset into file from 
+                 which to begin
+                 DWORD-- number of bytes to lock
+IFS_GETSPACE     BYTE-- logical drive number        Error returned by DOS
+                 (0 = A:, 1 = B:, ...)              struct dfree
+IFS_CLOSEALL     none                               None
+IFS_PORTOUT      WORD-- port # 0...2                0x9000
+                 WORD-- number of bytes
+                 BYTE[]-- data
+IFS_LOGIN        ASCIIz passWORD                    0x00 validated
+                                                    0x05 invalid password
+IFS_SHAREREQUEST ASCIIz-- share name                0x0000 (OK); 0x0005
+                                                    (access denied)
+                 ASCIIz-- passWORD                  WORD-- access bits
+IFS_LIST         WORD-- first share name to         0x0000 (OK); 0x0012
+                 retrieve                           (no more shares)
+                                                    WORD-- number of share
+                                                    names returned
+                                                    WORD-- number of bytes
+                                                    in buffer
+                                                    BYTES[]-- share data
+                                                              WORD (access)
+                                                              ASCIIz name
+                                                              ASCIIz path
+                                                              ASCIIz comments
+</pre>  
+<h4><a name="01aa_009d"><B>Table 3:</B> Receiving a packet.<a name="01aa_009d"></h4><P>
+<pre>
+     State     Description
+     0         Nothing found yet
+     1,2       Looking for ID (AY or LY)
+     3,4       Looking for length
+     5,6       Looking for notLength
+     &gt; 6       Waiting for remainder of the packet
+</pre>
+
+<h4><a name="01aa_009e"><B>Table 4:</B> User functions.<a name="01aa_009e"></h4><P>
+
+USER_LOAD_CHECK<P>
+
+<pre>  entry:  none
+  exit:   URESULT_OK; URESULT_NOT_LOADED</pre>
+
+USER_GET_STATS<P>
+
+<pre>  entry:  p1  = port #
+          p4  = ^status buffer
+  exit:   URESULT_OK; URESULT_PORT_NOT_OPEN; URESULT_INVALID_PORT</pre>
+
+USER_RESET<P>
+
+<pre>  entry:  p1  = port #
+  exit:   URESULT_OK; URESULT_PORT_NOT_OPEN; URESULT_INVALID_PORT</pre>
+
+USER_UNLOAD<P>
+
+<pre>  entry:  p4  = ^segment buffer (2 bytes)
+  exit:   URESULT_OK; URESULT_NOT_LOADED</pre>
+
+USER_CONNECT<P>
+
+<pre>  entry:  p1  = port #
+          p2  = 0 (disconnect), 1 (connect), 2 (connect/force)
+          p4  = ASCIIz password + ASCIIz timeout + ASCIIz retry count
+  exit:   URESULT_OK; URESULT_PORT_NOT_OPEN; URESULT_INVALID_PORT;
+          URESULT_BAD_PASSWORD; URESULT_IN_USE</pre>
+
+USER_DRIVE_MAP<P>
+
+<pre>  entry:  p1  = local drive ('a'..'z')
+          p2  = 0 (unmap), 1 (map), 2 (map/force)
+          p4  = ASCIIz share name + ASCIIz password
+  exit:   URESULT_OK; URESULT_DRIVE_INVALID; URESULT_SHARE_NOT_FOUND;
+          URESULT_DRIVE_IN_USE; URESULT_NOT_CONNECTED;
+          URESULT_BAD_PASSWORD; URESULT_MISMATCH</pre>
+
+USER_DRIVE_MAP_GET<P>
+
+<pre>  entry:  p1  = local drive ('a'..'z')
+          p4  = ^128 byte buffer
+  exit:   URESULT_OK; URESULT_DRIVE_NOT_MAPPED; URESULT_DRIVE_INVALID</pre>
+
+USER_PORT_MAP<P>
+
+<pre>  entry:  p1  = port (0..2 (lpt1..lpt3))
+          p2  = 0 (unmap), 1 (map), 2 (map/force)
+          p4  = ASCIIz share name + ASCIIz password
+  exit:   URESULT_OK; URESULT_SHARE_NOT_FOUND; URESULT_PORT_IN_USE;
+          URESULT_NOT_CONNECTED; URESULT_BAD_PASSWORD; URESULT_MISMATCH;
+          URESULT_INVALID</pre>
+
+USER_PORT_MAP_GET<P>
+
+<pre>  entry:  p1  = port (0..2)
+          p4  = ^128 byte buffer
+  exit:   URESULT_OK; URESULT_PORT_NOT_MAPPED; URESULT_PORT_INVALID;</pre>
+
+USER_LIST<P>
+
+<pre>  entry:  p1  = first share name to get
+          p2  = buffer size
+          p4  = ^buffer (buffer holds server name)
+  exit:   URESULT_OK; URESULT_SHARE_INVALID
+          buffer format: WORD number of shares returned
+          ...WORD access, ASCIIz name, ASCIIz path, ASCIIz comments,...</pre>
+
+USER_SHARE<P>
+
+<pre>  entry:  p1  = access flags (high bit set if port + port # lower 15 bits)
+          p2  = 0 (delete), 1 (add)
+          p4  = ASCIIz name + ASCIIz path + ASCIIz password +
+          ASCIIz remarks
+  exit:   URESULT_OK; URESULT_NAME_IN_USE; URESULT_PATH_NOT_FOUND;
+          URESULT_SHARE_BUFFER_FULL</pre>
+
+USER_SHARE_GET<P>
+
+<pre>  entry:  p1  = share # to get
+          p2  = # of bytes in buffer
+          p4  = ^ buffer
+  exit:  URESULT_OK; URESULT_INVALID_SHARE; URESULT_BUFFER_OVERFLOW
+         buffer holds: WORD (access) + ASCIIz name + ASCIIz path +
+         ASCIIz remarks</pre>
+
+USER_SET_DIRECT<P>
+
+<pre>  entry:  p1  = port #
+          p2  = 1 (lock port) 0 (unlock port)
+  exit:   URESULT_OK; URESULT_PORT_NOT_OPEN; URESULT_PORT_INVALID</pre>
+
+USER_READ_DIRECT<P>
+
+<pre>  entry:  p1  = port #
+          p2  = buffer length
+          p4  = ^buffer
+  exit:   URSULT_OK; URESULT_PORT_NOT_OPEN; URESULT_PORT_INVALID
+          buffer = WORD (# of bytes returned) + data</pre>
+
+USER_WRITE_DIRECT<P>
+
+<pre>  entry:  p1  = port #
+          p2  = buffer length
+          p4  = ^buffer
+  exit:  URSULT_OK; URESULT_PORT_NOT_OPEN; URESULT_PORT_INVALID</pre>
+
+<P>
+
+<h4><a name="01aa_009f"><a name="01aa_00a0">Listing One<a name="01aa_00a0"></h4><pre>
+#include &lt;stdlib.h&gt;
+#include &lt;dos.h&gt;
+#include &quot;dispatch.h&quot;
+#include &quot;asm.h&quot;
+#include &quot;server.h&quot;
+#include &quot;client.h&quot;
+#include &quot;misc.h&quot;
+/* states:
+    get byte  &lt;-------------+---+
+    byte == 'L' or 'K'? &lt;---+-+ |
+      |                     | | |
+      +---&gt; no ----------&gt;--+ | |
+      |                       | |
+    packet ID[0] = bytes      | |
+    get byte                  | |
+    byte == 'Y'               | |
+      |                       | |
+      +---&gt; no ----------&gt;----+ |
+      |                         |
+    packet ID[1] = byte         |
+    get word                    |
+    word &lt;= PACKETSIZE          |
+      |                         |
+      +---&gt; no ----------&gt;------+
+      |                         |
+    length = word               |
+    get word                    |
+    word = ~length              |
+      |                         |
+      +---&gt; no ----------&gt;------+
+      |
+    get remainder of packet
+    dispatch packet
+      |
+  if more than 1/2 sec passes since the last byte, the packet pointer is reset
+*/
+void Receive(PORT *port)
+{
+  register int key;
+  IO_BASE *io  = port-&gt;io;
+  RCVINFO *rcv = port-&gt;rcvInfo;
+  if (!port)
+    return;
+  key = io-&gt;readByte(io, 0);
+  while (key &gt;= 0) {
+    rcv-&gt;stats.bytes.rcvd++;
+    if (!rcv-&gt;packet) {
+      rcv-&gt;packet   = getPacket();
+      if (!rcv-&gt;packet)
+        return;
+      rcv-&gt;ptr      = (void *) rcv-&gt;packet;
+      rcv-&gt;ct       = 0;
+    } else {
+      if (Elapsed(rcv-&gt;lastTime) &gt; 180) {
+        rcv-&gt;stats.errors.timeout++;
+        rcv-&gt;ct = 0;
+      }
+    }
+    rcv-&gt;lastTime = CLOCK;
+    rcv-&gt;ptr[rcv-&gt;ct++] = key;
+    switch (rcv-&gt;ct) {
+      case 2:
+        if (key == 'Y')
+          break;
+        else {
+          rcv-&gt;stats.errors.packetID++;
+          rcv-&gt;ct = 1;
+        }
+      case 1:
+        if ((key != 'K') &amp;&amp; (key != 'L')) {
+          rcv-&gt;stats.errors.packetID++;
+          rcv-&gt;ct = 0;
+        } else
+          break;
+      case 4: /* length has been found */
+        if (rcv-&gt;packet-&gt;length &gt; PACKETSIZE) {
+          rcv-&gt;stats.errors.length++;
+          rcv-&gt;ct = 0;
+        }
+        break;
+      case 6: /* ~length has been found */
+        if (rcv-&gt;packet-&gt;length != ~rcv-&gt;packet-&gt;notLength) {
+          rcv-&gt;stats.errors.length++;
+          rcv-&gt;ct = 0;
+        }
+        break;
+      default:
+        if (rcv-&gt;ct == rcv-&gt;packet-&gt;length) {
+          DWORD oldCRC = rcv-&gt;packet-&gt;crc32;
+          rcv-&gt;packet-&gt;crc32 = 0;
+          if (crc32(0, rcv-&gt;packet, rcv-&gt;packet-&gt;length) != oldCRC) {
+            rcv-&gt;stats.errors.crc++;
+            rcv-&gt;ct = 0;
+          } else {
+            rcv-&gt;fwdPacket = rcv-&gt;packet;
+            rcv-&gt;packet = 0;
+            if (rcv-&gt;fwdPacket-&gt;ID[0] == 'K') {
+              rcv-&gt;stats.server.packetsRcvd++;
+              serverSubmit(io-&gt;port-&gt;server, rcv-&gt;fwdPacket);
+            } else {
+              rcv-&gt;stats.client.packetsRcvd++;
+              clientSubmit(io-&gt;port-&gt;client, rcv-&gt;fwdPacket);
+            }
+          }
+        }
+    }
+    key = io-&gt;readByte(io, 0);
+  }
+}
+/* send (packet) to (port) */
+void Transmit(PORT *port, PACKET *packet)
+{
+  IO_BASE *io        = port-&gt;io;
+  packet-&gt;length    += sizeof(*packet);
+  packet-&gt;notLength  = ~packet-&gt;length;
+  packet-&gt;crc32      = 0;
+  packet-&gt;crc32      = crc32(0, packet, packet-&gt;length);
+  io-&gt;writeString(io, packet, packet-&gt;length);
+}
+RCVINFO *createRcvInfo(void)
+{
+  return calloc(1, sizeof(RCVINFO));
+}
+void freeRcvInfo(RCVINFO *rcvInfo)
+{
+  free(rcvInfo);
+}
+</pre>
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+</BODY></HTML>

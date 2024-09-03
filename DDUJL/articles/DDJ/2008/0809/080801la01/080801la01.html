@@ -1,0 +1,285 @@
+<html>
+<head>
+<title>Managing Application  Thread Use</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> September 2008</p>
+
+<h1>Managing Application Thread Use</h1>
+<h2>Improving performance on shared  memory systems</h2>
+
+
+<h3>By Levent Akyil</h3>
+
+
+<I>Levent is a staff software engineer in Intel's Performance, Analysis, and Threading Lab. He can be contacted at <a href="mailto:levent.akyil@intel.com">levent.akyil@intel.com</a>.</I>
+
+<hr>
+
+
+
+
+<p>From high-end servers to desktops and laptops, multicore processors are increasingly replacing single-core processors. At the same time, however, application developers are confronted with new challenges when creating software that efficiently uses these multicore processors. </p>
+
+<p>The specific challenge I examine in this article is the situation in which multiple CPU-bound multithreaded applications create "oversubscription" on a server and/or desktop system. The problem occurs when individual applications create as many threads as the number of cores available, and when each of these threads performs CPU-intensive tasks. Consequently, oversubscription occurs, negatively impacting overall performance. In other words, without knowing the actual system load and other applications running on the system, each multithreaded application competes with each other for system resources.</p>
+
+
+<h3>Framework Details</h3>
+
+<p>The current generation of nonreal-time operating systems provide some type of fair resource (processor/core) allocation or scheduling; thus, the overall performance is impacted negatively when multiple multithreaded applications execute in parallel. Of course, there have been proposals&#151;static mapping (done before applications are started) and dynamic mapping (calculated at runtime), for instance&#151;about how operating systems can provide some level of quality of service (QoS) and how application QoS values can be mapped to processor capacity. </p>
+
+<p>The concept I propose here involves neither solving the oversubscription problem, nor providing a QoS service. Instead, my proposal involves a lightweight thread usage balancing framework that can be implemented without any changes to operating systems or runtime environments. (However, getting this functionality implemented in operating systems would make this mechanism available to all the applications on demand.) "Thread usage balancing" in this context refers to adjusting the number of threads each application uses, based on the utilization of the cores/processors. If not already using the maximum number of threads allowed (normally the number of physical cores available on the system), the applications only increase their thread count to the maximum allowed during their runtime. </p>
+
+
+<div>
+    
+<!--  -->    
+<img class="illowide" src="080801la01_f1.gif" style="width:425">
+
+<div class="caption" style="width:427">
+Figure 1: Block diagrams showing the framework (loads are the applications).
+</div>
+</div>
+
+
+<p>As Figure 1 illustrates, there are two fundamental parts to the dynamic load-balancing framework: </p>
+
+<ul>
+    <li>A stateless load governor running in the background, which monitors the utilization of the cores periodically. "Stateless" in this context means that the governor doesn't retain any information on how many threads each application uses. </li>
+  <li>The library that applications use to communicate to the governor and adjust their thread count accordingly. The communication takes place via sockets over TCP/IP. All applications set the number of threads to use for parallel regions (in the OpenMP sense), based on the feedback received from the governor, rather than setting the number of threads as the number of processors physically available or as they wish.</li>
+  </ul>
+
+<p>Also, applications only increase their thread count, but can't set it more than the physical number of cores. This makes the initial thread count with which the application starts worth mentioning.</p>
+
+
+
+
+
+
+
+
+<h3>The Load Governor </h3>
+
+<p>The load governor (Figure 2) uses a basic metric&#151;processor idle time&#151;to compute system utilization. Based on the idle time, the governor identifies available cores and returns the number of available cores to the requesting applications. For example, if the idle threshold is set to 5, the governor marks all cores that are idle 5 percent or more of their time as available (95 percent or less utilized) at the time of the snapshot. The processor statistics (system time, idle time, and so on) are collected from /proc/stats periodically (with Linux); this period can be adjusted as a parameter to the governor. </p>
+
+<p>The goal of the governor's algorithm is not to prevent oversubscription, but rather to allow applications to finish as soon as possible. The reflection of the algorithm on the applications can be described as "slow start fast finish" with the exception of the first multithreaded application that contacts the governor, because the first application is guaranteed to start with as many threads as the number of cores. (The assumption here is that when the first application starts, the utilization of all the cores is less than the defined threshold.)</p>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080801la01_f2.gif" style="width:305">
+
+<div class="caption" style="width:307">
+Figure 2: Block diagram showing the internals of the load governor.
+</div>
+</div>
+
+
+
+<h3>The Thread Count Library</h3>
+
+<p>The second part in this framework is the library providing the API calls to communicate to the governor, and API calls to adjust the number of threads based on the number of available cores received as a response. The applications increment their thread count by the number of available cores returned, with the ceiling being the number of physically available cores. </p>
+
+<p>The modifications to the original applications are minimal:</p>
+
+<ol>
+    <li>Include two header files. One for the thread count and governor communication, and one for the timing calculations. The header file for the timing calculations is not necessary but is used during the simulation. </li>
+  <li>Link with library. </li>
+  <li>Modify the code so that just before entering a parallel region, thread count is updated. </li>
+</ol>
+
+<p>Also, the applications were instrumented to run many iterations rather than just one. And before entering a parallel region, each application sets its thread count, which was updated by this sample OpenMP (<a href="http://www.openmp.org">www.openmp.org</a>) code segment:</p>
+
+
+
+<pre class="code">
+
+init_thread_count ( );       // initialize thread count
+while ( iter &lt; ITERATION ) 
+{
+   set_thread_count();       // update thread count
+   start_timer();
+   PARALLEL_REGION        //original benchmark
+   #pragma omp parallel for
+   for (...) 
+   {
+      WORK ( );
+   }
+   stop_timer();
+}
+
+</pre>
+
+<h3>Methodology </h3>
+
+<p>To simulate multiple multithreaded applications running in parallel, I used benchmarks parallelized via OpenMP. I chose OpenMP because it is easy to prototype with and easy to implement the proposed framework. Some of the benchmarks were taken from the OpenMP source code repository (SCR) project (<a href="http://sourceforge.net/projects/ompscr">http://sourceforge.net/projects/ompscr</a>) and others were written from scratch. All the benchmarks are CPU-bound and scale well. </p>
+
+<p>The simulation is performed in two different scenarios: </p>
+
+<ul>
+  <li>In the uniform run, two or more instances of the same benchmark were executed.</li>
+  <li>In the mix run, one or more instances of all benchmarks were run together simultaneously. </li>
+  </ul>
+
+<p>Again, the first benchmark that is started gets the maximum thread count, which is equal to the number of physically available processors.</p>
+
+<p>The baseline measurement for both uniform and mix scenarios is taken when any running benchmark sets the number of threads as the number of processors available on the system, rather than changing their thread count during runtime (no load governor is running). In other words, if <i>n</i> different benchmarks or <i>n</i> instances of any benchmarks are executed simultaneously, there is a total of (<i>n * the number of cores</i>) threads.</p>
+
+
+
+
+
+
+
+
+
+
+
+<h3>Test Results </h3>
+
+<p>In this simulation, I used a 2.67-GHz Intel Core 2 quad-core processor-based DP server with a total of 16-GB RAM running on Fedora Core 6. This platform provided 8 cores for the simulation. The load governor was set to run every 1 second to read the processor statistics from /proc/stats. Each benchmark communicated with the load governor every 10 seconds to update their thread count. The iteration count (ITERATION) was set as 100. Idle time threshold was set to 5, 10, 15, and 20 during the simulation for each test setup. The benchmarks I used in the simulation were: Prime, which finds the prime numbers within a range; Mandel, OpenMP SCR's Mandelbrot implementation that computes an estimation to the Mandelbrot Set area using MonteCarlo sampling; MD, OpenMP SCR's molecular dynamic simulation; and Matvec, matrix vector multiplication. All benchmarks were compiled using Intel C++ compiler version 10.0.</p>
+
+
+<h3>Uniform Test Results </h3>
+
+<p>This scenario was simulated with two and four instances of each benchmark. </p>
+
+<p>The pseudocode for the uniform simulation can be given as follows: The # of instances in the simulation was set to 2 and 4, respectively. </p>
+
+<pre class="code">
+
+for threshold in 5 10 15 20
+do   
+  for load in {prime, mandel, md, matvec}
+    do
+      start governor -thresh  -method
+         for i in # of instances
+         do 
+            start load
+            sleep &lt;sometime&gt;
+         done
+       wait_for_all_loads_to_finish
+       stop governor
+    done
+done
+
+
+</pre>
+<p>The uniform simulation results (Figure 3) show that regardless of the number of instances of the benchmarks (loads), the aggregate elapsed time can be reduced anywhere from 5-20 percent. These results also show that if the number of instances of a benchmark running in parallel is increased, then aggregate elapsed time can be decreased further. Each instance of any benchmark is capable of fully utilizing all cores on the system; therefore, various threshold values used in the simulation didn't make a significant difference. </p>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080801la01_f3.gif" style="width:400">
+
+<div class="caption" style="width:402">
+Figure 3: Uniform test results combined (4 instances of each benchmark; idle threshold 10).
+</div>
+</div>
+
+
+<h3>Mix Run Test Results</h3>
+
+<p>In the real world, however, it is more common to have multiple multithreaded applications running in parallel and competing for the limited number of cores available on the system, rather than running the same application in parallel. As multithreaded applications are more widely available, this is increasingly becoming an everyday scenario. Therefore, the idea behind the mix run is to simulate this case. During the simulation, a single instance of each multithreaded benchmark was executed simultaneously.</p>
+
+<p>The pseudocode for the mix simulation can be given as follows: # of instances here was set to 1 and then 2, respectively.</p>
+
+<pre class="code">
+
+for threshold in 5 10 15 20
+do
+  start governor -thresh -sched
+   for load in {prime, mandel, md, matvec}
+     do 
+       for i in # of instances
+        do    
+         start load
+         sleep &lt;sometime&gt;
+      done
+    done
+  stop governor
+done
+
+</pre>
+<p>Again, the first instances of each load will get the maximum thread count, which is equal to the number of physically available processors/cores. This ensures that the first benchmark to start will complete as fast as possible while others run slower.</p>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080801la01_f4.gif" style="width:550">
+
+<div class="caption" style="width:552">
+Figure 4: Single instances of each benchmark are executed in parallel.
+</div>
+</div>
+
+
+<p>In Figure 4, the total speed-up (that is, decrease in elapsed time of all benchmarks running simultaneously) is 1.23x. Only one out of four benchmarks (matvec) was negatively impacted in this simulation run. After analyzing all the simulation results, it became clear that with this framework, the execution time of each benchmark, and the order in which they are started, made a difference in the aggregate performance. The best aggregate elapsed time improvement was achieved when the benchmark that takes the least amount of time to complete was started first, and the second fastest benchmark as the second. This can be explained in the following manner: </p>
+
+<p>Let <i>L</i><sub>i</sub> be any given benchmark (load), <i>T</i><sub>Li</sub> be the execution time for a benchmark, and <i>n</i> the number of benchmarks. If benchmarks' time to completion is:</p>
+
+<p><i>T</i><sub>L1<i></sub> &lt;..&lt;T</i><sub>L(i-1) <i></sub>&lt; T</i><sub>Li <i></sub>&lt;...&lt;T</i><sub>Ln<i></sub></i></p>
+
+
+
+<p>then the best results are achieved when <i>L</i><sub>1</sub> is started first, then <i>L</i><sub>2</sub>. However, it is not guaranteed that <i>L</i><sub>1</sub> will pick up the available cores when <i>L</i><sub>1</sub> completes; any benchmark can pick up the available cores based on the fact that they communicate with the load governor independently and based on their own timer. In the best mix run, a total of 23 percent improvement on aggregate elapsed time was achieved.</p>
+
+<p>But if again:</p>
+
+
+
+<p><i>T</i><sub>Ln<i></sub>.&gt;...&gt; T</i><sub>L(i-1) <i></sub>&gt; T</i><sub>Li <i></sub>&gt;...&gt;T</i><sub>L1<i></sub></i></p>
+
+
+
+<p>then starting <i>L</i><sub>n</sub> first gives the worst aggregate elapsed time response. The explanation to this is that <i>L</i><sub>n</sub> will take all the available cores and yet still finish last, so that other benchmarks will start with a low number of threads and will complete without having a chance to increase their thread count. This is the only condition where a traditional (oversubscription) framework will out-perform the proposed framework.</p>
+
+<p>It was also noted that the more loaded the system or the longer the applications ran (higher iteration count), the better the aggregate performance.</p>
+
+<p>The dynamic nature of the framework can be analyzed by the Intel Thread Profiler.  Figure 5 shows the Thread Profiler analysis of one of the benchmarks during the test run. One can easily see that OpenMP worker threads were increased every time more processors became available.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080801la01_f5.gif" onclick = "popimage(this,'www.ddj.com - Managing Application  Thread Use - Figure 5')">
+
+<div class="caption">
+Figure 5: Intel Thread Profiler analysis showing how one benchmark increases its OpenMP worker threads dynamically within the framework. 
+</div>
+</div>
+
+
+
+<h3>Conclusion</h3>
+
+<p>Many applications are becoming demanding in how they use processor resources to take advantage of parallelism. However, these applications are not aware of the other applications running alongside them on the same system. Clearly, the lack of system-wide knowledge hinders not only the applications' performance but also the overall system performance.</p>
+
+<p>This framework showed that with a very basic metric and feedback mechanism, overall performance of the applications can be significantly improved. While the described lightweight framework is easy to implement and to take advantage of, it has some aspects that need improvement. Therefore, further study is needed on how to eliminate the dependency on the execution order of the applications. This can be solved by letting the load governor keep some state information about the thread usage of applications and their timing. In this manner, rather than merely increasing their thread count, applications can also decrease the number of threads they use.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

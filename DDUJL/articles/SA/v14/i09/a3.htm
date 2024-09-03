@@ -1,0 +1,638 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v14, i09: Using the Staircase Scheduler for Linux Kernel 2.6</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a3_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink"><a href="a3_f2.htm">Figure 2</a></span></td>
+		<td><span class="navbarLink"><a href="a3_f3.htm">Figure 3</a></span></td>
+		<td><span class="navbarLink"><a href="a3_f4.htm">Figure 4</a></span></td>
+	</tr>
+	<tr>
+		<td><span class="navbarLink"><a href="a3_t1.htm">Table 1</a></span></td>
+		<td><span class="navbarLink"><a href="a3_t2.htm">Table 2</a></span></td>
+		<td><span class="navbarLink"><a href="a3_t3.htm">Table 3</a></span></td>
+		<td><span class="navbarLink"><a href="a3_t4.htm">Table 4</a></span></td>
+		<td><span class="navbarLink"><a href="a3_t5.htm">Table 5</a></span></td>
+	</tr>
+	<tr>
+		<td><span class="navbarLink"><a href="a3_t6.htm">Table 6</a></span></td>
+		<td><a href="../../../../source/SA/2005/sep2005.tar"><b class=codeListing>sep2005.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><img src="a3.gif" width="200" height="167" align="right">Using 
+              the Staircase Scheduler for Linux Kernel 2.6</h1>
+            <P> Mulyadi Santosa
+            <P> The scheduler area of the Linux kernel is getting a major tune-up 
+              on the 2.6 series. In this article, I'll provide a brief explanation 
+              of these changes. I will also measure the effectiveness of both 
+              the Staircase scheduler and the O(1) scheduler on Linux kernel 2.6 
+              under a server workload and analyze the results.
+            <P> The O(1) scheduler is the new scheduler on 2.6 that was written 
+              by Ingo Molnar from Red Hat. This scheduler is a major improvement 
+              over the previous scheduler in 2.4. The main advantage is that it 
+              takes a constant time to select the best task inside the list of 
+              runnable processes. So, rather than expensively traversing a potentially 
+              long list of processes, it performs a lookup on a special map and 
+              picks the related process from there. This lookup is repeated on 
+              every context switch, so it's done in constant time no matter 
+              how many tasks are running in the Linux system.
+            <P> <b>What Is Staircase?</b>
+            <P> The Staircase scheduler, written by Con Kolivas, is a modification 
+              of the O(1) scheduler. The goal of the Staircase scheduler is to 
+              have a simpler design with intrinsic interactivity rather than have 
+              an interactivity estimator modify the behavior of the dual-priority 
+              array design. The Staircase scheduler is not included in the official 
+              Linux kernel package. The scheduler for Linux 2.6 is available from:
+            <P> 
+            <pre>
+http://kernel.kolivas.org
+</pre>
+            Or, you can get the backport patch set for kernel 2.4 from:
+            <P> 
+            <pre>
+http://www.plumlocosoft.com/kernel/
+</pre>
+            Staircase focuses on interactivity because, in the desktop workload 
+            case, many applications frequently pause and wait for some input (e.g., 
+            keypress, mouse click, or timer). While waiting for these actions, 
+            the applications are in sleep state or, technically speaking, TASK_INTERRUPTIBLE 
+            or TASK_UNINTERRUPTIBLE state. When the user, for example, presses 
+            Enter, an interrupt is generated and received by the kernel, and it 
+            wakes up the related process. The kernel must then somehow make the 
+            awakened process (part of the related application) preempt the currently 
+            running task and actually run again at the earliest occasion. If this 
+            process is managed well, the user won't suffer any unnecessary 
+            lag. In this aspect, Staircase tries to make an improvement over the 
+            O(1) scheduler.
+            <P> Staircase has two kernel parameters. One is /proc/sys/kernel/interactive, 
+              which enables or disables interactive mode. The other is /proc/sys/kernel/compute, 
+              which enables or disables compute mode. Simply use the following 
+              commands as root:
+            <P> 
+            <P> To enable interactive mode:
+            <P> 
+            <pre>
+# echo 1 &gt; /proc/sys/kernel/interactive
+</pre>
+            To enable compute mode:
+            <P> 
+            <pre>
+# echo 1 &gt; /proc/sys/kernel/compute
+</pre>
+            Here's how these commands work on Staircase version 10.5 (this 
+            might be different in the latest Staircase scheduler release):
+            <P> 
+            <P> 1. If interactive mode is enabled, Staircase will award a "burst" 
+              bonus on every task. This "burst" will lengthen the time 
+              a task stays on its highest priority according to Staircase's 
+              rule. The "burst" is initially set to 0 (zero) on every 
+              new task and increased whenever a task sleeps longer than a certain 
+              threshold. Of course, this burst bonus can't exceed a certain 
+              limit, so it is guaranteed that a task that sleeps most of the time 
+              won't receive unlimited burst. The burst bonus is also decreased 
+              whenever a task hits its lowest priority and climbs back to its 
+              initial priority.
+            <P> If interactive mode is disabled, every task's priority is 
+              constantly decreased by one after a certain time slice has expired 
+              (about 10 ms).
+            <P> 2. If compute mode is enabled, each task receives ten times the 
+              designated time slice (about 100 ms). The interactive mode status 
+              is <I>ignored</I> when compute mode is enabled, so there is no "burst" 
+              bonus here. Compute mode also delays process preemption (about 10 
+              ms on Uniprocessor). This has no effect on the normal context switch 
+              when the time slice of a process is expired. Delaying preemption 
+              is meant to reduce CPU cache thrashing due to frequent preemption. 
+              See the references for more information about preemption.
+            <P> 
+            <P> Here are the major differences between the O(1) scheduler and 
+              Staircase:
+            <P> 
+            <P> 1. The O(1) scheduler (also known as ingosched) uses two arrays 
+              per run queue, labeled as active and expired. Staircase only uses 
+              one array per run queue. This modification implies that an expired 
+              task doesn't move to an expired array but is reinserted into 
+              the same array (possibly on a different priority queue). The O(1) 
+              scheduler only does reinsertion into active arrays if the task is 
+              considered interactive enough.
+            <P> 2. The O(1) scheduler uses complex bonus dynamic priority calculation 
+              and awarding (-n .. 0 .. +n increment on top of the process's 
+              nice level after each time slice expiration). Conversely, Staircase 
+              constantly downgrades the dynamic priority of a process (adding 
+              +1) after each time slice expiration until it reaches the lowest 
+              priority level and then returns to initial priority.
+            <P> 
+            <P> For better visualization of how both schedulers prioritize running 
+              tasks, see Figure 1. Here, you can see where Staircase got its name 
+              -- constantly downgrading dynamic priority (which is increasing 
+              the number) makes the bars group in a staircase effect. "Slice" 
+              here refers to how long a task is running and getting priority decrement 
+              before it "ascends" back to its highest priority. For 
+              comparison, look at Figure 2 for the O(1) scheduler. "Epoch" 
+              refers to the duration from when no runnable process is selected 
+              to run until all runnable processes' time slices have expired. 
+              These charts provide only a general overview, and the schedulers 
+              might behave differently under certain circumstances. See the references 
+              for more information about the O(1) scheduler, the general scheduler 
+              mechanism, and scheduler documentation.
+            <P> <b>Testing Under Server Workload</b>
+            <P> Before going further, let's define the typical work that 
+              happens under server workload. Roughly speaking, in a server environment, 
+              the jobs are mostly running as background processes and waiting 
+              to receive some request. When the request is received, a process 
+              is expected to complete it as soon as possible without starving 
+              other running processes (or threads) heavily. Depending on the type 
+              of the application, these may be classified as I/O-bound processes 
+              or CPU-bound processes or both. These processes don't need 
+              to quickly return the results of their jobs, but this doesn't 
+              mean that they can perform slowly. For example, a Web server may 
+              need time to process a complex PHP script (possibly fetching data 
+              from a database) and compose the result. But if the process is so 
+              slow that it generates an HTTP timeout, it's unacceptable.
+            <P> Let's move to the crucial point: how does Staircase perform 
+              under server workload? Here we pick two applications to represent 
+              a server environment. One is MySQL version 3.23.58-9 benchmarked 
+              with Sysbench, available from:
+            <P> 
+            <pre>
+http://sysbench.sourceforge.net/
+</pre>
+            The other is Apache Web server version 2.0.49-4 benchmarked with Apache 
+            benchmark (ab). The MySQL server and Apache Web server used in this 
+            test are the default ones included in the Fedora Core 2 distribution.
+            <P> The general descriptions of test platform and execution strategies 
+              are below:
+            <P> 
+            <P> 1. The specification of the hardware is: 
+            <ul>
+              <li> AMD Athlon XP 1800+ (Uniprocessor) 
+              <li> MSI MS-6712 ATX Mainboard (VIA Apollo KT400 North Bridge and 
+                VT 8235 South Bridge) 
+              <li> Memory DDR 2700 184 CAS Latency 2.5 
+              <li> Hard disk Maxtor 80 GB EIDE DMA 133</ul>
+                <P> 2. The hard disk is partitioned into four areas: 
+            <ul><li> First primary partition (20 GB), mounted as root filesystem 
+                (/) 
+              <li> Second primary partition (15 GB), mounted as home directory 
+                (/home) 
+              <li> Third primary partition (512 MB), used as swap 
+              <li> First logical partition (1 GB), mounted as Apache data directory 
+                (/var/www)</ul>
+                <P> All (except the swap partition) are formatted using ext3 filesystem 
+                  and mounted using ordered mode.
+                <P> 3. The kernel version for this testbed is vanilla 2.6.10 with 
+                  and without the Staircase v10.5 patch. The kernel is compiled 
+                  using gcc 3.3.3 (default gcc of Fedora Core 2). On the O(1) 
+                  scheduler test, vanilla 2.6.10 is booted. On the Staircase test, 
+                  2.6.10+Staircase v10.5 is booted.
+                <P> 4. For the Apache benchmark, I used a simple PHP script, which 
+                  renders an HTML calendar of the current month. The script was 
+                  adapted from a downloadable script hosted at phpbuilder.net. 
+                  "ab" is running with concurrency level = 150 for total 
+                  of 4000 requests submitted per iteration.
+                <P> 5. For the MySQL benchmark, I used the preparation mode of 
+                  Sysbench to generate one million rows on a single table containing 
+                  random data. The table type is InnoDB. I selected InnoDB because 
+                  it does locking on the row level and also provides an Oracle-style 
+                  consistent non-locking read in SELECT statements. These features 
+                  increase multi-user concurrency and performance. Sysbench is 
+                  executed using 8 threads, submitting 10000 transactions per 
+                  iteration.
+                <P> 6. For each test, either on the original O(1) process scheduler 
+                  or the Staircase process scheduler, the deadline I/O scheduler 
+                  is used. Each test is executed 10 times, and the average and 
+                  standard deviation of the samples is calculated.
+                <P> 7. For each iteration of the test, rebooting is forced through 
+                  a shell script. In this way, we standardize the amount of caching 
+                  that occurs on each test run. If we don't do this, after 
+                  the first iteration of a test, the cache condition will be different 
+                  (i.e., more data will be initially present on buffer). So, the 
+                  test won't be solely a matter of the scheduler switch, 
+                  but also cache factor, making the analysis harder to do. This 
+                  also has the consequence of restarting MySQL and Apache services 
+                  on each iteration.
+                <P> 8. The test is conducted in single-user mode. The only services 
+                  running are MySQL (on database test) and Apache (on Web server 
+                  test). This way we can guarantee that there are no other tasks 
+                  running. Of course, internal kernel threads, such as pdflush 
+                  or ksoftirqd, are still running because they are needed to execute 
+                  certain kernel tasks. This makes the result less "noisy" 
+                  (less interference from other applications waiting to be executed).
+                <P> 9. The test uses all the possible combinations of the available 
+                  mode on the Staircase scheduler, so we have three combinations: 
+              <ul><li> Interactive enabled and compute disabled. 
+              <li> Interactive disabled and compute disabled. 
+              <li> Compute enabled (note that when compute mode is enabled, the 
+                interactive mode's status is ignored).</ul>
+                <P> We are focusing on three different aspects: 
+              <ul><li> Completion time (overall and per thread) 
+              <li> Latency 
+              <li> Scalability</ul>
+                <P> <b>Completion Time</b>
+                <P> The results of the Apache benchmark are listed in Table 1. 
+                  Take a look at the Time Taken For test (TTF) section. The vanilla 
+                  kernel took 16.356 seconds to complete, and Staircase took 16.418 
+                  seconds. This 0.38% difference shows that the O(1) scheduler 
+                  and the Staircase scheduler performed more or less equally on 
+                  managing competing threads. Compared with the O(1) scheduler, 
+                  the lower standard deviation of TTF on Staircase is a good indication 
+                  that Staircase can maintain runtime consistency.
+                <P> Note that the difference in TTF between Staircase (non-compute 
+                  enabled) and O(1) scheduler is actually below the TTF's 
+                  standard deviation.
+                <P> Here is the math:<p>
+                
+            <table width="100%" border="0" cellpadding="2">
+              <tr> 
+                <td>TTF value range</td>
+                <td>= TTF average +- TTF standard deviation </td>
+              </tr>
+              <tr> 
+                <td>Vanilla kernel's TTF range </td>
+                <td>= 16.356 + 0.232 -- 16.356 - 0.232 </td>
+              </tr>
+              <tr> 
+                <td>&nbsp;</td>
+                <td>= 16.588 -- 16.124 </td>
+              </tr>
+              <tr> 
+                <td colspan="2">Staircase (Interactive Disabled Compute Off) </td>
+              </tr>
+              <tr> 
+                <td>&nbsp;</td>
+                <td>= 16.418 + 0.211 -- 16.418 - 0.211 </td>
+              </tr>
+              <tr> 
+                <td>&nbsp;</td>
+                <td>= 16.629 -- 16.207 </td>
+              </tr>
+              <tr> 
+                <td colspan="2">Staircase (Interactive Enabled Compute Off) </td>
+              </tr>
+              <tr> 
+                <td>&nbsp;</td>
+                <td>= 16.423 + 0.156 -- 16.423 - 0.156 </td>
+              </tr>
+              <tr> 
+                <td>&nbsp;</td>
+                <td>= 16.579 -- 16.267 </td>
+              </tr>
+            </table>
+            <P> For example, if we take Staircase's average result (Interactive 
+              Enabled Compute Off), we get 16.423 seconds, but this value is inside 
+              the vanilla kernel range. So, in the long run, this confirms the 
+              previous statement that the schedulers perform equally well. 
+            <P> The Time Per Request (TPR) and Time Per Request across Concurrent 
+                  Request (TPRCR) values measure the individual time taken to 
+                  complete a single request. Let's focus on TPRCR as this 
+                  indicates how concurrent requests are managed individually.
+                <P> Here, the O(1) scheduler completed individual requests faster, 
+                  but the Staircase scheduler was closely competitive. The 1.23% 
+                  difference shows that these two schedulers race tightly to maximize 
+                  throughput.
+                <P> Note that the Staircase scheduler gave the fastest runtime 
+                  (TTF, TPR, and TPRCR) with interactive mode and compute mode 
+                  disabled. This shows that the "burst" award brought 
+                  no significant advantage on Apache, and it runs fine with constant 
+                  priority degradation. However, since the difference between 
+                  enabling interactive mode and disabling it is in the range of 
+                  the related standard deviation, we can safely use one of those 
+                  Staircase modes without seeing a significant difference.
+                <P> Enabling compute mode, however, gave the worst results for 
+                  Staircase scheduler in the TTF, TPR, and TPRCR cases, so it 
+                  is clear that compute mode should be avoided.
+                <P> Let's move to the MySQL test (see Table 2). Note that 
+                  during the MySQL test, when enabling compute mode, the test 
+                  failed 6-7 times. The error received was "failure to connect 
+                  to MySQL socket". Thus, we simply dropped the compute mode 
+                  from the benchmark.
+                <P> The major indicator of database performance is how many transactions 
+                  can be executed within a certain timeframe. More is better. 
+                  In this case, Tps (Transaction per second) is the statistic 
+                  we're looking for. On average, the O(1) scheduler beat 
+                  the Staircase scheduler with a slight difference (2.42%). However, 
+                  using the same calculation shown for the Apache case, we can 
+                  say that the schedulers produced equal results in the long run.
+                <P> Staircase performed best when the interactive mode was enabled. 
+                  This is the opposite of the Apache test results, which showed 
+                  that disabling the interactive mode worked best.
+                <P> Why is this the case? MySQL sometimes needs to fetch a big 
+                  block of data from the disk. With one million rows being read 
+                  and also updated on some occasions, several processes must wait 
+                  until the data is brought into buffer or actually committed 
+                  to disk. Combined with the locking scheme for each transaction, 
+                  this will reduce some degree of concurrency. A client process 
+                  that is unable to lock the needed rows (to safely perform operations) 
+                  will go to sleep. Here, the interactivity component plays a 
+                  major role by increasing burst on awakening the process and 
+                  causing the process to run longer on highest priority. This 
+                  makes the current running task that receives a burst bonus (e.g., 
+                  doing a read query) less likely to be preempted by another process. 
+                  The result is faster completion time.
+                <P> As always, total time when completing whole jobs is important. 
+                  The results show that O(1) can complete the whole Sysbench test 
+                  run faster than Staircase. O(1) needed 137.0962 seconds, whereas 
+                  Staircase (enabling Interactive mode) needed 140.4485 seconds. 
+                  To better judge this timing issue, look at the value of AvTr 
+                  (Average of time per request). On average, the O(1) scheduler 
+                  took 109.6 ms for each request, and Staircase took 112.3 ms.
+                <P> Here, assuming each single task consumes constant "x" 
+                  ms, the difference shows the extra time (overhead) taken for 
+                  context switch (including how fast the scheduler picks new process). 
+                  Also, keep in mind that a scheduler always picks tasks that 
+                  are in TASK_RUNNING state. Tasks in TASK_INTERRUPTIBLE or TASK_UNINTERRUPTIBLE 
+                  mode that must be awakened (back into TASK_RUNNING mode) need 
+                  extra time to be picked up by the scheduler. A scheduler should 
+                  try to balance these fairly to avoid heavy starvation among 
+                  ready-to-run processes and recently awakened processes. Objectively, 
+                  the O(1) scheduler managed this slightly more efficiently.
+                <P> <b>Latency</b>
+                <P> Faster runtime is everybody's concern, but latency must 
+                  also be considered. As we know, a single CPU (or single core 
+                  on a multiple-core CPU) architecture only executes a single 
+                  process at a time. If you have dual processor, then your computer 
+                  can execute two processes at a time, and so on. But on a busy 
+                  server, the running tasks might number in the hundreds or thousands 
+                  or more. So, the scheduler must pick one task and abandon the 
+                  others for a certain time slice. If the time slice is expired, 
+                  another task is picked up, and the previous one is paused. Thus, 
+                  there is always waiting time between the triggering of a task 
+                  and actual execution of the task. This waiting time also includes 
+                  the interval between when a task is paused by the scheduler 
+                  and when it is re-started. This waiting time is known as latency.
+                <P> For measuring latency, here are the indicators used:
+                <P> 1. For the Apache case, connection time is the base indicator. 
+                  The Apache benchmark (ab) provides this information in the "Connection 
+                  Times" section. Here we pick the "Total" row 
+                  and focus on minimum (min) and maximum (max) time. "Total" 
+                  time represents the time between when a client initiates a connection 
+                  and receives the last byte of data from the server (thus closing 
+                  the whole HTTP session). We also pick a number from "Percentage 
+                  of the requests..." section to represent a majority of 
+                  total connection time. It was decided that 95% was a fair number 
+                  to represent a majority inside the sampled data.
+                <P> 2. For MySQL case, once again we get data from "per-request 
+                  statistics". Similar to the Apache case, we also grab minimum 
+                  (min) time, maximum (max) time, and approximation of 95% value 
+                  (95% value). Again, 95% was considered representative of a majority 
+                  of per request runtime.
+                <P> In both cases, we calculated the following:
+                <P> 
+              <ul><li> Maximum to minimum difference (max-min diff). This number represents 
+                the worst-case latency. Because we have 10 samples, we used the 
+                average of them. 
+              <li> Majority (95% value) to minimum difference (major-min diff). 
+                This number represents the common case latency. Again, we used 
+                the average of the values.</ul>
+                <P> 
+                <P> The above numbers are equally weighted. Ideally, there should 
+                  be near zero difference between them. But since "maximum" 
+                  time has a probability of being a high number compared to "majority" 
+                  time, always expect a big difference between the max-min diff 
+                  and major-min diff.
+                <P> Let's observe Apache first (see Table 3). On latency 
+                  handling, the Staircase scheduler appears to have improved. 
+                  With interactive mode and compute mode disabled, the Staircase 
+                  scheduler lowered the worst-case latency (max-min) value. The 
+                  31.73% (1718.91 ms) difference is somewhat surprising, but since 
+                  Staircase focuses on interactivity, it proves that the algorithm 
+                  truly works.
+                <P> The major-min difference is also interesting. If we just look 
+                  at that column, we can quickly see that compute mode is the 
+                  best mode for Staircase. But, by observing the adjacent column, 
+                  we see that the max-min difference is very bad. Disabling both 
+                  interactive mode and compute mode still gives better latency 
+                  on major-min. Overall, the O(1) scheduler gives the lowest major-min 
+                  value.
+                <P> Now let's look at the MySQL test (see Table 4). Again, 
+                  we throw away the compute mode for the same reason it was dropped 
+                  from the "Completion Time" test previously. So, it 
+                  is just two modes of the Staircase versus the O(1) scheduler.
+                <P> Once again, with interactive mode and compute mode disabled, 
+                  the Staircase scheduler won on worst-case latency with 414.42 
+                  ms (24.5%). The difference shows that even on heavy operations, 
+                  such as this MySQL transaction, Staircase kept the latency low. 
+                  Obviously, huge starvation is not something a user expects when 
+                  awaiting SQL query results. This is not easy to solve, because, 
+                  again, locking (either table or row level) might complicate 
+                  latency. So, don't expect such a low latency if lock or 
+                  long sql transactions are submitted.
+                <P> In the major-min column, the O(1) scheduler consistently won, 
+                  just as in the Apache case. This brings us to an early conclusion 
+                  -- if you really care about worst-case latency, go with 
+                  the Staircase scheduler. But if you care more about how fast 
+                  your service serves the clients, the O(1) scheduler might be 
+                  the better choice.
+                <P> <b>Scalability</b>
+                <P> Now let's use a different number of worker threads on 
+                  each Apache and MySQL test. This scalability test measures timing 
+                  trends on each scheduler. In this test, the rules and configuration 
+                  are still the same; however, there are some changes to note:
+                <P> 1. On both tests (Apache and MySQL), we are pitting the O(1) 
+                  scheduler against only the non-compute mode of Staircase to 
+                  simplify analysis.
+                <P> 2. The test is executed using 8 different threads. I chose 
+                  8 because I use exponential thread numbers (e.g., 2, 4, 8, and 
+                  so on), but we are also limited by the available memory to run 
+                  such a huge number of threads. Thus, this scalability test only 
+                  provides a limited view of scalability, and we can't predict 
+                  what happens beyond the tested number of threads.
+                <P> On each thread number (for example, using 4 threads), I ran 
+                  the test 5 times and calculated the average runtime.
+                <P> 3. We are focusing only on overall completion time, because 
+                  the most relevant factor in a scalability test is throughput. 
+                  This is narrowed again on total time taken for all threads to 
+                  complete, because analyzing individual process time will be 
+                  overwhelming. For Apache, I used "Time Taken for tests" 
+                  output of ab, and "Total time" output from Sysbench.
+                <P> Note that scalability on Uniprocessor has vastly different 
+                  requirements than scalability on increasing numbers of processors, 
+                  so no conclusion on SMP scalability can be drawn from these 
+                  results.
+                <P> As previously, we will first analyze the Apache results (see 
+                  Table 5 and Figure 3) and then the MySQL results.
+                <P> To begin, we must pick a point as the base of scale. "Point" 
+                  here refers to number of running threads. Ideally, we would 
+                  pick 4 threads as the base because that's how we started. 
+                  Note, however, that from 4 to 16 threads, the Staircase scheduler 
+                  shows decreasing trends. This means that a single CPU is still 
+                  able to handle all these loads without penalty. Then, from 16 
+                  to 256 threads, total runtime is increasing. With this fact 
+                  in mind, I decided to measure scalability using 16 threads as 
+                  the base and compare it with results from 128 and 256 threads. 
+                  The actual calculation to compute the scale is shown in Table 
+                  5. Note that we are looking for the lower percentage, not the 
+                  higher one. A higher number means that runtime is increasing, 
+                  and we are looking for faster (lower) runtime.
+                <P> Here is the general form of the scalability formula used:
+                <P> 
+                <P> Scalability of B-to-A = (runtime result B / runtime result 
+                  A ) / (B / A)
+                <P> where B and A are number of threads.
+                <P> 
+                <P> In the 16-to-128 and 16-to-512 cases, Staircase showed better 
+                  scalability with interactive mode disabled -- 0.34% lower 
+                  than O(1) scheduler. We can say, therefore, that they scale 
+                  virtually equally. So, whenever we add 10, 20, or maybe 40 more 
+                  threads, we can expect the O(1) scheduler and the Staircase 
+                  to grow similarly.
+                <P> Does this mean Staircase can outperform O(1) scheduler with 
+                  a larger number of threads? It is hard to say so; by looking 
+                  at the table, the O(1) scheduler still performs better. However, 
+                  it is interesting to note that on 64 threads, we see very little 
+                  difference between them. Between the two Staircase modes, we 
+                  can see no significant difference (&lt; 0.5%), so there is no 
+                  significant growth/shrinkage on alternately using these two 
+                  modes.
+                <P> The MySQL scalability results are shown in Table 6 and Figure 
+                  4. Using the same logic as previously covered on Apache scalability 
+                  test, we start by picking a base point. From 2 to 16 threads, 
+                  all schedulers show decreasing trends. Then, from 16 to 256 
+                  threads, total runtime is increasing. So we use 16 threads as 
+                  the base and compare it with results from 64 and 256 threads. 
+                  The actual calculation to compute the scale is shown in Table 
+                  6.
+                <P> Table 6 shows that Staircase scaled slightly better (2%) than 
+                  O(1) scheduler. Since the growth is smaller, you can see that 
+                  the Sysbench test ran faster on 256 and 128 threads using the 
+                  Staircase scheduler. So, is the previous conclusion (MySQL completion 
+                  time section) wrong? Yes and no. You must recall that locking 
+                  is involved here, and a larger number of threads means serialization 
+                  will slow down everything to maintain data consistency. Therefore, 
+                  the scalability of a scheduler under database operation is somewhat 
+                  unpredictable.
+                <P> As with the Apache case, we can see no significant difference 
+                  (&lt; 0.7%) between the two Staircase modes, so there is no 
+                  significant growth/shrinkage on alternately using these two 
+                  modes.
+                <P> <b>Conclusions</b>
+                <P> Picking an alternative scheduler is always tricky. Remember 
+                  there is no single bull's-eye solution for scheduling. 
+                  In this article, I analyzed the Staircase scheduler's performance 
+                  under a server workload. The O(1) scheduler was chosen as a 
+                  baseline, because the Staircase represents major modifications 
+                  upon it -- primarily the removal of expired queue and modification 
+                  of dynamic priority calculation.
+                <P> Although the O(1) scheduler performed slightly better in both 
+                  Apache and MySQL tests, the Staircase scheduler shows great 
+                  promise in server workload (as shown on the latency test). Although 
+                  the Staircase scheduler was developed primarily for desktop 
+                  needs, we've seen that it can be the equivalent of the 
+                  O(1) scheduler in certain cases. Therefore, I recommend testing 
+                  the Staircase scheduler (and others) in your own configuration 
+                  to determine which one best suits your needs.
+                <P> Note that I received a last minute note from Con Kolivas that 
+                  throughput is the primary area addressed after version Staircase 
+                  version 10.5, so we may expect better results in updated Staircase 
+                  code in the near future.
+                <P> If you are interested in testing the Staircase scheduler with 
+                  other useful patches, there are ready-to-use patch sets available 
+                  from <B>http://kernel.kolivas.org</B> -- one for desktop 
+                  usage, and another for server usage.
+                <P> From the experiments, here are the important points about 
+                  Staircase:
+                <P> 1. Interactive mode yields different results on different 
+                  applications. The rule of thumb is to enable it on applications 
+                  that are heavy on I/O and disable it on less I/O-intensive tasks. 
+                  Memory-hogging tasks are not influenced much by interactive 
+                  mode, but extensive I/O disk tasks benefit from it.
+                <P> 2. Compute mode is not suitable for applications such as databases, 
+                  because it delays preemption and thus adds latency, a key factor 
+                  in improving overall throughput. However, it might be useful 
+                  on almost pure CPU tasks, such as rendering, because compute 
+                  mode gives a longer time slice, allowing the process to finish 
+                  faster with less chance of being preempted.
+                <P> 3. If you care about worst-case latency, disabling both interactive 
+                  mode and compute mode is the best way to go.
+                <P> 4. Disabling and enabling interactive mode makes the performance 
+                  of these schedulers scale quite similarly. So, if you get equal 
+                  results with a certain thread number, you will likely get equal 
+                  results when increasing or decreasing them. Therefore, if you 
+                  decide that a certain mode of Staircase works best for you, 
+                  stick with it unless the application characteristics (e.g., 
+                  table type, amount of cache, HTTP timeout) or hardware specifications 
+                  (e.g., RAM, L1/L2 cache, more CPU) are changed.
+                <P> Remember that this test was conducted in single-user mode. 
+                  However, single-user mode is not the one generally used in a 
+                  production environment. A sys admin usually picks run-level 
+                  3 (multi-user mode with network support) and runs ad hoc services 
+                  such as crond, xinetd and others. This environment might affect 
+                  how your main applications work. To lessen the effect, always 
+                  set non-primary tasks to a lower priority (using "nice"). 
+                  You can also explore the possibility of using SCHED_BATCH priority 
+                  implemented in the Con Kolivas patchset.
+                <P> <b>Acknowledgements</b>
+                <P> The author thanks God and the following people for the feedback 
+                  and comments that made this article better (in no particular 
+                  order): Con Kolivas, Jake Moilanen, Rick Lindsley, Mithlesh 
+                  Thukral, Amit Shah, R. Krishnakumar, Baruch Evans, Nur Hussein, 
+                  Josh Aas, Tony Vegan, Muli Ben Yehuda, Piotr Neuman, Philippe 
+                  Reynes.
+                <P> <b>References</b>
+                <P> 1. Brief explanation on how staircase scheduler works, by 
+                  Con Kolivas -- <B>http://lwn.net/Articles/87729/</B>
+                <P> 2. Documentation of Linux kernel scheduler (based on version 
+                  2.6.8.1) --<B>http://josh.trancesoftware.com/linux/</B>
+                <P> 3. Documents inside Linux kernel package explaining O(1) scheduler 
+                  -- Documentation\sched-design.txt, Documentation\sched-coding.txt
+                <P> 4. MySQL Reference Manual -- <B>http://dev.mysql.com/doc/mysql/en/index.html</B>
+                <P> 5. Schedtool, a tool to query or alter a process's scheduling 
+                  policy under Linux -- <B>http://freequaos.host.sk/schedtool/</B>
+                <P> 6. Con Kolivas patchset -- <B>http://kernel.kolivas.org</B>
+                <P> 7. Backport of Con Kolivas patchset on Linux kernel 2.4 -- 
+                  <B>http://www.plumlocosoft.com/kernel/</B>
+                <P> 8. Using MySQL to benchmark OS performance -- <B>http://software.newsforge.com/software/04/12/27/1238216.shtml?tid=72&amp;tid=29</B>
+                <P> 9. Comparing MySQL performance --<B>http://www.newsforge.com/article.pl?sid=04/12/27/1243207</B>
+                <P> <b>Further Reading</b>
+                <P> 1. Love, Robert, M. 2005. <I>Linux Kernel Development</I>, 
+                  2nd ed. Novell Press.
+                <P> 2. Linux kernel analysis -- <B>http://tldp.org/HOWTO/KernelAnalysis-HOWTO.html</B>
+                <P> 3. Linux: Benchmarking the Staircase Scheduler -- <B>http://kerneltrap.org/node/3589</B>
+                <P> 4. Description of The staircase scheduler -- <B>http://lwn.net/Articles/87729/</B>
+                <P> 5. Staircase vs. non-Staircase comparison -- <B>http://eaglet.rain.com/rick/linux/staircase/scase-vs-noscase.html</B>
+                <P> 6. OProfile-kernel profiler -- <B>http://oprofile.sourceforge.net/</B>
+                <P> 7. Patch: CPU scheduler evaluation tool -- <B>http://lwn.net/Articles/91455/</B>
+                <P> 8. CPU scheduler evaluation patch -- <B>https://sourceforge.net/projects/cpuse/; 
+                  http://cpuse.sourceforge.net/</B>
+                <P> 9. Linux Scheduler Stuff Page -- <B>http://www.xmailserver.org/linux-patches/lnxsched.html</B>
+                <P> <I>Mulyadi Santosa lives on Indonesia and works as a freelance 
+                  writer and IT consultant. He received his bachelor's degree 
+                  in informatics engineering. He specializes in clustering and 
+                  Internet services. He can be contacted at: <B>mulyadi.santosa@gmail.com</B>.</I></ul></table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

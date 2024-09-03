@@ -1,0 +1,561 @@
+<HTML>
+<HEAD><TITLE>DDJ, Software Careers Fall 97: Java RMI in Practice</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+
+
+
+
+<H1>Java RMI in Practice</H1>
+Software Careers Fall 1997 <I>Dr. Dobb's Journal</I>
+<H3><I>by Martin Remy</I></H3>
+<hr>
+
+<B>Listing One</B>
+<pre>
+/*********************************
+ * InterviewManagerInterface.java
+ * This interface is implemented
+ * by UnicastRemoteObjects who 
+ * can act as InterviewManagers 
+ * to the InterviewApplet.
+ */
+
+package remylabs.interview;
+
+import java.rmi.*;
+
+public interface InterviewManagerInterface extends Remote
+{
+       // method for starting or re-starting interview
+    public void startInterview(int iInterviewID)
+    throws RemoteException;
+
+       // method to find out current doc in QuestionSet
+    public String getCurrentQuestion(int iInterviewID)
+    throws RemoteException;
+
+       // method for advancing to the next question
+       // should return false at end of interview.
+    public boolean advance(int iInterviewID)
+    throws RemoteException;
+
+       // method to transmit answer to a question
+    public void storeResponse(int iInterviewID, int iResponse)
+    throws RemoteException;
+}
+</pre>
+<hr>
+
+<B>Listing Two</B>
+<pre>
+/***********************
+ * InterviewServer.java
+ * The class InterviewServer implements InterviewManagerInterface
+ * and tracks the interview on behalf of the client.
+ * Since the class uses InterviewPlan objects to 
+ * maintain knowledge of the state of an interview,
+ * it would be easy to use serialized InterviewPlan
+ * objects keyed to the interview ID to persistently
+ * store interview states.  
+ * note: this version prints trace info to stdout.
+ */
+
+package remylabs.interview;
+
+import java.util.*;
+import java.rmi.*;
+import java.rmi.server.*;
+
+public class InterviewServer extends UnicastRemoteObject 
+implements InterviewManagerInterface
+{
+    public static final String INVALID_ID_DOC = "error.html";
+
+    private Hashtable _htInterviews;
+
+    InterviewServer() throws RemoteException
+    {
+        super();
+        _htInterviews = new Hashtable();        
+    }
+
+       // not from IVM interface
+    public boolean isActiveInterview(int iInterviewID)
+    {
+       // this method could be extended to look for active
+       // interviews in Plan's persistent store -- see above
+
+        if (_htInterviews.containsKey(new Integer(iInterviewID)))
+            return true;
+        else 
+            return false;
+    }
+
+    public void startInterview(int iInterviewID) 
+    throws RemoteException
+    {
+        if (isActiveInterview(iInterviewID))
+        {
+               // we're restarting the interview
+            System.out.println("Restarting interview: " + iInterviewID);
+        }
+       else
+        {
+               // we construct a new InterviewPlan
+            System.out.println("Starting new interview: " + iInterviewID);
+            InterviewPlan plan = new InterviewPlan(iInterviewID);
+            _htInterviews.put(new Integer(iInterviewID), plan);
+        }
+    }
+
+    public String getCurrentQuestion(int iInterviewID) 
+    throws RemoteException
+    {
+        if (isActiveInterview(iInterviewID))
+        {
+            System.out.println("Getting current page for: " + iInterviewID);
+            return ((InterviewPlan)_htInterviews.
+                        get(new Integer(iInterviewID))).getCurrentQuestion();
+        }
+        else
+        {
+            System.out.println("inactive interview id 
+                          (" + iInterviewID + ") in: getCurrentQuestion()");
+            return INVALID_ID_DOC;
+        }
+    }
+    public void storeResponse(int iInterviewID, int iResponse)
+    {
+        if (isActiveInterview(iInterviewID))
+        {
+            System.out.println("Storing response: " + iResponse);
+            ((InterviewPlan)_htInterviews.
+                    get(new Integer(iInterviewID))).storeResponse(iResponse);
+        }
+        else
+        {
+            System.out.println("inactive interview id 
+                               (" + iInterviewID + ") in: storeResponse()");
+        }   
+    }
+    public boolean advance(int iInterviewID)
+    {
+        if (isActiveInterview(iInterviewID))
+        {
+            System.out.println("Advancing: " + iInterviewID);
+            InterviewPlan plan = ((InterviewPlan)_htInterviews.
+                                          get(new Integer(iInterviewID)));
+            if (plan.hasMoreQuestions())
+            {
+                plan.nextQuestion();
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+        else
+        {
+           System.out.println("inactive interview id 
+                                (" + iInterviewID + ") in: storeResponse()");
+            return false;
+        }   
+    }
+    public static void main(String args[])
+    {
+        try 
+        {
+            System.setSecurityManager(new RMISecurityManager());
+        }
+        catch(RMISecurityException ex)
+        {
+            System.out.println("Security Violation: " + ex.toString());
+        }
+        try
+        {
+            InterviewServer interviewServer = new InterviewServer();
+            try 
+            {
+                Naming.unbind("INTERVIEW_MGR");
+                System.out.println("apparently unbound...");
+            }
+            catch (Exception ex) {}
+            Naming.bind("INTERVIEW_MGR",interviewServer);
+            System.out.println("apparently bound...");
+        }
+        catch(Exception ex) { ex.printStackTrace(); }
+    }
+}</pre>
+<hr>
+<B>Listing Three</B>
+<pre>
+/***********************
+ * InterviewApplet.java
+ * The worker applet that
+ * manages the interview
+ * at the client.
+ */
+
+package remylabs.interview;
+
+import java.applet.*;
+import java.net.*;
+import java.rmi.*;
+import remylabs.interview.*;
+
+public class InterviewApplet extends Applet implements Remote
+{
+
+    public final static String LOGIN_DOC = "login.html";
+    public final static String ERROR_DOC = "error.html";
+
+   public final static int VOID_ID = -1;
+
+    private int _id = VOID_ID; // candidate's interview ID
+
+       // this references our Remote Object
+    private InterviewManagerInterface _interviewManagerInterface = null;
+
+    /****************************************
+     * initialized() indicates whether or not
+     * we are in a state to proceed with the interview
+     */
+    public boolean initialized()
+    {
+           // additional tests of ready state go here...
+
+        if (_interviewManagerInterface==null) return false;
+        if (_id != VOID_ID) return false;
+        return true;
+    }
+
+    /****************************************************
+     * showCurrentQuestion interrogates the remote object
+     * about the current question, and displays the HTML
+     */
+    public void showCurrentQuestion()
+    throws RemoteException
+    {
+        if (initialized())
+        {
+            String strDoc = _interviewManagerInterface.getCurrentQuestion(_id);
+            try
+            {
+                getAppletContext().showDocument(new URL(getDocumentBase(), 
+                                                           strDoc),"qframe");
+            }
+            catch (MalformedURLException exMalURL) { /* show error doc */ }
+        }
+    }
+    /***************************************
+     * respondAndAdvance is a process wrapper
+     * for the Server methods storeResponse() and
+     * advance().
+     */
+    public void respondAndAdvance(int iResponse)
+    throws RemoteException
+    {
+        if (initialized())
+        {
+               // store the response
+            _interviewManagerInterface.storeResponse(_id, iResponse);
+
+               // advance to the next question
+            boolean fMore = _interviewManagerInterface.advance(_id);
+
+           // if we're at the end, then say so
+           if (fMore)
+           {
+               showCurrentQuestion();
+           }
+           else
+           {   
+               // show end-of-interview page
+           }
+        }
+    }
+    /*******************************
+     * login starts or reestablishes 
+     * the interview.  The remote object
+     * remembers where we left off, if
+     * this is not our first session.
+     */
+    public void login(int id)
+    throws RemoteException
+    {
+       // this method is called when the user has typed in his interview ID,
+       // &amp; we are ready begin (or re-establish) our session with the remote
+       // object. note: we assume that init either found a remote object 
+       // or threw an exception to the browser.
+
+        _id = id;
+        _interviewManagerInterface.startInterview(_id);
+        showCurrentQuestion();  
+    }
+    /****************************************************
+     * verifyPage() confirms that we're on the right page
+     */
+    public void verifyPage(String strDoc)
+    {   
+        try
+        {
+            if (!strDoc.trim()
+                .equalsIgnoreCase(_interviewManagerInterface
+                .getCurrentQuestion(_id).trim()))
+            {
+                showCurrentQuestion();
+            }
+        }
+        catch (RemoteException exRemote) 
+        {
+            try
+            {
+                getAppletContext().showDocument(new URL(getDocumentBase(),
+                                                       ERROR_DOC),"qframe");
+            }
+            catch (MalformedURLException exMalURL) { /* status message */ }
+        }
+    }
+    /***************************************************
+     * init() takes care of establishing our RMI session
+     */
+    public void init()
+    {
+        Remote remoteObject = null;
+        // System.setSecurityManager(new RMISecurityManager());
+
+        try
+        {
+            remoteObject = Naming.lookup("INTERVIEW_MGR");
+
+        if (remoteObject instanceof InterviewManagerInterface)
+        {
+          _interviewManagerInterface = (InterviewManagerInterface)remoteObject;
+        }
+          else throw 
+          new Exception("No InterviewServer: got a " + remoteObject.
+                                         getClass().getName() + " instead.");
+        } catch(Exception ex) 
+{ throw new Error("RMI error: " + ex.toString()); }
+
+    }
+    /***************************************
+     * start() will be called by the browser
+     * when our containing frame first (re-)appears.
+     * In this case, we want to force login again,
+     * in case the candidate has surfed to another
+     * site and is coming back...
+     */ 
+    public void start()
+    {
+           // reset id
+        _id=VOID_ID;
+
+        try
+        {
+            getAppletContext().showDocument(new URL(getDocumentBase(), 
+                                                    LOGIN_DOC), "qframe");
+        } catch (MalformedURLException exMalURL) { /* ignore */ }
+    }
+    /**************************************
+     * stop() will be called by the browser 
+     * when the frame containing the applet
+     * is closed, which is effectively the
+     * end of a session for us.  Since the
+     * remote object saves state persistently,
+     * all we have to do is reset the id.
+     */
+    public void stop()
+    {
+        _id=VOID_ID;
+    }
+}</pre>
+<hr>
+
+<B>Listing Four</B>
+<pre>
+/********************
+ * InterviewPlan.java
+ * The class InterviewPlan represents an entire set
+ * of questions, generated to be randomized but fair,
+ * and covering the candidate's areas of expertise
+ * at the expected skill levels.
+ * This class also knows the answers to the questions
+ * as well as the candidate's responses.
+ * Each entry(question) corresponds to the filename of
+ * a document that presents the question.
+ * This relationship can be further abstracted, so that
+ * this class holds keys into a QUESTIONS table in a DB,
+ * for example, leaving the presentation medium to 
+ * consumers of this framework.
+ */
+
+package remylabs.interview;
+
+import java.util.*;
+
+public class InterviewPlan implements Enumeration
+{
+    public final static String DEFAULT_DOC = "error.html";
+    private Vector _vPlan;
+    private Vector _vAnswers;
+    private Vector _vResponses;
+
+    private int _iIndex;
+
+    public InterviewPlan(int iInterviewID)
+    {
+       // this ctor would contain a plan generator that builds an appropriate
+       // set of interview questions based on the id passed to the ctor,
+       // which is keyed to skill set, difficulty levels, length of the  
+       // interview, etc. note: In this demo, we build an arbitrary set.
+
+        _vPlan = new Vector();
+        _vAnswers = new Vector();
+        
+        _vPlan.addElement("cpp_003.html");
+        _vAnswers.addElement(new Integer(3));
+
+        _vPlan.addElement("oracledba_029.html");                
+        _vAnswers.addElement(new Integer(1));
+
+           // construct a responses vector 
+        _vResponses = new Vector(_vPlan.size());
+
+           // reset current index pointer
+        _iIndex = 0;
+
+    }
+
+    /**
+     * The Enumeration method hasMoreElements
+     */
+    public boolean hasMoreElements()
+    {
+        return hasMoreQuestions();
+    }
+
+    /**
+     * The Enumeration method nextElement
+     */
+    public Object nextElement()
+    {
+        return (Object)nextQuestion();
+    }
+
+    /**
+     * returns filename of next question's doc
+     */
+    public String nextQuestion()
+    {
+        _iIndex++;
+        if (hasMoreQuestions())
+            return ((String)_vPlan.elementAt(_iIndex));
+        else
+            return null;        
+    }
+
+    /**
+     * returns true if not at end
+     */
+    public boolean hasMoreQuestions()
+    {
+        if (_iIndex &lt; _vPlan.size())
+            return true;
+        else        
+            return false;
+    }
+
+    /**
+     * stores the reponse to the current question
+     */
+    public void storeResponse(int iResponse)
+    {
+        if (_iIndex &lt; _vPlan.size())
+        {
+            _vResponses.setElementAt(new Integer(iResponse), _iIndex);
+        }       
+    }
+
+    /**
+     * for resetting the current index pointer
+     */
+    public void reset()
+    {
+        _iIndex=0;
+    }
+
+    /**
+     * gets the doc at the current pointer
+     */
+    public String getCurrentQuestion()
+    {
+        return ((String)_vPlan.elementAt(_iIndex));
+    }
+}</pre>
+<hr>
+
+<B>Listing Five</B>
+<pre>
+&lt;!-- sample question document: cpp_007.html --&gt;
+
+&lt;HTML&gt;
+&lt;HEAD&gt;
+   &lt;META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=iso-8859-1"&gt;
+   &lt;META NAME="Author" CONTENT="Martin Remy"&gt;
+   &lt;META NAME="GENERATOR" CONTENT="Mozilla/4.0b4 [en] (Win95; I) [Netscape]"&gt;
+   &lt;TITLE&gt;Job Interview&lt;/TITLE&gt;
+&lt;/HEAD&gt;
+&lt;BODY onLoad='parent.jframe.document.InterviewApplet.
+verifyPage("cpp_003.html")'
+TEXT="#000000" BGCOLOR="#FFFFFF" LINK="#0000EE" VLINK="#551A8B" 
+ALINK="#FF0000"&gt;
+&lt;FONT SIZE=+1&gt;Question 7, C++&lt;/FONT&gt;
+&lt;BR&gt;
+&lt;HR SIZE=1 WIDTH="100%"&gt;
+&lt;BR&gt;&lt;FONT SIZE=+1&gt;&amp;nbsp;&lt;/FONT&gt;
+&lt;BR&gt;&lt;FONT SIZE=+2&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp; One of the differences 
+between structs&lt;/FONT&gt;
+&lt;BR&gt;&lt;FONT SIZE=+2&gt;&amp;nbsp;&amp;nbsp;&amp;nbsp; and classes in C++ is:&lt;/FONT&gt;
+&lt;UL&gt;&lt;FONT COLOR="#330033"&gt;&lt;FONT SIZE=+2&gt;a.&amp;nbsp; Structs cannot contain
+functions.&lt;/FONT&gt;&lt;/FONT&gt;
+&lt;BR&gt;&lt;FONT COLOR="#330033"&gt;&lt;FONT SIZE=+2&gt;b.&amp;nbsp; Default access in a struct
+is &lt;B&gt;&lt;TT&gt;public&lt;/TT&gt;&lt;/B&gt;.&lt;/FONT&gt;&lt;/FONT&gt;
+&lt;BR&gt;&lt;FONT COLOR="#330033"&gt;&lt;FONT SIZE=+2&gt;c.&amp;nbsp; You can't fail structs.&lt;/FONT&gt;&lt;/FONT&gt;&lt;/UL&gt;
+
+&lt;HR SIZE=1 WIDTH="100%"&gt;
+&lt;BR&gt;&amp;nbsp;
+&lt;a href="javascript:parent.jframe.document.InterviewApplet.
+respondAndAdvance(1)"&gt;
+&lt;IMG border=0 SRC="button.jpg" HSPACE=5 VSPACE=5 HEIGHT=15 WIDTH=45 
+ALIGN=ABSCENTER&gt;
+&lt;/a&gt;
+&lt;FONT SIZE=+2&gt;a&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;
+&lt;a href="javascript:parent.jframe.document.InterviewApplet.
+respondAndAdvance(2)"&gt;
+&lt;IMG border=0 SRC="button.jpg" HSPACE=5 VSPACE=5 HEIGHT=15 
+WIDTH=45 ALIGN=ABSCENTER&gt;&lt;/FONT&gt;
+&lt;/a&gt;
+&lt;FONT SIZE=+2&gt;b&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;&amp;nbsp;
+&lt;a href="javascript:parent.jframe.document.InterviewApplet.
+respondAndAdvance(3)"&gt;
+&lt;IMG SRC="button.jpg" HSPACE=5 VSPACE=5 HEIGHT=15 WIDTH=45 
+ALIGN=ABSCENTER&gt;&lt;/FONT&gt;
+&lt;/a&gt;
+&lt;FONT SIZE=+2&gt;c&lt;/FONT&gt;
+&lt;UL&gt;&lt;FONT COLOR="#3333FF"&gt;&lt;FONT SIZE=+2&gt;&lt;/FONT&gt;&lt;/FONT&gt;
+&lt;BR&gt;&lt;FONT COLOR="#3333FF"&gt;&lt;FONT SIZE=+2&gt;&lt;/FONT&gt;&lt;/FONT&gt;&lt;/UL&gt;
+
+&lt;/BODY&gt;
+&lt;/HTML&gt;
+</pre>
+<hr>
+<B>End Listings</B>
+<p>
+<b>DDJ</b>
+
+<p>
+
+</BODY>
+</HTML>

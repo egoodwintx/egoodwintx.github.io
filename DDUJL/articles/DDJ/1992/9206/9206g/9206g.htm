@@ -1,0 +1,783 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>JUN92: PROGRAMMING THE 12C INTERFACE</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>PROGRAMMING THE I<SUP>2</SUP>C INTERFACE<a name="0157_0003"></h1><P>
+<h2><a name="0157_0001"><a name="0157_0000">When intelligent devices need to communicate</h2><P>
+<h3>Mitchell Kahn</h3><P>
+<p><i><a name="0157_0002"><a name="0157_0000">Mitch is a senior strategic development engineer for Intel and can be contacted at 5000 W. Chandler Blvd., Chandler, AZ 85226 or at mkahn@sedona.  intel.com.</i></p><hr><P>
+The Inter-Integrated Circuit Bus (I&quot;{2}C Bus&quot; for short) is a two-wire, synchronous, serial interface designed primarily for communication between intelligent IC devices.  The I<SUP>2</SUP>C bus offers several advantages over &quot;traditional&quot; serial interfaces such as Microwire and RS-232. Among the advanced features of I<SUP>2</SUP>C are multimaster operation, automatic baud-rate adjustment, and &quot;plug-and-play&quot; network extensions.<P>
+Mention the I<SUP>2</SUP>C bus to a group of American engineers and you'll likely get hit with an abundance of blank stares.  I say American engineers because until recently the I<SUP>2</SUP>C bus was primarily a European phenomenon.  Within the last year, however, interest in I<SUP>2</SUP>C in the United States has risen dramatically.  Embedded systems designers are realizing the cost, space, and power savings afforded by robust serial interchip protocols.<P>
+The idea of serial interconnect between integrated circuits is not new.  Many semiconductor vendors offer devices designed to &quot;talk&quot; via serial links with other processors.  Current examples include Microwire (National Semiconductor), SPI (Motorola), and most recently Echelon's Neuron chips.  In all cases, the goal is the same: to reduce the wiring and pincount necessary for a parallel data bus.  It simply does not make economic sense to route a full-speed parallel bus to a slow peripheral.<P>
+Unfortunately for most serial-bus-capable devices, the choice of a bus protocol will dictate the CPU architecture.  For example, only two CPU architectures implement an on-chip I<SUP>2</SUP>C port.  If your choice of architecture precludes use of these architectures, then your only option is to implement the protocol in software.<P>
+The software implementation of the I<SUP>2</SUP>C protocol discussed in this article came about as a result of an implicit challenge during a staff meeting.  One of our managers proposed that we hire a consultant to write a software I<SUP>2</SUP>C driver for the Intel 80C186EB embedded processor. Being somewhat new to the group, I took exception (although not verbally!) to his suggestion. A weekend of intense hacking later, I presented the first prototype of the driver.  My reward?  I got to write a generic version of the driver for general distribution.<P>
+<h3><a name="0157_0004">Design Trade-offs<a name="0157_0004"></h3><P>
+Three distinct tasks are involved in implementing the I<SUP>2</SUP>C protocol: watching the bus, waiting for a specific amount of time, and driving the bus.  This became apparent when I flowcharted 1 byte of a typical bus transaction; see <a href="19920159.htm">Figure 1</A> .  The time delays associated with creating the bus waveforms would normally have been relegated to the 80C186EB's on-chip timers.  I could not, however, assume that the end users of my code would be able to spare a timer for the software I<SUP>2</SUP>C port.  I had to forego the elegance (and to some extent accuracy) of the on-chip timers for the sledgehammer approach of software timing loops.  Luckily, the I<SUP>2</SUP>C protocol is extremely forgiving with regard to timing accuracy.  The decision to use assembly instead of a high-level language stemmed directly from the need to control program-execution time.  I had neither the time nor the inclination to handtune high-level code.<P>
+Having made the decision to use assembly language, I faced my next problem: Could I make the code portable?  Intel offers a plethora of CPU and embedded-controller architectures.  Would it be possible to make the code somewhat portable between disparate assembly languages?  I found my answer in the use of macros.<P>
+All the basic building blocks of the I<SUP>2</SUP>C protocol (watching, waiting, and doing) can be compartmentalized into distinct macros.  The algorithms that make up the I<SUP>2</SUP>C driver are written with these macros as the framework.  You don't need to understand the intricacies of the I<SUP>2</SUP>C protocol to port these routines -- you just need to know how to make your CPU watch, wait, and do.<P>
+For example, a 4.7_uS delay is a common event during a transfer.  The macro %Wait_4_7_uS implements just such a delay by using the 8086 LOOP instruction with a couple of NOPs for tuning; see <a href="#0157_0005">Example 1(a)</A>.  Total execution time is readily calculated from instruction timing tables.  The same macro is ported to the i960 architecture in <a href="#0157_0005">Example 1(b)</A>.  Although I am a neophyte when it comes to i960 programming, I had no problems porting the core macros.<P>
+<h4><a name="0157_0005">Example 1: (a) 80C186 implementation of 4.7_uS wait macro; (b) 80960CA implementation of 4.7_uS wait macro.</h4><P>
+<pre>
+  (a)
+
+  %*DEFINE(Wait_4_7_uS)(
+          mov     cx, 5           ; 4 clocks
+          loop    $               ; 4*15+5 = 65 clocks
+          nop                     ; 3 clocks
+          nop                     ; 3 clocks
+                                  ; total = 75 clocks
+                                  ; 75 * 62.5ns = 4.69uS (close enough)
+          )
+
+  (b)
+
+  define(Wait_4_7_uS,'
+
+          lda     0x17, r4        # instruction may be issued in parallel
+                                  # so assume no clocks.
+  Ob:     cmpdeco 0, r4           # compare and decrement counter in r4
+          bne.t   Ob              # if !=0 branch back (predict taken
+                                  # branch)
+                                  #
+                                  # The cmpdeco and bne.t together take 3
+                                  # clocks in parallel minimum.
+                                  #
+                                  # 0x17 (25 decimal) * 3 = 75 clocks
+                                  # at 16MHz this is 4.69uS
+  ')</pre><P>
+<P>
+<h3><a name="0157_0006">Hardware Dependencies<a name="0157_0006"></h3><P>
+A few words about the target hardware are in order before I discuss the code.  Any implementation of the I<SUP>2</SUP>C protocol requires two open-drain (or open-collector), bidirectional port pins for the Serial Clock (SCL) and Serial Data (SDA) lines.  The code in this article was designed for the 80C186EB embedded processor, which has two open-drain ports on-chip.  The two pins, P2.6 (SCL) and P2.7 (SDA), are part of a larger 8-bit port. Processors without open-drain I/O ports can easily implement I<SUP>2</SUP>C with the addition of an external open-collector latch.<P>
+Two special-function registers, P2PIN and P2LTCH, are used to read and write the state of the port pins.  The 80C186EB allows the special-function registers to be located anywhere in either memory or I/O space.  For this implementation, I chose to leave the registers in I/O space, even though this limited my choice of instructions.  The 80186 architecture does not provide for read-modify-write instructions in I/O space (an AND to I/O, for example); it can only load and store (IN and OUT).  So why did I limit myself?  Again, I had to assume the lowest common denominator for our customers when designing my code.<P>
+<h3><a name="0157_0007">Building the Framework<a name="0157_0007"></h3><P>
+Early on in development, I decided to partition my code macros according to physical processes involved in the I<SUP>2</SUP>C protocol.  Code not directly involved in mimicking the actions of a hardware I<SUP>2</SUP>C port was not written as macros.  For example, the code necessary to access the stack frame is not written as a macro, whereas the code needed to toggle the clock line is. This was done to isolate architecture-dependent code sequences from the more generic I<SUP>2</SUP>C functions.  Macros were also not used for &quot;gray areas&quot; such as the shifting of serial data, which is both architecture dependent and physical in nature.  The I<SUP>2</SUP>C functions that passed the litmus test fell into the three aforementioned categories of watching, waiting, and doing.<P>
+The &quot;waiting&quot; macros provide a fixed-minimum time delay.  They are implemented using a simple LOOP $ delay.  The LOOP instruction decrements the CX register, then branches to the target (in this case itself) if the result is non-zero.  The delay is (n-1)*15+5 clocks, where n is the starting value in the CX register.  All the delays were calculated assuming a 16-MHz clock rate (62.5 nanoseconds per clock).  The code still works at lower CPU speeds because the I<SUP>2</SUP>C protocol only specifies minimum timings.  In fact, the delay macros are only &quot;accurate enough,&quot; providing timings as close as I could get to the specified minimum without undue tuning.<P>
+The &quot;watching&quot; macros are &quot;spin-on-bit&quot; polling loops.  These pieces of code wait for a transition on the appropriate I<SUP>2</SUP>C line to occur before allowing execution to continue. There are two polling macros for each of the two I<SUP>2</SUP>C signal lines; one for high-to-low transitions and one for low-to-high transitions.  The polling of the SCL line that gives rise to an important feature of I<SUP>2</SUP>C: automatic, bit-by-bit baud-rate adjustment.  Any device on the I<SUP>2</SUP>C bus may hold the clock line low in order to stall the bus for more time (a serial wait state).  The other devices on the bus are then forced to poll the SCL line until the slow device releases control of the clock.<P>
+The %Get_SDA_Bit macro also falls under the category of &quot;watching.&quot;  Its function is simply to return the state of the SDA line without waiting for a transition.  %Get_SDA_Bit is used primarily to pull the serial data off the bus when the clock is valid.<P>
+The &quot;doing&quot; macros control the state of the clock and data lines.  As with the polling macros, there are four types -- one for each transition of the SCL or SDA lines.  The &quot;doing&quot; macros are named to reflect the physical operations they perform.  For example, %Drive_SCL_Low always drives the SCL line to a low state.  %Release_SCL_High, on the other hand, relinquishes control of the SCL line, which may then be pulled high or driven low by another device on the bus.  A read-modify-write operation is used for the bit manipulation so that the other 6 bits of Port 2 are not affected by the I<SUP>2</SUP>C operations.<P>
+<h3><a name="0157_0008">Getting on the Bus<a name="0157_0008"></h3><P>
+Three procedures were created using the macro framework.  I'll describe only the master transmit (<a href="#0157_000e">Listing One</A>, page 106) and master receive functions (<a href="#0157_0010">Listing Two</A>, page 108), as they represent the needs of most I<SUP>2</SUP>C users. The slave procedure is long and intricate and will not be described here.<P>
+An I<SUP>2</SUP>C master transmission proceeds as follows:<P>
+<OL>
+<LI>The master polls the bus to see if it is in use.</LI>
+<LI>The master generates a start condition on the bus.</LI>
+<LI>The master broadcasts the slave address and expects an acknowledge (ACK) from the addressed slave.</LI>
+<LI>The master transmits 0 or more bytes of data, expecting an ACK following each byte.</LI>
+<LI>The master generates a stop condition and releases the bus.</LI>
+</OL>
+The stack frame for the master transmit procedure, 12CXA.A86, includes a far pointer to the message for transmission, the byte count for the message, and the slave address.  Far pointers and far procedure calls are used in all the procedures.  No attempt was made to conform to a specific high-level language calling convention, although such a conversion would be trivial. The procedures save only the state of the modified segment registers.<P>
+The master transmit procedure performs error checking on the passed parameters before attempting to send the message.  The maximum message length is set at 64 Kbytes by the segmentation of the 80186 memory space.  This restriction could be removed by including code to handle segment boundaries.  The transmit procedure also checks the direction bit in the slave address to ensure that a reception was not erroneously indicated.  Errors are reported back to the calling procedure through the AX register.  (The exact code is in <a href="#0157_000e">Listing One</A>.)<P>
+The first step in sending a message is getting on the I<SUP>2</SUP>C bus.  The macro %Check_For_Bus_Free simply polls the bus to determine if any transactions are in progress.  If so, the transmit procedure aborts with the appropriate error code.  If the bus is free, a start condition is generated.  The start condition is defined as a high-to-low transition of SDA with SCL high followed by a 4.7_uS pause.  These waveforms are easily generated with the %Drive_SDA_Low and %Wait_4_7_uS macros.<P>
+All communication on the I<SUP>2</SUP>C bus between the stop and start conditions, including addressing and data, takes place as an 8-bit data value followed by an acknowledge bit.  This lead to the natural nested loop structure for the body of the procedure; see <a href="1992015a.htm">Figure 2</A>.<P>
+The inner loop is responsible for transmitting the 8 bits of each data byte.  Each transmitted bit generates the appropriate data (SDA) and clock (SCL) waveforms while checking for both serial wait states and potential bus collisions.  A bus collision occurs when two masters attempt to gain control of the bus simultaneously.  The I<SUP>2</SUP>C protocol handles collisions with the simple rule: &quot;He who transmits the first 0 on the SDA line wins the bus.&quot; To ensure that we (the master transmit procedure) own the bus, the SDA line is checked whenever transmitting a 1.  If a 0 is present, then a collision has occurred (because another master is pulling the line low), and the transfer must be aborted.<P>
+Control is turned over to the outer loop after the 8 bits of data (or address) have been transmitted.  The outer loop immediately checks for an acknowledge from the addressed slave. The transfer is aborted if an acknowledge is not received.  At the end of the ACK bit the message length counter is decremented.  Control is returned to the inner loop if more data remains, otherwise a stop condition is generated and the master transmit procedure terminates.<P>
+Registers are used for intermediate result storage throughout the body of the procedure. For example, the AH register is used to hold the current value (either address or data) being shifted onto the SDA line.  This eliminates the need for local data storage within the procedure.<P>
+<h3><a name="0157_0009">On the Receiving End<a name="0157_0009"></h3><P>
+The steps involved in an I<SUP>2</SUP>C master receive transaction are almost identical to those in transmission:<P>
+<OL>
+<LI>The master polls the bus to see if it is in use.</LI>
+<LI>The master generates a start condition on the bus.</LI>
+<LI>The master broadcasts the slave address and expects and ACK from the addressed slave.</LI>
+<LI>The master receives 0 or more bytes of data and sends an ACK to the slave after each byte. The master signals the last byte by not sending an ACK.</LI>
+<LI>The master generates a stop condition and releases the bus.</LI>
+</OL>
+A far pointer to receive buffer is passed on the stack to the master receive procedure.  The remainder of the parameters--slave address and message count--are identical between the two procedures.  The received message length is fixed at 64 Kbytes, again because of segmentation.  The error-checking, bus-availability sensing, and start-condition generation sections of the receive procedure are lifted verbatim from the transmit code.<P>
+The structure of the receive procedure differs slightly once the start condition has been generated; see <a href="1992015b.htm">Figure 3</A>.  The slave address is transmitted using one iteration of the transmit procedure's outer loop.  Control is passed to the receive loop once the slave acknowledges its address.<P>
+The receive loop structure is patterned after that of the transmit procedure.  The inner loop controls the clocking of the SCL line and the shifting of the serial data off the SDA line into the CPU.  Eight iterations of the inner loop are performed to receive each byte. The outer loop stores the received byte in the buffer, decrements the byte count, then sends an ACK to the slave.  The last data byte is signalled by not sending an ACK.<P>
+<h3><a name="0157_000a">Using the Procedures<a name="0157_000a"></h3><P>
+<a href="#0157_0012">Listing Three</A> (page 110) shows a short program that uses both the master transmit and master receive procedures.  The call to procedure I2C_XMIT displays the word &quot;bUS-&quot; on a four-character, seven-segment display controlled by the SAA1064 I[2]C compatible display driver.  The time of day is read from the PCF8583 real-time clock by the call to procedure I2C_RECV.<P>
+Please note that interrupts must be disabled during the execution of both procedures.  An interruption at an inopportune time (when the master is not in control of the clock) could cause the bus to hang.  If you need to service interrupts periodically, then enable them only when the clock is driven low.<P>
+These procedures have been tested on a wide array of I<SUP>2</SUP>C devices ranging from serial EEPROMs to voice synthesizers.  No compatibility problems have been seen to date.<P>
+<h3><a name="0157_000b">Enhancing the Code<a name="0157_000b"></h3><P>
+I've kicked around many ideas for enhancing the I<SUP>2</SUP>C procedures.  You could, for example, replace the timing loops with timed interrupts.  That way, the CPU could perform useful work during the pauses.  Along the same lines, the pauses could be scheduled using a real-time kernel, again improving CPU throughput.  Finally, you could add a high-level language calling structure.<P>
+The use of timed interrupts adds an order of magnitude to the complexity of the code, but would be worth it for high-performance, real-time systems.<P>
+<h3><a name="0157_000c">Conclusion<a name="0157_000c"></h3><P>
+I[2]C is not the only game in town when in comes to serial protocols.  Hopefully, some of the techniques presented here will carry over into the development of other &quot;simulated&quot; serial protocols, such as those targeted at the home-automation market.  Who knows, maybe someday a snippet of my code may find its way into a truly intelligent dishwasher.  I'll be waiting....<P>
+<h3><a name="0157_000d">References<a name="0157_000d"></h3><P>
+I<SUP>2</SUP>C Bus Specification, Philips Corporation (undated).<P>
+
+<PRE>
+
+_PROGRAMMING THE I2C INTERFACE_
+by Mitchell Kahn
+
+
+<a name="0157_000e">
+<a name="0157_000f"></pre><B>[LISTING ONE]</B><pre><a name="0157_000f">
+
+$pagelength (30)
+$mod186
+$debug
+$xref
+
+NAME    i2c_transmit;
+
+$include (\include\pcp_io.inc)
+
+PUBLIC i2c_xmit
+
+;******   EQUates  ******
+BUS_FREE_MIN           EQU   2       ; Loop counter for free bus delay.
+MAXIMUM_MESSAGE_LEN     EQU     255
+
+CODE_ILLEGAL_ADDR       EQU     020H
+CODE_MSG_LEN            EQU     040H
+
+;****** STACK FRAME STRUCTURE ******
+stack_frame     STRUC
+ret_ip          DW      ?
+ret_cs          DW      ?
+buffer_offset   DW      ?
+buffer_segment  DW      ?
+count           DW      ?
+address         DW      ?
+stack_frame     ENDS
+
+%*DEFINE(Drive_SCL_Low)(
+        mov     dx, P2LTCH
+        in      al, dx
+        and     al, 10111111B           ; SCL is bit 6
+        out     dx, al
+        )
+%*DEFINE(Release_SCL_High)(
+        mov     dx, P2LTCH
+        in      al, dx
+        or      al, 01000000B
+        out     dx, al
+        )
+%*DEFINE(Drive_SDA_Low)(
+        mov     dx, P2LTCH
+        in      al, dx
+        and     al, 01111111B           ; SDA is bit 6
+        out     dx, al
+        )
+%*DEFINE(Release_SDA_High)(
+        mov     dx, P2LTCH
+        in      al, dx
+        or      al, 10000000B
+        out     dx, al
+        )
+%*DEFINE(Wait_4_7_uS)(
+        mov     cx, 5
+        loop    $
+        nop
+        nop
+        )
+%*DEFINE(Wait_Half_Bit_Time)(
+        mov     cx, 3
+        loop    $
+        )
+%*DEFINE(Wait_SCL_Low_Time)(
+        mov     cx, 5
+        loop    $
+        nop
+        nop
+        )
+%*DEFINE(Wait_SCL_High_Time)(
+        mov     cx, 5
+        loop    $
+        nop
+        nop
+        )
+%*DEFINE(Wait_For_SCL_To_Go_Low)LOCAL wait(
+        mov     dx, P2PIN
+%wait:  in      al, dx
+        test    al, 01000000B
+        jne     %wait
+        )
+%*DEFINE(Wait_For_SCL_To_Go_High)LOCAL wait(
+        mov     dx, P2PIN
+%wait:  in      al, dx
+        test    al, 01000000B
+        je      %wait
+%*DEFINE(Wait_For_SDA_To_Go_High)LOCAL wait(
+        mov     dx, P2PIN
+%wait:  in      al, dx
+        test    al, 10000000B
+        je      %wait
+        )
+        )
+%*DEFINE(Get_SDA_Bit)(
+        mov     dx, P2PIN
+        in      al, dx
+        and     al, 0080H
+        )
+%*DEFINE(Check_For_Bus_Free)(
+        mov   dx, P2PIN
+   in   al, dx
+        mov     bl, 0C0H         ; Mask for SCL and SDA.
+        and     al, bl           ; If SCL and SDA are high
+        xor     al, bl           ; this sequence will leave a zero in AX.
+        )
+
+;***************************************************************************
+;**  Revision History: 0.0 (7/90): First frozen working verion. No slave wait
+;**    timeout. No arbitration turn around.  Inefficient register usage.
+;**    0.1 (7/16/90): 8-bit registers used (improves  80C188EB. Use STRUCT for
+;**    stack frame clarity. Implements slave wait timeout. Saves ES.
+;***************************************************************************
+
+;*****************************************************************
+;**                     Procedure I2C_XMIT                      **
+;**             Call Type:      FAR                             **
+;**             Uses     :      All regs.                       **
+;**             Saves    :      DS and ES only.                 **
+;**             Stack Frame:                                    **
+;**             [bp]=   ip                                      **
+;**             [bp+2]= cs                                      **
+;**             [bp+4]= message offset                          **
+;**             [bp+6]= message segment                         **
+;**             [bp+8]= message count                           **
+;**             [bp+10]= slave adress                           **
+;**             Return Codes in AX register:                    **
+;**             XX00 = Transmisiion completed without error     **
+;**             XX01 = Bus unavailable                          **
+;**             XX02 = Addressed slave not responding           **
+;**             nn04 = Addressed slave aborted during xfer      **
+;**                    (nn= number of bytes transferred before  **
+;**                     transfer aborted)                       **
+;**             XX08 = Arbitration loss (note 1)                **
+;**             XX10 = Bus wait timeout                         **
+;**             XX20 = Illegal address                          **
+;**             XX40 = Illegal message count                    **
+;**             note 1: Arbitration loss requires that the      **
+;**                     I2C unit switch to slave receive        **
+;**                     mode.  This is not implemented.         **
+;*****************************************************************
+
+code       segment  public
+                assume cs:code
+i2c_xmit   proc   far
+                mov     bp, sp
+                push    ds
+                push    es
+                test    word ptr [bp].address,01H       ; Check for illegal
+                                                        ; address (a READ).
+                jz      addr_ok
+                mov     ax, CODE_ILLEGAL_ADDR           ; Illegal addr
+                pop     es
+                pop     ds
+                ret     8                       ; Tear down stack frame
+addr_ok:
+                mov   cx, [bp].count          ; Get message length.
+                cmp     cx, MAXIMUM_MESSAGE_LEN
+                jle     message_len_ok          ; Message is 256 or less
+                                                ; characters.
+                mov     ax, CODE_MSG_LEN        ; Bad length return code.
+                pop     es
+                pop     ds
+                ret     8
+message_len_ok:
+                mov     si, [bp].buffer_offset  ; Get message offset.
+                mov     ax, [bp].buffer_segment ; Get message segment
+                mov     ds, ax                  ; and put in DS.
+      ; Test for I2C bus free condition.
+                ; SCL and SDA must be high at least 4.7uS
+                mov     cx, BUS_FREE_MIN        ; initialize free time counter.
+
+                ; The following loop takes 48 clocks while cx&gt;1 and 33 clocks
+                ; on the last iteration. To insure that bus is free, samples
+                ; of bus must span at least 4.7uS. At 16Mhz: 48*(62.5ns)=3uS
+                ; The first sample is at 0us, the second at 3us, and the
+                ; third will be at 6.  Although this exceeds the 4.7us
+                ; spec, it is better safe than sorry.
+bus_free_wait:
+                %Check_For_Bus_Free
+                jz     i2c_bus_free
+                ; At this point the bus is not available.
+                mov     ax, 01H                 ; 01= return code for
+                pop     es                      ; a busy bus.
+                pop     ds
+                ret     8                       ; return and tear down
+                                                ; stack frame.
+i2c_bus_free:   loop    bus_free_wait      ; bus may be free but wait
+                                      ; the 4.7uS required!
+                ; I2C bus is available, generate a START condition
+                %Drive_SDA_Low
+                %Wait_4_7_uS
+                mov     ax, [bp].address
+                xchg    ah, al                  ; ah = address
+next_byte:   mov   di, 8         ; set up bit counter
+next_bit:   %Drive_SCL_Low
+                %Wait_Half_Bit_Time
+      mov   bl, ah        ; get current data
+      and   bl, 080H      ; strip MSB
+      mov   dx, P2LTCH
+      in   al, dx
+      and   al, 7fh
+      or   al, bl         ; set bit 7 to reflect
+                  ; data bit
+      out   dx, al         ; xmit data bit
+                %Wait_Half_Bit_Time
+                %Release_SCL_High
+                %Wait_For_SCL_To_Go_High
+
+                ; At this point SCL is high so if there is another master
+                ; attempting to gain the bus, it's data would be valid here.
+                ; We need only check when our data is &quot;1&quot;...
+
+                test    bl, 80H            ; Is data a &quot;1&quot;?
+                jz      won_arbitration    ; If not -&gt; don't check arbitration.
+
+                mov     dx, P2PIN
+                in      al, dx
+                test    al, 80H                 ; Is SDA high?
+                jnz     won_arbitration
+                jmp     lost_arbitration        ; If SDA != 1 then we lost
+                                                ; arbitration....
+won_arbitration:
+                %Wait_SCL_High_Time
+      shl   ah, 1                   ; shift current byte
+                dec   di         ; tick down bit counter
+      jne   next_bit      ; continue bits
+; a byte has been completed.  Time to get an ACKNOWLEDGE.
+                %Drive_SCL_Low
+                %Wait_Half_Bit_Time
+                %Release_SDA_High
+                %Wait_Half_Bit_Time
+                %Release_SCL_High
+                %Wait_For_SCL_TO_Go_High
+                ; SCL is now high.  We must loop while checking SDA for 4.7us.
+                ; With a count of 3 we have a delay of 89 clocks (5.5uS). This
+                ; could be find tuned with NOPs when performance is critical.
+                mov     cx, 3
+check_4_ack:
+                %Get_SDA_Bit                    ; Is SDA a &quot;0&quot;
+      jnz   abort_no_ack      ; if so -&gt; abort
+      loop   check_4_ack
+; if we've gotten to here, then an acknowledge was received.
+                mov     ah, byte ptr [si]
+      inc   si         ; point to next byte
+                dec   word ptr [bp].count   ; dec string counter
+      js      xfer_done
+                jmp   next_byte
+; END OF MESSAGE: Issue a STOP condition
+xfer_done:
+                mov     di, 0                   ; Normal completion code.
+                jmp     i2c_bus_stop
+abort_no_ack:
+                cmp     si, [bp].buffer_offset  ; Check if this is the
+                je      slave_did_not_respond   ; first byte (the address ).
+                mov     di, 4H                  ; Abort during xfer code.
+                jmp     i2c_bus_stop
+slave_did_not_respond:
+                mov     di, 02H                 ;
+i2c_bus_stop:
+                %Drive_SCL_Low
+                %Wait_Half_Bit_Time
+      %Drive_SDA_Low
+           %Wait_4_7_uS
+                %Release_SCL_High
+                %Wait_For_SCL_To_Go_High
+                %Wait_4_7_uS
+                %Release_SDA_High
+                %Wait_For_SDA_To_Go_High
+
+                mov     ax, di
+                pop     es
+                pop     ds
+                ret     8                       ; Return and tear
+                                                ; down stack frame.
+lost_arbitration:
+                mov     dx, P2LTCH
+                in      al, dx                  ; Release SDA and SCL
+                or      al, 0C0H
+                out     dx, al
+                mov     ax, 08H                 ; Lost arbitration code.
+                pop     es
+                pop     ds
+                ret     8
+i2c_xmit   endp
+code       ends
+end
+
+
+
+
+
+<a name="0157_0010">
+<a name="0157_0011"></pre><B>[LISTING TWO]</B><pre><a name="0157_0011">
+
+$pagelength (30)
+$mod186
+$debug
+$xref
+
+NAME    i2c_receive;
+
+$include (/include/pcp_io.inc)
+
+PUBLIC i2c_recv
+
+;****** EQUates ******
+BUS_FREE_MIN     EQU     1H             ; Loop counter for free bus delay.
+MAXLEN           EQU     255
+
+;****** STACK FRAME STRUCTURE  ******
+stack_frame     STRUC
+ret_ip          DW      ?
+ret_cs          DW      ?
+buffer_offset   DW      ?
+buffer_segment  DW      ?
+count           DW      ?
+address         DW      ?
+stack_frame     ENDS
+
+%*DEFINE(Drive_SCL_Low)(
+        mov     dx, P2LTCH
+        in      al, dx
+        and     al, 10111111B           ; SCL is bit 6
+        out     dx, al
+        )
+%*DEFINE(Release_SCL_High)(
+        mov     dx, P2LTCH
+        in      al, dx
+        or      al, 01000000B
+        out     dx, al
+        )
+%*DEFINE(Drive_SDA_Low)(
+        mov     dx, P2LTCH
+        in      al, dx
+        and     al, 01111111B           ; SDA is bit 6
+        out     dx, al
+        )
+%*DEFINE(Release_SDA_High)(
+        mov     dx, P2LTCH
+        in      al, dx
+        or      al, 10000000B
+        out     dx, al
+        )
+%*DEFINE(Wait_4_7_uS)(
+        mov     cx, 5
+        loop    $
+        nop
+        nop
+        )
+%*DEFINE(Wait_Half_Bit_Time)(
+        mov     cx, 3
+        loop    $
+        )
+%*DEFINE(Wait_SCL_Low_Time)(
+        mov     cx, 5
+        loop    $
+        nop
+        nop
+        )
+%*DEFINE(Wait_SCL_High_Time)(
+        mov     cx, 5
+        loop    $
+        nop
+        nop
+        )
+%*DEFINE(Wait_For_SCL_To_Go_Low)LOCAL wait(
+        mov     dx, P2PIN
+%wait:  in      al, dx
+        test    al, 01000000B
+        jne     %wait
+        )
+%*DEFINE(Wait_For_SCL_To_Go_High)LOCAL wait(
+        mov     dx, P2PIN
+%wait:  in      al, dx
+        test    al, 01000000B
+        je      %wait
+%*DEFINE(Wait_For_SDA_To_Go_High)LOCAL wait(
+        mov     dx, P2PIN
+%wait:  in      al, dx
+        test    al, 10000000B
+        je      %wait
+        )
+        )
+%*DEFINE(Get_SDA_Bit)(
+        mov     dx, P2PIN
+        in      al, dx
+        and     al, 0080H
+        )
+%*DEFINE(Check_For_Bus_Free)(
+        mov dx, P2PIN
+    in  al, dx
+        mov     bl, 0C0H                ; Mask for SCL and SDA.
+        and     al, bl                  ; If SCL and SDA are high
+        xor     al, bl                  ; this sequence will leave
+        )                               ; a zero in AX.
+code    segment  public
+        assume cs:code
+
+i2c_recv    proc    far
+
+              ; The LSB of the address for a READ always has a &quot;1&quot; in the LSB.
+              ; The first step is to check for a legal address....
+                mov     bp, sp
+                push    ds
+                push    es
+                test    word ptr [bp].address,01H    ; Check for illegal
+                                                     ; address (an XMIT).
+                jnz     addr_ok
+                ; The address passed was for a transmit (WRITE). This is
+                ; illegal in this procedure....
+                mov     ax, 20H                 ; Illegal addr
+                pop     es
+                pop     ds
+                ret     8                       ; Tear down stack frame
+addr_ok:
+                cmp     word ptr [bp].count, MAXLEN
+                jg      message_wrong_len
+                cmp     word ptr [bp].count, 1  ; check message length
+                jge     len_ok
+message_wrong_len:
+                mov     ax, 40H                 ; error code
+                pop     es
+                pop     ds
+                ret     8                       ; tear down frame
+len_ok:
+                ; Test for I2C bus free condition.
+                ; SCL and SDA must be high at least 4.7uS
+                mov     cx, BUS_FREE_MIN        ; initialize free time counter.
+; Following loop takes 48 clocks while cx&gt;1 and 33 clocks on last iteration.
+; To insure that bus is free, samples of bus must span at least 4.7uS. At 16Mhz
+; 48*(62.5ns)= 3uS. First sample is at 0us, second at 3us, and third will be at
+; 6. Although this exceeds 4.7us spec, it is better safe than sorry.
+bus_free_wait:
+                %Check_For_Bus_Free
+                jz     i2c_bus_free
+                ; At this point the bus is not available.
+                mov     ax, 01H                 ; 01= return code for
+                pop     es                      ; a busy bus.
+                pop     ds
+                ret     8             ; return and tear down stack frame.
+i2c_bus_free:   loop    bus_free_wait ; bus may be free but wait 4.7uS required
+                ; I2C bus is available, generate a START condition
+                %Drive_SDA_Low
+                %Wait_4_7_uS
+                ; A receive begins with transmission of the ADDRESS
+            mov di, 8           ; set up bit counter
+next_bit:
+        %Drive_SCL_Low
+        %Wait_Half_Bit_Time
+                mov     bx, [bp].address
+        and bl, 080H        ; strip MSB
+        mov dx, P2LTCH
+        in  al, dx
+        and al, 7fh
+        or  al, bl          ; set bit 7 to reflect data bit
+        out dx, al          ; xmit data bit
+        sal [bp].address,1          ; shift current byte
+                %Wait_Half_Bit_Time
+                %Release_SCL_High
+                %Wait_For_SCL_To_Go_High
+                ; At this point SCL is high so if there is another master
+                ; attempting to gain the bus, it's data would be valid here.
+                ; We need only check when our data is a &quot;1&quot;...
+                test    bl, 10000000B      ; Is data a &quot;1&quot;?
+                je      won_arbitration    ; If not -&gt; don't check arbitration.
+                mov     dx, P2PIN
+                in      al, dx
+                test    al, 10000000B           ; Is SDA high?
+                jnz     won_arbitration
+                jmp     lost_arbitration
+won_arbitration:
+                %Wait_4_7_uS                ; count off high time.
+        dec di          ; tick down bit counter
+        jne next_bit        ; continue bits
+; The address has been completed.  Time to get an ACKNOWLEDGE.
+                %Drive_SCL_Low
+                %Wait_Half_Bit_Time
+                %Release_SDA_High
+                %Wait_Half_Bit_Time
+                %Release_SCL_High
+; Here we are expecting to see an acknowledge from addressed slave receiver:
+        %Wait_For_SCL_To_Go_High        ; a wait state
+        mov cx, 3
+check_4_ack:
+        mov dx, P2PIN
+        in  al, dx          ; get SDA value
+        and al, 10000000B       ; is it high?
+        jnz abort_no_ack        ; if so -&gt; abort
+        nop
+        nop
+        nop                             ; NOPs for timing at 16Mhz
+                loop    check_4_ack
+; if we've gotten to here, then an acknowledge was received.
+; At this point in the code, slave receiver has acknowledged
+; receipt of its address. SCL has just been driven low, SDA is floating.
+                jmp     start_recv
+abort_no_ack:
+                %Drive_SCL_Low
+                mov     di, 02H                 ; Code for unresponsive slave.
+                jmp     i2c_bus_stop
+; Now the master transmitter switches to master receiver....
+start_recv:
+                mov     di, [bp].buffer_offset
+                mov     ax, [bp].buffer_segment
+                mov     es, ax
+next_byte_r:    mov     bx, 0
+                mov     si, 8
+next_bit_r:
+                %Drive_SCL_Low
+                %Wait_4_7_uS
+                %Release_SCL_High
+                %Wait_For_SCL_To_Go_High
+                %Get_SDA_Bit
+                shr     al, 7                   ; move SDA value to LSB
+                or      bl, al                  ; drop in lsb of bl
+                %Wait_4_7_uS
+        dec si              ; tick down bit counter
+        je  byte_Recv_comp      ; continue bits
+                shl     bl, 1                   ; shift bl for next bit
+                jmp     next_bit_r
+; The word has been completed.  Time to send an ACKNOWLEDGE.
+byte_Recv_comp:
+                mov     al, bl
+                stosb
+        %Drive_SCL_Low
+                %Wait_Half_Bit_Time
+; Here we need to decide whether or not to transmit an acknowledge. If this is
+; last byte required from slave, we do not send an ack; otherwise we do....
+                dec     [bp].count              ; decrement the message count
+                cmp     [bp].count, 0
+                jne     send_ack
+                %Release_SDA_High
+                jmp     do_ack
+send_ack:       %Drive_SDA_Low
+
+do_ack:
+        %Wait_Half_Bit_Time
+                %Release_SCL_High
+        %Wait_For_SCL_To_Go_High
+                %Wait_4_7_uS
+                %Drive_SCL_Low
+                %Wait_Half_Bit_Time
+                %Release_SDA_High
+                cmp     [bp].count, 0
+                je      recv_done
+                jmp     next_byte_r
+recv_done:      mov     di, 00
+
+i2c_bus_stop:
+                %Wait_Half_Bit_Time
+        %Drive_SDA_Low
+            %Wait_4_7_uS
+                %Release_SCL_High
+                %Wait_For_SCL_To_Go_High
+                %Wait_4_7_uS
+                %Release_SDA_High
+                %Wait_For_SDA_To_Go_High
+                mov     ax, di
+                pop     es
+                pop     ds
+                ret     8              ; Return and tear down stack frame.
+lost_arbitration:
+                mov     dx, P2LTCH
+                in      al, dx                  ; Release SDA and SCL
+                or      al, 0C0H
+                out     dx, al
+                pop     es
+                pop     ds
+                ret     8
+i2c_recv    endp
+code        ends
+end
+
+
+
+
+
+<a name="0157_0012">
+<a name="0157_0013"></pre><B>[LISTING THREE]</B><pre><a name="0157_0013">
+
+$mod186
+$debug
+$xref
+
+$include (\include\pcp_io.inc)  ; a file of EQUates for 186EB register names
+
+NAME    i2c_example
+EXTRN   i2c_recv:far, i2c_xmit:far
+
+%*DEFINE(XMIT(ADDR,COUNT,MESSAGE))(
+        push    %ADDR
+        push    %COUNT
+        push    seg %MESSAGE
+        push    offset %MESSAGE
+        call    i2c_xmit
+        )
+%*DEFINE(RECV(ADDR,COUNT,BUFFER))(
+        push    %ADDR
+        push    %COUNT
+        push    seg %BUFFER
+        push    offset %BUFFER
+        call    i2c_recv
+        )
+stack   segment stack
+        DW      20 DUP (?)
+ t_o_s  DW      0
+stack   ends
+data    segment para public 'RAM'
+bus_msg     db  00h,77h,01h,02h,04h,08h  ; the LED I2C message
+recv_buff       db      255 dup(?)
+data            ends
+usr_code        segment para 'RAM'
+                assume cs:usr_code
+start:          mov     ax, data                ; data segment init
+                mov     ds, ax
+                cli
+                assume ds:data
+                mov     ax, stack               ; set up stack
+                mov     ss, ax
+                assume ss:stack
+                mov     sp, offset t_o_s
+                mov     dx, P2DIR               ; set up open-drain
+                in      ax, dx                  ; port pins on 186EB
+                and     ax, 3FH
+                out     dx, ax
+                mov     dx, P2CON
+                in      ax, dx
+                and     ax, 03FH
+                out     dx, ax
+                ; The I2C address of the LED driver is 70H for a transmit.
+                %XMIT(70H,6,bus_msg)            ; send &quot;bus&quot; message
+                ; The address for the clock is 0xA3 for a receive.
+                %RECV(0A3H,15,recv_buff)   ; read first 15 bytes in clock chip.
+usr_code        ends
+                end     start
+
+
+
+
+
+Example 1: (a) 80C186 implementation of 4.7uS wait macro; (b) 80960CA
+implementation of 4.7uS wait macro.
+
+
+(a)
+
+
+%*DEFINE(Wait_4_7_uS)(
+        mov     cx, 5           ; 4 clocks
+        loop    $               ; 4*15+5 = 65 clocks
+        nop                     ; 3 clocks
+        nop                     ; 3 clocks
+                                ; total = 75 clocks
+                                ; 75 * 62.5ns = 4.69uS (close enough)
+        )
+
+
+(b)
+
+
+define(Wait_4_7_uS,'
+
+        lda     0x17, r4        # instruction may be issued in parallel
+                                # so assume no clocks.
+0b:     cmpdeco 0, r4           # compare and decrement counter in r4
+        bne.t   0b              # if !=0 branch back (predict taken
+                                # branch)
+                                #
+                                # The cmpdeco and bne.t together take 3
+                                # clocks in parallel minimum.
+                                #
+                                # 0x17 (25 decimal) * 3 = 75 clocks
+                                # at 16MHz this is 4.69
+</pre>
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

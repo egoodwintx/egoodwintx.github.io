@@ -1,0 +1,366 @@
+<HTML>   
+     <HEAD>
+<TITLE>May 2001 C++ Experts Forum/From Mechanism to Method</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.05/tocmay.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">From Mechanism to Method: Distinctly Qualified</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Kevlin Henney</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+
+<p>The Standard library string type is a product of elegance and sufficiency.</p>
+<p>OK, OK, just kidding. If it looks like the product of design by committee, it's because it was. If you appreciate minimalist design, its baroqueness is certain to disappoint.</p>
+<p>The road to Hell is paved with good intentions, and the Standard library string is full of good intentions. The standard <b>basic_string</b> class template started life as a simple class and reached its middle age as an over-parameterized class template with a bad name and a bloated interface. The process of standardization added somewhat more than two cents worth: What about generalization for internationalization? What about copy optimization through reference counting? What about customizing its memory allocation? What about safe indexing? What about reverse search operations that mirror each forward search operation? What about support for STL? And support for similar index-based operations? You see, good intentions every one of them. But too much compromise in design leads to a compromised design.</p>
+<p>In spite of this criticism, I use the standard <b>string</b> type. For one thing, it's standard, and for another it satisfies more of my string needs than a vanilla <b>char *</b>. More positively, inside this behemoth is a small class (or two) struggling to get out. There is a sense of obligation to try to release and realize it. In this article, I don't want to address each and every last detail of such a redesign, but I would like to outline an approach. In particular, I want to declutter the interface a little to clear the path to a better understanding of something that has haunted string classes for the last decade or so: the specter of copy optimization through reference counting and copy-on-write.</p> 
+<p>The issues thrown up by reference counting can be tackled head on, with limited success, or tackled laterally. The resolution lies in a combination of restraint and substitutability principles <a href="#1">[1]</a>, and in particular treating <b>const</b> qualification as a form of type separation [<a href="#2">2</a>, <a href="#3">3</a>].</p>
+
+<H3><FONT COLOR="#000080">Minimalism</FONT></H3>
+
+<p>The open secrets of good design practice include the importance of knowing what to keep whole, what to combine, what to separate, and what to throw away.</p>
+<p>We can start with the name. Names are important. Hiding the templatedness of strings does not actually help the reader in any way, except perhaps to discourage them to think of or use strings as templated abstractions. The reason we are left with the common <b>typedef</b>ed names of <b>string</b> and <b>wstring</b>, and the cumbersome underlying names of <b>basic_string&lt;char&gt;</b> and <b>basic_string&lt;wchar_t&gt;</b>, is historical. Originally, in the pre-STL era, the proposed Standard library was light on templates &#151; in fact it was quite light, period &#151; and <b>string</b> and <b>wstring</b> were classes. In modern C++ programming, we are more familiar with template usage and would not be quite so reticent about the names or accepting of the supposed benefit of hiding templated usage. If we consider strings to be templated with respect to their character type, then so be it: <b>string&lt;char&gt;</b> and <b>string&lt;wchar_t&gt;</b> are clearer, more direct, and proud to be templated.</p> 
+
+<H4><FONT COLOR="#000080">Orthogonality</FONT></H4>
+
+<p>Designing a string class is more of a challenge than many people appreciate. If you have not already done so (several times), it's worth a try: It's a good C++ work out &#151; memory management, operator overloading, optimization, etc. The problem is not so much in language features or implementation, but in interface. What problem is a string designed to solve? Without a clear focus, you discover that everyone has a slightly different view of what a string should be: a self-managed array of characters; a wrapper for <b>char*</b> and <b>&lt;cstring&gt;</b>; a small piece of text that requires simple access and concatenation; a potentially large stretch of text that requires efficient slicing and rearrangement operations; regular-expression searchable text; and so on. The problem is one of choice: All of these suggestions are reasonable, but satisfying them all simultaneously is not. Any attempt to create a single string class that does so cannot succeed. We have enough existence proofs to back this up.</p> 
+<p>There is already an excellent example of how to solve this design problem in the Standard library: the STL. The STL stands head and shoulders above other container libraries because it is not a container library: It is a specification that defines independent, open-ended families of algorithms, function objects, iterators, and containers along with the requirements that allow them to be combined. Independent ideas are expressed independently, with algorithms separated from underlying container representation through iterators and from functional specifics through function objects. This orthogonal design separates concerns quite clearly. The added bonus is that you get some predefined algorithms, function objects, iterators, and containers thrown into the deal.</p>
+<p>There is no single container class that satisfies all of our needs, so we have requirements and exemplars in the library. Given that we now know that asking how to write a single string class is the wrong design question, we can see how the cleaner STL-style solution can be applied to strings. In the first instance, we can consider strings to be sequences. Their bit-copyable elements, common use of null termination, conversions, concatenation, and I/O further characterize them. If we start with this, we end up with a minimal interface that can be satisfied by lightweight <b>char *</b> wrappers and scalable string implementations &#151; such as SGI's <b>rope</b> template <a href="#4">[4]</a> &#151; and even <b>std::basic_string</b>. The more complex functionality associated with different string types is then expressed orthogonally through algorithms so that new algorithms can act on all strings and new strings can take advantage of old algorithms. Now, should we want an all-singing, all-dancing, killer-app, last-one-you'll-ever-need string, we can write our own &#151; so long as it satisfies the base requirements of what is means to be a string.</p>
+
+<H4><FONT COLOR="#000080">Choice</FONT></H4>
+
+<p>An interface should represent reasonable goals and present its user with reasonable choices &#151; overachieving interfaces are weaker and more complex, not stronger and simpler.</p>
+<p>Consider, for instance, the issue of subscripting. <b>operator[]</b> is not required to perform bounds checking whereas <b>at</b> is. Indexing out of bounds causes undefined behavior for <b>operator[]</b> and an <b>out_of_range</b> exception for <b>at</b>. On the surface, this looks like a reasonable choice: You get to choose the <i>quality of failure</i> for yourself. The problem is that such an option is utterly useless and cannot be reasonably exercised. When would you consciously choose to write code that needed <b>at</b> rather than <b>operator[]</b>? If you make the choice, you have already anticipated the bug and can therefore prevent it.</p>
+<p>If you have a choice, it should be reasonable to exercise it. It should also be possible to exercise it. Take allocators. Please. The world of containers would be far simpler without them, and very, very few people would miss them. People that actually need to customize their memory allocation &#151; for shared memory, for persistence, for the sake of it &#151; find themselves working against rather than with the allocator model. Trying effective memory management of a container whose representation and management is not fully open to you is like eating with a knife and fork... held with chopsticks... through mittens. If you are serious about managing the allocation of a container, then get serious and manage it: Write your own container type. It is simpler, more likely to work, and is very much in the extensible spirit of the STL &#151; more so than limiting yourself to the handful of default container implementations in <b>std</b>.</p>
+
+<H4><FONT COLOR="#000080">Consistency</FONT></H4>
+
+<p>Another property of a well-designed interface is consistency. Some functions in <b>basic_string</b> throw exceptions on failure, whereas others do not. This is already inconsistent, but is made more so by the presence of both <b>operator[]</b> and <b>at</b>. If <b>operator[]</b> is shadowed by the exception-throwing <b>at</b>, then where are the exception-throwing doubles for iteration? If an exception-throwing access operator is considered reasonable, you should expect &#151; indeed, demand &#151; safe and unsafe variants for other forms of access. After all, what is good for the goose is good for the gander. However, we have established that <b>at</b> is not reasonable, so there is no need to clutter up the string interface any further.</p>
+
+<H3><FONT COLOR="#000080">Mad COW Disease</FONT></H3>
+
+<p>Strings get copied. Fact of life. Copy assignment and construction afford strings their value-based behavior. But strings are not lightweight classes. They encapsulate a heap allocated representation and copying could be expensive, especially if the copied string is never modified:</p>
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    size_t used, reserved; // current length and allocated space
+    char_type *text; // allocated and deallocated representation
+};
+</pre>
+
+<p>The compiler is entitled to a number of optimizations. For instance, the following:</p>
+
+
+<pre>
+std::string cow = &quot;Woof!&quot;;
+</pre>
+
+<p>is equivalent to:</p>
+
+<pre>
+std::string cow = std::string(&quot;Woof!&quot;);
+</pre>
+
+<p>but can be &#151; and normally is &#151; optimized to:</p>
+
+<pre>
+std::string cow(&quot;Woof!&quot;);
+</pre>
+
+<p>For assignment, overloading <b>operator=</b> to take a <b>const char *</b> prevents a conversion to a temporary that is then used with the ordinary copy assignment operator. The result of string concatenation is a temporary string object:</p>
+
+<pre>
+std::string loud_cow = cow + &quot;!!&quot;;
+</pre>
+
+<p>Here <b>operator+</b> returns a temporary <b>std::string</b> object that is used to initialize <b>loud_cow</b>. Depending on how the called function is written, the <i>named return value</i> optimization (NRV) allows a compiler to construct directly into <b>loud_cow</b> [<a href="#5">5</a>, <a href="#6">6</a>] rather than create an additional temporary object. This optimization applies only to copy construction, not copy assignment: If <b>loud_cow</b> is assigned the result of the concatenation, a temporary is created and then discarded. Similarly, in the following initialization two temporaries are created, only one of which can be optimized away by the NRV:</p> 
+
+<pre>
+std::string loud_cow = cow + &quot; &quot; + cow;
+</pre>
+
+<p>Because value objects of class type are commonly passed around by <b>const</b> reference, copying typically happens through assignment, data member initialization, and return values. We can see that the compiler already has considerable license to optimize, and that techniques such as overloading to prevent conversions and preferring initialization to construction help reduce the temporary burden, so to speak. But in complex expressions and initialization of data members, we can also see that there may still be the need to amortize the cost of copying.</p>
+<p>What is required of an optimization? Transparency &#151; so it is substitutable for the unoptimized version &#151; and optimization &#151; many optimizations aren't. In particular, the requirement of transparency means that users should not be entertained by new and interesting bugs.</p>
+
+<H4><FONT COLOR="#000080">Counting the Bodies</FONT></H4>
+
+<p>The most common copy optimization is to share the representation of a string when a copy is made rather than make a deep copy that results in heap allocation. This means that copying is simple and cheap. Only when the string is going to be modified does the &quot;real&quot; copy occur to avoid aliasing surprises. This lazy, just-in-time model &#151; commonly referred to as <i>copy on write</i> &#151; defers the cost of allocation until the point it is absolutely needed. If it is never needed, the cost is not paid. However, few things in life are for free: The sharing is not without overhead. For a start, it must be managed, which increases the complexity of the code. The referencing must also be tracked so that when &#151; as a result of assignment or destruction &#151; a string's text body is no longer referenced, it is properly deallocated, and when only a single string handle refers to a text body, redundant deep copies are not made.</p>
+<p>There are five ways in which references held by string handles to text bodies can be sensibly tracked, each with its own particular tradeoffs:</p>
+<p>1. <i>Hold separate pointers to the reference count and the actual text</i>. This means that the footprint of the string object is a little larger and that we are paying for the allocation of two heap objects. The allocation means that it is unlikely that we recoup our investment unless a text body is shared by more than two string handles. For a single reference, this is a not an optimization. Holding a <b>static</b> reference count of <b>1</b> and only allocating a dynamic count when the figure rises above that can reduce the overhead in this case. This will complicate the implementation, but if the majority of strings are never copied, this will be a saving. If, on the other hand, the string handle's footprint is a concern, the information duplicated between sharing handles can also be associated with the count, reducing the footprint to two pointers:</p>
+
+<pre>template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    struct shared
+    {
+        size_t used, reserved, count;
+    };
+    shared *info;
+    char_type *text;
+};
+</pre>
+
+<p>2. <i> Hold a single pointer to an object that contains the reference count, the pointer to the shared text, and the text size information</i>. This always results in the allocation of two objects on the heap, and there is an extra level of indirection to reach the actual text. For some designs this could provide an additional benefit of allowing the actual text to be reallocated or virtualized in some way (e.g., to disk), without affecting the handle objects. In the common case, the main benefits of this approach are a little more restricted. The string handle's footprint has now been reduced to a single pointer, and, if you want to add a constructor and destructor to the shared body, the management of the text memory can be hidden from the string handle. In its simplest form, we can see the basic rearrangement is a proper handle-body configuration [<a href="#7">7</a>, <a href="#8">8</a>]:</p> 
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    struct shared
+    {
+        size_t used, reserved, count;
+        char_type *text;
+    };
+    shared *body;
+};
+</pre>
+
+<p>3. <i> Hold a single pointer to memory that contains both the information about the string text &#151; including the reference count &#151; and the string text itself</i>. The information is held as a prefix to the <b>char_type</b> array. Only a single pointer is held in the handle, only a single allocation is performed, and treating the space before the text as a different type allows access to the string information. Although this solution is at a slightly lower level, it can be very effective <a href="#9">[9]</a>, especially when encapsulated within the string handle. The drawbacks to this approach are that any resize must also involve reallocating and copying the information prefix, and also the intent of the code and connections between the data structures is less obvious:</p> 
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    struct shared
+    {
+        size_t used, reserved, count;
+    };
+    char_type *text; // reinterpret_cast&lt;shared *&gt;(text) - 1
+};
+</pre>
+
+<p>4. <i> Link copied objects together in a doubly-linked list and hold a pointer to the string text</i>. The information about the string text can be held duplicated in each string handle or as a prefix of the text body's memory. When the links going to the previous and next string handle are both null (or, in a circular configuration, pointing to <b>this</b>), the text body is uniquely owned. This style of reference accounting (it is not really reference counting because there is no explicit count) is perhaps least appropriate for strings because there are no operations that require traversal of all handles. Each string handle will have a larger footprint than the other solutions considered so far, although only a single allocation is required per text body:</p> 
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    size_t used, reserved;
+    char_type *text;
+    string *previous, *next;
+};
+</pre>
+
+<p>5. <i> Hold the string text in a managed lookup table and retain some kind of reference into the table</i>. The information about the string can be held alongside the actual text in the table. This approach is suitable when the aim is not simply to reduce copy cost, but also to eliminate any duplicate strings. It is effectively a symbol table. The cost of initialization from a raw string is increased because of an initial search and a possible initial insertion, and there is increased space overhead per text body that exists. Strings can be held uniquely so that some string features, such as reserved capacity, are no longer appropriate. For strings, the typical implementation is to hold a <b>static</b> repository, which introduces its own issues as far as initialization and finalization ordering. This is typically not a suitable design for general purpose strings:</p> 
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    struct less {...}; // function object type for comparison
+    struct info
+    {
+        size_t used, count;
+    };
+    typedef map&lt;const char_type *, info, less&gt; string_map;
+    static string_map strings;
+    string_map::iterator entry;
+};
+</pre>
+
+<p>Clearly, there are many ways to skin a cow. For general-purpose, copy-on-write strings, the first three techniques are the most appropriate and most common.</p>
+
+<H4><FONT COLOR="#000080">Trying to be Smart</FONT></H4>
+
+<p>It seems clear that non-<b>const</b> operations such as <b>operator+=</b> and <b>resize</b> require a string handle to operate on its own copy of the text body. It also seems clear that <b>const</b> operations, such as <b>size</b> and <b>compare</b>, can operate without ill effect on a shared representation. This seems to divide operations in the string world neatly into two type types. However, there is a gray territory in between. What about non-<b>const</b> <b>operator[]</b>? This operator may be used for both reading from and writing to a string:</p>
+
+<pre>
+string&lt;char&gt; cow = &quot;Woof!&quot;, ghost = cow;
+ghost[3] = cow[1];
+</pre>
+
+<p>Both of these calls result in a call to the non-<b>const</b> <b>operator[]</b>, but for assignment, we want to assure that a deep copy happens, because reading a deep copy would be wasteful. There is no way to distinguish between these uses within <b>operator[]</b>. What we need is a smarter reference to do the work for us:</p>
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+public:
+    class reference
+    {
+    public:
+        ...
+        char &amp;operator=(char); // perform deep copy before write
+        operator char() const; // use shared representation
+    private:
+        string *target;
+        size_t index;
+    };
+    reference operator[](size_t);
+    ...
+};
+</pre>
+
+<p>This smart reference approach works in most cases. However, a smart reference is not totally substitutable for a real reference. The following fails to compile because <b>std::swap</b> expects real references:</p>
+
+<pre>
+swap(cow[3], ghost[1]);
+</pre>
+
+<p>There are other problems with the smart reference approach for strings [<a href="#10">10</a>, <a href="#11">11</a>], some of which are related to dubious practice &#151; holding the address of a returned reference &#151; and others to do with constraints in the Standard &#151; the <b>reference</b> type is required to be a real reference, no smart references allowed.</p>
+<p>And don't think that the problem is just confined to <b>operator[]</b>: It also applies to the <b>iterator</b> type, which may be used for both reading and writing. Therefore, for reference-counted strings, <b>iterator</b> must be a smart pointer rather than raw pointer type for the reference-counting optimization to be fully effective.</p>
+
+<H4><FONT COLOR="#000080">Pessimism</FONT></H4>
+
+<p>The outlook is pessimistic. As a copy optimization, the effectiveness of copy-on-write reference counting has been reduced to a few cases. In other cases it may be quite the opposite of an optimization, regardless of the investment and increase in code complexity.</p>
+<p>The only workable evaluation model for these problem functions is a pessimistic one: You don't know whether the user is going to read or write through the returned reference, and you have to just accept that and assume the worst. You may also consider catching some of the corner cases for undefined behavior, such as holding onto the address of a returned reference. In these cases you have to prevent any future sharing so that if the current string is used as the source for a copy, it causes a deep copy rather than sharing:</p>
+
+<pre>template&lt;typename char_type&gt;
+class string
+{
+public:
+    typedef char_type *iterator;
+    iterator begin()
+    {
+        reserve();
+        return text;
+    }
+    void reserve(); // reserve representation exclusively
+    ...
+private:
+    ...
+    char_type *text;
+};
+</pre>
+
+<p>All in all, this further reduces the effectiveness of copy optimization to a few corner cases. For non-<b>const</b> cases, there appears little to be gained from considering this a general-purpose optimization.</p>
+
+<H4><FONT COLOR="#000080">Threadbare</FONT></H4>
+
+<p>The final body blow comes with the introduction of multithreading. Sharing a reference-counted text body becomes unnecessarily interesting when the sharing is between threads. The gut instinct of programmers new to threaded programming is that a mutex or equivalent synchronization primitive will solve the problem. For instance:</p>
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    struct shared
+    {
+        size_t used, reserved, count;
+        mutex guard;
+        char_type *text;
+    };
+    shared *body;
+};
+</pre>
+
+<p>Synchronization primitives are operating system resources, and as such may be potentially scarce and costly to obtain. The temptation is then to share a common mutex for all string objects:</p>
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    struct shared
+    {
+        size_t used, reserved, count;
+        char_type *text;
+    };
+    static mutex guard;
+    shared *body;
+};
+</pre>
+
+<p>In addition to the initialization and finalization issues, you now have another problem: performance. First of all, locking and unlocking mutexes for all data accesses comes with a measurable overhead. And second, all string objects are now serialized through the same mutex, creating a potential bottleneck. Given that the aim of copy-on-write reference counting is to optimize &#151; and taken with all the other issues raised previously &#151; a mutex-based approach is not even on the radar.</p> 
+<p>If you look carefully at what you need to lock, you will see that the locking revolves around the reference count. Many operating systems provide you with lock-free synchronization primitives for incrementing and decrementing integers (e.g., <b>InterlockedIncrement</b> and <b>InterlockedDecrement</b> on Win32). With careful coding, it is now possible to ensure that no shared text body is ever compromised by race conditions. But note that these primitives still incur a performance penalty &#151; few things in life are free.</p>
+
+<H3><FONT COLOR="#000080">Separation of Concerns</FONT></H3>
+
+<p>There is a question we have to ask ourselves: Is it all worth it? The assumption has always been that this is a good general-purpose optimization, from the early days of standardization <a href="#12">[12]</a> to the current Standard <a href="#13">[13]</a>. At every stage, accommodating this style of implementation has caused headaches, even without the threading issues. The concern is not a recent one <a href="#14">[14]</a>:</p>
+<blockquote>
+<p>A use-counted class is more complicated than a non-use-counted equivalent, and all of this horsing around with use counts takes a significant amount of processing time. If the time spent copying values is small enough (either because the values are small and cheap to copy or they are not copied very often), changing the class to do use counting may make programs <i>slower</i>. Always do some performance measurements when making this kind of change to convince yourself that this optimization is not really a pessimization!</p>
+</blockquote>
+<p>With multithreading, the issues become even more involved <a href="#15">[15]</a>, and the horsing around becomes a full-blown stampede (but hopefully not a race condition...). This simply reinforces an earlier conclusion: It is not possible to design a single string implementation that satisfies all uses. Thus the default implementation that causes the fewest surprises (bugs) &#151; either in use or in implementation &#151; is to avoid copy-on-write reference counting. Avoiding it, or providing explicit information on how to disable it, is the approach now adopted by many libraries [<a href="#16">16</a>, <a href="#4">4</a>].</p>
+<p>So deeply rooted is the idea that copy-on-write reference counting is mandatory for strings that many developers are shocked &#151; and sometimes go into denial &#151; when they discover that the return on investment in this technique is often negligible and sometimes negative. The long-standing belief in this old practice is, however, younger than faith in another more fundamental software engineering principle: separation of concerns. And hey, do we have concerns.</p> 
+
+<H4><FONT COLOR="#000080">A Qualified Difference</FONT></H4>
+
+<p>Listen to the code; it is trying to tell you something: Mixing reference counting with mutability causes problems. Period. However, if you listen closely, you can hear a leading question, the whisper of a solution: What if you don't mix reference counting with mutability? What if we are dealing with two related but distinct types?</p>
+<p>From an interface perspective, we can see that we can use a string either as something that is read-mostly information or as a read-and-write space. From an implementation perspective, problems with reference counting arise only with mutability. Previously we explored the idea of <b>const</b> qualification being a form of subtype relationship <a href="#2">[2]</a> and one that can be reflected in inheritance <a href="#3">[3]</a>. For value types, we can define separate classes, not related through inheritance, and provide substitutability through conversions <a href="#1">[1]</a>.</p>
+<p>Consider a design where <b>string</b> covers the general case and something like <b>const_string</b> covers the immutable case. <b>const_string</b> has a subset of the operations of string: the <b>const</b> ones plus some that effect a rebinding of handle to the text body, such as <b>operator=</b>. <b>const_string</b> is different from <b>const string</b>, which prevents all modification, but still comes with any baggage not relevant to <b>const</b> (e.g., reserved capacity). It is more like the relationship between <b>iterator</b> and <b>const_iterator</b>.</p>
+<p>Not only do <b>string</b> and <b>const_string</b> differ in interface, but they can also differ in implementation: <b>string</b> should not be reference counted, but <b>const_string</b> may be. <b>const_string</b> has none of the concerns that plagued copy-on-write for a mutable string, and thread safety can be catered for by atomic increment and decrement operations.</p> 
+<p>Before you get too attached to the names <b>string</b> and <b>const_string</b> &#151; and assuming that your compiler fully supports partial template specialization &#151; consider one last refinement that uses template specialization and lets us keep a single name:</p> 
+
+<pre>
+template&lt;typename char_type&gt;
+class string
+{
+    ...
+private:
+    ...
+    size_t used, reserved;
+    char_type *text; // unshared
+};
+
+template&lt;typename char_type&gt;
+class string&lt;const char_type&gt;
+{
+    ...
+private:
+    ...
+    struct shared
+    {
+        const size_t used;
+        size_t count;
+    };
+    char_type *text; // reinterpret_cast&lt;shared *&gt;(text) - 1
+};
+</pre>
+
+<p>With this approach, <b>string&lt;char&gt;</b> is a common, writeable string, and <b>string&lt;const char&gt;</b> is the idiom used to work with the read-only variant.</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+<p>What do you get when you cross a string class with copy-on-write reference counting? A problem. What do you get when you cross that with separation according to qualification? A solution.</p>
+<p>The road to optimization is full of potholes. Trying to shoe horn many interface and implementation possibilities into a single type leads to twisted back roads. Separating core representation from algorithmic abstraction can clarify and clean up a string interface. Separation according to qualification is also a simplifying decision, both for interface and implementation. A cure &#151; in strings at least &#151; for Mad COW Disease <a href="#17">[17]</a>.</p> 
+
+<H3><FONT COLOR="#000080">Notes and References</FONT></H3>
+
+<p><a name="1"></a>[1] Kevlin Henney. &quot;From Mechanism to Method: Substitutability,&quot; <i>C++ Report</i>, May 2000, also available from <b>http://www.curbralan.com</b>.</p>
+<p><a name="2"></a>[2] Kevlin Henney. &quot;From Mechanism to Method: Good Qualifications,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, January 2001, <b>http://www.cuj.com/experts/1901/henney.htm</a>.</b>
+<p><a name="3"></a>[3] Kevlin Henney. &quot;From Mechanism to Method: Total Ellipse,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, March 2001, <b>http://www.cuj.com/experts/1903/henney.htm</b>.</p>
+<p><a name="4"></a>[4] SGI Standard Template Library Programmer's Guide, <b>http://www.sgi.com/tech/stl/</b>.</p>
+<p><a name="5"></a>[5] Margaret Ellis and Bjarne Stroustrup, <i>The Annotated C++ Reference Manual</i> (Addison-Wesley, 1990).</p>
+<p><a name="6"></a>[6] Stanley Lippman. <i>Inside the C++ Object Model</i> (Addison-Wesley, 1996).</p>
+<p><a name="7"></a>[7] James Coplien. <i>Advanced C++: Programming Styles and Idioms</i> (Addison-Wesley, 1992).</p>
+<p><a name="8"></a>[8] Erich Gamma, Richard Helm, Ralph Johnson, and John Vlissides. <i>Design Patterns: Elements of Reusable Object-Oriented Software</i> (Addison-Wesley, 1995).</p>
+<p><a name="9"></a>[9] Kevlin Henney. &quot;Counted Body Techniques,&quot; <i>Overload</i> 25, April 1998, also available from <b>http://www.curbralan.com</b>.</p>
+<p><a name="10"></a>[10] Scott Meyers. <i>More Effective C++: 35 New Ways to Improve Your Programs and Designs</i> (Addison-Wesley, 1996).</p>
+<p><a name="11"></a>[11] Herb Sutter. &quot;GotW #44: Reference Counting &#151; Part II,&quot; September 1998, <b>http://www.gotw.ca/gotw/044.htm</b>.</p>
+<p><a name="12"></a>[12] Steve Teale. &quot;Proposing a C++ String Class Standard,&quot; <i>Dr. Dobb's Journal</i>, October 1991.</p>
+<p><a name="13"></a>[13] <i>International Standard: Programming Language - C++</i>, ISO/IEC 14882:1998(E), 1998.</p>
+<p><a name="14"></a>[14] Robert Murray. <i>C++ Strategies and Tactics</i> (Addison-Wesley, 1993).</p>
+<p><a name="15"></a>[15] Herb Sutter. &quot;GotW #45: Reference Counting &#151; Part III,&quot; October 1998, <b>http://www.gotw.ca/gotw/045.htm</b>.</p>
+<p><a name="16"></a>[16] <i>The Dinkum C++ Library</i>, Dinkumware Ltd, <b>http://www.dinkumware.com/</b>.</p>
+<p><a name="17"></a>[17] Thanks to Andrei Alexandrescu's original use of the <i>Mad COW</i> term on <b>comp.std.c++</b>.</p>
+
+<p><i><b>Kevlin Henney</b> is an independent consultant and trainer specializing in C++, Java, OO design, patterns, and software architecture.  He can be reached at <b>kevlin@curbralan.com</b>.</i></p>
+
+</BLOCKQUOTE></BODY></HTML>

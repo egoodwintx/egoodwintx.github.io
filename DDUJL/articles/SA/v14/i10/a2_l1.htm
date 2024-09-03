@@ -1,0 +1,291 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v14, i10: Listing 1 autoconfig.pl</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a2.htm">Article</a></span></td>
+		<td><span class="navbarLink">Listing 1</span></td>
+		<td><a href="../../../../source/SA/2005/oct2005.tar"><b class=codeListing>oct2005.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h2><B>Listing 1 </B><I>autoconfig.pl</I></h2>
+            <p> 
+            <pre>
+#!/usr/bin/perl
+# prepares TFTP directory, *simple* DHCP, and *simple* DNS for server # install.
+# stdin (or file argument) needs to have space-delimited file:
+#  hostname MAC IP TFTP-server-IP pxeconfig-profile-name
+# use as "perl autoconfig.pl --help"
+use strict;
+use warnings;
+use Getopt::Long;
+use File::Copy qw(mv cp);
+use File::Path qw(mkpath);
+
+$ENV{PATH}="/sbin:/bin:/usr/sbin:/usr/bin:/usr/local/sbin:/usr/local/bin";
+our $DNS_DIR = "/var/named";
+our $DNS_SERVER = "dns.example.com";
+our $DNS_SERVER_IP = "10.1.1.1";
+our $TFTP_ROOT = "/tftpboot";
+our $MASTER_INSTALL_DIR = "$TFTP_ROOT/install";
+our @INSTALL = ();
+our %subnets;
+our $COUNT = 1;
+our $NAMED_CONF = "/etc/named.conf";
+our $DHCPD_CONF = "/etc/dhcpd.conf";
+our $CFENGINE_KEYS = "/var/cfengine/ppkeys";
+
+GetOptions( "dns-dir=s" =&gt; \$DNS_DIR,
+            "dns-server=s" =&gt; \$DNS_SERVER,
+            "install=s" =&gt; \@INSTALL,
+            "usage" =&gt; \&amp;usage,
+            "help" =&gt; \&amp;usage,
+          ) or exit 1;
+
+our %INSTALL = map { $_, 1 } @INSTALL;
+
+# MAIN
+
+initialize_dhcp();
+initialize_dns();
+
+while( my $machine = read_machine() ) {
+  add_hashinfo( $machine );
+  do_dhcp_config( $machine);
+  do_dns_config( $machine);
+  do_install( $machine ) if install_p( $machine );
+}
+
+finalize_dhcp();
+finalize_dns();
+
+# END MAIN
+
+sub soa {
+  my $zone = shift;
+  &lt;&lt;"_SOA_";
+@ IN SOA $DNS_SERVER root.example.com ( 1 3600 1800 604800 86400 )
+@ NS $DNS_SERVER.
+_SOA_
+}
+
+sub install_p {
+  my $machine = shift;
+
+  if ( $INSTALL{ $machine-&gt;{name} }
+       or $INSTALL{ $machine-&gt;{short_name} }
+       or $INSTALL{ $machine-&gt;{ip} }
+       or $INSTALL{ $machine-&gt;{mac} } ) {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+sub ip_to_hex {
+  return join '',
+    map { uc sprintf("%02x", $_ ) }
+      split /\./, shift;
+}
+
+sub do_install {
+  my $machine = shift;
+  my $ip = $machine-&gt;{ip};
+  my $hex_ip = ip_to_hex( $ip )
+    or die "Couldn't calculate hex IP from '$ip'\n";
+
+  print "installing $ip ($hex_ip)\n";
+  my $in_file = "$MASTER_INSTALL_DIR/$machine-&gt;{pxe}";
+  die "PXE type '$machine-&gt;{pxe}' does not have a corresponding file \
+    '$in_file'!\n" unless -e $in_file;
+  my $out_file = "$TFTP_ROOT/pxelinux.cfg/$hex_ip";
+  cp ( $in_file, $out_file )
+    or die "Couldn't copy: $!\n";
+  chmod 0666, $out_file;
+
+  my $cfengine_key = "$CFENGINE_KEYS/root-$ip.pub";
+  unlink $cfengine_key if ( -e $cfengine_key);
+
+  unless ( -s $in_file == -s $out_file ) {
+    die "Copy from '$in_file' to '$out_file' seems to have failed\n";
+  }
+}
+
+sub read_machine {
+  while (&lt;&gt;) {
+    s/#.*//; s/^\s+//; s/\s+$//;
+    next unless $_;
+    my @machine = split /\s+/;
+    return { name =&gt; $machine[0],
+             mac =&gt; $machine[1],
+             ip =&gt; $machine[2],
+             dhcp =&gt; $machine[3],
+             pxe =&gt; $machine[4],
+             disk =&gt; $machine[5],
+           };
+  }
+  return;
+}
+
+sub add_hashinfo {
+  my $machine = shift;
+  ( my $short_host = $machine-&gt;{name} ) =~ s|\..*||;
+  $machine-&gt;{short_name} = $short_host;
+}
+
+# DHCP
+sub initialize_dhcp {
+  open *main::DHCP, "&gt; $DHCPD_CONF"
+    or die "Can't open '$DHCPD_CONF': $!\n";
+  print main::DHCP "ddns-update-style none;\n\n";
+}
+
+
+sub do_dhcp_config {
+  my $machine = shift;
+
+  (my $subnet = $machine-&gt;{ip} ) =~ s/\.\d+$//;
+  unless ( $subnets{$subnet}++ ) {
+    print main::DHCP "subnet $subnet.0 netmask 255.255.255.0 {}\n\n";
+  }
+
+  ( my $router = $machine-&gt;{ip} ) =~ s/\d+$/254/;
+
+  print main::DHCP &lt;&lt; "_END_MACHINE_";
+host $COUNT {
+    option routers $router;
+    option host-name "$machine-&gt;{name}";
+    option domain-name-servers $DNS_SERVER_IP;
+    hardware ethernet $machine-&gt;{mac};
+    fixed-address $machine-&gt;{ip};
+    filename "/pxelinux.0";
+    next-server $machine-&gt;{dhcp};
+}
+_END_MACHINE_
+  $COUNT++
+}
+
+sub finalize_dhcp {
+  system("service dhcpd restart");
+}
+
+
+# DNS
+sub initialize_dns {
+  opendir D, $DNS_DIR
+    or die "Can't open '$DNS_DIR': $!\n";
+  while( my $f = readdir D ) {
+    my $path = "$DNS_DIR/$f";
+    next unless -f $path;
+    unlink $path;
+  }
+}
+
+sub write_to_zone {
+  my ($zone, $data) = @_;
+
+  open F, "&gt;&gt; $DNS_DIR/$zone" or die "Can't open '$DNS_DIR/$zone': $!\n";
+  print F $data;
+}
+
+sub do_dns_config {
+  my $machine = shift;
+  my @rev_ip = reverse split /\./, $machine-&gt;{ip};
+  my $last_octet = shift @rev_ip;
+  my $zone = join '.', @rev_ip, qw(in-addr arpa);
+
+  write_to_zone( $zone, "$last_octet IN PTR $machine-&gt;{name}.\n" );
+
+  my @rev_name = split /\./, $machine-&gt;{name};
+  my $last_name = shift @rev_name;
+  $zone = join '.', @rev_name;
+
+  write_to_zone( $zone, "$last_name IN A $machine-&gt;{ip}\n" );
+
+}
+
+sub finalize_dns {
+  opendir D, $DNS_DIR
+    or die "Can't open '$DNS_DIR': $!\n";
+  my @zones;
+
+  while( my $zone = readdir D ) {
+    my $path = "$DNS_DIR/$zone";
+    next unless -f $path;
+    push @zones, $zone;
+    my $tmp_path = $path . ".tmp";
+
+    mv ($path, $tmp_path);
+
+    open F, "&gt; $path" or die "Can't open '$path': $!\n";
+    print F soa( $zone );
+    open TMP, "$tmp_path" or die "Can't open '$tmp_path': $!\n";
+    print F $_ while (&lt;TMP&gt;);
+    close F;
+    close TMP;
+    unlink $tmp_path;
+  }
+
+  open CONF, "&gt; $NAMED_CONF" or die "Can't open '$NAMED_CONF': $!\n";
+  print CONF qq{options { directory "$DNS_DIR"; };\n\n};
+  foreach my $zone ( @zones ) {
+    print CONF &lt;&lt;"_ZONE_";
+zone "$zone" in {
+  type master;
+  file "$zone";
+};
+
+_ZONE_
+  }
+  system("service named restart");
+}
+
+sub usage {
+  die &lt;&lt;"_USAGE_";
+usage: $0
+          [ --dns-dir=/path/to/dns ]
+          [ --dns-server=x.y.z.example.com ]
+          [ --install=server.example.com
+          [ --install=server2.example.com ... ] ]
+          hosts.conf
+          | --help | --usage
+_USAGE_
+}
+</pre></table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

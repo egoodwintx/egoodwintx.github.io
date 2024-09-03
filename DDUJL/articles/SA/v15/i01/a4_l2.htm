@@ -1,0 +1,405 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v15, i01: Listing 2 check_lbnodes.pl</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a4.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a4_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink"><a href="a4_f2.htm">Figure 2</a></span></td>
+		<td><span class="navbarLink"><a href="a4_f3.htm">Figure 3</a></span></td>
+		<td><span class="navbarLink"><a href="a4_f4.htm">Figure 4</a></span></td>
+	</tr>
+	<tr>
+		<td><span class="navbarLink"><a href="a4_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink">Listing 2</span></td>
+		<td><span class="navbarLink"><a href="a4_l3.htm">Listing 3</a></span></td>
+		<td><a href="../../../../source/SA/2006/jan2006.tar"><b class=codeListing>jan2006.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h4><B>Listing 2 </B><I>check_lbnodes.pl</i></h4>
+            <p> 
+            <pre>
+#!/usr/bin/perl
+#
+## Name:         check_lbnodes.pl - load balance node monitoring program
+#
+## Author:      Tom Northcutt
+## Synopsis:    Checks status of web server load balance nodes, modifies 
+#               list of nodes and restarts accordingly.
+## Description:
+#               This script is designed to be run from a cron job 
+#               in order to check load balance nodes status (based on homepage
+#               access) and modify the squid load balance list in order to
+#               reflect running nodes accordingly.  Additional checks for 
+#               homepage modification and backup status are also incorporated.
+#               A temporary file is used to keep track of the last 
+#               modification of the homepage in question. 
+#
+# user defined section ###
+
+#file containing list of possible nodes
+my $pnodes = "/usr/local/squid/etc/servers-list.txt";
+
+#file containing list of currently running nodes
+my $cnodes = "/usr/local/squid/etc/servers-up.dat";
+
+#name of master node 
+my $master = "server1";
+
+#how to start/stop squid
+my $squid_start = "/etc/rc.d/init.d/squid start";
+my $squid_stop = "/etc/rc.d/init.d/squid stop";
+
+#how to restart load balancer (just kill it, it respawns from squid)
+my $redir_restart = q[ for i in `ps -ef |grep redir|grep perl| awk \
+  '{print $2}'`; do sudo skill -9 $i ; done] ;
+
+# file to log sent mail messages to
+my $maillog = "/etc/squid/check_homepage_mail.log";
+
+# email address of person to receive homepage change warnings
+# $admin_email = q"root@localhost";
+my $admin_email = q(sysadmin@mailserver.localdomain);
+
+# Files containing the previous primary homepage and new page. 
+# Used to check for changes.
+my $cached_page = "/tmp/cached_homepage.txt";
+my $new_page = "/tmp/new_homepage.txt";
+
+# sendmail
+my $sendmail = "/usr/lib/sendmail -t";
+
+
+# END user defined section ###
+
+use Sys::Syslog qw(:DEFAULT setlogsock);
+setlogsock "UNIX";
+
+use File::Copy;
+use LWP::UserAgent;
+my $ua = new LWP::UserAgent;
+$ua-&gt;agent("AgentName/0.1 " . $ua-&gt;agent);
+$date = `date`;
+
+# Load in list of potential nodes:
+open NODES, "&lt; $pnodes";
+my @nodesraw = &lt;NODES&gt;;
+close NODES;
+  #exclude commented lines
+my @nodeslist;
+foreach $i (@nodesraw){
+    ($i =~ /^#/) ? next : push (@nodeslist,$i);
+}
+
+#load in list of current nodes:
+open NODESOLD, "&lt; $cnodes";
+my @nodesold = &lt;NODESOLD&gt;;
+close NODESOLD;
+
+#debugging
+my $debug;
+if ($ARGV[0] =~ /debug/){$debug = 1 || 0};
+
+
+##MAIN ###
+my @nodesnew;
+foreach $i (@nodeslist){    
+    chop $i;
+    #check homepage on each node, modify if necessary
+    my $req1 = new HTTP::Request GET =&gt; "http://$i.localdomain/index.html";
+    $res1 = $ua-&gt;request($req1);
+    my $res_success1 = $res1-&gt;is_success();
+    if ($res_success1){push(@nodesnew, $i)};
+
+    ##check master node homepage for changes
+    #write new web page to a file        
+    if ($i eq "$master"){
+    check_hp(\$req1);
+    }
+}
+
+##check nodes
+#if full node list nodes is the total list of nodes
+if (@nodesnew == @nodeslist &amp;&amp;  @nodesnew == @nodesold){
+    print "all full node list nodes are up\n" if $debug;
+}elsif(@nodesold == @nodesnew){
+    print "node(s) still down\nfull node list:\n@nodeslist\n\ncurrently \
+      up:\n@nodesnew\n" if $debug;
+    mail_admin("node(s) still down","node(s) still down\nfull node \
+      list:\n@nodeslist\n\ncurrently up:\n@nodesnew\nprevious:\n@nodesold");
+}elsif(@nodesnew &gt; @nodesold){
+    print "a node came back up\nfull node list:\n@nodeslist\n\ncurrently \
+      up:\n@nodesnew\n\nprevious:\n@nodesold\n" if $debug;
+    update_nodes(\@nodesnew, 1);
+    mail_admin("node(s) came back up","a node came back up\nfull node \
+      list:\n@nodeslist\n\ncurrently up:\n@nodesnew\n");
+}elsif(@nodesnew &lt; @nodesold){
+    print "a node went down\n\nfull node list:\n@nodeslist\n\ncurrently \
+      up:\n@nodesnew\n\nprevious:\n@nodesold\n" if $debug;
+    update_nodes(\@nodesnew, 1);
+    mail_admin("a node went down","a node went down\nfull node \
+      list:\n@nodeslist\n\ncurrently up:\n@nodesnew\n");
+
+}else{
+    print "didn't catch this case\n";
+}
+
+
+##ENDMAIN ###
+
+
+
+## SUBROUTINES ###
+
+
+##(array_diff ARRAY1, ARRAY2)
+# compare two lists and return the differences
+# that are in ARRAY1 but not in ARRAY2, rerun
+# function with ARRAY2, ARRAY1 for other differences
+sub array_diff{
+    my ($list1, $list2) = @_;
+    
+    my @diff;
+    foreach $i (@$list1){
+    my $match = 0;
+    foreach $j (@$list2){
+        if ("$i" eq "$j"){$match = 1;next;}
+    }
+    if($match == 0){
+        push(@diff, "$i");
+    }
+    }
+    return @diff;
+} 
+
+##(get_pid PROCESS_NAME)
+# Given a process name, this routine returns the process id.
+# If the process isn't running, returns 0;
+sub get_pid {
+  my ($process_name) = @_;
+
+  my @ps_info = `/bin/ps -C $process_name`;
+  $null = shift(@ps_info); #first line is ps header info
+  my $ps_elem = @ps_info; #num elements in @it #icky perl
+  
+  my $ps_line = $ps_info[--$ps_elem];
+  $ps_line =~ s/^ +//; #ps output varies, remove all leading whitespace
+
+  #in case server forked, process last line 
+  my ($pid, @null) = split(/ /, $ps_line);
+  return $pid if $pid;
+  return 0;
+}
+
+
+## (mail_admin SUBJECT, MESSAGE)
+# Send a message to the system administrator leting them know of
+# special circumstances. 
+sub mail_admin {
+  my ($subject,$message) = @_;
+  
+  open(MAIL, "| $sendmail")
+    or die "PROXY-ALERT: Can't fork for sendmail: $!\n";
+  
+  print MAIL &lt;&lt;"ENDMAIL";
+From: $admin_email
+To: $admin_email
+Subject: $subject
+
+$message
+ENDMAIL
+  
+   close(MAIL);        # close the pipe
+
+  #log this event
+  open (MAILLOG, "&gt;&gt; $maillog") 
+    or die "PROXY-ALERT: Couldn't open the maillog: $maillog : $!\n";
+  print MAILLOG "\n" . "-"x70 . "\n";
+  print MAILLOG "$subject\n$message\n";
+  close(MAILLOG);
+}
+
+
+##(syslog_msg MESSAGE, PRIORITY)
+# Send syslog(3) a message to enter into the system logs appropriately.
+# PRIORITY can be one of: debug, info, notice, warning, err, crit, alert
+# or emerg (in reverse order of precedence, INFO is default).  
+sub syslog_msg{
+  my $message = shift;
+  my $priority = shift || "info";
+
+  openlog('check_homepage', 'cons,pid', 'user');
+  syslog("$priority", "$message");
+  closelog();
+  return 1;
+}
+
+
+##(check_hp) 
+# Check for homepage changes and report info to administrator
+#
+sub check_hp{
+    my $req = shift;
+    my $req1 = $$req;
+
+    print "checking the homepage for $master\n" if $debug;
+    open (NPAGE, "&gt; $new_page")
+    or mail_admin("PROXY-ERROR: can't open $new_page",
+              "$date - unable to open the file \
+                           $new_page for writing")
+    and die "SQUID-ALERT: can't open $new_page: $!\n";
+    
+    print NPAGE $res1-&gt;content;
+    close NPAGE;
+
+    #check for cached page                            
+    if  (! -e "$cached_page"){
+    mail_admin("PROXY-ERROR: no cached page: $cached_page",
+           "$date - $cached_page doesn't exist");
+    
+    copy("$new_page", "$cached_page")
+      or die "PROXY-ALERT: couldn't copy $new_page to $cached_page: $!\n";
+
+    die "PROXY-ALERT: $cached_page doesn't exist, created new.: $!\n";
+    }
+
+    #compare new and cached pages                     
+    $difference = `diff $cached_page $new_page`;
+    if($difference){
+
+    mail_admin("PROXY-ALERT: - webserver homepage has changed",
+           "$date The following changes were detected:\n$difference");
+    
+    syslog_msg("webserver homepage has changed, see $maillog");
+    
+    copy("$new_page", "$cached_page")
+        or die "PROXY-ALERT: couldn't copy $new_page to$cached_page: $!\n" ;
+    }
+}
+
+##(update_nodes NODE_ARRAY, RESTART)                                    
+# Generates a new node list file, then optionally restarts either squid
+# server entirely or just the redir script.  RESTART option takes a
+# value of 0,1,2.  0) does not restart a server, 1) restarts redir.pl
+# only, 2) restarts squid entirely.
+
+sub update_nodes{
+    my $upnodes = shift;
+    my $restart = shift || 0;
+
+    #write new nodelist to file
+    open NODESOLD, "&gt; $cnodes";
+    print "updating nodes:\n" if $debug;
+    foreach $i (@$upnodes){
+    print NODESOLD "$i\n";
+    }
+    close NODESOLD;
+
+    if ($restart == 1){
+    print "restarting load balance scripts\n" if $debug;
+    `$redir_restart`;
+    }elsif($restart == 2){
+    print "restarting squid\n" if $debug;
+    `$squid_stop`;
+    `$squid_start`;
+    }
+}
+
+
+
+1;
+
+=head1 NAME
+
+check_lbnodes.pl - proxy/load balance monitoring program
+
+=head1 AUTHOR
+
+Tom Northcutt
+
+
+=head1 SYNOPSIS
+
+Checks status of web server and load balance nodes, removes unavailable 
+nodes from the balancer, and reports on homepage changes
+
+
+=head1 DESCRIPTION
+
+This script is designed to be run from a cron job in order to check
+load balancing node status (based on homepage access) remove
+unavailable nodes from the system accordingly.  Additional checks for
+homepage modification and backup status are also incorporated.  A
+temporary file is used to keep track of the last modification of the
+homepage in question.  
+
+
+=head1 SUBROUTINES
+
+=item B&lt;sub get_pid(PROCESS_NAME)&gt;
+
+ Given a process name, this routine returns the process id.
+ If the process isn't running, returns 0;
+
+=item B&lt;sub mail_admin(SUBJECT, MESSAGE)&gt;
+
+ Send a message to the system administrator leting them know of
+ special circumstances. 
+
+=item B&lt;sub syslog_msg(MESSAGE, PRIORITY)&gt;
+
+ Send syslog(3) a message to enter into the system logs appropriately.
+ PRIORITY can be one of: debug, info, notice, warning, err, crit, alert
+ or emerg (in reverse order of precedence, INFO is default).  
+
+=item B&lt;sub update_nodes(NODE_ARRAY, RESTART)&gt;
+
+ Generates a new node list file, then optionally restarts either squid
+ server entirely or just the redir script.  RESTART option takes
+ a value of 0,1,2.  0) does not restart a server, 1) restarts redir.pl
+ only, 2) restarts squid entirely.
+
+=item B&lt;sub check_hp(REQUEST_OBJECT)&gt;              
+
+ Check for homepage changes and report info to administrator.  Takes a 
+ lwp request object as input.
+
+
+=cut</pre></table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

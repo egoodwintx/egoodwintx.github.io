@@ -1,0 +1,280 @@
+
+
+
+<html>
+<head>
+<title>April, 2005: Creating Dynamic Singletons &amp; the Loki Library</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>Creating Dynamic Singletons &amp; the Loki Library</h1>
+<p><i>C/C++ Users Journal</i> April, 2005</p>
+<h2>Trade-offs in implementing the Singleton design pattern</h2>
+
+
+<h3>By Curtis Krauskopf</h3>
+
+
+<I>Curtis Krauskopf is the principal of The Database Managers Inc., where he creates decompilers. He can be contacted at curtis@ decompile.com.</I>
+
+<hr>
+
+
+
+
+
+<p>My C++ program is using a third-party database library. It uses one object that represents the state of the database. The database object can be dynamically deleted to release all of its resources and it needs to be automatically deleted if it still exists at program termination. "So how am I going to solve this problem?" I ask myself.</p>
+
+<p>The "one object" requirement screams for a Singleton solution. But the ability to dynamically destroy a Singleton isn't handled by most Singleton implementations [1]. After the Singleton has been manually destroyed, it needs to automatically resurrect itself the next time it's used in the program. Also, if the Singleton exists when the program terminates, it needs to destroy itself to release its resources. </p>
+
+<p>In this article, I examine the trade-offs in implementing the Singleton design pattern, show how the Loki C++ Library of design patterns and idioms accommodates them, and then define a new policy to solve a difficult problem that Loki does not address. Along the way, I illustrate several issues related to <b>std::atexit</b>, create a new policy that works well within a policy-based framework, and work around the abstraction limitations offered by Loki's Singleton. The policy encapsulates a technique in which a Singleton watches the lifetime of another Singleton.</p>
+
+<p>The Loki library has a Singleton template called a <b>SingletonHolder</b>, which lets you instantiate a Singleton from any <b>struct</b> or class with a constructor that takes no parameters [2]. The Loki implementation provides template policies that let you specify how the Singleton is created, how it is destroyed, and even what threading model it uses (either single threaded or multithreaded). </p>
+
+<p>From a user's perspective, all of these features are wrapped into a single <b>typedef</b> that looks like this:</p>
+
+<pre>
+typedef SingletonHolder&lt;MyClass,
+  CreateUsingNew,
+  DefaultLifetime,
+  SingleThreaded
+&gt; obj;
+
+</pre>
+
+<p>And because of default parameters in the template, this declaration can be simplified to be more friendly looking:</p>
+
+<pre>
+typedef SingletonHolder&lt;MyClass&gt;obj;
+
+</pre>
+
+<p>The Singleton is accessed by using <b>obj::Instance()</b>. The <b>Instance()</b> method returns a reference to the Singleton so you access the Singleton's methods with the dot operator, like this: </p>
+
+<pre>
+obj::Instance().method();
+
+</pre>
+<h3>SingletonHolder Policies</h3>
+
+<p>There are three template policies that specify how a Singleton is created: <b>CreateUsingNew</b>, <b>CreateUsingMalloc</b>, and <b>CreateStatic</b>. Both <b>CreateUsingNew</b> and <b>CreateUsingMalloc</b> do that obvious thing of creating the object using <b>new</b> or <b>malloc</b>. <b>CreateStatic</b> uses placement <b>new</b> to create the object in static memory.</p>
+
+<p>There are four template policies that define the Singleton's lifetime: <b>DefaultLifetime</b>, <b>NoDestroy</b>, <b>PhoenixSingleton</b>, and <b>SingletonWithLongevity</b>.</p>
+
+<p>The <b>DefaultLifetime</b> policy mimics the lifespan of a normal global C++ object: The object lives until the program terminates, then the object's destructor is called.</p>
+
+<p>The <b>NoDestroy</b> policy is the simplest&#151;the Singleton is not destroyed. Undestroyed Singletons are not a memory leak but are a potential resource leak [3].</p>
+
+<p>The <b>PhoenixSingleton</b> is an interesting policy because it can resurrect a Singleton during program termination. When the Singleton is needed after it has been destroyed (when the program is terminating), the <b>PhoenixSingleton</b> policy causes the Singleton to be reincarnated. All of the code needed for this ability is invisible to users. Here's an example of a <b>PhoenixSingleton</b> declaration and use:</p>
+
+<pre>
+class Example {
+public:
+  void method() { ... }
+};
+typedef SingletonHolder&lt;
+  Example,
+  CreateUsingNew,
+  PhoenixSingleton
+&gt; myExample;
+ ...
+myExample()::Instance().method();
+
+</pre>
+
+<p>Despite its name, the <b>SingletonWithLongevity</b> policy does not create a Singleton that retains its state after it has been destroyed (it does not create a persistent Singleton). Instead, it lets users specify the order in which Singletons are destroyed. With this policy, regardless of what order the Singletons were created or first accessed, the Singletons are destroyed in a user-defined priority [4].</p>
+
+<p>The <b>SingletonWithLongevity</b> policy has a static function called <b>SetLongevity</b>. Both globally and locally declared dynamic objects can be scheduled for destruction by using <b>SetLongevity()</b>:</p>
+
+<pre>
+Example *pLocal =
+  new Example("Dynamic Example");
+SetLongevity(pLocal, 5);
+
+</pre>
+
+<p>The default (third) parameter for <b>SetLongevity</b> is:</p>
+
+<pre>
+Loki::Private::Deleter&lt;Example&gt;::Delete
+
+</pre>
+
+<p>This is a static function that simply calls <b>delete</b> on whatever object is passed to it. <b>SetLongevity</b> uses <b>std::atexit()</b> to register a callback function that deletes the object during program termination. <a href="0504krauskopfl1.html" target="_BLANK">Listing 1</a> is a <b>Keyboard</b> Singleton object scheduled for destruction with a longevity value of 10.</p>
+<h3>Back to PhoenixSingleton</h3>
+
+<p>Whereas <b>SingletonWithLongevity</b> lets users specify the destruction order of Singletons, the <b>PhoenixSingleton</b> policy takes a different philosophy. It says, "I don't care what order the Singletons are destroyed; but if I need a Singleton after it has been destroyed, automatically bring it back to life and then schedule it for destruction again."</p>
+
+<p><a href="0504krauskopfl2.html" target="_BLANK">Listing 2</a>, an example of the <b>PhoenixSingleton</b> policy at work, defines <b>Example</b> and <b>Log</b> classes that display text when each class's constructor and destructor execute. <b>Log</b> is a <b>PhoenixSingleton</b>.</p>
+
+<p>The <b>Example</b> object's destructor calls the <b>Log</b> Singleton. If a <b>Log</b> Singleton doesn't exist when the <b>Example</b> destructor executes, a <b>Log</b> object is instantiated.</p>
+
+<p>In <b>main()</b>, the longevity for the <b>Example</b> object is set before a <b>Log</b> object is instantiated. Calling <b>SetLongevity</b> schedules the object for destruction. This is important because, for this test program, the <b>Log</b> Singleton needs to be destroyed before the <b>Example</b> object is destroyed so that the <b>Log</b> Singleton is a dead reference when the <b>Example</b> object is destroyed. Loki causes the <b>Log</b> Singleton to be destroyed before the dynamically allocated <b>Example</b> object because the <b>Log</b> Singleton was the last object instantiated&#151;this mimics automatic C++ object destruction rules. <a href="0504krauskopff1.html" target="_BLANK">Figure 1</a> shows the output of <a href="0504krauskopfl2.html" target="_BLANK">Listing 2</a>. </p>
+
+<p>What should be surprising about this output is the last line&#151;or rather, what's not the last line. If the <b>PhoenixSingleton</b> policy was really working, you should expect "Log d'tor" to be the last line. So why is the <b>PhoenixSingleton</b> policy not destroying <b>Log</b> a second time?</p>
+
+<p>The reason is because of some oddities in the <b>std::atexit</b> function. Both the C and C++ Standards were unclear about what should happen when <b>atexit()</b> is called from within a function that itself was called when the <b>atexit</b> call stack is unwinding. This has been fixed in a subsequent corrigendum [5], but your compiler may not be compatible. </p>
+
+<p>Common sense says "it should just work," but Andrei Alexandrescu discovered "on three widely used compilers that the behavior ranges from incorrect (resource leaks) to application crashes" [6].</p>
+
+<p>Loki allows <b>PhoenixSingletons</b> that are resurrected to become resource leaks when the <b>ATEXIT_FIXED</b> symbol is not defined at compile time. Of course, one reliable way of knowing if <b>atexit</b> works well for functions called during exit processing on your compiler is to read the documentation. Because most compilers don't have obscure library functions documented to that degree, you can try the atexit/test.cpp program (available at http://www.cuj.com/code/). </p>
+<h3>Back To the Problem</h3>
+
+<p><a href="0504krauskopft1.html" target="_BLANK">Table 1</a> shows a comparison of the Loki lifetime policies and the problem. The <b>PhoenixSingleton</b> policy is the closest solution because its limitation is being able to handle a Singleton deleted by users. The limitation exists because there is no way to tell <b>atexit</b> that a function shouldn't be called anymore. </p>
+<h3>Building a Policy</h3>
+
+<p>I need a callback function for <b>atexit</b> that doesn't blindly delete a Singleton. I also need to create a policy that lets the Singleton be deleted on demand but automatically deletes the Singleton at the end of the program, if it's still alive.</p>
+
+<p><b>DeletableSingleton</b> seems like an appropriate name. It needs the same policy interface that the <b>SingletonHolder</b> lifetime policies use. <a href="0504krauskopfl3.html" target="_BLANK">Listing 3</a> is the public interface for <b>DeletableSingleton</b>.</p>
+
+<p>It looks straightforward. The oddest part is the <b>pFun</b> parameter&#151;it's a pointer to a static function that takes no arguments and returns void. When a <b>SingletonHolder</b> wants to schedule a Singleton for destruction, it calls <b>ScheduleDestruction</b> in the lifetime policy and passes a callback function that the policy should use when the Singleton needs to be destroyed.</p>
+
+<p><a href="0504krauskopfl4.html" target="_BLANK">Listing 4</a> shows a snippet of the <b>SingletonHolder</b> class that schedules a Singleton's destruction when the object is instantiated. <a href="0504krauskopfl5.html" target="_BLANK">Listing 5</a> is the <b>DestroySingleton</b> template method that is used to destroy <b>SingletonHolder</b> Singletons. This is the function pointer that is passed to <b>ScheduleDestruction</b>.</p>
+
+<p>The way that a Singleton is destroyed depends on how it was created. <a href="0504krauskopfl5.html" target="_BLANK">Listing 5</a> shows that <b>CreationPolicy&lt;T&gt;::Destroy</b> is called to destroy the Singleton.</p>
+
+<p>Putting all of these pieces together, this is how it works:</p>
+
+
+
+<ol>
+  <li>The first time the code in <a href="0504krauskopfl4.html" target="_BLANK">Listing 4</a> executes, <b>pInstance_</b> is <b>null</b> and <b>destroyed_</b> is <b>false</b>.</li>
+  <li><b>MakeInstance()</b> creates an instance of the Singleton by calling <b>CreationPolicy&lt;T&gt;:: Create();</b>.</li>
+  <li><b>MakeInstance()</b> calls <b>ScheduleDestruction</b> with a callback function pointer. This is where the <b>DestroySingleton</b> policy gets to take over. It needs to remember the pointer function passed to <b>DestroySingleton</b> so that it can be called later when the Singleton needs to be deleted during program termination. <b>ScheduleDestruction</b> needs to register a callback function in <b>atexit</b> that is smart enough to not blindly delete the Singleton if it has already been deleted by users.</li>
+  <li>At some point, users might manually delete the Singleton. When that happens, the private <b>destroyed_</b> Boolean in <b>SingletonHolder</b> is set to <b>true</b> to signal that <b>pInstance_</b> is a dead reference.</li>
+  <li>The Singleton might again be referenced in the program. Since it's a dead reference when <b>MakeInstance()</b> is called, this time, <b>MakeInstance()</b> calls <b>OnDeadReference()</b> in the <b>DestroySingleton</b> policy.</li>
+  <li><b>MakeInstance</b> then calls <b>CreationPolicy&lt;T&gt;:: Create()</b> again to recreate the Singleton.</li>
+  <li><b>MakeInstance</b> then once again calls <b>ScheduleDestruction</b>. Because the <b>DeletableSingleton</b>-specific callback static function has already been registered in <b>atexit</b> (in step 2), <b>ScheduleDestruction</b> only needs to remember the pointer function passed on this iteration. This is because it might be different than on the first pass when the original (now dead) Singleton was instantiated.</li>
+  <li>The program eventually terminates. <b>atexit</b> unwinds the function callback stack and the custom static for <b>DestroySingleton</b> is called. If the Singleton is still alive (if <b>destroyed_</b> in <b>SingletonHolder</b> is <b>false</b>), the most recent function pointer passed to <b>ScheduleDestruction</b> is called to destroy the Singleton. If the Singleton has been killed manually, there is nothing for the callback function to do so, it should quietly terminate.</li>
+</ol>
+
+
+
+<p>Based on this step-by-step account, the code for <b>DestroySingleton</b>'s <b>ScheduleDestruction</b> method is in <a href="0504krauskopfl6.html" target="_BLANK">Listing 6</a>.</p>
+
+<p><b>GracefulDelete</b> is a function for the <b>DeletableSingleton</b> policy that checks if the Singleton has been deleted. It's a static callback function that <b>atexit</b> calls when the program terminates.</p>
+
+<p>For <b>GracefulDelete</b> to do its work, it needs to know the status of <b>SingletonHolder</b>'s <b>destroyed_</b> Boolean. Unfortunately, that is private data and <b>SingletonHolder</b> doesn't provide any method that otherwise exposes <b>destroyed_</b>.</p>
+<h3>Back To the Drawing Board</h3>
+
+<p>I could cheat and make <b>destroyed_</b> public&#151;or better (if there is such a thing as "better" cheating), I could add a method to <b>SingletonHolder</b> that returns <b>destroyed_</b>'s status.</p>
+
+<p>The abstraction provided by <b>SingletonHolder</b> is otherwise fine, so I'll do some more work to accommodate a new policy.</p>
+
+<p>I only need to know when the Singleton is manually destroyed; otherwise, I can assume it's still alive and Do The Right Thing in <b>GracefulDelete</b>.</p>
+
+<p>The way users would manually destroy a <b>SingletonHolder</b> that uses the <b>DestroySingleton</b> policy is to call this prototype:</p>
+
+<pre>
+CreationPolicy&lt;T&gt;::Destroy(T*);
+
+</pre>
+
+<p>where <b>CreationPolicy</b> is the creation policy users specified for the <b>SingletonHolder</b> for class <b>T</b>. Because <b>MakeInstance()</b> returns a reference and <b>Destroy</b> takes a pointer, an actual call would look like this: </p>
+
+<pre>
+MyClass &amp;singleton =
+   myclass::MakeInstance();
+CreateUsingMalloc&lt;MyClass&gt;
+  ::Destroy(singleton);
+
+</pre>
+
+<p>This would certainly delete the Singleton, but there are two problems:</p>
+
+<ul>
+  <li>Whenever the creation policy for the Singleton changes, it's inconvenient to find all of the occurrences of <b>Destroy</b> and change the creation policy there, too. A <b>typedef</b> would simplify the work, but the <b>typedef</b> would still have to be changed whenever the creation policy for the Singleton was changed. If you get it wrong, the compiler will not help you because it doesn't know why you're calling <b>Destroy</b>&#151;it just knows that you want to call <b>Destroy</b> for a particular creation policy. The compiler will use a template that uses the obsolete policy you've specified. You could be using <b>free()</b> to destroy your statically allocated Singletons!</li>
+  <li>However <b>Destroy</b> is called, there needs to be some kind of hook that tells <b>DeletableSingleton</b> that the Singleton is dead because we can't peek into <b>SingletonHolder</b> to get that information.</li>
+</ul>
+
+
+
+<p>What about that <b>Loki::Private::Deleter&lt;...&gt;::Delete</b> static that is used as a default parameter to <b>SetLongevity</b>? It's just fine for Singletons that use the <b>CreateUsingNew</b> policy, but it won't work for the other policies because the <b>Deleter</b> static always uses <b>delete</b> to kill the Singleton.</p>
+
+<p>Since <b>atexit()</b> is calling a static method to destroy the Singleton (<b>GracefulDelete</b>) when the program terminates, what if users called the same method? That would actually work if <b>GracefulDelete</b> kept track of the status of the Singleton.</p>
+
+<p>The pseudocode for <b>GracefulDelete</b> is:</p>
+
+<pre>
+if (singleton is dead) then exit
+mark singleton as dead
+call SingletonHolder's callback function
+
+</pre>
+
+<p>The code for <b>GracefulDelete</b> is:</p>
+
+<pre>
+void DeletableSingleton&lt;T&gt;
+  ::GracefulDelete()
+{
+  if (isDead) return;
+  isDead = true;
+  deleter();
+}
+
+</pre>
+
+<p>Remember that <b>deleter</b> is a pointer to the <b>SingletonHolder</b> callback function.</p>
+
+<p><a href="0504krauskopfl7.html" target="_BLANK">Listing 7</a> implements the <b>DeletableSingleton</b> policy. The code to delete a Singleton that is using the <b>DeletableSingleton</b> policy is:</p>
+
+<pre>
+DeletableSingleton&lt;MyClass&gt;::
+  GracefulDelete();
+
+</pre>
+
+<p>This can even be simplified by using a <b>typedef</b>:</p>
+
+<pre>
+typedef DeletableSingleton&lt;MyClass&gt;
+  killMyClass;
+ ...
+killMyClass::GracefulDelete();
+
+</pre>
+
+<p>What if the <b>typedef</b> for the Singleton for <b>MyClass</b> is changed to not be a <b>DeletableSingleton</b>? What if it's changed to use the <b>PhoenixSingleton</b> or even the <b>NoDelete</b> policy?</p>
+
+<p>The program still uses this code to try to manually delete the Singleton. The compiler won't catch this mistake, but it's not a problem. The first thing that <b>GracefulDelete</b> does is check if <b>isDead</b> is <b>true</b>. <b>isDead</b> defaults to <b>true</b> and it is only set <b>false</b> when <b>ScheduleDestruction</b> is called in <b>DeletableSingleton</b>. Since that never happens for Singletons that don't use the <b>DeletableSingleton</b> policy, there isn't a problem. The Singleton isn't manually deleted, but it still is automatically deleted when using policies other than <b>NoDelete</b>.</p>
+
+<p>That's exactly what you would like to have happen. The code for manually deleting the policy does nothing when the Singleton isn't using <b>DeletableSingleton</b> and the code works right when the Singleton is using the <b>DeletableSingleton</b> policy.</p>
+<h3>Program Termination</h3>
+
+<p><b>DeletableSingleton</b> only calls <b>std::atexit()</b> the first time a specific Singleton class is instantiated to prevent filling up the <b>atexit()</b> stack. <b>DeletableSingleton</b>s are always deleted in the order of their first instantiation, not based on their most recent instantiation.</p>
+
+<p>That leads to a problem, though. What happens if a <b>DeletableSingleton</b> is instantiated after its own <b>atexit</b> callback function has executed? In that case, based on <a href="0504krauskopfl7.html" target="_BLANK">Listing 7</a>, the Singleton becomes a resource leak because <b>GracefulDelete</b> will not be passed to <b>atexit</b> again.</p>
+
+<p>That problem can be fixed, too. <a href="0504krauskopfl8.html" target="_BLANK">Listing 8</a> shows the differences of <a href="0504krauskopfl7.html" target="_BLANK">Listing 7</a> that eliminate a resource leak. <b>atexitCallback</b> was made protected so that users wouldn't accidentally use it instead of <b>GracefulDelete</b>.</p>
+<h3>Conclusion</h3>
+
+<p>The Loki library provides a <b>SingletonHolder</b> template that is able to create a Singleton object from any user-defined class. The library is flexible enough to provide automatic deletion for most policies and to provide automatic deletion for objects allocated with <b>new</b> that are not otherwise deleted by users.</p>
+
+<p>The <b>PhoenixSingleton</b> policy lets a Singleton be resurrected if it was destroyed during program termination. None of the Loki policies allow Singletons to be manually deleted by users and to provide automatic deletion if the Singleton is still alive at program termination.</p>
+
+<p>The <b>DeletableSingleton</b> policy provides exactly those services. The <b>GracefulDelete</b> static is even graceful enough to not do any harm if it's called when the Singleton does not use the <b>DeletableSingleton</b> policy.</p>
+
+<p>Because <b>DeletableSingleton</b> is using a template, all of the instances of <b>DeletableSingleton&lt;T&gt;</b> for any type <b>T</b> are using the same pairs of static Booleans (<b>isDead</b> and <b>needCallback</b>). Effectively, <b>DeletableSingleton</b> becomes a Singleton that is watching another Singleton.</p>
+<h3>Acknowledgment</h3>
+
+<p>Thanks to Andrei Alexandrescu for peer-reviewing this article and providing excellent suggestions.</p>
+<h3>References</h3>
+
+<ol>
+  <li>[1]	Vlissides, John. "To Kill a Singleton," <i>C++ Report</i>, June 1996.</li>
+  <li>[2]	http://sourceforge.net/projects/loki-lib/.</li>
+  <li>[3]	Alexandrescu, Andrei. <i>Modern C++ Design: Generic Programming and Design Patterns Applied</i>, Addison-Wesley, 2001, page 133.</li>
+  <li>[4]	The errata note for <i>Modern C++ Design</i>, located at http://moderncppdesign.com/errata/, for page 142 reports that the comparison for <b>LifetimeTracker::Compare</b> is backwards&#151;it should make higher longevity objects last longer, but instead it destroys the highest longevity objects first. Alexandrescu's note for this errata is that it has been fixed in the code on SourceForge. If your implementation of Loki does the opposite, then download the most current version of Loki and try again.</li>
+  <li>[5]	The full WG21 committee has voted to accept the Defect Report's Proposed Resolution as a Technical Corrigenda (ISO/IEC IS 14882:1998(E)). The solution is completely compatible with Loki's expectation of having <b>ATEXIT_FIXED</b> defined at compile time.</li>
+  <li>[6]	Alexandrescu, Andrei. <i>Modern C++ Design: Generic Programming and Design Patterns Applied</i>, Addison-Wesley, 2001, page 139. </li></ol>
+
+
+
+
+
+
+</body>
+</html>

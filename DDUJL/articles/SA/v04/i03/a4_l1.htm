@@ -1,0 +1,540 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE><title>v04, i03: Listing 1: tape2tape script</title></TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#990000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink><a href="a4.htm">Article</a></span></td>
+		<td><span class=navbarLink>Listing 1</span></td>
+		<td><span class=navbarLink><a href="a4_t1.htm">Table 1</a></span></td>
+		<td><span class=navbarLink><a href="a4_t2.htm">Table 2</a></span></td>
+		<td><a href="../../../../source/SA/1995/may95.tar"><b class=codeListing>may95.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<H1>Listing 1: tape2tape script</H1><p>
+<PRE>
+#!/bin/ksh
+#Program: tape2tape   This script will copy from fixed-block tape to tape
+#and can optionally perform a checksum  of source and destination tapes.
+#This script will automatically determine tape format, and the number of
+#files on a tape, if unknown.
+#10/31/94 PVELLECA, HSSC, Rockledge FL
+
+#CAPTURE COMMAND LINE ARGUMENTS FOR LATER PARSING.
+THISFILE=$0
+ARG1=$1
+ARG2=$2
+NUMARG=${#*}
+
+#MAKE COPY OF STANDARD I/O FOR USE LATER.
+exec 3&lt;&amp;0       #COPY OF STD IN
+exec 4&gt;&amp;1       #COPY OF STD OUT
+TMPFILE=/tmp/dd$$
+
+#CREATE A TABLE OF SUPPORTED QIC FORMATS AND THEIR RESPECTIVE
+#I/O DEVICE INTERFACES (TAPE DRIVE SPECIAL FILES). THIS TABLE MUST
+#HAVE THE FOLLOWING FORMAT:
+#  : &lt;QIC_TYPE&gt; &lt;NO_REWIND_SOURCE_DEVICE&gt;
+&lt;NO_REWIND_DESTINATION_DEVICE&gt;
+#
+#  QIC_TYPE: THE QIC FORMAT, E.G. QIC150.
+#  NO_REWIND_SOURCE_DEVICE: THE NO-REWIND SPECIAL FILE FOR THAT QIC_TYPE,
+#  FOR THE SOURCE TAPE DRIVE E.G. /dev/nrmt0m or /dev/nrst0.
+#  NO_REWIND_DESTINATION_DEVICE: THE NO-REWIND SPECIAL FILE FOR THAT QIC_TYPE,
+#  FOR THE DESTINATION TAPE DRIVE E.G. /dev/nrmt1m or /dev/nrst16.
+#
+#SOURCE/DESTINATION ENTRIES CAN BE REPEATED FOR DIFFERENT FORMATS THAT USE
+#THE SAME SPECIAL FILE. SEE MAN PAGE FOR THE DEVICE INTERFACE FOR YOUR SYSTEM
+#(E.G tz(4) FOR ULTRIX, st(4s) FOR SUN).
+#
+#THESE !!!!!!! MUST !!!!!! BE NO-REWIND DEVICES, OR THE COPY WILL NOT WORK.
+
+#FORMAT         SOURCE DEVICE   DESTINATION DEVICE   -REMEMBER, NO-REWIND!
+#######         ############    #################
+: QIC24         /dev/nrmt0a     /dev/nrmt1a
+: QIC120        /dev/nrmt0l     /dev/nrmt1l
+: QIC150        /dev/nrmt0m     /dev/nrmt1m
+: QIC320        /dev/nrmt0h     /dev/nrmt1h
+
+#DEFAULT CHECKSUM WHEN FINISHED WITH COPY. OPERATOR CAN TOGGLE THIS
+FROM THE
+#COMMAND LINE WITH THE '-c' OPTION.
+DEFAULT_SUM=FALSE
+
+#################################################
+### SHOULDNT NEED TO EDIT BELOW THIS LINE #######
+#################################################
+
+#CATCH ^C (INTERRUPT) AND KILL ALL RUNNING CHILDREN BEFORE EXITING.
+trap &quot;KillChildProcesses;rm -f $TMPFILE;exit 1&quot; 2
+
+#DEFINE FUNCTIONS
+function WaitForTape
+{
+#WAIT FOR TAPE DRIVES TO GO ONLINE, ETC
+#INPUT: (Input|Output) ASSUMES DEFAULT_FORMAT[3] IS SET BY MAIN PROGRAM.
+#OUTPUT: none.
+#THESE mt STATUS CODES ARE IN HEX, WHICH IS FAIRLY STANDARD, BUT YOU MAY
+#WANT TO CHECK YOURS IF THE SCRIPT FAILS. REMEMBER BECAUSE THEY ARE HEX,
+#THESE ARE STRINGS TO THE SHELL, NOT INTEGERS.
+ONLINE=200
+OFFLINE=204
+ONLINE_WRITELOCK=208
+OFFLINE_WRITELOCK=20C
+
+#DETERMINE IF SOURCE|DEST DEVICE ARGUMENT
+IO_TYPE=$1
+#GET FIRST CHAR
+IO_TYPE=`expr &quot;$IO_TYPE&quot; : '\(.\)' \| 'x'|tr 'A-Z' 'a-z'`
+if [ $IO_TYPE = &quot;i&quot; ]; then
+#DEVICE IS INPUT
+TAPE_TYPE=SOURCE
+TAPE_DEVICE=${DEFAULT_FORMAT[1]}
+else
+#DEVICE IS OUTPUT
+TAPE_TYPE=DESTINATION
+TAPE_DEVICE=${DEFAULT_FORMAT[2]}
+fi
+#LOOP AND WAIT UNTIL DRIVE BECOMES AVAILABLE.
+STOP=1
+SLEEPCOUNTER=0
+while [ $STOP -ne 0 ]; do
+#CHECK STATUS ON DEVICE
+mt -f $TAPE_DEVICE stat &gt;/dev/null 2&gt;&amp;1
+STOP=$?
+sleep 1  #DONT EAT UP CPU
+((SLEEPCOUNTER=SLEEPCOUNTER+1))     #COUNT TIME SPENT SLEEPING.
+((MSGTIMER=SLEEPCOUNTER%40))        #INTERVAL BETWEEN WAITING MESSAGES.
+if [ $SLEEPCOUNTER -eq 20 -o $MSGTIMER -eq 0 ]; then
+print &quot;        Waiting for $TAPE_TYPE drive...&quot;
+fi
+done
+
+#THIS ASSUMES THE mt COMMAND RETURNS THE HEX STATUS CODE TO STDOUT
+#THAT LOOKS LIKE: 'status  &lt;hex_code&gt;'.  CHECK YOUR IMPLEMENTATION.
+#ENSURE DRIVE IS ON-LINE
+set -A MTSTAT `mt -f $TAPE_DEVICE stat|egrep '^stat'`
+MTSTAT=${MTSTAT[1]}
+if [ &quot;$MTSTAT&quot; = $OFFLINE -o &quot;$MTSTAT&quot; = $OFFLINE_WRITELOCK ]; then
+Beep 2
+print &quot;Please place $TAPE_DEVICE ($TAPE_TYPE) ONLINE.&quot;
+print -n &quot;Hit [return] when ready ...&quot;
+read READY &lt;&amp;3
+WaitForTape $IO_TYPE
+fi
+
+#ENSURE DESTINATION TAPE IS NOT WRITE PROTECTED.
+if [ $TAPE_TYPE = &quot;DESTINATION&quot; ]; then
+if [ &quot;$MTSTAT&quot; = $ONLINE_WRITELOCK ]; then
+Beep 2
+print &quot;Please remove WRITE PROTECT on $tape_device ($tape_type).&quot;
+print -n &quot;Hit [return] when ready ...&quot;
+read READY &lt;&amp;3
+WaitForTape $IO_TYPE
+fi
+fi
+}
+
+function Beep
+{
+#INPUT: integer
+#OUTPUT: integer number of beeps
+COUNT=$1
+COUNT=${count:=1}
+while [ $COUNT -gt 0 ]; do
+#CONVERT NEWLINE TO BEEP
+print|tr '\012' '\007'
+((COUNT=COUNT-1))
+done
+}
+
+function DisplaySyntax
+{
+#DISPLAY SYNTAX AND EXIT
+#INPUT: none.
+#OUTPUT: (syntax_message)
+print &quot;SYNTAX:  t2t [-c] [numfiles]&quot;
+print &quot;         QIC Tape to tape copy.&quot;
+print &quot;         c: toggles default checksum setting&quot;
+print &quot;         numfiles: 0 or blank for unkown; otherwise some integer.&quot;
+exit 1
+}
+
+function KillChildProcesses
+{
+#KILL PROCESS(ES) (RUNNING AND STOPPED) STARTED BY THIS SCRIPT.
+#INPUT: none
+#OUTPUT: none
+#GET LIST OF JOBS IN FORMAT SUPPORTED BY KILL: %1 %2 ...
+JOBS=`jobs|sed  's,\[\([0-9]*\)\].*,%\1,'`
+kill -9 $JOBS 1&gt;/dev/null 2&gt;&amp;1
+return $?
+}
+
+function RewindTapes
+{
+#WAIT FOR SOURCE AND DESTINATION DRIVES TO GO ONLINE, THEN REWIND.
+#INPUT: none
+#OUTPUT: none
+WaitForTape Input 1&gt;&amp;4 &amp;
+WaitForTape Output 1&gt;&amp;4 &amp;
+wait
+print -n &quot;Rewinding tapes ...&quot;
+mt -f ${DEFAULT_FORMAT[1]} re 1&gt;&amp;4 &amp;
+mt -f ${DEFAULT_FORMAT[2]} re 1&gt;&amp;4 &amp;
+wait
+print &quot;done.&quot;
+}
+
+function ChangeDefault
+{
+#USE OPERATOR INPUT TO CHANGE A VARIABLE SETTING.
+#INPUT: (message, default_value)
+#OUTPUT: (new_value)
+TEXTMSG=$1
+
+DEFAULT=$2
+print -n &quot;$TEXTMSG [${DEFAULT}]: &quot; &gt;&amp;4
+read INPUT &lt;&amp;3
+print ${INPUT:=$DEFAULT}
+}
+
+function SetDefaults
+{
+#ALLOW OPERATOR TO CHANGE DEFAULT SETIINGS.
+print &quot; &quot;
+print &quot;======================COPY INFORMATION ===================&quot;
+if [ $NUM_FILES_KNOWN -eq 0 ]; then
+print &quot;Number of files:..................$NUM_FILES&quot;
+else
+print &quot;Number of files:..................0 (UNKNOWN)&quot;
+fi
+print &quot;Perform checksums after copy:.....$SUM&quot;
+print &quot;Source format:....................$INPUT_FORMAT&quot;
+print &quot;Destination format:...............$OUTPUT_FORMAT&quot;
+print &quot;Block transfer size:..............$BLOCK_SIZE&quot;
+print &quot; &quot;
+print -n &quot;Do you want to change defaults [no]? &quot;
+read READY &lt;&amp;3
+READY=`expr &quot;$READY&quot; : '\(.\)' \| 'n'|tr 'A-Z' 'a-z'`
+if [ $READY = &quot;y&quot; ]; then
+if [ $NUM_FILES_KNOWN -eq 0 ]; then
+NUM_FILES=$NUM_FILES
+else
+NUM_FILES=0
+fi
+NUM_FILES=`ChangeDefault &quot;Number of files&quot; $NUM_FILES`
+NUM_FILES=`CheckNumfiles $NUM_FILES`
+NUM_FILES_KNOWN=$?
+SUM=`ChangeDefault &quot;Perform checksums after copy:&quot; $SUM`
+SUM=`CheckCheckSum $SUM`
+INPUT_FORMAT=`ChangeDefault &quot;Source format&quot; $INPUT_FORMAT`
+set -A INPUT_FORMAT `CheckFormat $INPUT_FORMAT Input`
+INPUT_DEVICE=${INPUT_FORMAT[1]}
+OUTPUT_FORMAT=`ChangeDefault &quot;Destination format&quot; $OUTPUT_FORMAT`
+set -A OUTPUT_FORMAT `CheckFormat $OUTPUT_FORMAT Output`
+OUTPUT_DEVICE=${OUTPUT_FORMAT[2]}
+BLOCK_SIZE=`ChangeDefault &quot;Block transfer size&quot; $BLOCK_SIZE`
+BLOCK_SIZE=`CheckBlockSize $BLOCK_SIZE`
+SetDefaults
+fi
+}
+
+function CheckNumfiles
+{
+#ENSURE NUMBER OF FILES TO COPY IS LEGAL.
+#INPUT: (Number_of_files)
+#OUTPUT: (Number_of_file; STATUS=NUM_FILES_KNOWN)
+NUM_FILES=$1
+#ENSURE NUMBER OF FILES IS AN INTEGER AND KNOWN.
+NUM_FILES=`expr &quot;$NUM_FILES&quot; : '\([1-9][0-9]*\)' \| 0`
+#DECIDE IF NUMBER OF FILES IS KNOWN.
+if [ $NUM_FILES -eq 0 ]; then
+#NUMBER OF FILES IS NOT KNOWN
+NUM_FILES_KNOWN=1
+NUM_FILES=1
+else
+#NUMBER OF FILES IS KNOWN
+NUM_FILES_KNOWN=0
+fi
+print $NUM_FILES
+#RETURN STATUS IS USED BY CALLING PROGRAM:  0-&gt; TRUE 1-&gt; FALSE
+return $NUM_FILES_KNOWN
+}
+
+function CheckCheckSum
+{
+#ENSURE SELECTION OF CHECKSUM IS LEGAL.
+#INPUT:  (Check_sum)
+#OUTPUT: (Check_sum)
+REQUEST=$1
+#DECIDE IF CHECKSUMS ARE TO BE DONE.
+DS=`expr &quot;$DEFAULT_SUM&quot; : '\(.\)'|tr 'A-Z' 'a-z'`
+#DISCOVER THE OPPOSITE OF THE DEFAULT SETTING
+if [ $DS = &quot;y&quot; -o $DS = &quot;t&quot; ]; then
+NOT_DEFAULT_SUM=FALSE
+else
+NOT_DEFAULT_SUM=TRUE
+fi
+REQUEST=`expr &quot;$REQUEST&quot; : '-\{0,1\}\([A-Za-z]\)' \| &quot;$DS&quot;|tr 'A-Z' 'a-z'`
+#DETERMINE NEW CHECKSUM SETTING.
+if [ &quot;$REQUEST&quot; = &quot;c&quot; ]; then
+REQUEST=$NOT_DEFAULT_SUM
+elif [ &quot;$REQUEST&quot; = &quot;t&quot; -o &quot;$REQUEST&quot; = &quot;y&quot; ]; then
+REQUEST=TRUE
+else
+REQUEST=FALSE
+fi
+print $REQUEST
+}
+
+function CheckFormat
+{
+#ENSURE QIC FORMAT SELECTED IS SUPPORTED AS DENOTED AT THE TOP OF THIS FILE.
+#INPUT:  (QIC_Format, Input|Output)
+#OUTPUT: (QIC_Format, Input_Device, Output_Device)
+REQUEST=$1
+#REMOVE HYPHENS, ETC AND PRETTY UP OPERATOR INPUT.
+REQUEST=`print $REQUEST|sed 's,\([^qicQIC0-9]\),,g'|tr 'a-z' 'A-Z'`
+IO_TYPE=$2
+#GET FIRST CHAR
+IO_TYPE=`expr &quot;$IO_TYPE&quot; : '\(.\)' \| 'x'|tr 'A-Z' 'a-z'`
+#BASED ON INPUT, GET DEVICES FROM THE TABLE AT THE TOP OF THIS FILE.
+set -A CHECKREQUEST `GetTapeInfo $REQUEST`
+#IF OPERATOR INPUT DOES NOT RESOLVE, THEN USE THE DEFAULT.
+if [ ${#CHECKREQUEST} -eq 0 ]; then
+REQUEST=$DEFAULT_FORMAT
+else
+REQUEST=$CHECKREQUEST
+fi
+#GET DEVICES.
+GetTapeInfo $REQUEST
+}
+
+function CheckBlockSize
+{
+
+#ENSURE BLOCK SIZE SELECTED IS LEGAL.
+#INPUT:  (Block_size)
+#OUTPUT: (Block_size)
+BLOCK_SIZE=$1
+#COPY BLOCK SIZE AS USED BY dd. BIGGER VALUES ALLOW BETTER THROUGHPUT
+#BECAUSE THE DRIVES CAN STREAM. 10K WORKS WELL FOR MOST QIC TAPES.
+DEFAULT_BLOCK_SIZE=10k
+BLOCK_SIZE=${BLOCK_SIZE:=$DEFAULT_BLOCK_SIZE}
+#ENSURE BLOCKSIZE IS LEGAL, ALLOWING FOR SUFFIXES PER dd(1).
+BLOCK_SIZE=`expr &quot;$BLOCK_SIZE&quot; : '\([0-9][0-9]*[kKbBwW]*\)' \
+\| $DEFAULT_BLOCK_SIZE |tr 'KBW' 'kbw'`
+print $BLOCK_SIZE
+}
+
+function DetermineCopyFormat
+{
+#READ THE DESTINATION TAPE TO AUTOMATICALLY DETERMINE DEFAULT QIC FORMAT.
+#INPUT: none
+#OUTPUT: (QIC_Format, Input_Device, Output_Device)
+#GET SUPPORTED QIC FORMATS, SORTED BY INCREASING QIC FORMAT.
+#IGNORE THE PREFIX &quot;QIC&quot; TO ALLOW NUMERIC SORTING.
+set -A SUPPORTED_FORMATS `grep &quot;^: &quot;  $THISFILE|awk '{print $2}'|sort +.3nr`
+NSF=${#SUPPORTED_FORMATS[*]}
+#CHOOSE A DEFAULT FORMAT FROM LIST (USED ONLY TO MANIPULATE TAPE, NOT COPY).
+set -A DEFAULT_FORMAT `GetTapeInfo $SUPPORTED_FORMATS`
+RewindTapes 1&gt;&amp;4
+print -n &quot;Checking DESTINATION format...&quot; 1&gt;&amp;4
+COUNT=0
+while [ $COUNT -lt $NSF ]; do
+set -A TEST_FORMAT `GetTapeInfo ${SUPPORTED_FORMATS[$COUNT]}`
+if [ `expr &quot;$CHECKED_FORMAT&quot; : &quot;.*$TEST_FORMAT&quot;` -eq 0 ]; then
+#HAVE NOT YET CHECKED THIS FORMAT.
+CHECKED_FORMAT=&quot;$CHECKED_FORMAT $TEST_FORMAT&quot;
+#WRITE OUT 1 BLOCK OF GARBAGE TO DESTINATION TAPE.
+dd if=/bin/sh of=${TEST_FORMAT[2]} bs=512 count=1 &gt;$TMPFILE 2&gt;&amp;1
+set -A DDSTAT `cat $TMPFILE 2&gt;/dev/null`
+if [ &quot;${DDSTAT[0]}&quot; -eq &quot;${DDSTAT[3]}&quot; ]; then
+#THE NUMBER OF RECORDS_IN = RECORDS_OUT FOR dd.  THIS IS NOT TRUE IF
+#FORMAT DOES NOT MATCH TAPE TYPE.
+#WE HAVE FOUND THE HIGHEST ALLOWABLE CAPACITY.
+DISCOVERED_FORMAT=$TEST_FORMAT
+((COUNT=NSF))
+fi
+fi
+((COUNT=COUNT+1))
+done
+print &quot;done.&quot; 1&gt;&amp;4
+GetTapeInfo ${DISCOVERED_FORMAT:=$HIGHEST_FORMAT}
+}
+
+function GetTapeInfo
+{
+#USE INPUT TO GET SPECIAL FILE INFO OF A SUPPORTED QIC FORMAT.
+#INPUT: (QIC_Format)
+#OUTPUT: (QIC_Format, Input_Device, Output_Device)
+PIECE=$1
+set -A INFO `grep -i &quot;^:.*$PIECE&quot; $THISFILE`
+print ${INFO[1]} ${INFO[2]} ${INFO[3]}
+}
+
+
+#################################################
+#INITALIZE TAPE COPY SETTINGS
+#################################################
+set -A FORMAT `DetermineCopyFormat`
+INPUT_FORMAT=&quot;[AUTO-SELECT]&quot;  #OTHERWISE CAN SET TO: ${FORMAT[0]}
+OUTPUT_FORMAT=${FORMAT[0]}
+INPUT_DEVICE=${FORMAT[1]}
+OUTPUT_DEVICE=${FORMAT[2]}
+set -A DEFAULT_FORMAT ${FORMAT[*]}
+BLOCK_SIZE=`CheckBlockSize`
+if [ $NUMARG -gt 2  -o &quot;$ARG1&quot; = &quot;-x&quot; ]; then
+Beep 1
+DisplaySyntax
+elif [ $NUMARG -eq 2 ]; then
+#TWO ARGS, TOGGLE CHECKSUM AND NUM_FILES IS POSSIBLY KNOWN
+SUM=$ARG1
+NUM_FILES=$ARG2
+elif [ $NUMARG -eq 1 ]; then
+#NOT SURE IF ARG IS CHECKSUM OR NUM_FILES
+SUM=$ARG1
+NUM_FILES=$ARG1
+else
+#NO ARGS
+SUM=$DEFAULT_SUM
+NUM_FILES=0
+fi
+SUM=`CheckCheckSum $SUM`
+NUM_FILES=`CheckNumfiles $NUM_FILES`
+NUM_FILES_KNOWN=$?
+
+SetDefaults
+RewindTapes 1&gt;&amp;4
+
+#################################################
+#BEGIN MAIN PROGRAM
+#################################################
+#PERFORM TAPE COPY
+print &quot; &quot;
+print &quot;======================PERFORMING COPY===================&quot;
+COUNT=0
+while [ $NUM_FILES -gt 0  ]; do
+((COUNT=COUNT+1))
+print &quot;Copy file #$COUNT ...&quot;
+WaitForTape Input 1&gt;&amp;4 &amp;
+WaitForTape Output 1&gt;&amp;4 &amp;
+wait
+#THIS SCRIPT ASSUMES THE FOLLOWING ABOUT dd:
+#IF ASKED TO OPERATE PAST EOV, IT MAY PLACE THE DRIVE OFFLINE
+#AND IT WILL PRINT THE FOLLOWING MESSAGE TO STD ERROR (2):
+#dd: end of media, load another volume.
+#WITH SUCCESSFUL COPY OPERATION, dd PRINTS THE FOLLOWING MESSAGE
+#TO STD ERROR:
+#X+Y records in
+#A+B records out
+dd if=$INPUT_DEVICE of=$OUTPUT_DEVICE bs=$BLOCK_SIZE 1&gt;$TMPFILE 2&gt;&amp;1 &amp;
+DD_PID=${!}
+DDISDONE=&quot;FALSE&quot;
+while [ $DDISDONE = &quot;FALSE&quot; ];do
+set -A DDSTAT `cat $TMPFILE 2&gt;/dev/null`
+#GET STATUS AS REPORTED BY dd
+if [ ${DDSTAT[1]:=&quot;notdone&quot;} = &quot;records&quot; ]; then
+#dd IS FINISHED
+cat $TMPFILE
+rm -f $TMPFILE
+if [ &quot;${DDSTAT[0]}&quot; = &quot;0+0&quot; -a &quot;${DDSTAT[3]}&quot; = &quot;0+0&quot; ];
+then
+#BUT FILE IS ONLY AN EOF MARKER- NO DATA.
+#MUST EXPLICITLY WRITE EOF, BECAUSE dd WONT FOR A ZERO-LENGTH FILE.
+WaitForTape Output 1&gt;&amp;4
+mt -f $OUTPUT_DEVICE weof 1
+elif [ &quot;${DDSTAT[0]}&quot; != &quot;${DDSTAT[3]}&quot; ]; then
+#CHOSEN OUTPUT FORMAT NOT COMPATIBLE WITH TAPE TYPE.
+print &quot;ERROR: OUTPUT FORMAT POSSIBLY INCORRECT. COPY ABORTED.&quot;
+KillChildProcesses
+exit 1
+fi
+DDISDONE=&quot;TRUE&quot;
+elif [ ${DDSTAT[1]} = &quot;end&quot; ]; then
+#dd HAS REPORTED END OF MEDIA, AND TAPE MAY NOW BE OFFLINE.
+kill -9 $DD_PID &gt;/dev/null 2&gt;&amp;1
+((COUNT=COUNT-1))
+print &quot;Source tape contains $COUNT files.&quot;
+NUM_FILES_KNOWN=0         #NUMBER OF FILES IS NOW KNOWN.
+DDISDONE=&quot;TRUE&quot;
+elif [ ${DDSTAT[1]} = &quot;notdone&quot; ]; then
+#dd IS NOT DONE
+sleep 1
+else
+#dd HAS ENCOUNTERED AN ERROR
+cat $TMPFILE
+rm -f $TMPFILE
+print &quot;UNKNOWN dd ERROR: COPY ABORTED.&quot;
+KillChildProcesses
+exit 1
+fi
+done
+if [ $NUM_FILES_KNOWN -eq 0 ]; then
+((NUM_FILES=NUM_FILES-1))
+fi
+done
+rm -f $TMPFILE
+RewindTapes 1&gt;&amp;4
+
+#################################################
+#VERIFY
+#################################################
+if [ $SUM != 'FALSE' ]; then
+print &quot; &quot;
+print &quot;======================VERIFY COPY===================&quot;
+NUM_FILES=$COUNT
+COUNT=0
+while [ $NUM_FILES -gt 0 ]; do
+((COUNT=COUNT+1))
+( print &quot;SOURCE File#$COUNT checksum: \
+`dd if=$INPUT_DEVICE bs=$BLOCK_SIZE 2&gt;/dev/null|sum`&quot; )&amp;
+( print &quot;DEST   File#$COUNT checksum: \
+`dd if=$OUTPUT_DEVICE bs=$BLOCK_SIZE 2&gt;/dev/null|sum`&quot; )&amp;
+print &quot; &quot;
+wait
+((NUM_FILES=NUM_FILES-1))
+done
+RewindTapes 1&gt;&amp;4
+fi
+
+print &quot; &quot;
+print &quot;Finished with copy.&quot;
+exit 0
+#END MAIN PROGRAM
+</pre><p>
+<p>
+
+
+<P>
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

@@ -1,0 +1,396 @@
+<html>
+<head>
+<title>Oct02: Two-Axis, Real-Time  Camera Control</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Two-Axis, Real-Time  Camera Control</h1>
+<p><i>Dr. Dobb's Journal</i> October 2002</p>
+<h2>Keeping on eye on things with RTLinux</h2>
+
+<h3>By Cort Dougan</h3>
+
+<I>
+Cort is the director of engineering and cofounder of FSMLabs. He can be contacted at cort@fsmlabs.com.</I>
+
+<hr>
+
+<p>RTLinux/Pro from FSMLabs (the company I work for) allows rapid development of application code and drivers for control of devices such as servo motors for robotics and security monitors. In this article, I'll present software for viewing live images and controlling a servo-motor-driven, dual-axis mounted camera via a web page. I built this system to watch Kepler, my sick cat, while I was at the office (see <A NAME="rf1"><A HREF="0210ff1.htm">Figure 1</A>). Although Kepler usually stays in the same room, I still needed to move the camera around to find him. Once built, the camera and mount I'll describe here proved the perfect solution. </p>
+<p>The camera mount is made from scrap pieces of Lexan plastic, machine screws, and a hose clamp. Each axis of the mount is directly driven by a Hobbico CS-61 servo motor (http://www.hobbico.com/) so that servo-motor rotation results in corresponding rotation of the camera. Any type of altitude/azimuth mount with servo motors would work, however.</p>
+<DDJADVERTISEMENT INLINE>
+
+<p>The servo motors are driven by a circuit that provides 5v DC, ground, and signal lines to each of the motors. A DB25 connector on the end routes the first five data lines of the parallel-port connector to the five motor signal lines. Raising any of these parallel-port data lines raises the signal line on that servo-motor pin. For the camera, I used Logitech's QuickCam 3000 Pro USB camera (http://www.logitech.com/) because it is inexpensive, quickly produces high-quality images, and is supported under Linux (<A NAME="rf2"><A HREF="0210ff2.htm">Figure 2</A>).</p>
+
+<p>For its part, RTLinux is an operating system that runs Linux as the lowest priority task. RTLinux applications execute in the RTLinux environment rather than the Linux environment. This gives real-time applications priority over normal Linux applications&#151;and even Linux itself. On standard PCs like a 650-MHz Pentium III, RTLinux can deliver 5 <img src="mu.gif" width="8" height="13">s worst-case interrupt latency and 30 <img src="mu.gif" width="8" height="13">s worst-case jitter for periodic tasks. This means users still have a normal Linux system with X Windows, web servers, databases, and other applications available for Linux, but also get an environment where hard real-time applications can run. RTLinux applications are compiled as loadable kernel modules that are loaded and run after Linux has booted. In this article, I'll show how to build, compile, and run RTLinux drivers and applications. The complete source code is available electronically; see "Resource Center," page 5. To run these programs, you'll need to be running RTLinux (http://www.fsmlabs.com/).</p>
+
+
+
+<h3>Parallel-Port Driver</h3>
+
+
+<p>To drive motors through the parallel port, I needed to be able to easily write to the parallel port from RTLinux applications. While there are parallel-port drivers available for RTLinux, it's easy enough to write one from scratch. Drivers in RTLinux advertise their services to other RTLinux apps through files in /dev, just as with a standard UNIX system. These /dev files, managed by RTLinux drivers, are not directly accessible from the Linux environment. Consequently, a Linux application that opens /dev/lpt0 is communicating with the Linux (nonreal-time) parallel-port driver, not the RTLinux driver. Conversely, a RTLinux app that opens /dev/lpt0 is communicating with the RTLinux driver, not the Linux driver.</p>
+
+
+<p>This driver provides a /dev/lpt0 file that can be used through POSIX <i>open()</i>, <i>read()</i>, <i>write()</i>, <i>ioctl</i>, and <i>close()</i> calls from RTLinux applications. <A NAME="rl1"><A HREF="#l1">Listing One</A> is the initialization code for the parallel-port driver. The <i>init_module()</i> function is called when the module is loaded. The only thing I do in it is call <i>rtl_register_dev()</i> to register a handler for /dev/lpt0. <i>cleanup_module()</i> is called when the driver module is removed and unregisters the /dev/lpt handler.</p>
+
+<p>Anytime a RTLinux app opens /dev/lpt0, the <i>open()</i> that was registered with the call to <i>rtl_register_dev()</i> is called. The same is true for <i>close()</i> calls on /dev/lpt0. This is the place to do device initialization/shutdown or perform housekeeping on each open/close, if necessary. <A NAME="rl2"><A HREF="#l2">Listing Two</A> is the open/close code for the driver. </p>
+
+<p>Most of the work in the driver is done with <i>read()</i>/<i>write()</i> calls; see <A NAME="rl3"><A HREF="#l3">Listing Three</A>. I assume the value PORT 0x378 to be the address of the data register of the parallel port. This may vary, but it is the most common value for PC hardware and makes the driver much simpler. A more full-featured version would have the port address as a configuration value or might even probe for it.</p>
+
+<p>I also maintain the value <i>out_byte</i> that stores the last written value to the parallel port. I use this value later when doing <i>ioctl()</i> calls. The <i>read()</i> operation is simple and just reads from the data port and returns the value. The first few lines of the function check the input parameters to ensure that enough space was provided to store a single character. The <i>read()</i> that this driver implements only reads and returns to the caller a single character even though users may have provided space for much more data in the argument <i>buf</i>. A more full-featured driver would likely poll the device until <i>count</i> characters were read or would just read until no more data was available on the parallel port. RTLinux's semaphore and signal features would make the write more sophisticated, but here I want to treat the parallel port as a collection of digital I/O lines. In fact, since my app only wants to output data, I cheated and left <i>read()</i> as a placeholder for future updates. <i>write()</i> is not much more complex than <i>read()</i>. It loops through each byte of data to be written to the port, saves the output value in <i>out_byte</i>, then writes the value to the data register of the parallel port.</p>
+
+<p>The code presented to this point lets RTLinux apps perform <i>open()</i>, <i>read()</i>, <i>write()</i>, and <i>close()</i>. But what happens if you want to have a couple of apps that each need a few of the control lines? For example, in a robot project I worked on, two of the parallel port data lines were used for a camera mount (as in this article), but the other six data lines were used for DC drive motors. This driver lets you easily handle such a situation by creating set-bit/clear-bit operations through <i>ioctl()</i> calls. </p>
+
+<p>I added RTL_PAR_SETBIT and RTL_PAR_CLEARBIT definitions to include/rtl/ioctl.h. These values are unique to each driver, so there will be no conflicts. <A NAME="rl4"><A HREF="#l4">Listing Four</A> is the <i>ioctl()</i> code for the parallel-port driver. The <i>ioctl()</i> call either raises RTL_PAR_SETBIT or lowers RTL_PAR_CLEARBIT to the given line (argument <i>l</i>) on the parallel port. </p>
+
+<p>RTLinux applications must be compiled with very specific options&#151;something that's not easy to do by hand. Consequently, RTLinux provides a template Makefile that makes the job straightforward. <A NAME="rl5"><A HREF="#l5">Listing Five</A> is the Makefile that builds the parallel-port driver. The inclusion of rtl.mk pulls in all the predefined rules and compiler flags necessary to correctly build an RTLinux application. This Makefile assumes you've installed RTLinux in /opt/rtldk-1.1/rtlinuxpro, the default install location for RTLinux/Pro 1.1. If you install RTLinux (either the open or free version), you'll need to update the Makefile to represent where RTLinux is installed. Assuming the source file is named rtl_parallel.c, the Makefile builds your app without problems.</p>
+
+
+
+<h3>Servo-Motor Driver</h3>
+
+
+<p>Once the parallel-port driver is complete, you can begin working with the servo-motor driver. The parallel-port driver didn't need to communicate with Linux applications (only other RTLinux apps), but the servo-motor driver needs to. The most common communication model between Linux and RTLinux tasks is the real-time FIFO. Anyone who has used a normal FIFO under Linux (as created with mkfifo) knows how this works: A process on one end writes to a FIFO, which appears as a normal file, while another process reads from the other end. With RTLinux, the reader might be a real-time process, while the writer is a user-space program shuttling directives to the real-time code through the FIFO, or vice versa. In either case, FIFO devices are normal character devices (/dev/rtf*), and both ends can interact with the devices through normal POSIX calls such as <i>open()</i>, <i>close()</i>, <i>read()</i>, and <i>write()</i>.</p>
+
+
+<p>In this case, Linux tasks need to send commands to the servo-motor driver. I only need user tasks to be able to write to the driver, but the servo motor doesn't need to send messages back to Linux tasks. Consequently, I use two real-time FIFOs&#151;one for each motor&#151;to send a position that the servo motor should move to. Once I know where the motor should be, I need to move it there. When I initialize the driver, I create one thread (RTLinux task) for each motor. The job of each thread is to toggle the data line on the parallel port that signals a motor. </p>
+
+<p>To control the Hobbico CS-61 motors, I need to send the motor a signal every 20 ms. If I want the motor to move to minimum deflection (to the far left), I give it a high on the control line for 1 ms, then drop it low for 19 ms. For full deflection (to the far right position), I need to raise the signal line for 2 ms, then lower it for 18 ms. This gives about 180 degrees of rotation. </p>
+
+<p>In <A NAME="rl6"><A HREF="#l6">Listing Six</A>, the <i>init_module()</i> is called first when the program is loaded. The first thing I do is open the real-time FIFOs that used to communicate with Linux tasks. I create <i>#define</i>s for FIFOs 16 and 17 corresponding to the first and second servo motors. I picked these specific FIFOs randomly; their numbers have no special significance. I then install handlers for each of the FIFOs. The first argument to <i>rtf_create_handler()</i> selects the FIFO number for which the handler is installed. The second argument is a function to be called anytime a Linux tasks does a <i>write()</i> to the FIFO. This lets the code asynchronously read from the Linux side without needing to poll the FIFO.</p>
+
+<p>Next, I open the parallel-port device that I'll be using to control the motors. This <i>open()</i> call uses the parallel-port driver I described previously. I then must create the RTLinux tasks that do the work of turning the parallel-port bits on/off. I call <i>pthread_create()</i> to create each task. The argument <i>thread[i]</i> is where the thread ID is stored by the call, and <i>thread_code</i> is the function to begin executing as the new task. The fourth argument, <i>i</i>, is passed as an argument to the function <i>thread_code</i> and is used to determine which motor to control. The second argument, NULL, tells <i>pthread_create()</i> to use default thread attributes for this task.</p>
+
+<p>In <A NAME="rl7"><A HREF="#l7">Listing Seven</A>, <i>cleanup_module()</i> does some housekeeping to shut the system down. The <i>pthread_cancel()</i> calls stop for each task, and waits for each to finish. The <i>close()</i> calls close the real-time FIFOs; and the final <i>close()</i> closes the parallel port.</p>
+
+<p>Recall in <A NAME="rl6"><A HREF="#l6">Listing Six</A> I registered <i>fifo_handler()</i> as the FIFO write handler. The handler is called with a single argument that gives you the FIFO number that was written to. I use that to <i>read()</i> from the proper file descriptor into <i>msg</i>. If this is successful, I convert the string in <i>msg</i> into an <i>int</i> and store it in <i>position</i>.</p>
+
+<p>I then test <i>position</i> to make sure that it's a sane value, between 0 and 180 degrees of deflection. If there is an error, I return -1; if not, set <i>pulse_length</i> to the time in nanoseconds needed to raise the output line high (<A NAME="rl8"><A HREF="#l8">Listing Eight</A>).</p>
+
+<p>I command the motor to minimum deflection with a 1 ms high signal and full (180 degrees) deflection with a 2 ms high signal I need to avoid doing an actual 1 ms/180 deg since it would lose precision as an integer operation. Floating point is extremely slow, so I avoid it as well. I just rely on algebra to save me by performing a simple equation: 1 ms&times;position/180 deg.</p>
+
+<p><i>thread_code()</i> is where the motor actually gets moved. This code is timing critical and requires the real-time features of RTLinux. In keeping with RTLinux design principles, this is also the simplest and smallest piece of code.</p>
+
+<p>The code enters an endless loop terminated only by the <i>pthread_cancel()</i> call in <i>cleanup_module()</i>. Each iteration of the loop goes through a complete motor command&#151;raising the data line and lowering it. The first line of code in the loop uses an <i>ioctl()</i> call to turn on the bit <i>num</i> representing the motor controlled by this task. I hold the line high for <i>pulse_length[num]</i> nanoseconds, which was set by <i>fifo_handler()</i>.</p>
+
+<p>The <i>timespec_add_ns()</i> adds <i>pulse_length[num]</i> to the current time, and the <i>clock_nanosleep()</i> call sleeps until that time has elapsed. Once I return from <i>clock_nanosleep()</i>, I'm done holding the line high on the parallel port and need to lower it. This is timing critical, since each degree of rotation is represented by 1 ms/180 deg=5.55 <img src="mu.gif" width="8" height="13">s difference in the duration of the high signal. Tested under load with a 650-MHz Pentium III, RTLinux/Pro gave a worst-case periodic jitter of 30 <img src="mu.gif" width="8" height="13">s (which gives a position accuracy of about 5.4 degrees). Linux, without RTLinux, caused delays well over 20 ms under load when I tested. Linux completely missed frames and would cause the motor to either swing wildly (when holding the line high for incorrect amounts of time) or go completely limp (when missing the frame entirely). </p>
+
+<p>It's possible to optimize periodic timer RTLinux applications (such as this one) down to 0 <img src="mu.gif" width="8" height="13">s latency with the RTLinux TIMER_ADVANCE feature. I've left that out of this example because 5.4 degree accuracy is enough for this project. </p>
+
+<p>Last in the loop, I call <i>ioctl()</i> to lower the data line to the motor, compute how much time is left in the 20 ms frame, and then go to sleep. When I return from the sleep, the loop continues and it starts all over again (<A NAME="rl9"><A HREF="#l9">Listing Nine</A>).</p>
+
+
+
+<h3>The Web Page</h3>
+
+
+<p>The web page displays the image from the camera and lets me control the rotation and tilt of the camera. The easiest way to do this is through three frames, one for each section. <A NAME="rl10"><A HREF="#l10">Listing Ten</A> is the index web page I use to pull the frames together. This pulls in three different HTML files and arranges them properly. </p>
+
+
+<p>To display the image from the camera, I use Camserv (http://cserv.sourceforge.net/), a freely available program for delivering streaming video over the Web. This program streams images from the camera to UNIX port 9192. This lets any web page refer to that port and get a streaming image from the camera without needing to deal with the complexities of managing the image. I don't go through the details of installing Camserv, V4Linux, or the camera itself since this is documented elsewhere. The line <i>&lt;IMG SRC=hostname:9192&gt;</i> is the HTML to refer to this image once Camserv is running. Just replace <i>hostname</i> with the hostname of the computer running Camserv and the image appears.</p>
+
+<p>You rotate the camera to its full left and then full right stop with: </p>
+
+<blockquote><p>
+echo 0 &gt; /dev/rtf16</p>
+
+<p>
+echo 180 &gt; /dev/rtf16</p>
+
+</blockquote><p>Likewise, you can tilt it up and down with:</p>
+
+
+<blockquote><p>
+echo 0 &gt; /dev/rtf17</p>
+
+<p>
+echo 180 &gt; /dev/rtf17</p>
+
+</blockquote>
+
+<p>The pan.html file (<A NAME="rl11"><A HREF="#l11">Listing Eleven</A>) controls the pan position of the camera by calling a CGI script, pan.sh, with an argument that gives it the position to move to. The script just writes this argument to /dev/rtf16, which actually moves the camera. I refer to positions -90 through 90 degrees instead of 0 through 180 on the web page. This seems to make more sense for end users even though it is represented differently internally. I do something similar when tilting the camera; see <A NAME="rl12"><A HREF="#l12">Listing Twelve</A>.</p>
+
+
+
+<h3>Further Application</h3>
+
+
+<p>This article illustrates how most RTLinux projects can be designed and completed.  The goal is always to keep the real-time portion of a project small and simple so that it can execute in the least amount of time and with the greatest determinism.</p>
+
+
+<p></p>
+
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>int init_module(void)
+{ 
+   if (rtl_register_dev("/dev/lpt0", &amp;rtl_par_fops) )
+   { 
+       printk("Unable to install driver\n");
+       return - EIO;
+   }
+   return 0;
+}
+void cleanup module(void)
+{ 
+   rtl_unregister_dev("/dev/lpt0");
+}
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two</H4>
+
+
+<pre>static int rtl_par_open(struct rtl_file *filp)
+{ 
+   return 0;
+}
+static int rtl_par_release(struct rtl_file *filp)
+{ 
+   return 0;
+}
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+<H4><A NAME="l3">Listing Three</H4>
+
+
+<pre>#define PORT 0x378
+char out_byte;
+static ssize_t rtl_par_read(struct rtl_file *filp, char *buf, 
+                                       size_t count, off_t* ppos)
+{ 
+   if ( count &lt; sizeof(char) )
+      return - 1;
+   buf[0] = inb( PORT );
+   return 0;
+}
+static ssize_t rtl_par_write(struct rtl_file *filp, const char *buf,
+                                        size_t count, off_t* ppos)
+{ 
+   int i;
+   for ( i = 0; i &lt; count; i++ )
+   { 
+      out_byte = buf[i];
+      outb( out_byte, PORT );
+   }
+   return 0;
+}
+</pre>
+<P>
+<A HREF="#rl3">Back to Article</A>
+</P>
+<H4><A NAME="l4">Listing Four</H4>
+
+
+<pre>static int rtl_par_ioctl(struct rtl_file *filp, 
+                            unsigned int request, unsigned long l)
+{ 
+   switch ( request )
+   { 
+   case RTL_PAR_SETBIT:
+      out_byte | = 1&lt;&lt;l;
+      break;
+   case RTL_PAR_CLEARBIT:
+      out_byte &amp;= ~(1&lt;&lt;l);
+      break;
+   default:
+      return - EINVAL;
+   }
+   outb( out_byte, PORT );
+   return 0;
+}
+</pre>
+<P>
+<A HREF="#rl4">Back to Article</A>
+</P>
+<H4><A NAME="l5">Listing Five</H4>
+
+
+<pre>include /opt/rtldk-1.1/rtlinuxpro/include/rtl.mk
+all: rtl_parallel.o
+clean:
+   rm - f *.o
+</pre>
+<P>
+<A HREF="#rl5">Back to Article</A>
+</P>
+<H4><A NAME="l6">Listing Six</H4>
+
+
+<pre>define SERVO_FIFO 16
+pthread_t thread[2];
+int fd[2], fd_par;
+int init_module(void)
+{ 
+   int i;
+   char file[256];
+   /* open the fifo's */
+   for ( i = 0; i &lt; 2; i++ )
+   { 
+      sprintf( file, "/dev/rtf%d", SERVO_FIFO+i );
+      if ( (fd[i] = open(file, O_RDONLY | O_CREAT | O_NONBLOCK) ) &lt; 0 )
+      { 
+         rtl_printf("Could not open %s\n", file);
+         return -1;
+      } 
+   }
+   /* create FIFO handlers */
+   for ( i = 0; i &lt; 2; i++ )
+      rtf_create_handler(SERVO FIFO+i, fifo_handler);
+   /* open the parallel port device */
+   if ( (fd_par = open("/dev/lpt0", O_NONBLOCK)) &lt; 0 )
+   { 
+      rtl_printf("Could not open /dev/lpt0\n");
+      return -1;
+   }
+   /* create the tasks */
+   for ( i = 0; i &lt; 2 ; i++ )
+      { 
+      if ( pthread_create( &amp;thread[i], NULL, thread_code, (void *)i ) )
+         rtl_printf("thread %d failed create\n", i);
+      }
+   return 0;
+}
+</pre>
+<P>
+<A HREF="#rl6">Back to Article</A>
+</P>
+<H4><A NAME="l7">Listing Seven</H4>
+
+
+<pre>void cleanup_module(void)
+{ 
+   int i;
+   for ( i = 0 ; i &lt; NUM MOTORS ; i++ )
+   { 
+      pthread_cancel( thread[i] );
+   close(fd[i]);
+   }
+   close(fd par);
+}
+</pre>
+<P>
+<A HREF="#rl7">Back to Article</A>
+</P>
+<H4><A NAME="l8">Listing Eight</H4>
+
+
+<pre>unsigned long pulse_length[2];
+int fifo_handler(unsigned int fifo)
+{ 
+   int position = -1, err;
+   char msg[16];
+   char *junk;
+   /* read "position" from 0-180 degrees */
+   while ( (err = read(fd[fifo - SERVO FIFO], msg, sizeof(msg) )) != 0 )
+      position = simple_strtoul(msg, &amp;junk, 10);
+   /* stay within the range of the motor */
+   if ( (position &lt; 0) | | (position &gt; 180) )
+   return -1;
+   /* compute pulse width */
+   pulse_length[fifo - SERVO FIFO] = 1000000 /* 1ms */ 
+                                     + ((1000000 * position)/180);
+   return 0;
+}
+</pre>
+<P>
+<A HREF="#rl8">Back to Article</A>
+</P>
+<H4><A NAME="l9">Listing Nine</H4>
+
+
+<pre>unsigned long frame length = 20000000;
+void *thread_code(void *t)
+{ 
+   int num = (int)t;
+   clock_gettime( CLOCK REALTIME, &amp;next );
+   for (;;)
+   { 
+      /* turn on the pulse */
+      ioctl(fd_par, RTL_PAR_SETBIT, num);
+      /* setup for the idle part of the duty cycle */
+      timespec_add_ns( &amp;next, pulse_length[num] );
+      clock_nanosleep( CLOCK_REALTIME,TIMER_ABSTIME, &amp;next, NULL);
+      /* turn off the pulse */
+      ioctl(fd_par, RTL_PAR_CLEARBIT, num);
+      /* setup for the next pulse */
+      timespec_add_ns( &amp;next,frame_length - pulse_length[num] );
+      clock_nanosleep( CLOCK_REALTIME,TIMER_ABSTIME, &amp;next, NULL);
+   } 
+}
+</pre>
+<P>
+<A HREF="#rl9">Back to Article</A>
+</P>
+<H4><A NAME="l10">Listing Ten</H4>
+
+
+<pre>&lt;HTML&gt;
+&lt;HEAD&gt;&lt;TITLE&gt;RtlCam&lt;/TITLE&gt;
+&lt;/HEAD&gt;
+&lt;FRAMESET COLS="*,60"&gt;
+&lt;FRAMESET ROWS="*,40"&gt;
+&lt;FRAME SRC="image.html" NAME="image"&gt;
+&lt;FRAME SRC="pan.html" NAME="pan"&gt;
+&lt;/FRAMESET&gt;
+&lt;FRAME SRC="tilt.html" NAME="tilt"&gt;
+&lt;/FRAMESET&gt;
+&lt;/BODY&gt;
+&lt;/NOFRAME&gt;&lt;/FRAMESET&gt;
+&lt;/HTML&gt;
+</pre>
+<P>
+<A HREF="#rl10">Back to Article</A>
+</P>
+<H4><A NAME="l11">Listing Eleven </H4>
+
+
+<pre>Camera Position, relative to center:
+&lt;a href="/cgi-bin/pan.sh?0"&gt;-90&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?15"&gt;-75&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?30"&gt;-60&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?60"&gt;-30&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?75"&gt;-15&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?90"&gt;center&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?105"&gt;+15&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?120"&gt;+30&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?135"&gt;+45&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?150"&gt;+60&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?165"&gt;+75&lt;/a&gt;
+&lt;a href="/cgi-bin/pan.sh?180"&gt;+90&lt;/a&gt;
+</pre>
+<P>
+<A HREF="#rl11">Back to Article</A>
+</P>
+<H4><A NAME="l12">Listing Twelve</H4>
+
+
+<pre>Tilt:
+&lt;a href="/cgi-bin/tilt.sh?180"&gt;+90&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?165"&gt;+75&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?150"&gt;+60&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?135"&gt;+45&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?120"&gt;+30&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?105"&gt;+15&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?90"&gt;center&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?75"&gt;-15&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?60"&gt;-30&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?45"&gt;-45&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?30"&gt;-60&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?15"&gt;-75&lt;/a&gt;&lt;br&gt;
+&lt;a href="/cgi-bin/tilt.sh?0"&gt;-90&lt;/a&gt;&lt;br&gt;</pre>
+<P>
+<A HREF="#rl12">Back to Article</A>
+</P>
+
+
+</body>
+</html>

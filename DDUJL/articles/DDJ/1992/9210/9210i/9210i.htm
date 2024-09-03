@@ -1,0 +1,711 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>OCT92: A SOURCE CODE PROFILER</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>A SOURCE CODE PROFILER<a name="0236_0003"></h1><P>
+<h2><a name="0236_0001"><a name="0236_0000">Identifying code that needs to work faster</h2><P>
+<h3>Keith W. Boone</h3><P>
+<p><i><a name="0236_0002"><a name="0236_0000">Keith is the general manager of Computer Maintenance Organization in Tallahassee, Florida and is a contributing author to Tricks of the Windows 3.1 Masters (Howard Sams, 1992).  He can be reached on CompuServe at 75230,2070.</i></p><hr><P>
+The 90/10 rule is a well-known rule in programming that says the users will spend 90 percent of their time using 10 percent of your code.  Knowing this, you should spend most of your time optimizing that code, but how do you avoid spending 90 percent of your time just identifying it?  This problem is especially apparent in highly complex or recursive algorithms -- you cannot easily determine how often functions are used.  Without special hardware or use of assembly language, how can you identify the code that really needs to work faster?<P>
+Fortunately, this is a well-studied problem, and tools called &quot;profilers&quot; exist to help you locate which functions are being used.  A number of profilers are available (Microsoft's Source Profiler, Borland's Turbo Profiler, and Watcom's Profiler and Sampler all spring to mind); some are bundled with compilers, others are not.  However, effective profilers are not always efficiently used.  In this article, I'll discuss ways you can make the most out of a profiler, using as an example a working profiler you can build yourself.  While most of my discussion focuses on the design and implementation of my profiler, many of the techniques governing the program's use can be extended to other profilers.<P>
+I've used my profiler on 286/386/486 systems under DOS 3.3, 4.01, and 5.0.  It makes use of the hardware clock interrupt (INT 8) which executes a service routine 18.2 times per second. The profiler uses this interrupt to periodically determine where your program is currently executing.<P>
+The program was originally written using Microsoft's C 5.1 compiler and has been tested with C 5.1, C 6.0, and QuickC 2.0.  It should work with little or no modification in other environments, provided that the extended keywords far and interrupt are supported.  It may cause problems in systems using diskcaching programs, and it will not run under Windows.  In order to generate useful reports, your linker must be able to create MAP files that supply the segment and offset address of the functions in your program in a format similar to that created by Microsoft's linker.<P>
+<h3><a name="0236_0004">How the Profiler Works<a name="0236_0004"></h3><P>
+The profiler is divided into three parts: PROFILER.C (<a href="#0236_000c">Listing One</A>, page 128); SPEEDUP.C (<a href="#0236_000e">Listing Two</A>, page 128); and PROF.C (<a href="#0236_0010">Listing Three</A>, page 128).  <a href="#0236_000c">Listings One</A> and <a href="#0236_000e">Two</A> contain the runtime functions executed by your program.  <a href="#0236_000c"> Listing One</A> contains an interrupt service routine (ISR) which traps interrupt 8, the system timer interrupt.  When a timer interrupt occurs, this routine compares the return address on the stack to the region of code being profiled.  If the address is not in the region being profiled, no further action is taken.  Otherwise, the address is scaled to the size of the buffer, and the word in the buffer corresponding to that address is incremented. The output of the profiler is essentially an array of unsigned integers.  Each word indicates the number of times the program was found executing code at an address corresponding to the position of the word in the array.  (For more details on the IBM timer, see the accompanying textbox, &quot;Hardware Notes.&quot;)<P>
+<a href="#0236_000e">Listing Two</A> contains a function called speedup(), which is used to increase the number of interrupts received per second.  This code was originally developed on an 80286/12-MHz processor.  At the time, 18.2 samples per second was sufficient.  Today I use an 80486/50-MHz system.  Needless to say, my programs run a lot faster; therefore, I need many more samples per second.  This function would be better coded in assembly to reduce the overhead of the timer interrupt.  However, my intention is to provide the entire profiler using the C language.<P>
+The last part of the program reports on the data output by the writemon() function.  It uses the MAP file output by your linker and a few additional bytes of information to determine what functions were executed.  It accumulates the time used by each function and outputs them in sorted order.<P>
+Several problems came up while I was writing this profiler.  A number of these occurred simply because the profiler intercepts the timer-interrupt.  The timer-interrupt function can be running at any time, and any attempt to change variables used by the interrupt handler can cause a &quot;race&quot; condition -- a condition where executing two processes produces different (and possibly incorrect) results, depending on which process finished first.  Consider the case in which a buffer address needs to be changed.  The 8086 CPU does not have an uninterruptible instruction that could transfer four bytes to memory.  The assignment of the buffer address takes at least two, and possibly several more instructions.  If, during this process, the timer-interrupt handler is activated, the pointer to the buffer would be half right.  That is to say, it would contain the segment address of the new buffer and the offset address of the old buffer, or some other equally bad combination.  The pointer could address memory that is not a part of either buffer, or even part of your program.  The solution is to disable any profiling when these variables are being changed.  This is the purpose of the global variable status in <a href="#0236_000c">Listing One</A>.<P>
+Further problems arise when speeding up the system timer, Fortunately, I happened across an assembly routine by Alan Holub from his &quot;C Chest&quot; column (DDJ, December 1987).  I translated his code into C and added this speedup() function to the profiler for this article.  I separated the speedup() function from the rest of the program for two reasons.  You can disable the speedup() feature of the profiler by including an empty speedup() function in your program.  Furthermore, I think I will find speedup() useful in other programming projects (and hopefully you will as well).  Passing speedup() too large a value for your system can cause your system to hang because of lost interrupts.  Values up to 1024 seem to be acceptable for most uses; larger values produce too much overhead and really slow down your system; even larger values will hang it.<P>
+The next problem was resolving function addresses.  The 8086 CPU uses a segmented architecture in which several different values can actually be used to refer to the same address.  My profiler is not intended to support protected mode programs although it could with major modification, Fortunately, converting a segmented address into a linear (or physical) address is not difficult.  The linear() function performs the same math that the 8086 CPU uses to convert a SEGMENT:OFFSET address into a physical address.<P>
+The last major design problem I had to solve was relocation.  In order to identify the function being executed, the reporting program must know where your program was loaded in memory.  The profiler assumes that the program will be loaded in a contiguous block of memory, and that all functions in your program will have the same position in relationship to the start of that block, no matter where the code is loaded.  If these conditions are met, you only need to know the location of one function in the program.  Since nearly all C programs have a main function, its address is used as the reference.  Microsoft's linker outputs virtual function addresses in the MAP file.  These addresses would only be correct if your program were loaded at physical address 0:0.  However, the relationship between the function addresses found in the MAP file and the actual addresses in memory are the same.<P>
+<h3><a name="0236_0005">Using the Profiler in Your Application<a name="0236_0005"></h3><P>
+To initialize the profiler, simply call profile(buf, len, first, last, speed).  buf is an array of len unsigned integers that should be initialized to 0.  The profile() function does not initialize buf for you.  You could take advantage of the fact that buf is not reset to 0 to accumulate profiling data over several program sessions.  If you do this, look out for overflow errors caused by accumulating more than 65,535 hits at one code address.  Overflow could have been checked using the _profmon() function, but I've decided to let it occur silently.  You can, however, modify _profmon() to check for overflow.  If overflow occurs, you have several choices: You could simply increment the next or previous word in the buffer (but what if that overflows?); you could generate an error message; or you could generate a table of overflowed addresses.  Remember that anything done in _profmon() must be done fast and cannot use most DOS or runtime routines because it is executing at interrupt time.  You can reset the profiler by passing it a NULL buffer pointer.<P>
+The first and last addresses given to the profile() function are used to determine the region of code being profiled.  Any functions not between first and last will not be profiled.  Note that the last function will not be profiled since its starting address is the end of the profiled region.  Some C compilers automatically create a function etext(), which is simply the last address used by any program code.  You can also determine the last function address by examining the MAP file generated by the linker.  If you want to profile your entire program, simply create an empty function after the last function listed in the linker MAP and use it as the argument last.  It is perfectly legal to pass NULL and 0xFFFF:0x000F as the values for first and last.  The profiler will then profile everything being executed in memory.<P>
+<a href="#0236_000a">More Details.</A><P>
+The value provided in speed is passed to the speedup() function whenever the profiler is enabled.  The profiler disables speedup() when it is disabled.  In my initial implementation, speedup() was not called by any of the profiler functions.  You simply called it before profiling to speed up the system timer, and afterwards to restore the system timer to normal speed.  Since these two functions intercept interrupt vector 8, it was possible to hang the system by calling them in incorrect order.  By including a call to speedup() in the monitor() function, I was able to control the order and further bullet-proof the code.  It also allowed me to include the speedup factor in the profiler output file, so you will see correct times.<P>
+Having initialized the profiler, you must enable it by calling monitor(flag).  If flag is True, profiling will be enabled.  Conversely, profiling will be disabled if flag is False. This feature allows you to profile just a few sections of code without suffering from profiler overhead where it is not needed.  For example, I initially used the profiler to speed up the evaluation function of a chess program.  I simply placed a monitor(1) statement before the call to the evaluation function, and a monitor(0) after it.  Thus I profiled only those functions used to evaluate the chessboard, and ignored the functions that were part of the rather weighty user interface.<P>
+Always disable the profiler before exiting your program.  Failing to disable it or reset it (by calling profile with a NULL buffer) will cause errors, because the timer interrupt will still be pointing to an ISR in your program.  The code and memory for the routine may still work through several simple DOS programs, but eventually your system will crash.  If your program crashes while running the profiler, you should reboot it to remove the profiler, otherwise dangerous things could happen!  Using Control-Break to exit a program while it is profiling could hang your system.  This inadequacy could be fixed by adding code to remove the profiler on any abnormal exit, but this requires intercepting more vectors.  I have found little need for this feature as I use the profiler on already debugged code (which should be the normal order of things).<P>
+After profiling your program, the data collected must be output to a file for processing by PROF.EXE.  This is handled by calling writemon(filename), where filename is the name of the file in which you want to store the data.  It saves the position of your program in memory, the total number of clock ticks that occurred while the profiler was active, the addresses of the program region being profiled, the system-timer speedup factor used, and the length and contents of the profile buffer.  The writemon() function should be called before resetting the profiler, otherwise the profiler will not know what data should be output.<P>
+<h3><a name="0236_0006">Notes on Using the Profiler<a name="0236_0006"></h3><P>
+TESTPROF.C (see <a href="#0236_0012">Listing Four</A>, page 131) is a simple &quot;Sieve of Eratosthenes&quot; program.  It shows the proper use of the profiler runtime functions.  <a href="#0236_0007">Figure 1</A> shows sample output from PROF.EXE and the effect of different speedup values on profiler output from the same program.  Many things can affect the output of the profiler, including disk caching, RAM caching, and various TSR programs.  When profiling, disable any disk-caching programs you are using, especially any cache that performs delayed writes.  This will give you more accurate profiler output.  The profiler itself increases program-execution time because it steals cycles during a timer interrupt to perform its work. Using larger speedup values will increase this overhead, and you will begin to see altered results in the output of the profiler.<P>
+<h4><a name="0236_0007">Figure 1: Sample profiler output for the TESTPROF.C program.</h4><P>
+<pre>
+   Start:  24624
+   End:  24952
+  Length:   4096
+   Scale:      1
+   Speed:      1
+   Time: 00:10.384
+  Time        Routine    % of Total  % of Accounted
+  00:02.197   _markbit   21.16%      40.82%
+  00:02.087   _markall   20.11%      38.78%
+  00:00.659   _findnext   6.35%      12.24%
+  00:00.439   _testbit    4.23%       8.16%
+  00:05.384   Total   51.85%
+   Start:  24624
+   End:  24952
+  Length:   4096
+   Scale:      1
+   Speed:      2
+   Time: 00:15.741
+  Time        Routine    % of Total  % of Accounted
+  00:02.060   _markbit   13.09%      41.90%
+  00:01.483   _markall    9.42%      30.17%
+  00:00.741   _testbit    4.71%      15.08%
+  00:00.467   _findnext   2.97%       9.50%
+  00:00.164   DOS         1.05%       3.35%
+  00:04.917   Total  31.24%
+        .         .         .
+   Start:  24624
+     End:  24952
+  Length:   4096
+   Scale:      1
+   Speed:    512
+   Time: 00:39.369
+  Time        Routine    % of Total  % of Accounted
+  00:01.964   _markbit   4.99%       57.89%
+  00:01.161   _testbit   2.95%       34.21%
+  00:00.182   _findnext  0.46%       5.38%
+  00:00.082   _markall   0.21%       2.42%
+  00:00.002   DOS        0.01%       0.09%
+  00:03.393   Total  8.62%</pre><P>
+<P>
+For best results, start the profiler with no speedup value (0 or 1) and a buffer at least as long as all of the functions you wish to profile.  Continue doubling the speedup value until you get acceptable results.  Buffer size also affects the output.  If your buffer is significantly smaller than the region of code you are profiling, the profiler may incorrectly assign clock ticks to the function before the one actually being executed.  Your buffer should have at least one element for every 16 to 32 bytes of code being profiled.  Using larger scales (or, one element per 64 bytes) will give erroneous results in some cases because results from smaller functions will be combined with functions immediately before them in memory.  Smaller functions are often heavily used, which could further distort your results.<P>
+<h3><a name="0236_0008">Reporting<a name="0236_0008"></h3><P>
+PROF.C in <a href="#0236_0010">Listing Three</A>(page 128) provides the reporting features of the profiler.  The readmap() function imports the MAP file produced by the linker.  It searches for the strings by value to locate the section of the MAP file containing function addresses sorted by address.  It ignores all absolute symbols found in the MAP.  You could replace this function with one that imported symbols from other file formats.  The readmap() function should set nmap to the number of map entries used, and set emaina to the address of the main function.  emaina is used as a reference address to determine the location of other functions in memory.<P>
+My readmap() function adds two entries used to indicate the amount of time spent in other code.  The DOS entry simply collects all time spent in any code whose address is before the first address of your program.  The BIOS entry collects all of the time spent in code that occurs after your program in memory.  If you profile all memory in a plain vanilla MS-DOS system (no HIMEM.SYS driver or other use of upper-memory blocks), these entries will correctly report the amount of time your program spends executing MS-DOS or BIOS routines.<P>
+<h3><a name="0236_0009">Possible Improvements<a name="0236_0009"></h3><P>
+A good profiler not only tells you how much time is spent in each function, but also indicates how many times each function is called.  This is useful if you want to identify functions that would benefit from fast calling conventions, conversion to inline code (if your compiler supports it), or macros (if not).  Counting function calls could be done by modifying the stack check (__CHKSTK) function provided with your compiler.  The __CHKSTK function could call a routine similar to _profmon(), passing its return address.  This would require a second buffer, or you could split the buffer passed to profile() in two.<P>
+You could also add support for different symbol-table formats or additional features.  For example, some compilers will output the line numbers and addresses of each line of code. Adding support for line numbers would involve adding a little more code to the reporting program, and the code would be very similar to that already used for counting time spent in a function.  Note that reporting on line numbers would provide limited data unless the system timer was sped up by an appreciable factor.  At that point, it might be necessary to code _profmon() directly in assembly and to limit scaling to powers of two in order to limit the amount of time spent in the ISR.<P>
+<h3><a name="0236_000a"><a name="0236_000b">Hardware Notes<a name="0236_000b"></h3><P>
+The IBM PC and compatible systems use three programmable timers for system timing, memory refresh, and speaker control.  Originally, the timers were all part of one chip on the system board--the Intel 8254 programmable interval timer.  Today, a VLSI chip usually handles these functions and much more, but the timing functions work the same as with the 8254.  The input of Timer 0 is connected to a 1.19318-MHz signal which decrements the timer by 1 each time the signal goes high.  The output of Timer 0 is connected to the interrupt 0 input of the first 8259 interrupt controller, which is used to control and prioritize interrupts occurring in the system.  The 8259 essentially forces the processor to execute an INT 8 instruction whenever the counter element of Timer 0 reaches 0.<P>
+Each timer has a control register, status register, counter register, counter element, and output latch.  The counter register contains the starting value loaded into the counter element after its reaches 0.  The output latch is used to save the contents of the counter element to be read by the CPU.  Your system BIOS loads Timer 0's counter register with a value of 65,536 shortly after your system is booted.  This generates approximately 18.2 interrupts per second (1.19318 MHz/65536=18.2065 Hz).  You can speed up the system timer by decreasing the value contained in its counter register.<P>
+<a href="#0236_000e">Listing Two</A> contains a function that speeds up the system timer in this manner.  Note that it calls the old timer interrupt only when its internal counter is 0. Otherwise, it sends an end-of-interrupt command to the 8259 controller.  The end-of-interrupt command is necessary to allow the 8259 to continue processing interrupt requests.<P>
+--KB<P>
+<P>
+
+<PRE>
+
+
+_YOUR OWN SOURCE CODE PROFILER_
+by Keith W. Boone
+
+<a name="0236_000c">
+<a name="0236_000d"></pre><B>[LISTING ONE]</B><pre><a name="0236_000d">
+
+/* PROFILER.C -- Copyright (c) 1992 by Keith W. Boone, Tallahassee, FL
+ * This program contains the runtime functions required to profile C source
+ * code. Permission is granted to use or distribute this source code without
+ * any restrictions as long as this entire notice is included intact. You may
+ * use or include this software in any product that you sell for profit.
+ * This software is distributed as is, and is no liability is granted.
+ */
+
+#include    &lt;stdio.h&gt;
+#include    &lt;dos.h&gt;
+
+static long     start,      /*  Linear code start address      */
+                end,        /*  Linear code end address        */
+                reference,  /*  Main function address          */
+                ticker;     /*  Global total time in profiler  */
+static int      *buffer,    /*  Pointer to CS:IP tick buffer   */
+                length,     /*  Length of the buffer           */
+                scale,      /*  Scaling factor for the buffer  */
+                status,     /*  Status = TRUE if profiling     */
+                (interrupt far *old8)(); /* Old clock interrupt */
+unsigned        speedup_factor = 1; /*  Clock speedup factor    */
+
+/***** Convert a far pointer to a linear address *****/
+long linear(void far *ptr)
+{
+    long    addr = FP_SEG(ptr);
+    if ((long)ptr == -1l)
+        return 0x100000;
+    addr &lt;&lt;= 4;
+    addr += FP_OFF(ptr);
+    return addr;
+}
+/*****  _profmon is a clock interrupt handler which is used to  mark what
+function your program is in during the interrupt. *****/
+interrupt far _profmon(int es, int ds, int di, int si,
+    int bp, int sp, int bx, int dx, int cx, int ax,
+    unsigned ip, unsigned cs
+)
+{
+    if (status)         /* If profiling */
+    {   long    addr = cs;
+        addr &lt;&lt;= 4;
+        addr += ip;     /* Compute Phys address */
+        ticker++;       /* Increase total time */
+        if ((addr &gt;= start) &amp;&amp; (addr &lt;= end)) /* If in range of code */
+        {   addr -= start;
+            buffer[addr / scale]++; /* Update buffer */
+        }
+    }
+    _chain_intr(old8);
+}
+/***** profile(buf, len, first, last, speed) initializes the profiler. Buf is
+ Buf is a pointer to an array of integers that keeps track of CS:IP locations
+ while profiling.  First and last are pointers to the functions where profiling
+ will occur. Note that the function last is never profiled! Speed is the clock
+ frequency multiplier passed to speedup() when turning profiling on. *****/
+profile(int *buf, int len, int (*first)(), int (*last)(), unsigned speed)
+{
+    unsigned    i, j;
+    long        size;
+    int     main();
+    buffer = buf;
+    length = len;
+    start = linear((void far *)first);    /* Conver to linear address */
+    end = linear((void far *)last);
+    reference = linear((void far *)main); /* main() is relocation ref */
+    status = 0;                           /* Profiling off initially */
+    speedup_factor = speed;               /* Used with speedup() */
+
+    if (buf == NULL)                      /* buf==NULL is reset */
+    {   if (old8 != NULL)
+            _dos_setvect(0x08, old8);
+        return 0;
+    }
+    size = (end - start);                /* Compute size and scale */
+    scale = ((size - 1) / length) + 1;
+    return 0;
+}
+/***** monitor(flag) turns profiling on or off.  If turning profiling on then
+ the program needs to trap the clock interrupt, then set status = TRUE.
+ Otherwise the program resets the clock interrupt, then sets status = FALSE.
+ This ensures that status does not change to FALSE while in _profmon(),
+ not really a big deal, but cleaner. ******/
+monitor(int flag)
+{
+    if (buffer == NULL)          /* Turn on w/out initialization is error */
+        return -1;
+    if (flag)                    /* If turning profiling on */
+    {   if (speedup_factor &gt; 1)  /* Speed up clock by saved */
+            speedup(speedup_factor);  /* speedup factor */
+        old8 = _dos_getvect(0x08);    /* get old clock handler */
+        _dos_setvect(0x08, _profmon); /* set new vector */
+    }
+    else    if (old8 != NULL)         /* Else turning off */
+    {   _dos_setvect(0x08, old8);     /* reset old vector */
+        old8 = NULL;
+        if (speedup_factor &gt; 1)       /* Restore clock speed */
+            speedup(1);               /* Note reverse order! */
+    }
+    status = flag;                    /* Set on/off flag */
+    return 0;
+}
+/***** writemon(filename) copies the profiling data to the file specified
+ for later use by PROF.EXE. *****/
+writemon(char *filename)
+{
+    FILE    *fp = fopen(filename, &quot;wb&quot;);
+    if (fp == NULL)
+        return -1;
+    monitor(0);
+    fwrite(&amp;reference, 1, sizeof(reference), fp);
+    fwrite(&amp;ticker, 1, sizeof(ticker), fp);
+    fwrite(&amp;start, 1, sizeof(start), fp);
+    fwrite(&amp;end, 1, sizeof(start), fp);
+    fwrite(&amp;length, 1, sizeof(length), fp);
+    fwrite(&amp;scale, 1, sizeof(scale), fp);
+    fwrite(&amp;speedup_factor, 1, sizeof(speedup_factor), fp);
+    fwrite(buffer, length, sizeof(*buffer), fp);
+    fclose(fp);
+}
+
+
+
+
+
+<a name="0236_000e">
+<a name="0236_000f"></pre><B>[LISTING TWO]</B><pre><a name="0236_000f">
+
+#include    &lt;dos.h&gt;
+
+static int  (interrupt far *oldclk)();  /* Old clock interrupt  */
+static unsigned counter,                /* Current counter value */
+                factor;
+#define PICCMD  0x20                    /* 8259 PIC command port */
+#define EOI     0x20                    /* EOI command */
+
+#define TCTRL   0x43                    /* Timer control port */
+#define T0DATA  0x40                    /* Timer 0 data port */
+#define T0LOAD  0x36                    /* Timer 0 load command */
+
+/****** _spdup is an interrupt handler which processes clock interrupts which
+ have been sped up. *****/
+interrupt far _spdup()
+{
+    if (counter--)                      /* If counter non-zero */
+        outp(PICCMD, EOI);              /* Send EOI and return */
+    else
+    {   counter = factor;               /* Otherwise reset counter */
+        _chain_intr(oldclk);            /* and exec old handler */
+    }
+}
+speedup(unsigned newfact)
+{
+    unsigned divider;
+    if (newfact &lt;= 1)                   /* Reset timer handler */
+    {   factor = 1;
+        if (oldclk)                     /* reset only if set */
+        {   _dos_setvect(0x08, oldclk); /* in the first place */
+            outp(TCTRL, T0LOAD);
+            outp(T0DATA, 0);
+            outp(T0DATA, 0);            /* standard divisor */
+            oldclk = 0;
+        }
+    }
+    else
+    {   if (!oldclk)
+            oldclk = _dos_getvect(0x08); /* Save old handler */
+        counter = factor = newfact;
+        divider = 65536L / newfact;
+        _disable();                     /* Disable interrupts */
+        outp(TCTRL, T0LOAD);
+        outp(T0DATA, divider);
+        outp(T0DATA, (divider &gt;&gt; 8));   /* load new divisor */
+        _enable();                      /* Enable interrupts */
+        _dos_setvect(0x08, _spdup);     /* use our handler */
+    }
+}
+
+
+
+
+
+<a name="0236_0010">
+<a name="0236_0011"></pre><B>[LISTING THREE]</B><pre><a name="0236_0011">
+
+/*  PROF.C -- Copyright (c) 1992 by Keith W. Boone, Tallahassee, FL
+ * This program contains the reporting facilities used to profile C code.
+ * Permission is granted to use or distribute this source code without any
+ * restrictions as long as this entire notice is included intact. You may use
+ * or include this software in any product that you sell for profit.
+ * This software is distributed as is, and is no liability is granted.
+ */
+
+#include    &lt;stdio.h&gt;
+long start,     /* linear address of Start of profiled code    */
+    end,        /* End of profiled code                        */
+    reference,  /* Address of main function to resolve reloc   */
+    ticker;     /* Value of ticker at end of profiling         */
+int *buffer,    /* Pointer to profile buffer                   */
+    length,     /* Length of profile buffer                    */
+    scale,      /* Scale used (code address to buffer address) */
+    factor;     /* Clock speedup factor                        */
+
+typedef struct mapentry  /* Used to store MAP file information */
+{   long    address, /* Linear address of function             */
+        count;       /* computed # of ticks in function        */
+    char    *name;   /* Function Name                          */
+}   MAP;
+
+MAP map[4096];          /*  Limited to 4096 functions           */
+int nmap = 0;           /*  Number of Map table entries used    */
+long    emaina;         /*  Linear address of main function     */
+
+/***** Sortmap(m1, m2) is a callback function used by qsort to sort
+ map table entried by linear address. *****/
+sortmap(MAP *m1, MAP *m2)
+{   if (m1-&gt;address &lt; m2-&gt;address)
+        return -1;
+    if (m1-&gt;address &gt; m2-&gt;address)
+        return 1;
+    return 0;
+}
+/***** Readmap(filename) reads in the MAP stored in 'filename' and loads the
+data into map[].  *****/
+readmap(char *filename)
+{
+    char    line[80], *ptr, *strrchr(), *strdup();
+    long    off, seg;
+    FILE    *fp = fopen(filename, &quot;rt&quot;);
+
+    if (fp == NULL) /* Return error code if cannot open MAP file */
+        return -1;
+    map[nmap++].name = &quot;DOS&quot;; /* Address below first are in DOS */
+
+    /* Read each line of the map file until you find &quot;Publics by Value&quot;.
+     * This is VERY linker dependent! */
+    while (fgets(line, 80, fp))
+    {   if (ptr = strrchr(line, 'b'))
+        {   if (strcmp(ptr, &quot;by Value\n&quot;) == 0)
+                break;
+            else ptr = NULL;
+        }
+    }
+    if (ptr == NULL)    /* If we didn't find &quot;Publics by Value&quot; */
+    {   fclose(fp);     /* the return with an failure code. */
+        return -1;
+    }
+    while (fgets(line, 80, fp))
+    {   /* remove trailing linefeed from line */
+        if (ptr = strrchr(line, '\n'))
+            *ptr = 0;
+        if (!*line)
+            continue;                         /* Ignore empty lines  */
+        else if (strncmp(line + 12, &quot;Abs&quot;, 3) == 0)
+            continue;                         /* And Absolue values */
+        sscanf(line, &quot; %lX:%lX&quot;, &amp;seg, &amp;off); /* Get the seg:off */
+        map[nmap].address = (seg &lt;&lt; 4) + off; /* convert to linear */
+        ptr = strrchr(line, ' ');             /* find function name */
+        map[nmap].name = strdup(++ptr);       /* make a copy of it */
+
+        if (strcmp(ptr, &quot;_main&quot;) == 0)        /* Found main() */
+            emaina = map[nmap].address;       /* save it's address */
+        nmap++;
+    }
+    qsort(map + 1, nmap - 1,  sizeof(MAP), sortmap); /* Sort by address */
+    map[nmap++].name = &quot;BIOS&quot;;     /* Addresses beyond last are in BOIS */
+    return 0;
+}
+/***** Readmon(filename) reads in the profile data stored in 'filename' and
+ and outputs vitals on the profiled data. *****/
+readmon(char *filename)
+{
+    FILE    *fp = fopen(filename, &quot;rb&quot;);
+    void    *calloc();
+    int m, s, k;
+    float   T;
+
+    if (fp == NULL)
+        return -1;
+    fread(&amp;reference, 1, sizeof(reference), fp);
+    fread(&amp;ticker, 1, sizeof(ticker), fp);
+    fread(&amp;start, 1, sizeof(start), fp);
+    fread(&amp;end, 1, sizeof(start), fp);
+    fread(&amp;length, 1, sizeof(length), fp);
+    fread(&amp;scale, 1, sizeof(scale), fp);
+    fread(&amp;factor, 1, sizeof(factor), fp);
+    buffer = (int *)calloc(sizeof(int), length);
+    fread(buffer, length, sizeof(int), fp);
+    fclose(fp);
+
+    T = ticker / (18.2 * factor);
+    m = T / 60;
+    T -= m * 60;
+    s = T;
+    T -= s;
+    k = T * 1000;
+    printf(&quot; Start: %6ld\n&quot;, start);
+    printf(&quot;   End: %6ld\n&quot;, end);
+    printf(&quot;Length: %6d\n&quot;, length);
+    printf(&quot; Scale: %6d\n&quot;, scale);
+    printf(&quot; Speed: %6d\n&quot;, factor);
+    printf(&quot;  Time: %02d:%02d.%03d\n&quot;, m, s, k);
+    return 0;
+}
+/***** mapcmp(m1, m2) is a callback function used by qsort to sort map table
+ entried by amount of time used by the function. *****/
+mapcmp(MAP *m1, MAP *m2)
+{   if (m1-&gt;count &gt; m2-&gt;count)
+        return -1;
+    else if (m1-&gt;count == m2-&gt;count)
+        return 0;
+    else return 1;
+}
+main(int argc, char **argv)
+{
+    int i,                  /* profile buffer index */
+        j;                  /* MAP entry index */
+    long    addr;           /* Current linear address */
+    int m,                  /* Minutes */
+        s,                  /* Seconds */
+        t;                  /* thousandths */
+    char    buf[32],        /* File name buffer */
+        *strchr();
+    float   seconds,        /* time in a function in seconds */
+        accounted,          /* accounted for in all profiled functions */
+        percent;            /* Percent of total accounted */
+    if (argc &lt; 2)
+    {  fprintf(stderr, &quot;Usage: %s program[.map] [program[.mon]]\n&quot;, *argv);
+        exit(1);
+    }
+    /* Append .map to files that have no extension specified for arg 1 */
+    if (strchr(argv[1], '.'))
+        strcpy(buf, argv[1]);
+    else sprintf(buf, &quot;%s.map&quot;, argv[1]);
+    if (readmap(buf))
+    {   fprintf(stderr, &quot;Error reading map '%s'.\n&quot;, buf);
+        exit(1);
+    }
+    /* If second arg specified, then use it, otherwise use first arg */
+    if (argc &gt; 2)
+        i = 2;
+    else
+    {   i = 1;
+        if (strchr(argv[1], '.')) /* remove ext from first arg  */
+            *strchr(argv[1], '.') = 0;
+    }
+    /* Append .mon to files that have no extension specified for arg 2 */
+    if (strchr(argv[i], '.'))
+        strcpy(buf, argv[i]);
+    else    sprintf(buf, &quot;%s.mon&quot;, argv[i]);
+    if (readmon(buf))
+    {   fprintf(stderr, &quot;Error reading '%s'.\n&quot;, buf);
+        exit(1);
+    }
+    start -= reference; /* Offset start by the &amp;main */
+    end -= reference;
+    for (i = 1; i &lt; (nmap - 1); i++) /* adjust map by &amp;main */
+        map[i].address -= emaina;
+    map[0].address = 0x8000000;  /* DOS start = max neg */
+    map[nmap].address = 0x7FFFFFF;   /* BIOS end = max pos */
+
+    /***** For each entry in the buffer, find the first map address (j)
+     whose function encompasses addr, and update the time spent in
+     that function. *****/
+    accounted = 0.0;
+    addr = start;
+    j = 0;
+    for (i = 0; (i &lt; length) &amp;&amp; (j &lt; nmap); i++)
+    {   if (buffer[i])
+        {   while ((j &lt; nmap) &amp;&amp; (addr &gt; map[j+1].address))
+                j++;
+            map[j].count += buffer[i];
+            accounted += buffer[i];
+        }
+        addr += scale;
+    }
+    qsort(map, nmap, sizeof(MAP), mapcmp);  /* Sort by time used */
+    /* For each function, output time used, and accumulate the total */
+    printf(&quot;Time\t\tRoutine\t\t    %% of Total\t    %% of Accounted\n&quot;);
+    for (i = 0; i &lt; nmap; i++)
+    {   if (map[i].count)
+        {   seconds = map[i].count;
+            seconds /= (18.2 * factor);
+            m = seconds / 60;
+            seconds -= m * 60;
+            s = seconds;
+            seconds -= s;
+            t = seconds * 1000;
+            printf(&quot;%02d:%02d.%03d\t%-20s\t%5.2f%%\t%5.2f%%\n&quot;,
+                m, s, t, map[i].name,
+                map[i].count * 100.0 / ticker,
+                map[i].count * 100.0 / accounted);
+        }
+    }
+    /* Output accounted/total times */
+    percent = (100.0 * accounted) / ticker;
+    accounted /= 18.2 * factor;        /* Convert accounted to seconds */
+    m = accounted / 60;
+    accounted -= m * 60;
+    s = accounted;
+    accounted -= s;
+    t = accounted * 1000;
+    printf(&quot;%02d:%02d.%03d\t%-20s\t%5.2f%%\n&quot;, m, s, t, &quot;Total&quot;, percent);
+}
+
+
+
+
+
+<a name="0236_0012">
+<a name="0236_0013"></pre><B>[LISTING FOUR]</B><pre><a name="0236_0013">
+
+#include    &lt;stdio.h&gt;
+#define PLEN    4096
+unsigned    pbuf[PLEN];
+
+#define ALEN    8000
+#define MAX (ALEN*8L)
+char    array[ALEN];
+
+markbit(char *array, long bit)
+{
+    array[bit/8] |= 1 &lt;&lt; (bit % 8l);
+}
+testbit(char *array, long bit)
+{
+    return array[bit/8] &amp; (1 &lt;&lt; (bit % 8l));
+}
+markall(char *array, long bit)
+{
+    long    temp;
+    for (temp = bit + bit; temp &lt; MAX; temp += bit)
+        markbit(array, temp);
+}
+long findnext(char *array, long bit)
+{
+    long    temp;
+    for (temp = bit + 1; temp &lt; MAX; temp++)
+        if (!testbit(array, temp))
+            return temp;
+    return 0;
+}
+extern last();
+main()
+{
+    long    value,
+        start,
+        clock();
+    int speed;
+    char    buff[16];
+    printf(&quot;Speedup\tTime\n&quot;);
+    for (speed = 1; speed &lt;= 2048; speed += speed)
+    {   /* reset program workspace on each iteration */
+        memset(pbuf, 0, sizeof(pbuf));
+        memset(array, 0, sizeof(array));
+        /* Set profile buffer, program addresses and speedup */
+        /* note that main() is not profiled */
+        profile(pbuf, PLEN, markbit, main, speed);
+        start = clock();
+        printf(&quot;%5d\t&quot;, speed);
+        /* Enable profiling */
+        monitor(1);
+        /* Execute sieve of Eratosthenese */
+        for (value = 2; value; value = findnext(array, value))
+            markall(array, value);
+        /* Disable profiling */
+        monitor(0);
+        /* Output profile data for this pass */
+        printf(&quot;%ld\n&quot;, clock() - start);
+        sprintf(buff, &quot;tst%05d.mon&quot;, speed);
+        writemon(buff);
+    }
+}
+
+
+
+Figure 1: Sample profiler output for the TESTPROF.C program
+
+ Start:  24624
+ End:  24952
+Length:   4096
+ Scale:      1
+ Speed:      1
+ Time: 00:10.384
+Time       Routine    % of Total  % of Accounted
+00:02.197   _markbit   21.16%      40.82%
+00:02.087   _markall   20.11%      38.78%
+00:00.659   _findnext   6.35%      12.24%
+00:00.439   _testbit    4.23%       8.16%
+00:05.384   Total   51.85%
+ Start:  24624
+ End:  24952
+Length:   4096
+ Scale:      1
+ Speed:      2
+ Time: 00:15.741
+Time       Routine    % of Total  % of Accounted
+00:02.060   _markbit   13.09%      41.90%
+00:01.483   _markall    9.42%      30.17%
+00:00.741   _testbit    4.71%      15.08%
+00:00.467   _findnext   2.97%       9.50%
+00:00.164   DOS         1.05%       3.35%
+00:04.917   Total  31.24%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:      4
+ Time: 00:18.434
+Time        Routine    % of Total  % of Accounted
+00:01.895   _markbit   10.28%      45.10%
+00:01.208   _markall    6.56%      28.76%
+00:00.659   _testbit    3.58%      15.69%
+00:00.398   _findnext   2.16%       9.48%
+00:00.041   DOS         0.22%       0.98%
+00:04.203   Total   22.80%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:      8
+ Time: 00:19.848
+Time       Routine    % of Total  % of Accounted
+00:01.737   _markall   8.75%       36.19%
+00:01.675   _markbit   8.44%       34.91%
+00:00.748   _testbit   3.77%       15.59%
+00:00.521   _findnext  2.63%       10.87%
+00:00.116   DOS        0.59%        2.43%
+00:04.800   Total   24.19%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:     16
+ Time: 00:20.669
+Time        Routine    % of Total   % of Accounted
+00:02.026   _markbit   9.80%        44.66%
+00:01.146   _markall   5.55%        25.28%
+00:00.831   _testbit   4.02%        18.32%
+00:00.484   _findnext  2.34%        10.67%
+00:00.048   DOS        0.23%         1.06%
+00:04.536   Total   21.95%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:     32
+ Time: 00:21.299
+Time        Routine    % of Total  % of Accounted
+00:02.558   _markbit   12.01%      49.03%
+00:01.237   _markall    5.81%      23.72%
+00:00.781   _testbit    3.67%      14.97%
+00:00.506   _findnext   2.38%       9.71%
+00:00.133   DOS         0.63%       2.57%
+00:05.218   Total    24.50%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:     64
+ Time: 00:22.092
+Time        Routine    % of Total  % of Accounted
+00:02.423   _markbit   10.97%      45.22%
+00:01.655   _markall    7.49%      30.88%
+00:00.728   _testbit    3.30%      13.58%
+00:00.510   _findnext   2.31%       9.53%
+00:00.042   DOS         0.19%       0.78%
+00:05.359   Total   24.26%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:    128
+ Time: 00:23.507
+Time        Routine    % of Total  % of Accounted
+00:01.892   _markall   8.05%       37.09%
+00:01.677   _markbit   7.14%       32.89%
+00:01.008   _testbit   4.29%       19.77%
+00:00.518   _findnext  2.21%       10.16%
+00:00.004   DOS        0.02%        0.08%
+00:05.101   Total   21.70%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:    256
+ Time: 00:27.389
+Time        Routine    % of Total  % of Accounted
+00:04.228   _markall   15.44%      46.14%
+00:02.544   _markbit    9.29%      27.77%
+00:01.134   _findnext   4.14%      12.38%
+00:00.973   _testbit    3.55%      10.62%
+00:00.283   DOS         1.04%       3.09%
+00:09.164   Total    33.46%
+ Start:  24624
+   End:  24952
+Length:   4096
+ Scale:      1
+ Speed:    512
+ Time: 00:39.369
+Time        Routine    % of Total  % of Accounted
+00:01.964   _markbit   4.99%       57.89%
+00:01.161   _testbit   2.95%       34.21%
+00:00.182   _findnext  0.46%       5.38%
+00:00.082   _markall   0.21%       2.42%
+00:00.002   DOS        0.01%       0.09%
+00:03.393   Total   8.62%
+
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

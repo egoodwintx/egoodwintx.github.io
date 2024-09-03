@@ -1,0 +1,430 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+  <title>Sending Mail Without Sendmail - The Perl Journal, Summer 1999</title>
+  <meta name="generator" content=
+  "HTML Tidy for Linux/x86 (vers 12 April 2005), see www.w3.org">
+  <meta name="vscategory" content="Perl">
+  <meta name="vsisbn" content="">
+  <meta name="vstitle" content="Sending Mail Without Sendmail">
+  <meta name="vsauthor" content="Dan Sugalski">
+  <meta name="searchdescription" content=
+  "What we're going to do in this article is build a sendmail replacement suitable both for use in place of a real sendmail and as donor code which you will undoubtedly gut for your own use.">
+  <meta name="vspublisher" content="Earthweb">
+  <meta name="vspubdate" content="Summer 1999">
+
+</head>
+
+<body bgcolor="#FFFFFF">
+  <!-- end head -->
+  <font face="verdana" size="1">Issue 14, Summer 1999</font>
+
+  <h2 align="center">Sending Mail Without Sendmail</h2>
+
+  <h4>Dan Sugalski</h4>
+
+  <p><b>Optional Packages:</b> libnet, mailtools Sooner or later,
+  most Perl programmers find themselves needing to send electronic
+  mail from a program. It might be for a CGI application, or
+  sending out autoconfirmations, or generating monthly e-mail
+  invoices, or sending reports to the payroll department. Now, the
+  normal way to send e-mail from Perl looks something like
+  this:</p>
+  <pre>
+open (SENDMAIL, "|/usr/lib/sendmail -t") or die "sendmail";
+print SENDMAIL "From: (goes here)\n";
+print SENDMAIL "To: (goes here)\n";
+print SENDMAIL "Subject: Test mail\n\n";
+print SENDMAIL "Message body goes here";
+close SENDMAIL or die "Hey, sendmail failed!";
+</pre>
+
+  <p>Nice, simple, and straightforward, right?</p>
+
+  <p>Well... no. It's not this simple if you're on a non-Unix
+  machine (such as Windows, NT, VMS, OS/390, or the Mac) or, for
+  whatever reason, you don't have <tt>sendmail</tt> or a reasonable
+  facsimile installed. And even if you do have <tt>sendmail</tt>,
+  you might not want to pay the cost to invoke it just to send a
+  single mail message. It is, after all, a fairly big program, and
+  the last thing you really want is for your system monitoring
+  program to drop dead because it couldn't fork off
+  <tt>sendmail</tt> to tell you it was out of process slots.</p>
+
+  <p>So, what we're going to do in this article is build a
+  <tt>sendmail</tt> replacement suitable both for use in place of a
+  real <tt>sendmail</tt> and as donor code which you will
+  undoubtedly gut for your own use. (I use the mail sending
+  routines in some system monitoring programs, for example.)</p>
+
+  <h3>Some E-Mail Background</h3>
+
+  <p>Before we go into the code that actually sends the mail, we
+  need to talk about what exactly e-mail is and how it works.</p>
+
+  <h3>E-Mail Is A Store-And-Forward System</h3>
+
+  <p>The single most important thing about e-mail that anyone can
+  know is that e-mail is <i>not</i> a direct delivery,
+  point-to-point system like, for example, the web. Instead, e-mail
+  is a store-and-forward system. What this means is that when you
+  send mail to someone it doesn't go directly to their computer.
+  Instead, it goes to some intermediate machine, which itself might
+  forward the mail to another machine before the mail gets to its
+  final destination.</p>
+
+  <p>And, in many cases, the machine you think is the final
+  delivery system isn't. It's common for the machine publicly
+  advertised in e-mail addressed to be just a gateway to another
+  mail system. Corporate mail systems are often like this, as the
+  host you think is the final destination is really a gateway
+  through a firewall, a gateway to a completely different mail
+  system (such as GroupWise or Lotus CC:Mail), or both.</p>
+
+  <h3>There's More Than One Way To Deliver Mail</h3>
+
+  <p>The standards for e-mail, like the standards for most
+  everything else on the Internet, are set down in a series of
+  documents called RFCs. (Short for Request for Comments, although
+  the standards set down are quite a bit stronger than the name
+  might imply. See <a href=
+  "ftp://ftpeng.cisco.com/fred/rfc-index/rfc.html" target=
+  "resource window">ftp://ftpeng.cisco.com/fred/rfc-index/rfc.html</a>
+  for a comprehensive list.) The standards for SMTP, the Simple
+  Mail Transport Protocol, are set down in RFC821, while the
+  standards for e-mail headers are set down in RFC822.</p>
+
+  <p>The most common way to deliver mail from one system to another
+  is via SMTP, which requires a network connection. Usually that
+  connection is TCP/IP, but SMTP will work over a variety of other
+  network protocols. The other main delivery method is UUCP. UUCP
+  is normally a dialup connection, and doesn't require constant
+  connectivity between hosts. With UUCP, the client system
+  occasionally polls a host system for any pending work. (UUCP is
+  used to transfer more than just mail. It's designed to transfer
+  arbitrary files between two systems, and is often used to move
+  Usenet news in addition to mail.)</p>
+
+  <h3>There Are Standards Governing E-mail</h3>
+
+  <p>There are many different e-mail systems kicking around, but
+  we're going to be talking about the most common type, normally
+  called "Internet e-mail." It's a bit of a misnomer, though, since
+  it's certainly not restricted to machines on the Internet.</p>
+
+  <p>Since the code we're going to work with sends mail over the
+  network via SMTP, we need to make sure that it follows the
+  standards properly. Not to worry, though-- SMTP is simple.</p>
+
+  <h3>The Mail Itself</h3>
+
+  <p>Finally, let's talk a bit about the actual message. While it
+  might come as something of a surprise, the message is actually
+  the least interesting part of mail delivery.</p>
+
+  <p>E-mail sent via SMTP has three parts, which is probably one
+  part more than you were expecting. The contents of e-mail is also
+  governed by standards, in this case RFC822 and its descendants.
+  (If you're going to be building e-mail messages, you should
+  definitely read this RFC. You might also want to read some of the
+  follow-on RFCs that extend 822.)</p>
+
+  <h3>The Message Body: Completely Uninteresting</h3>
+
+  <p>The least interesting part of a mail message, at least as far
+  as we're concerned, is the <i>message body.</i> While people care
+  the most about this bit, the mail transport software doesn't care
+  in the least about it. It's just data that needs to be sent on
+  its way. The body consists of everything after the first blank
+  line in the message.</p>
+
+  <h3>The Message Headers: Only Mildly Interesting</h3>
+
+  <p>All the lines up to the first blank line in the message are
+  considered the <i>message headers.</i> In general, mail transport
+  software doesn't care very much at all about the message headers.
+  With one exception, the mail software isn't supposed to mess with
+  the headers at all. Nor is it supposed to pay any attention to
+  them.</p>
+
+  <p>The single exception to the "leave the headers alone" rule is
+  the <tt>Received:</tt> header. Each mail system that relays a
+  message is supposed to add a <tt>Received:</tt> header at the top
+  of each message. You can use these headers to track the systems
+  that a message has passed through.</p>
+
+  <p>RFC822 does mandate a minimum set of headers. To be fully
+  compliant, all mail should have at least a <tt>From:</tt>,
+  <tt>Date:</tt>, and either a <tt>To:</tt> or <tt>Bcc:</tt>
+  header. There are others, of course, listed in the various RFCs.
+  The standards mandate that <i>only</i> headers listed in the RFCs
+  can be in a header--you can't make up your own. RFC822 grants a
+  single exception--headers that begin with <tt>X-</tt> are
+  allowed.</p>
+
+  <h3>The Message Envelope: The Really Interesting Bit</h3>
+
+  <p>When one system sends mail to another, it doesn't just open up
+  a connection and start pumping data across. There's a
+  conversation that takes place where the sender tells the receiver
+  who it is, who the mail is for, and who the mail is from. This
+  information is called the <i>envelope</i> because it acts like an
+  envelope for a letter--it encloses the letter but isn't actually
+  a part of it. The information in the envelope is the only
+  information used by the receiving system to determine what it
+  should do with the mail and who should receive it. The recipients
+  listed in the mail headers don't have anything to do with who the
+  mail is ultimately delivered to.</p>
+
+  <h3>Sending Mail In Six Easy Steps</h3>
+
+  <p>An SMTP transaction is a reasonably simple thing. Your program
+  connects to the remote server, identifies itself, tells the
+  remote machine who the mail is from, who it's to, and then sends
+  the message. Simple, huh? All the details are specified in
+  RFC821, and if you're going to be writing an SMTP client you
+  should definitely read it before writing any code.</p>
+
+  <p>There are two gotchas involved in SMTP conversations that
+  might slip past a quick reading of the RFC. First, all lines end
+  with a CRLF (carriage-return and linefeed) pair, <i>not</i> a
+  bare linefeed. <tt>\n</tt> is not appropriate as a line ending.
+  Use <tt>\cM\cJ</tt> instead. Second, RFC821 says that the SMTP
+  channel is 7-bit and the high bits of all bytes should be
+  cleared. This restriction is lifted in a later RFC, but it
+  requires a mildly different, and somewhat more complex,
+  conversation between client and server.</p>
+
+  <p>Conversations between client and server are fairly
+  straightforward. The client sends a command with an optional
+  parameter and then a CRLF. The server responds with a three-digit
+  status code and a one-line message describing the status. The
+  first digit provides the general message class--<tt>2</tt>xx for
+  OKs, <tt>3</tt>xx for start mail transmission, <tt>4</tt>xx for
+  temporary errors, and <tt>5</tt>xx for permanent errors. You can
+  check the first digit for the general status of the request and
+  proceed accordingly. It's best to abort the transaction and try
+  again later on <tt>4</tt>xx errors, but abort the transaction and
+  give up on <tt>5</tt>xx errors -- except in special cases. It's
+  silly to toss a whole mail message if one recipient in a list of
+  a dozen fails, for example. SMTP places some limits on the
+  transmission of commands and messages; they're listed in <a href=
+  "tpj0402-0025.html">Table 1</a>. These numbers are what RFC821
+  requires from a conformant SMTP server and client. Servers can
+  (but don't have to) accept larger values.</p>
+
+  <h3>Step One: Connecting To The Remote SMTP Server</h3>
+
+  <p>According to the standard, SMTP servers are supposed to be
+  listening on TCP port 25, so the client should open a connection
+  there. When the connection is successfully made, the server will
+  send out a single-line message with a status code.</p>
+
+  <h3>Step Two: Identifying Ourselves</h3>
+
+  <p>After connecting, the next step is to identify ourselves. This
+  is done with the <tt>HELO</tt> command (no, that's not a typo).
+  The full command is:</p>
+  <pre>
+HELO name.of.connecting.machineCRLF
+</pre>
+
+  <p>While many servers will still accept a <tt>HELO</tt> with no
+  (or a bogus) name, many no longer do because of spam. (A common
+  spammer trick was to leave off the name or mis-identify
+  themselves to try to slip past security measures.)</p>
+
+  <h3>Step Three: Identifying The Mail Sender</h3>
+
+  <p>Next, your program needs to say who's sending the mail. This
+  is done with the MAIL command, which looks like this:</p>
+
+  <p><tt>MAIL FROM: &lt;user@host.com&gt;</tt> <i>CRLF</i></p>
+
+  <p>Note that the contents of <tt>&lt;&gt;</tt> are real--you need
+  to store the sending e-mail address there. This is the address
+  that all bounced mail will go to. If the mail being sent cannot
+  be bounced (because, for example, it's a bounce notice itself and
+  thus bouncing it would set up a nasty loop) the address can be an
+  empty <tt>&lt;&gt;</tt>.</p>
+
+  <h3>Step Four: Identifying The Mail Recipients</h3>
+
+  <p>After telling the remote system who the mail is from, you need
+  to tell it who the mail is going to. This is done with the RCPT
+  command. Your program sends out one or more RCPTs, which look
+  like this:</p>
+
+  <p><tt>RCPT TO: &lt;user@host.com&gt;</tt><i>CRLF</i></p>
+
+  <p>Once again, the addresses must be enclosed in angle brackets.
+  You may send up to 100 RCPTs per mail message, and the server
+  will send back a status on each one. It's not uncommon to have a
+  message with multiple recipients bounce one or two.</p>
+
+  <h3>Step Five: Sending The Mail</h3>
+
+  <p>Once you've identified the sender and recipients, it's time to
+  send out the mail itself. The <tt>DATA</tt> command marks the
+  start of the message itself, which continues until you send a
+  line with just a period. If you need to send a line with just a
+  period on it for some reason, the protocol allows for sending a
+  doubled period, which the server converts to a single period.
+  When you do send out the line with a single period to end the
+  mail message, the server will respond with a status message that
+  tells you what it thinks of your mail.</p>
+
+  <h3>Step Six: Closing Down The Connection</h3>
+
+  <p>Finally, you need to close down the connection by sending the
+  <tt>QUIT</tt> command. While it's not uncommon to see programs
+  send a <tt>QUIT</tt> and drop the connection, you should wait for
+  the final status to make sure that things went properly.</p>
+
+  <h3>And now we do what, exactly?</h3>
+
+  <p>So, we now know how to send mail in general. The next step is
+  sending mail in specific. How do we send mail in Perl? Well,
+  we're going to show you.</p>
+
+  <p>There are three common ways to send mail directly from Perl:
+  Net::SMTP, Mail::Mailer, and talking directly to the mail host.
+  We'll go over each of these methods in turn. We'll present an
+  example of sending mail with each of the three different
+  methods.</p>
+
+  <h3>Sending with Mail::Mailer</h3>
+
+  <p>Mail::Mailer, included as part of the MailTools module, sits
+  on top of Net::SMTP, so it requires the libnet bundle to run.
+  Both modules are well worth the time, so install (or get your
+  sysadmin to install) them into your production tree. They're
+  worth it. Anyway, as you can see from the <a href=
+  "tpj0402-0026.html">sample program</a>, sending mail with
+  Mail::Mailer's pretty straightforward. The whole thing's only 14
+  lines, and that's including comments.</p>
+
+  <p>The one thing to keep in mind with Mail::Mailer is that it
+  figures out the sender and recipients from the headers of the
+  mail message, so you lose the separation of the envelope and
+  headers. That's not necessarily bad, just something to
+  remember.</p>
+
+  <h3>Sending with Net::SMTP</h3>
+
+  <p>Net::SMTP, which is included as part of the libnet bundle,
+  puts a fairly thin wrapper around the SMTP conversation, just
+  barely encapsulating it. There's one function call for each step
+  of the SMTP conversation, with just enough code wrapped around
+  things to perform tasks like error checking.</p>
+
+  <p>As you can see from the <a href=
+  "tpj0402-0027.html">example</a>, it's a bit more verbose than
+  using Mail::Mailer, though not by much. You've got full control
+  over the SMTP conversation this way, although you don't get
+  fine-grained response codes.</p>
+
+  <h3>Sending things by hand</h3>
+
+  <p>Finally, there's the fully manual way. It's significantly
+  longer than any of our other methods -- too long for this
+  magazine, but you can find my <tt>smailer.pl</tt> program on the
+  TPJ web site. The reason it's so long is that we include the code
+  that actually sends the mail out. In the other examples that code
+  is encapsulated in other modules.</p>
+
+  <p>We're not going to spend too much time going over this code,
+  because you can't see it here. However, we'll touch on a few high
+  points. You'll notice, for example, that we use <tt>syswrite</tt>
+  to write the data out, while we use <tt>&lt;&gt;</tt> to read it
+  in, and on two different filehandles to boot. Why?</p>
+
+  <p>Well, the big reason is to compensate for a variety of odd
+  socket and <tt>stdio</tt> implementations on the platforms that
+  Perl runs on. <tt>syswrite</tt> is guaranteed to work for
+  writing, and <tt>&lt;&gt;</tt> works okay for reading. They each
+  use a separate filehandle to make sure there aren't any
+  underlying <tt>stdio</tt> buffer collisions.</p>
+
+  <p>You'll also note that the code doesn't really care much which
+  non-<tt>2</tt>xx response code it gets--it considers them all
+  errors and returns the status to the caller of the subroutine,
+  who can hopefully do something reasonable with the return
+  values.</p>
+
+  <p>Other than that, the code is pretty straightforward. The
+  <tt>smailer()</tt> subroutine is written such that you ought to
+  be able to just cut and paste it into your own code and have it
+  run. (You can, for example, fill in some of the empty variables
+  at the top of the subroutine if you want to avoid the overhead of
+  computing them on every invocation.)</p>
+
+  <h3>So which do you choose?</h3>
+
+  <p>Now that we've covered the three different methods, the next
+  question is--which one is the right one? The answer, of course,
+  is "it depends."</p>
+
+  <p>The hand-rolled method is the lightest of the three methods:
+  It's snappy and takes up very little memory, although it does
+  sacrifice some flexibility. For instance, it doesn't handle
+  ESMTP, the extension to SMTP that allows for delivery
+  notifications and 8-bit characters in mail messages.</p>
+
+  <p>Net::SMTP is more flexible than the hand-rolled way of doing
+  things, but you pay for that increased flexibility in several
+  ways. It's fully object-oriented, which means that it incurs
+  Perl's not insubstantial method call overhead. It's also layered
+  on top of the IO modules, which are themselves quite large. (This
+  is only a consideration if you're not already using them, of
+  course.) On the other hand, it does talk ESMTP, and exposes SMTP
+  in easy-to-use pieces.</p>
+
+  <p>Mail::Mailer is the most flexible of the three methods. In
+  addition to connecting via SMTP, it can also send mail by
+  invoking <tt>sendmail</tt>, or by firing off <tt>mail</tt> or an
+  equivalent. It's also got the highest overhead in terms of both
+  speed and memory usage. It's layered on top of Net::SMTP, and so
+  inherits the Net::SMTP overhead as well as generating some of its
+  own.</p>
+
+  <p>In general, I'd recommend using Mail::Mailer for
+  general-purpose mailing work. While it's got some overhead, the
+  delays you might incur will be far less than typical network
+  latency. The extra flexibility and robustness are worth it.</p>
+
+  <p>If you find the overhead of Mail::Mailer is a bit much,
+  especially if your need to send mail using minimal computational
+  resources, go for the hand-rolled approach. Also, if you're not
+  using any of the IO modules, and you're not sending mail that's
+  got 8-bit characters in it, the hand-rolled method should work
+  well.</p>
+
+  <p>Finally, for the very curious, it is possible to write a
+  reasonable emulation of sendmail with Perl and these mail
+  routines, at least enough to send mail with it. I have an
+  implementation that I mess with on and off. Versions occasionally
+  make it to my CPAN directory, so you can always check there to
+  see how it's going.</p>
+
+  <p>__END__</p>
+  <hr>
+
+  <p><i>Dan Sugalski is the VMS Systems Administrator for the
+  Oregon University System's ITS department. He's been involved in
+  the VMS Perl port for a few years, likes threading, mail, doing
+  obscure things in XS, and tilting at windmills. To reach him you
+  can either leave your message and a plate of cookies under the
+  bushes by your front door or send mail to <a href=
+  "mailto:dan@sidhe.org">dan@sidhe.org</a> .</i> <i>One of the big
+  downsides to presenting code to send e-mail is the possibility of
+  it being used for spamming. While there's no way short of
+  violence to stop antisocial morons, it never hurts to have the
+  guys in expensive suits and thin watches on your side. So, the
+  copyright notice:</i> <i>All the code presented in this article
+  is Copyright 1999 Dan Sugalski (The text, of course, is covered
+  by TPJ's copyright.) It may be used for any purpose you like as
+  long as you don't misrepresent it as your own, or send out
+  unsolicited mass e-mail of any sort.</i> <!-- end of file --></p>
+</body>
+</html>

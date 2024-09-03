@@ -1,0 +1,502 @@
+<HTML>
+<META NAME="year" CONTENT="1995">
+
+<HEAD>
+<TITLE>JAN95: Basic Arithmetic with Infinite Integers</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Basic Arithmetic with Infinite Integers<a name="003b_000a"></h1><P>
+<h2><a name="003b_0008"><a name="003b_0000">Working with large numbers without losing digits</h2><P>
+<h3>Jeffrey W. Hamilton</h3><P>
+<p><i><a name="003b_0009"><a name="003b_0000">Jeff is a researcher at IBM's T.J. Watson Research Center. He can be contacted at jeffh@watson.ibm.com.</i></p><hr><P>
+Sometimes you probably wish you had a little more flexibility with integer arithmetic. While 32-bit integers permit you to express a large range of numbers, there are problems that require larger values. For example, did you realize you can't balance the U.S. budget with 32-bit integers? Of course, you could switch to floating-point arithmetic, but then you sacrifice the accuracy of your results. In this article, I'll describe how to implement an efficient method for representing infinite integers and algorithms for doing simple arithmetic with infinite integers.<P>
+I first ran across the need for infinite integers while implementing a small LISP interpreter. Common LISP supports standard fixed-length integers, but it also contains a data type called &quot;big numbers.&quot; In theory, a big number can represent any integer (assuming you have enough memory to contain the bits). There are two common methods for representing infinite integers. <P>
+The first involves storing the numbers in a byte array, which is also known as &quot;unpacked binary-coded decimal notation.&quot; Each digit of the number occupies one byte. You start the byte array with a two-byte integer that contains the length of the number. To represent the sign of the number, you use the most-significant bit of the length: 0 means the number is positive, and 1 means the number is negative. With this representation, you can store a number that is up to 32,767 digits long. If you need a larger number, you can always reserve four bytes at the start of the array. Notice in <a href="#003b_0013">Example 1</A> that the digits are stored in reverse order. This makes expanding and contracting the number easier as we manipulate its value. Adding two numbers simply involves adding each digit. If the result of the addition is greater than 9, subtract 9 and add 1 to the next digit to the right. If there is a carry from the last digit, you adjust the length field by adding 1. The advantages of this storage format are as follows:<P>
+<UL>
+<li>It is easy to understand: Manipulations are just like the arithmetic you learned in grade school. </li>
+<li>Many processors contain built-in functions to perform arithmetic on byte arrays, such as the AAA, AAS, AAM, and AAD instructions in the Intel 80x86 microprocessors. </li>
+<li>You can print a number by simply adding the value of the character <I>A</I> to each digit.</li>
+</UL>
+The main disadvantage is the amount of space the number occupies. Each byte could hold 256 unique values, but you are only using ten of them.<P>
+To minimize this problem, the packed binary-decimal format stores a digit in each nibble (4 bits) of memory. Notice in <a href="#003b_0014">Example 2</A> that you have reduced the amount of memory required to hold the number by half while increasing the number of digits that can be represented. You can now represent a number that is up to 65,534 digits long, but you have lost some advantages. While still storing each byte of the number in reverse order, you are storing the digits within the byte with the most-significant nibble first. You do this because many processors have built-in instructions for handling packed decimal numbers. The Intel 80x86 DAA and DAS instructions, for instance, expect the most-significant nibble to be on the left side of the byte. While it is more difficult to read, it can be done, so most implementors prefer this format to the unpacked binary-decimal format. The packed binary-decimal format introduces additional problems. Intel processors can add, subtract, multiply, and divide unpacked binary-decimal numbers, but they can only add and subtract packed binary-decimal numbers. This is not much of a hindrance; you simply must unpack each byte as you multiply two numbers and repack the results. Since you can do this byte-by-byte as you work through the number, you don't need additional space in memory to hold the unpacked versions of the two numbers. Of course, for printing, each digit must be unpacked as each number is printed.<P>
+<h3><a name="003b_000b">A Better Way<a name="003b_000b"></h3><P>
+Still, it bothered me that I was only using 20 values in each byte. There were 236 values just sitting idle in memory, not being productive! In <I>Seminumerical Algorithms</I> (Addison-Wesley, 1981), Knuth presents examples that use any based arithmetic, not just decimal. I began to wonder what would happen if I set my base to the size of a byte, or better yet, an integer? Why, then nothing would be wasted! As an added bonus, I could use the common instructions that are available in every compiler to manipulate the numbers and it would still be efficient. Using this format with a two-byte length field means I can represent numbers with over 160,000 digits in their printed form.<P>
+While my implementation of these numbers is in C, you could use any language to accomplish the same thing. The only requirement is that the language and target machine can represent integers in two different forms where the larger form is at least twice the size of the smaller form. In my C implementation, I am assuming a <I>short int</I> is 16 bits long and a <I>long int</I> is 32 bits.<P>
+<h3><a name="003b_000c">Creating Big Numbers<a name="003b_000c"></h3><P>
+The file bignum.h (<a href="#003b_0015">Listing One</A>) contains the basic definition of an infinite integer type called <I>bignum</I>--a pointer to a structure containing a <I>length </I>field (that also holds the sign bit) and a variable-length array of elements. Every <I>bignum</I> will contain at least one element. The least-significant element is stored in the lowest index in the array. The value in the elements is kept as a positive integer. Only the sign bit determines whether the number is positive or negative.<P>
+Besides defining the type, bignum.h also contains ANSI-C prototypes for all the functions, a set of convenience macros for decomposing <I>bignum</I>s, and definitions for some necessary constants.<P>
+The routine <I>new_bignum</I> in convert.c (<a href="#003b_0016">Listing Two</A>) is the basic allocation routine. It takes one argument--the number of elements the <I>bignum </I>will contain. It returns a <I>bignum</I> with the <I>length </I>field set to the number of elements in the number and the sign bit set to POSITIVE. The actual value of a newly created <I>bignum</I> is undefined. The creating routine is required to fill in the values of each element.<P>
+Two things can go wrong when you try to create a <I>bignum</I>: You can run out of memory or the user can ask for too many elements. In the case of an error, NULL is returned instead of a <I>bignum,</I> and <I>errno</I> is set to the reason the call failed. This places the burden of checking for errors and handling them on the callers of the function.<P>
+If you can make a <I>bignum</I>, you also need a way to discard numbers that are no longer needed. The routine <I>destroy_ bignum</I> releases the memory occupied by a <I>bignum</I>, accepting a previously created <I>bignum</I> or a NULL. Accepting NULL allows for simpler handling of exceptions when dealing with <I>bignum</I>s. If you set all temporary <I>bignum</I>s to NULL before attempting to create them, you can destroy all temporary <I>bignum</I>s on an exception without having to keep track of which <I>bignum</I>s were actually allocated.<P>
+Another useful routine is <I>copy_bignum,</I> which creates a temporary number that can be altered within a routine. Without temporary copies, a subroutine would end up changing the values of <I>bignum</I>s passed to it.<P>
+<h3><a name="003b_000d">Converting Integers to Big Numbers<a name="003b_000d"></h3><P>
+In an ideal world, users of the infinite-integer library should never have to see the internals of a <I>bignum</I>. Instead, they would start with known data types and call functions to convert the known data type into and out of <I>bignum</I> format. Most conversions will require math functions that work on <I>bignum</I>s, so for the moment, I'll restrict the discussion to signed and unsigned integers.<P>
+The <I>ltobig</I> routine converts a signed long integer into a <I>bignum</I>. Because C automatically promotes smaller integer formats to the long format, you can avoid creating routines for converting <I>char</I>, <I>short</I>, and <I>int</I> data types. The first thing the <I>ltobig</I> routine does is check for the sign of the long integer being passed in. If it is negative, the number is complemented so that its absolute value can be stored. We also take the time to make sure only the minimum number of elements needed to hold a <I>bignum</I> are allocated. By guaranteeing that all <I>bignum</I>s are in their smallest format, you simplify the comparison of two <I>bignum</I>s.<P>
+The <I>ultobig</I> routine converts unsigned long integers into <I>bignum</I> format.<P>
+Converting a <I>bignum</I> to an integer is more awkward. Since a <I>bignum</I> can contain more significant bits than a long, you must have a way to notify the caller that the <I>bignum</I> couldn't be converted. The <I>bigtol</I> and <I>bigtoul</I> routines handle signed and unsigned long conversions, but a complete library would need functions for signed and unsigned <I>char</I>s, <I>short</I>s, and <I>int</I>s. The caller passes where to store the converted value instead of directly returning the value. The direct return value is used to indicate success or failure. These functions return 0 if the value could be converted and --1 if there was a problem. The <I>errno</I> value is set to BIGNUM_ NOSPACE when there are too many significant bits.<P>
+<h3><a name="003b_000e">Negation<a name="003b_000e"></h3><P>
+Negating a <I>bignum</I> is trivial. All you have to do is flip the sign bit. To maintain the rule that no function alters the value of its parameters, <I>neg_bignum</I> first duplicates its argument and then flips the sign bit in the copy.<P>
+<h3><a name="003b_000f">Comparing Big Numbers<a name="003b_000f"></h3><P>
+A fundamental operation in any number system is deciding whether a number is bigger, smaller, or equal to another number. The <I>cmp_bignum</I> routine in the logic.c (<a href="#003b_0017">Listing Three</A>) returns 1 if the first number is larger than the second, 0 if they are equal, and --1 if the second number is larger than the first.<P>
+The natural way to implement a comparison is to subtract the two numbers and check for negative, positive, or zero results. However, this leads to inefficiencies, since the subtraction function creates a new number that will have to be discarded. Another problem is that the implementation of <I>sub_bignum</I> needs a comparison function to determine the sign of the result. Using <I>sub_bignum</I> in the comparison function would have lead to an infinite recursion.<P>
+Several optimizations are done in <I>cmp_ bignum</I> to return the answer as quickly as possible. The first check is the sign of the two numbers. If they are different, a positive number is always bigger than a negative one, so there is no need to go any further. After noting the sign of the two numbers, the second shortcut is to check how many elements are in each number. Longer numbers are bigger than shorter numbers (or, if we are working with negative numbers, longer numbers are smaller than shorter numbers). In the worst case, you begin checking each element, starting with the most significant, stopping as soon as you find a difference. If there is no difference, then the numbers are the same, and we return 0.<P>
+<h3><a name="003b_0010">Minimal Representation<a name="003b_0010"></h3><P>
+For this function to work, you must guarantee that two <I>bignum</I>s with the same value are stored in the same format. For example, you could create a number 0 that contained two elements, both of which had the value zero. If this occurs, the complexity of the comparison would increase and its speed would be severely diminished.<P>
+You avoid this by making a rule stating that all <I>bignum</I>s are stored in the smallest way that still holds all significant bits. The <I>reduce_bignum</I> routine in math.c (<a href="#003b_0018">Listing Four</A>) implements this rule by scanning for leading 0 elements in a <I>bignum</I> and removing them.<P>
+<h3><a name="003b_0011">Addition<a name="003b_0011"></h3><P>
+The <I>add_bignum</I> function in the file math.c sums two <I>bignum</I>s and returns the result in a newly created <I>bignum</I>. Because these functions do not alter the values passed to them, the caller is responsible for releasing numbers that are no longer used.<P>
+The algorithm for adding <I>bignum</I>s is the same one used when adding numbers on a piece of paper. To add 59,283 to 3,876,390, you were taught to start with the least-significant digits, add them together, and write down the result. If the result had more than one digit, you only wrote the least-significant digit down and added the more-significant to the next pair of digits. (In other words, you carried the overflow.) <P>
+Adding <I>bignum</I>s works the same way, but instead of ten unique digits, you have 65,535 unique values for each digit. Remember that the largest carry when adding two digits is still the value 1, and the size of the result is at most one digit more than the longest number.<P>
+In the <I>add_bignum</I> routine, first determine constant values so you don't have to recompute them in the addition loop. Then allocate space for the resulting <I>bignum</I> using the largest potential size. If the results happen to be less than what's allocated, you can recover the space with the <I>reduce_bignum</I> function. <P>
+The For loop is where the real work is accomplished. Add one digit (or element) at a time with each pass of the loop. Since the addition can be bigger than an element by one bit, do the addition in a bigger number format than that in which the element is stored. The <I>carry</I> variable is the temporary storage location. After the addition, the lower half of the <I>carry</I> contains the number to store in the result, and the upper half contains the <I>carry</I> for the next pass of the loop. While adding digits, use zeros at the end of a number when adding two numbers of different lengths, and watch the sign of the number being added. Since the digits are being stored in absolute-value form, you must add the digit if it is positive, or subtract the digit if it is negative. This also means that the upper value of <I>carry</I> can take on three values: 1, 0, or --1. By defining <I>carry</I> as a signed number, shifting the upper half down to the bottom half ensures that the value remains the same.<P>
+Most machines have add-with-carry and subtract-with-borrow instructions. These would have been useful, but most high-level languages do not give you direct access to these instructions or the carry flag. If you want to optimize the addition loop, you can always replace it with a machine-level version tailored for your particular machine. However, the code that I present is fairly machine independent and will execute rapidly on most machines.<P>
+Once the two numbers have been added, you're faced with the difficult problem of deciding whether the result is positive or negative. The key is that the sign is the same as the number with the largest absolute value, unless the two numbers have the same absolute value but different signs. In the exception case, the answer is zero, which is always positive. <P>
+Since the largest potential size for the result was allocated, the result must be passed through the <I>reduce_bignum</I> routine to remove any leading zeros.<P>
+<h3><a name="003b_0012">Subtraction<a name="003b_0012"></h3><P>
+Subtraction is handled the same as addition. Since addition handles negative numbers, you just flip the sign bit of the second number before entering the addition loop. I could have avoided duplicating the <I>add_ bignum</I> code in <I>sub_bignum</I> by calling <I>neg_bignum</I> on the second number and then calling <I>add_ bignum</I>, but this would have caused a temporary number to be created and destroyed. Since most memory-manager functions are expensive to call, I felt it was better to duplicate the code.<P>
+<h4><a name="003b_0013"><B>Example 1:</B> The number 598341038459653 as unpacked binary decimal.<a name="003b_0013"></h4><P>
+<pre>0100: 00 0F 03 05 06 09 03 04
+0108: 08 03 00 01 04 03 08 09
+0110: 05</pre><P>
+<h4><a name="003b_0014"><B>Example 2:</B> The number 598341038459653 as packed binary decimal.<a name="003b_0014"></h4><P>
+<pre>0100: 00 08 53 96 45 38 10 34
+0108: 98 05</pre><P>
+<P>
+<h4><a name="003b_0015">Listing One<a name="003b_0015"></h4><pre>
+
+/* Infinite Integer Definitions -- by Jeffrey W. Hamilton, 1993
+** NOTE: This code assumes that a 'short int' is two bytes
+**       and a 'long int' is four bytes.
+*/
+#ifndef BIGNUM_DEFINES
+#define BIGNUM_DEFINES
+typedef struct BigNum {
+   unsigned short int length;     /* Left most bit is used for the sign of the number */
+   unsigned short int element[1]; /* Minimum of one element */
+} *bignum;
+
+/* Convience Routines */
+#define NEGATIVE 0x8000
+#define POSITIVE 0
+#define BIGNUM(sign, value) { (sign) | 1, (value) }
+#define BIGNUM_SIZE(b) ((b)-&gt;length &amp; ~NEGATIVE)
+#define BIGNUM_SIGN(b) ((b)-&gt;length &amp; NEGATIVE)
+#define BIGNUM_SIZEOF(len) (sizeof(struct BigNum) + (((len)-1) * 
+                                                      sizeof(unsigned short)))
+#define FORCE_POSITIVE(b) ((b)-&gt;length &amp;= ~NEGATIVE)
+#define FORCE_NEGATIVE(b) ((b)-&gt;length |= NEGATIVE)
+#define FORCE_INVERT(b)   ((b)-&gt;length = (BIGNUM_SIGN(b) ^ NEGATIVE) | 
+                                                               BIGNUM_SIZE(b))
+
+/* Error Conditions */
+#define BIGNUM_BADARG  22
+#define BIGNUM_NOSPACE 12
+#define BIGNUM_ZERO    1
+
+#ifndef max
+#define max(x,y) (((x) &lt; (y)) ? (y) : (x))
+#endif
+
+bignum new_bignum(short int size);
+void   destroy_bignum(bignum);
+bignum copy_bignum(bignum);
+bignum ltobig(long int number);
+double bigtod(bignum);
+bignum dtobig(double);
+bignum strtobig(char *string, char **endPoint, int radix);
+char * bigtostr(bignum number, char *target, int maxLength, int radix);
+bignum reduce_bignum(bignum);
+bignum add_bignum(bignum, bignum);
+bignum sub_bignum(bignum, bignum);
+bignum neg_bignum(bignum);
+bignum mult_bignum(bignum, bignum);
+bignum div_bignum(bignum, bignum, bignum *);
+bignum shiftl_bignum(bignum, unsigned long);
+bignum shiftr_bignum(bignum, unsigned long);
+bignum or_bignum(bignum, bignum);
+bignum xor_bignum(bignum, bignum);
+bignum and_bignum(bignum, bignum);
+bignum not_bignum(bignum);
+bignum set_bit_bignum(bignum, unsigned long, int value);
+int    test_bit_bignum(bignum, unsigned long);
+#endif
+
+
+</pre>
+<h4><a name="003b_0016">Listing Two<a name="003b_0016"></h4><pre>
+
+/* Infinite Integer Conversion Facility -- by Jeffrey W. Hamilton, 1993 */
+#include &lt;stdlib.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;ctype.h&gt;
+#include &lt;string.h&gt;
+#include &lt;math.h&gt;
+#include &lt;errno.h&gt;
+#include &quot;bignum.h&quot;
+
+/* Allocate space for a bignum, but does not intialize it.
+** Input: Number of elements to allocate. Must be greater than 0.
+** Output: The allocated space
+** Error: Returns NULL with errno set to one of the following:
+**        BIGNUM_BADARG  - Size if less than 1
+**        BIGNUM_NOSPACE - No enough memory available to allocate the number
+*/
+bignum new_bignum(short int size)
+{
+   bignum temp;
+
+   if (size &lt;= 0) {
+      errno = BIGNUM_BADARG;
+      return NULL;
+   }
+   if ((temp = malloc(BIGNUM_SIZEOF(size))) == NULL) {
+      errno = BIGNUM_NOSPACE;
+   }
+   temp-&gt;length = size;
+   return temp;
+}
+/* Release the space occupied by a bignum 
+** Input: Number to be released.
+*/
+void destroy_bignum(bignum temp)
+{
+   free(temp);
+}
+/* Create a duplicate copy of a bignum
+** Input: Number to be copied.
+** Output: Copy of the number
+** Error: Returns NULL with errno set to one of the following:
+**        BIGNUM_NOSPACE - No enough memory available to allocate the number
+*/
+bignum copy_bignum(bignum temp)
+{
+   int size;
+   bignum result;
+   size = BIGNUM_SIZE(temp);
+   if ((result = new_bignum(size)) == NULL) return NULL;
+   memcpy(result, temp, BIGNUM_SIZEOF(size));
+   return result;
+}
+/* Convert a long int to a bignum
+** Input: A long integer number to be converted.
+** Output: The equivalent value in bignum format
+** Error: Returns NULL and errno will be set to:
+**        BIGNUM_NOSPACE - Not enough space to hold the number in memory.
+*/
+bignum ltobig(long temp)
+{
+   int sign;
+   bignum result;
+
+   /* Determine the sign of the number and put the value in absolute form */
+   if (temp &lt; 0) {
+      sign = NEGATIVE;
+      temp = -temp;
+   } else {
+      sign = POSITIVE;
+   }
+   /* Try to allocate the minimum space needed */
+   if ((temp &amp; 0xFFFF0000L) == 0) {
+      /* Number will fit in one element */
+      if ((result = new_bignum(1)) == NULL) return NULL;
+      result-&gt;element[0] = (unsigned short) temp;
+   } else {
+      /* Number needs two elements */
+      if ((result = new_bignum(2)) == NULL) return NULL;
+      result-&gt;element[0] = (unsigned short) temp;
+      result-&gt;element[1] = (unsigned short) (temp &gt;&gt; 16);
+   }
+   /* Record the correct sign */
+   result-&gt;length |= sign;
+   return result;
+}
+/* Convert an unsigned long int to a bignum
+** Input: A long integer number to be converted.
+** Output: The equivalent value in bignum format
+** Error: Returns NULL and errno will be set to:
+**        BIGNUM_NOSPACE - Not enough space to hold the number in memory.
+*/
+bignum ultobig(unsigned long temp)
+{
+   bignum result;
+
+   /* Try to allocate the minimum space needed */
+   if ((temp &amp; 0xFFFF0000L) == 0) {
+      /* Number will fit in one element */
+      if ((result = new_bignum(1)) == NULL) return NULL;
+      result-&gt;element[0] = (unsigned short) temp;
+   } else {
+      /* Number needs two elements */
+      if ((result = new_bignum(2)) == NULL) return NULL;
+      result-&gt;element[0] = (unsigned short) temp;
+      result-&gt;element[1] = (unsigned short) (temp &gt;&gt; 16);
+   }
+   return result;
+}
+/* Convert a bignum to a long
+** Input: A bignum to be converted.
+** Output: The equivalent value as a long.
+** Error: Returns NULL and errno will be set to:
+**        BIGNUM_NOSPACE - Not enough space to hold the number in a long.
+*/
+int bigtol(bignum num, long *temp)
+{
+   if (BIGNUM_SIZE(num) &gt; 2) {
+      /* Two many significant bits */
+      errno = BIGNUM_NOSPACE;
+      return -1;
+   } else if (BIGNUM_SIZE(num) == 2) {
+      if (num-&gt;element[1] &amp; NEGATIVE) {
+         /* The number contains more than 31 significant bits */
+         errno = BIGNUM_NOSPACE;
+         return -1;
+      }
+      *temp = ((long) num-&gt;element[1] &lt;&lt; 16) | num-&gt;element[0];
+   } else {
+      *temp = num-&gt;element[0];
+   }
+   if (BIGNUM_SIGN(num) == NEGATIVE) *temp = -*temp;
+   return 0;
+}
+/* Convert a bignum to an unsigned long
+** Input: A bignum to be converted.
+** Output: The equivalent value as a long.
+** Error: Returns NULL and errno will be set to:
+**        BIGNUM_NOSPACE - Not enough space to hold the number in a long.
+*/
+int bigtoul(bignum num, unsigned long *temp)
+{
+   if (BIGNUM_SIZE(num) &gt; 2) {
+      /* Two many significant bits */
+      errno = BIGNUM_NOSPACE;
+      return -1;
+   } else if (BIGNUM_SIZE(num) == 2) {
+      *temp = ((unsigned long) num-&gt;element[1] &lt;&lt; 16) | num-&gt;element[0];
+   } else {
+      *temp = num-&gt;element[0];
+   }
+   if (BIGNUM_SIGN(num) == NEGATIVE) *temp = -*temp;
+   return 0;
+}
+
+
+</pre>
+<h4><a name="003b_0017">Listing Three <a name="003b_0017"></h4><pre>
+/* Infinite Integers Logic Facility -- by Jeffrey W. Hamilton, 1993 */
+#include &lt;stdlib.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+#include &quot;bignum.h&quot;
+
+/* Compare first bignum to the second
+** Input: Two bignums
+** Output: Returns  -1 if first is less than second
+**                   0 if first equals second
+**                  +1 if first is greater than second
+*/
+int cmp_bignum(bignum num1, bignum num2)
+{
+   int isNegative;
+   int i;
+
+   /* Quick check based on sign */
+   if (BIGNUM_SIGN(num1) != BIGNUM_SIGN(num2)) {
+      if (BIGNUM_SIGN(num1) == NEGATIVE) return -1;
+      return 1;
+   }
+   /* Use a flag to compensate for positive / negative numbers */
+   isNegative = (BIGNUM_SIGN(num1) == NEGATIVE) ? 1 : 0;
+
+   /* Quick check based on length */
+   if (BIGNUM_SIZE(num1) &lt; BIGNUM_SIZE(num2)) {
+      return (isNegative) ? 1 : -1;
+   } else if (BIGNUM_SIZE(num1) &gt; BIGNUM_SIZE(num2)) {
+      return (isNegative) ? -1 : 1;
+   }
+   /* It looks like we have to be more thorough */
+   for (i = BIGNUM_SIZE(num1) - 1; i &gt;=0; i--) {
+      if (num1-&gt;element[i] &lt; num2-&gt;element[i]) {
+         return (isNegative) ? 1 : -1;
+      } else if (num1-&gt;element[i] &gt; num2-&gt;element[i]) {
+         return (isNegative) ? -1 : 1;
+      }
+   }
+   /* They are equal */
+   return 0;
+}
+
+
+</pre>
+<h4><a name="003b_0018">Listing Four<a name="003b_0018"></h4><pre>
+
+/* Infinite Integers Math Facility -- by Jeffrey W. Hamilton, 1993 */
+#include &lt;stdlib.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &lt;errno.h&gt;
+#include &quot;bignum.h&quot;
+
+/* Reduce a bignum to occupy the minimum space required
+** Input: bignum to be reduced
+** Output: reduced bignum
+*/
+bignum reduce_bignum(bignum number)
+{
+  register int j;
+
+  /* Remove leading zero values from the high end of the number */
+  for (j = BIGNUM_SIZE(number); (j &gt; 1) &amp;&amp; (number-&gt;element[j-1] == 0); j--);
+
+  /* Special case: We don't allow a negative zero */
+  if ((j == 1) &amp;&amp; (number-&gt;element[0] == 0)) {
+      FORCE_POSITIVE(number);
+  }
+  /* If the number is already at a minimal size, return it */
+  if (j == BIGNUM_SIZE(number)) return number;
+
+  /* Reallocate the number at a smaller size. In theory realloc could fail, 
+  ** but since we are always reducing the space we are occupying, a failure
+  ** would be a sign of a VERY poor memory manager.
+  */
+  number-&gt;length = BIGNUM_SIGN(number) | j;
+  return realloc(number, BIGNUM_SIZEOF(j));
+}
+/* Add two bignums
+** Input: numbers to add
+** Output: a bignum that is the sum
+** Errors: Returns NULL with errno set to one of the following:
+**         BIGNUM_BADARG  - Size if less than 1
+**         BIGNUM_NOSPACE - No enough memory available to allocate the results
+*/
+bignum add_bignum(bignum num1, bignum num2)
+{
+  long carry;
+  int size, size1, size2;
+  int sign1, sign2;
+  register int i;
+  bignum result;
+
+  carry = 0;
+
+  /* Insure sum can hold the results */
+  size1 = BIGNUM_SIZE(num1);
+  size2 = BIGNUM_SIZE(num2);
+  size = max(size1, size2) + 1;
+  if ((result = new_bignum(size)) == NULL) return NULL;
+
+  sign1 = BIGNUM_SIGN(num1);
+  sign2 = BIGNUM_SIGN(num2);
+
+  /* Add the numbers */
+  for (i = 0; i &lt; size; i++) {
+     if (i &lt; size1) {
+        /* We still have elements of num1 to process */
+          if ((unsigned) sign1 == NEGATIVE) {
+           carry -= num1-&gt;element[i];
+        } else {
+           carry += num1-&gt;element[i];
+        }
+     }
+     if (i &lt; size2) {
+        /* We still have elements of num2 to process */
+          if ((unsigned)sign2 == NEGATIVE) {
+           carry -= num2-&gt;element[i];
+        } else {
+           carry += num2-&gt;element[i];
+        }
+     }
+     result-&gt;element[i] = (unsigned short) carry;
+     carry &gt;&gt;= 16;
+  }
+  /* Adjust the sign of the results */
+  if (carry &lt; 0) {
+     /* Complement the answer */
+     carry = 0;
+     for (i = 0; i &lt; size; i++) {
+        carry -= result-&gt;element[i];
+        result-&gt;element[i] = (unsigned short) carry;
+        carry &gt;&gt;= 16;
+     }
+     FORCE_NEGATIVE(result);
+  }
+  return reduce_bignum(result);
+}
+/* Subtract the second bignum from the first.
+** Input: numbers to subtract.
+** Output: a bignum that is the subtraction
+** Errors: Returns NULL with errno set to one of the following:
+**         BIGNUM_BADARG  - Size if less than 1
+**         BIGNUM_NOSPACE - No enough memory available to allocate the results
+*/
+bignum sub_bignum(bignum num1, bignum num2)
+{
+   long carry;
+   int size, size1, size2;
+   int sign1, sign2;
+   register int i;
+   bignum result;
+
+   carry = 0;
+
+   /* Insure sum can hold the results */
+   size1 = BIGNUM_SIZE(num1);
+   size2 = BIGNUM_SIZE(num2);
+   size = max(size1, size2) + 1;
+   if ((result = new_bignum(size)) == NULL) return NULL;
+
+   sign1 = BIGNUM_SIGN(num1);
+   /* Invert the sign for subtraction */
+   sign2 = (BIGNUM_SIGN(num2) == NEGATIVE) ? POSITIVE : NEGATIVE;
+
+   /* Do a normal add with the inverted second number */
+   for (i = 0; i &lt; size; i++) {
+      if (i &lt; size1) {
+         /* We still have elements of num1 to process */
+            if ((unsigned)sign1 == NEGATIVE) {
+            carry -= num1-&gt;element[i];
+         } else {
+            carry += num1-&gt;element[i];
+         }
+      }
+      if (i &lt; size2) {
+         /* We still have elements of num2 to process */
+         if ((unsigned)sign2 == NEGATIVE) {
+           carry -= num2-&gt;element[i];
+        } else {
+           carry += num2-&gt;element[i];
+        }
+      }
+      result-&gt;element[i] = (unsigned short int) carry;
+      carry &gt;&gt;= 16;
+   }
+   /* Adjust the sign of the results */
+   if (carry &lt; 0) {
+      /* Complement the answer */
+      carry = 0;
+      for (i = 0; i &lt; size; i++) {
+         carry -= result-&gt;element[i];
+         result-&gt;element[i] = (unsigned short) carry;
+         carry &gt;&gt;= 16;
+      }
+      FORCE_NEGATIVE(result);
+   }
+   return reduce_bignum(result);
+}
+/* Compute the negative of a bignum
+** Input: number to negate
+** Output: a negated copy of the number
+** Errors: Returns NULL with errno set to one of the following:
+**         BIGNUM_BADARG  - Size if less than 1
+**         BIGNUM_NOSPACE - No enough memory available to allocate the results
+*/
+bignum neg_bignum(bignum number)
+{
+   bignum result;
+
+   if ((result = copy_bignum(number)) == NULL) return NULL;
+   FORCE_INVERT(result);
+   return result;
+}
+
+</pre>
+<HR><P>Copyright &copy; 1995, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

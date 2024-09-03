@@ -1,0 +1,418 @@
+<html>
+<head>
+<title>Logging in C++</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> October 2007</p>
+
+<h1>Logging in C++</h1>
+<h2>A typesafe, threadsafe, portable logging mechanism</h2>
+
+
+<h3>By Petru Marginean</h3>
+
+
+<I>Petru is a vice president for Morgan Stanley, where he works as a C++ senior programmer in investment banking. He can be contacted at petru.marginean@gmail.com.</I>
+
+<hr>
+
+
+
+
+<p>Logging is a critical technique for troubleshooting and maintaining software systems. It's simple, provides information without requiring knowledge of programming language, and does not require specialized tools. Logging is a useful means to figure out if an application is actually doing what it is supposed to do. Good logging mechanisms can save long debugging sessions and dramatically increase the maintainability of applications.</p>
+
+<p>In this article, I present a simple&#151;but highly useful&#151;logging framework that is typesafe, threadsafe (at line-level), efficient, portable, fine-grained, compact, and flexible. The complete source code, which works with Visual C++ 7.1, g++ 3.3.5, and CC 5.3 on Sun and other platforms, is available electronically; see "Resource Center," page 5.</p>
+
+
+<h3>The First Step</h3>
+
+<p>Let's take a first stab at a <i>Log</i> class. Listing One uses an <i>std::ostringstream</i> member variable called "os" to accumulate logged data. The <i>Get()</i> member function gives access to that variable. After all data is formatted, <i>Log</i>'s destructor persists the output to the standard error. You use <i>Log</i> class like this:</p>
+
+<pre class="code">
+
+Log().Get(logINFO) &lt;&lt; "Hello " &lt;&lt; username;
+
+
+</pre>
+<p>Executing this code creates a <i>Log</i> object with the <i>logINFOx</i> logging level, fetches its <i>std::stringstream</i> object, formats and accumulates the user-supplied data, and finally, persists the resulting string into the log file using exactly one call to <i>fprintf().</i></p>
+
+<p>Why flush during destruction? The last two steps are important because they confer threadsafety to the logging mechanism. The <i>fprintf()</i> function is threadsafe, so even if this log is used from different threads, the output lines won't be scrambled. According to gnu.org/software/libc/manual/html_node/Streams-and-Threads.html:</p>
+
+	
+
+<pre class="code">
+// Log, version 0.1: a simple logging class
+enum TLogLevel {logERROR, logWARNING, logINFO, logDEBUG, logDEBUG1,
+logDEBUG2, logDEBUG3, logDEBUG4};
+class Log
+{
+public:
+   Log();
+   virtual ~Log();
+   std::ostringstream&amp; Get(TLogLevel level = logINFO);
+public:
+   static TLogLevel&amp; ReportingLevel();
+protected:
+   std::ostringstream os;
+private:
+   Log(const Log&amp;);
+   Log&amp; operator =(const Log&amp;);
+private:
+   TLogLevel messageLevel;
+};
+std::ostringstream&amp; Log::Get(TLogLevel level)
+{
+   os &lt;&lt; "- " &lt;&lt; NowTime();
+   os &lt;&lt; " " &lt;&lt; ToString(level) &lt;&lt; ": ";
+   os &lt;&lt; std::string(level &gt; logDEBUG ? 0 : level - logDEBUG, '\t');
+   messageLevel = level;
+   return os;
+}
+Log::~Log()
+{
+   if (messageLevel &gt;= Log::ReportingLevel())
+   {
+      os &lt;&lt; std::endl;
+      fprintf(stderr, "%s", os.str().c_str());
+      fflush(stderr);
+   }
+}</pre>
+<div class="caption">
+   Listing One
+</div>	
+	
+
+
+<p>The POSIX Standard requires that by default the stream operations are atomic...issuing two stream operations for the same stream in two threads at the same time will cause the operations to be executed as if they were issued sequentially. The buffer operations performed while reading or writing are protected from other uses of the same stream. To do this, each stream has an internal lock object that has to be (implicitly) acquired before any work can be done.</p>
+
+<p>Before moving on to a more efficient implementation, let's write code to insert tabs in proportion to the logging level, and append an <i>std::endl</i> to each chunk of text. This makes the log line oriented and easy to read by both humans and machines. Here's the relevant code:</p>
+
+<pre class="code">
+
+Log::ReportingLevel() = logDEBUG2;
+const int count = 3;
+Log().Get(logDEBUG) &lt;&lt; "A loop with "    &lt;&lt; count &lt;&lt; " iterations";
+for (int i = 0; i != count; ++i)
+{
+   Log().Get(logDEBUG1)        &lt;&lt; "the counter i = " &lt;&lt; i;
+}
+
+
+</pre>
+<p>which outputs:</p>
+
+<pre class="code">
+
+- 22:25:23.643 DEBUG: 	A loop with 3 iterations
+- 22:25:23.644 DEBUG1: 	the counter i = 0
+- 22:25:23.645 DEBUG1: 	the counter i = 1
+- 22:25:23.645 DEBUG1: 	the counter i = 2
+
+
+</pre>
+<p>Indentation makes the logging more readable. More leading tabs imply a more detailed level of logging.</p>
+
+
+
+
+
+
+
+
+
+<h3>A Little Trick</h3>
+
+<p>So far, the framework has shown good returns on only minor investments: It offers some nice formatting rules (the tabs according with the logging level and final <i>std::endl</i>) in a small, easy-to-use package. However, the current <i>Log</i> has an efficiency problem: If the logging level is set to actually do nothing, <i>Log</i> accumulates the data internally&#151;just to notice later, during destruction, that no output is required! This single issue is big enough to be a showstopper against <i>Log</i>'s use in a production system.</p>
+
+<p>You can use a little trick that makes the code, when logging is not necessary, almost as fast as the code with no logging at all. Logging will have a cost only if it actually produces output; otherwise, the cost is low (and actually immeasurable in most cases). This lets you control the trade-off between fast execution and detailed logging. </p>
+
+<p>Let's move the check from the destructor to the earliest possible time, which is just before the construction of the <i>Log</i> object. In this way, if the logging level says you should discard the logged data, you won't even create the <i>Log</i> object.</p>
+
+<pre class="code">
+
+#define LOG(level) \
+if (level &gt; Log::ReportingLevel()) ; \
+else Log().Get(level)
+
+
+</pre>
+<p>Now the first example becomes:</p>
+
+
+
+<pre class="code">
+LOG(logINFO) &lt;&lt; "Hello " &lt;&lt; username;
+
+</pre>
+<p>and is expanded by the preprocessor to (new lines added for clarity):</p>
+
+<pre class="code">
+
+if (logINFO &gt; Log::ReportingLevel())
+;
+else
+Log().Get(logINFO) &lt;&lt; "Hello " &lt;&lt; username;
+
+
+</pre>
+<p>Consequently, the <i>Log</i> class becomes simpler as the <i>messageLevel</i> member and the test in the destructor are not needed anymore:</p>
+
+<pre class="code">
+
+
+Log::~Log()
+{
+   os &lt;&lt; std::endl;
+   fprintf(stderr, "%s", os.str().c_str());
+   fflush(stderr);
+}
+
+
+</pre>
+<p>Logging is much more efficient now. You can add logging liberally to your code without having serious efficiency concerns. The only thing to remember is to pass higher (that is, more detailed) logging levels to code that's more heavily executed. </p>
+
+<p>After applying this trick, macro-related dangers should be avoided&#151;we shouldn't forget that the logging code might not be executed at all, subject to the logging level in effect. This is what we actually wanted, and is actually what makes the code efficient. But as always, "macro-itis" can introduce subtle bugs. In this example:</p>
+
+<pre class="code">
+
+LOG(logINFO) &lt;&lt; "A number of " &lt;&lt; NotifyClients() &lt;&lt; " were notified.";
+
+</pre>
+<p>the clients will be notified only if the logging level detail will be <i>logINFO</i> and lower. Probably not what was intended! The correct code should be:</p>
+
+<pre class="code">
+
+const int notifiedClients = NotifyClients();
+LOG(logINFO) &lt;&lt; "A number of " &lt;&lt; notifiedClients &lt;&lt; " were notified.";
+
+
+</pre>
+
+
+
+
+
+
+
+
+
+
+
+<h3>Going Generic</h3>
+
+<p>Another issue with the implementation we built so far is that the code is hardwired to log to <i>stderr</i>, only <i>stderr</i>, and nothing but <i>stderr</i>. If your library is part of a GUI application, it would make more sense to be able to log to an ASCII file. The client (not the library) should specify what the log destination is. It's not difficult to parameterize <i>Log</i> to allow changing the destination <i>FILE*</i>, but why give <i>Log</i> a fish when we could teach it fishing? A better approach is to completely separate our <i>Log</i>-specific logic from the details of low-level output. The communication can be done in an efficient manner through a policy class. Using policy-based design is justified (in lieu of a more dynamic approach through runtime polymorphism) by the argument that, unlike logging level, it's more likely you decide the logging strategy upfront, at design time. So let's change <i>Log</i> to define and use a policy. Actually, the policy interface is very simple as it models a simple string sink:</p>
+
+
+
+<pre class="code">
+static void Output(const std::string&amp; msg);
+
+</pre>
+<p>The <i>Log</i> <i>class</i> morphs into a class template that expects a policy implementation:</p>
+
+<pre class="code">
+
+template &lt;typename OutputPolicy&gt;
+class Log
+{
+  //...
+};
+template &lt;typename OutputPolicy&gt;
+Log&lt;OutputPolicy&gt;::~Log()
+{
+  OutputPolicy::Output(msg.str());
+}
+
+</pre>
+<p>That's pretty much all that needs to be done on <i>Log</i>. You can now provide the <i>FILE*</i> output simply as an implementation of the <i>OutputPolicy</i> policy; see Listing Two. The code below shows how you can change the output from the default <i>stderr</i> to some specific file (error checking/handling omitted for brevity):</p>
+
+<pre class="code">
+
+FILE* pFile = fopen("application.log", "a");
+Output2FILE::Stream() = pFile;
+FILE_LOG(logINFO) &lt;&lt; ...;
+
+
+</pre>
+<p>A note for multithreaded applications: The <i>Output2FILE</i> policy implementation is good if you don't set the destination of the log concurrently. If, on the other hand, you plan to dynamically change the logging stream at runtime from arbitrary threads, you should use appropriate interlocking using your platform's threading facilities, or a more portable wrapper such as <i>Boost</i> threads. Listing Three shows how you can do it using <i>Boost</i> threads.</p>
+
+
+<pre class="code">
+class Output2FILE // implementation of OutputPolicy
+{
+   public:
+   static FILE*&amp; Stream();
+   static void Output(const std::string&amp; msg);
+};
+inline FILE*&amp; Output2FILE::Stream()
+{
+   static FILE* pStream = stderr;
+   return pStream;
+}
+inline void Output2FILE::Output(const std::string&amp; msg)
+{
+   FILE* pStream = Stream();
+   if (!pStream)
+       return
+
+   fprintf(pStream, "%s", msg.c_str());
+   fflush(pStream);
+}
+typedef Log&lt;Output2FILE&gt; FILELog;
+#define FILE_LOG(level) \
+if (level &gt; FILELog::ReportingLevel() || !Output2FILE::Stream()) ; \
+else FILELog().Get(messageLevel)</pre>
+<div class="caption">
+   Listing Two
+</div>	
+	
+	
+
+<pre class="code">
+#include &lt;boost/thread/mutex.hpp&gt;
+class Output2FILE
+{
+public:
+    static void Output(const std::string&amp; msg);
+    static void SetStream(FILE* pFile);
+private:
+    static FILE*&amp; StreamImpl();
+    static boost::mutex mtx;
+};
+
+inline FILE*&amp; Output2FILE::StreamImpl()
+{
+    static FILE* pStream = stderr;
+    return pStream;
+}
+inline void Output2FILE::SetStream(FILE* pFile)
+{
+    boost::mutex::scoped_lock lock(mtx);
+    StreamImpl() = pFile;
+}
+inline void Output2FILE::Output(const std::string&amp; msg)
+{
+    boost::mutex::scoped_lock lock(mtx);
+    FILE* pStream = StreamImpl();
+    if (!pStream)
+        return;
+    fprintf(pStream, "%s", msg.c_str());
+    fflush(pStream);
+}</pre>
+<div class="caption">
+   Listing Three
+</div>	
+
+<p>Needless to say, interlocked logging will be slower, yet unused logging will run as fast as ever. This is because the test in the macro is unsynchronized&#151;a benign race condition that does no harm, assuming integers are assigned atomically (a fair assumption on most platforms).</p>
+
+
+<h3>Compile-Time Plateau Logging Level</h3>
+
+<p>Sometimes, you might feel the footprint of the application increased more than you can afford, or that the runtime comparison incurred by even unused logging statements is significant. Let's provide a  means to eliminate some of the logging (at compile time) by using a preprocessor symbol <i>FILELOG_MAX_LEVEL</i>:</p>
+
+<pre class="code">
+#ifndef FILELOG_MAX_LEVEL
+#define FILELOG_MAX_LEVEL logDEBUG4
+#endif
+#define FILE_LOG(level) \
+  if (level &gt; FILELOG_MAX_LEVEL) ;\
+  else if (level &gt; FILELog::ReportingLevel() || !Output2FILE::Stream()) ; \
+   else FILELog().Get(level)
+
+
+</pre>
+<p>This code is interesting in that it combines two tests. If you pass a compile-time constant to <i>FILE_LOG</i>, the first test is against two such constants and any optimizer will pick that up statically and discard the dead branch entirely from generated code. This optimization is so widespread, you can safely count on it in most environments you take your code. The second test examines the runtime logging level, as before. Effectively, <i>FILELOG_MAX_LEVEL</i> imposes a static plateau on the dynamically allowed range of logging levels: Any logging level above the static plateau is simply eliminated from the code. To illustrate:</p>
+
+<pre class="code">
+
+bash-3.2$ g++ main.cpp
+bash-3.2$ ./a.exe DEBUG1
+- 22:25:23.643 DEBUG:	A loop with 3 iterations
+- 22:25:23.644 DEBUG1:	the counter i = 0
+- 22:25:23.645 DEBUG1:	the counter i = 1
+- 22:25:23.645 DEBUG1:	the counter i = 2
+bash-3.2$ g++ main.cpp -DFILELOG_MAX_LEVEL=3
+bash-3.2$ ./a.exe DEBUG1
+- 22:25:31.972 DEBUG:	A loop with 3 iterations
+
+</pre>
+
+
+
+
+
+
+
+
+
+
+<h3>Final Tips on Using Log</h3>
+
+<p>I've been using an interesting technique that lets you compare different runs by actually <i>diff</i>'ing  the log files from each run. This is especially useful when you have no idea what could be wrong and why you get different results when running the same code:</p>
+
+<ul>
+  <li>On different platforms (Linux versus Windows).</li>
+  <li>On different versions of the same the same platform (RHEL3 vs. RHEL4).</li>
+  <li>With different compiler settings (debug versus optimize).</li>
+</ul>
+
+<p>Just turn the verbosity to maximum detail level (remember, because the logging is so light, you already have a lot of log statements on <i>logDEBUGx</i> in your code), run the application in the two different contexts, remove the timestamps from the log files (using, for instance, the sed program), and compare the two outputs. Even though the output files can be huge, it is the difference between them that matters, and that difference tends to be small and highly informative.</p>
+
+<p>Another nice outcome of using this log framework was combining the logging of multiple different applications (or multiple instances of a single application) in a single unique file. Just open the same file from several applications in append mode, and voila&#151;nicely interleaved logs from various processes! The resulted log file is still meaningful and (on a decent operating system at least) preserves log lines as atomic units. </p>
+
+<p>I've done some measurements to actually see how fast the runtime mechanism is (versus the compile time). The results turned out to be very good. I ran the same code in three different configurations:</p>
+
+<ul>
+    <li>off-INFO. log disabled at compile time, used as a base line.</li>
+  <li>on-INFO. log enabled at compile time, disabled at runtime (using INFO level of detail).</li>
+  <li>on-DEBUG4. log enabled at runtime and compile time (using DEBUG4 level of detail).</li>
+  </ul>
+
+<p>Each configuration was run multiple (20) times (to eliminate the possible random errors). Figure 1 and Table 1 illustrate the results. As you can see, the runtime performance (25.109 sec) matches the compile time (25.109 sec). That means you really will pay for logging only if you are going to use it.</p>
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!-- http://i.cmpnet.com/ddj/images/article/2007/07/ -->    
+<img class="illowide" src="070901pm01_f1.gif" onclick = "popimage(this,'www.ddj.com - Logging in C++ - Figure 1')">
+
+<div class="caption">
+Figure 1: Log speed tests.
+</div>
+</div>
+
+
+
+<div>
+<table cellpadding="3">
+	<tr>
+		<td></td> <td>on-DEBUG4  </td> <td>off-INFO  </td> <td>on-INFO</td>
+	</tr>
+	<tr>
+		<td>AVERAGE </td> <td>00:00:28.002</td> <td>00:00:25.106</td> <td>00:00:25.109</td>
+	</tr>
+	<tr>
+		<td>STDEV   </td> <td>0.0000029838 </td> <td>0.0000008605 </td> <td>0.0000014926</td>
+	</tr>
+</table>
+
+
+<div class="caption">
+Table 1
+</div>
+</div>
+
+
+<p>I found very useful in practice to also output the thread ID from where the output comes from along with the timestamp and logging level. This is a real help when reading a log file that comes from a multithreading application.</p>
+
+
+
+</body>
+</html>

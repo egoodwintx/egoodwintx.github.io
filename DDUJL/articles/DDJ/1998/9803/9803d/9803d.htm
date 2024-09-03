@@ -1,0 +1,275 @@
+<html>
+<META NAME="year" CONTENT="1998">
+<head>
+<title>Dr. Dobb's Journal March 1998: Tracing BSD System Calls</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Tracing BSD System Calls</h1>
+
+<p><i>Dr. Dobb's Journal</i> March 1998
+</p>
+<h2>Developing a "trussing" relationship with your operating system</h2>
+
+<h3>By Sean Eric Fagan</h3>
+
+<I>Sean, a BSD developer for many years, can be contacted at sef@kithrup.com.</I>
+
+<hr>
+
+<p>One of the more useful utilities available on some UNIX systems is "truss," also known as "strace" or "trace." The truss utility monitors the system calls made by a program. Unlike a debugger, truss does not need to have symbols compiled into the executable. Consequently, it can work with any executable, without recompilation, making it invaluable in many debugging situations. And since truss can monitor processes that are already running, it's helpful for debugging system programs and daemons such as <i>init</i> and <i>inetd</i>.</p>
+
+<p>Like all 4.4BSD-derived systems, FreeBSD has a ktrace program that monitors system calls. It does this with a kernel facility that dumps information about each system call made by a process. ktrace stores this information in a file (which can grow very large); the kdump utility presents the information in a human-readable fashion.</p>
+
+<p>truss uses a different kernel facility that stops the process whenever it enters or leaves the kernel. After truss gets the desired information, it restarts the process and the cycle continues. Unfortunately, this facility isn't in the stock FreeBSD kernel, so I added it. In this article, I'll describe how to add this facility to the FreeBSD 2.2 kernel (the 3.0 kernel already has it). </p>
+
+<p>FreeBSD is a free, UNIX-like operating system, based on the 4.4BSD-Lite distribution from the University of California at Berkeley Computer Science Research Group (CSRG). 4.4BSD-Lite is the successor to Net/2, which formed the basis for 386BSD (see the <i>DDJ</i> series "Porting UNIX to the 386," by William and Lynne Jolitz, January-November 1991 and February-July 1992). Information about FreeBSD, including how to obtain it, is available at http://www.freebsd.org/. It is also available on CD-ROM from Walnut Creek CD-ROM (http://www.cdrom.com/).</p>
+
+<h3>The <i>stopevent()</i> Kernel Function</h3>
+
+<p>To simplify the kernel changes, I created a single function, <i>stopevent(),</i> that could be easily invoked from many places. My original version of <i>stopevent()</i> used a variation on the standard SIGSTOP signal, one of the "job control" signals added to 4.2BSD. It's related to the SIGTSTP signal, which is usually sent in response to Control-Z on the terminal. Unlike SIGTSTP, SIGSTOP cannot be caught or ignored.</p>
+
+<p>There are problems with this approach. When a process receives SIGSTOP, its parent is notified -- this is how the shell knows to continue when you suspend a program with Control-Z. This doesn't work well for truss. Besides being rude (the parent may not be the one that requested the stop), it also makes it complicated for truss to monitor signal delivery. Proper implementation also requires some intimate knowledge of process switching.</p>
+
+<p>The alternative is to use the <i>sleep()</i> or <i>tsleep()</i> facility. <i>sleep()</i> makes a process wait for an event or resource (the opposite is <i>wakeup()</i>). When a process invokes <i>sleep()</i>, that process stops, no signal is generated, and no processes are notified. This is the approach used in <a name="rl1"><a href="9803d.htm#l1">Listing One</A>. </p>
+
+<p>My <i>stopevent()</i> function uses five fields (see <a name="rt1"><a href="9803dt1.htm">Table 1</A>), which I added to FreeBSD's process structure (<i>struct proc</i>, in &lt;sys/proc.h&gt;). These fields aren't always sufficient. For example, in the case of a signal delivery, <i>stopevent()</i> passes back the signal number in the <i>p_xstat</i> field in the <i>proc</i> structure. This field is also used by <i>exit()</i> and <i>wait()</i>. If this multiple usage causes future conflicts, another entry may have to be added to the <i>proc </i>structure.</p>
+
+<p>As the code indicates, <i>p_step</i> is set when <i>stopevent()</i> is invoked, and checked every time the process wakes up. The <i>tsleep()</i> in the loop controls it.</p>
+
+<h3><i>tsleep()</i> and <i>wakeup()</i></h3>
+
+<p>The first argument to <i>tsleep()</i> is the "channel," an arbitrary value used to identify the sleeping process for a future call to <i>wakeup()</i>. The second parameter indicates the priority of the process when it does awake, and whether a signal can interrupt the sleep. The third parameter is a string used by ps and the kernel's status mechanism to communicate to a user where the process is. Finally, the fourth parameter is the duration of the sleep; a duration of zero means the process will sleep forever.</p>
+
+<p>For <i>stopevent()</i>, this means that the process is put to sleep at PWAIT priority and cannot be interrupted. The channel it is sleeping on is the address of <i>p-&gt;p_step</i>, one of the fields added to the <i>proc</i> structure. Since each process has its own <i>proc</i> structure, this ensures that the address of <i>p-&gt;p_step</i> is unique -- meaning that only this process will be awakened when needed.</p>
+
+<p><i>wakeup()</i> is called with the channel code that was passed to <i>sleep(). </i>It goes through the list of sleeping processes, and schedules all processes that have a matching value. (The corresponding <i>wakeup_one()</i> wakes only the first matching process.) <i>stopevent()</i> calls <i>wakeup(</i>&amp;<i>p-&gt;p_stype)</i> before <i>tsleep()</i>. This wakes the truss program (or any other program using this kernel facility) so it can handle the event.</p>
+
+<p>There is no attempt to restrict monitoring to a single process -- multiple processes can, in fact, be monitoring the same target process. (For example, one process might be interested only in core dumps or system calls; another may want to watch the signal deliveries.) As a result, all processes that are sleeping on the &amp;<i>p-&gt;p_stype</i> of a particular process will be awakened by this <i>wakeup()</i> call; it is up to each monitoring process to check only for the events it is interested in.</p>
+
+<p>However, because &amp;<i>p-&gt;p_stype</i> is unique for each process, the <i>wakeup()</i> only affects those processes that are interested in this particular process.</p>
+
+<h3>Invoking <i>stopevent()</i></h3>
+
+<p>The STOPEVENT() macro is a simple wrapper that invokes <i>stopevent()</i> if the corresponding event is being checked by the process. This macro allows a single line to be dropped into nearly any part of the kernel, with no other code changes.</p>
+
+<p>The current implementation uses a bitmask that could support 32 different events. Six were enough for my needs: S_SIG for a signal delivery; S_EXIT for a process exit; S_EXEC for the <i>exec()</i> of a new program; S_SCE for a system-call entry; S_SCX for a system-call exit; and S_CORE for a coredump.</p>
+
+<p>STOPEVENT() is placed with the appropriate arguments at a convenient place where a process should stop. I added <i>STOPEVENT(p, S_SCE, callp-&gt;sy_narg);</i> to syscall() (the kernel side of the system call interface, in /sys/i386/i386/trap.c). This has the process stop, just after system call entry, if that event is being monitored. <i>callp-&gt;sy_narg</i> contains the number of 32-bit word arguments for the system call.</p>
+
+<p>The file diff.out (available electronically, see "Resource Center," page 3) shows the differences between the original FreeBSD 2.2 kernel and the one with my changes. In particular, you can see where I have placed STOPEVENT() in the kernel; in almost all cases, there was no extra work to be done. The one exception is kern_sig.c; in two places, it is necessary to check if signals are being monitored at all. The <i>psignal()</i> function normally skips the signal delivery if the signal is ignored or blocked. However, it always handles the signal if the process is being debugged, so the debugger can follow the attempted signals. I added a check for <i>p-&gt;p_stop</i>&amp;<i>S_SIG</i> so truss can also follow attempted signals. A similar change had to be made to <i>issig()</i>, which actually receives the signal and delivers it to the process.</p>
+
+<h3>Inside Signal Delivery</h3>
+
+<p>Because of the design of the UNIX kernel, delivering a signal requires two different kernel functions. UNIX is a preemptive, multitasking system; thus, user processes that run for too long are interrupted, then the kernel runs. However, the kernel itself is never preempted. When it is ready to change to a new process context, it does so explicitly by calling <i>mi_switch()</i>, which is invoked from <i>issig()</i>, <i>tsleep()</i>, and just before returning from a system call.</p>
+
+<p>The kernel is almost always running in the context of a process. Since one process cannot arbitrarily affect another, the kernel cannot do so on behalf of a process, either. This is why signal delivery, for example, requires two functions. The <i>psignal()</i> function runs in the sender's context; <i>issig()</i> runs in the receiver's context. A similar issue arises with truss, which also interfaces two different processes: one being traced and one doing the tracing.</p>
+
+<h3>Interfacing with procfs</h3>
+
+<p>The procfs filesystem (usually available as /proc) was added to 4.4BSD to simplify access to the kernel process list. Within procfs, each process is represented by a directory, and files within a directory provide access to particular information about that process; see <a name="rf1"><a href="9803df1.htm">Figure 1</A>. For example, "ls /proc" will list all running processes, while "ls -l /proc" will also tell you the owner of each process.</p>
+
+<p>There are some tricks involved in working with procfs. The <i>procfs_exit()</i> kernel function forcibly closes any open procfs files that refer to the specified function. This must be called when a process exits, since the corresponding procfs files will no longer exist. When I added a call to STOPEVENT() to kern_exit.c, I placed it before the call to <i>procfs_exit()</i> so that a monitoring process can have one last look.</p>
+
+<p>The procfs file system is also used by my procctl and truss programs to access and control the new tracing facility.</p>
+
+<p>There are several possible ways to interface with procfs; the easiest is to use <i>read()</i> and <i>write()</i>. For example, the procfs ctl and status files use this type of interface: The command "echo hup &gt; /proc/ curproc/ctl" sends a SIGHUP signal to the shell. Similarly, "cat /proc/curproc/status" yields something like <i>cat 1852 1849 114 </i>18555 5,1 ctty 880144638,200853 0,0 0,4255 nochan 100 100 20,20,20,0,8,10, 11,31,1000,2000. </p>
+
+<p>However, when trying to control a process (which involves sending a command, then finding out the status), this proves to be pretty ungainly. To stop a process, you would first send a stop command to the ctl file, then repeatedly read the status file until the process stopped. (Plan 9 uses a variant of this.)</p>
+
+<p>I chose to communicate through <i>ioctl()</i>. Normally, <i>ioctl()</i> cannot be called with a regular file, but that can be solved by removing the preemptive error return from <i>vn_ioctl()</i> -- the per-<i>vnode</i> IOCTL routine will still return the correct error (ENOTTY) for any file type that doesn't support it, but the correct IOCTL routine will be called for those that do.</p>
+
+<p>The rest of the procfs changes are to add <i>ioctl</i> options. First, they must be defined. To do that, I added a new kernel file &lt;sys/pioctl.h&gt; (for "process ioctl"), which defines six new <i>ioctl</i> options: PIOCBIS sets event flag(s); PIOCBIC clears event flag(s); PIOCSFL sets nonevent flags; PIOCSTATUS gets process status information; PIOCWAIT waits for a process to stop; and PIOCCONT continues a process.</p>
+
+<p>The _IOW and _IOR macros in <a name="rl2"><a href="9803d.htm#l2">Listing Two</A> construct a 32-bit value that is used by the IOCTL system call to determine what to do with the third argument to IOCTL -- _IOW means that it is copied from user space to kernel space, and _IOR is the other way around.</p>
+
+<p><a name="rl3"><a href="9803d.htm#l3">Listing Three</A> shows <i>procfs_ioctl</i>, which implements these new <i>ioctl</i> options. As you can see, PIOCBIS, PIOCBIC, and PIOCSFL are fairly straightforward.</p>
+
+<p>Both PIOCSTATUS and PIOCWAIT fill out a <i>procfs_status</i> structure, provided by users. The <i>procfs_status</i> structure indicates whether the process is stopped on an event or not (and, if so, which event it has stopped on), which events are being monitored, any extra data set by STOPEVENT(), and the currently unused flags.</p>
+
+<p>The difference between the two is that PIOCWAIT will put the requesting process to sleep until the target process stops. This is, of course, where the <i>wakeup()</i> in <i>stopevent()</i>, mentioned previously, comes into play. First, PIOCWAIT checks to see if the process is already stopped. If so, it has nothing to do. If the process is not stopped, however, PIOCWAIT then calls <i>tsleep()</i> on the <i>p_stype</i>. When <i>stopevent()</i> goes to stop the process, it first schedules any sleeping processes to be woken up. Unlike the <i>tsleep()</i> in <i>stopevent(), </i>PCATCH is set, meaning that the waiting process can be interrupted by signals.</p>
+
+<p>The last currently supported IOCTL option is PIOCCONT. This restarts a process that was stopped, and is modeled after the ptrace PT_CONTINUE method. This allows a stopped process to continue with a specified signal, if desired. (PT_CONTINUE also allows an address to be specified; however, the PC can be set via procfs, by opening up /proc/process-id/regs and modifying it.)</p>
+
+<p>PIOCCONT restarts the process by first clearing the <i>p_step</i> flag in the target process; this tells <i>stopevent()</i> (which is running in the context of the stopped process) that it is okay to run now. It then wakes up the process, and is done.</p>
+
+<h3>The procctl Program</h3>
+
+<p>The first program to use the interface is procctl. This is an administrative program, which "unsticks" processes. Remember that a process stopped via <i>stopevent()</i> will not respond to signals.</p>
+
+<p>As programs go, procctl is simple but limited -- the user must specify process IDs and there are no options. For each process, it simply clears the event bit mask, and continues the process. It warns about failures, but continues.</p>
+
+<p>Although simple, it is functional and does demonstrate the interface: PIOCBIC clears specified bits (~0 indicates that it should clear all of the bits in the event mask), and PIOCCONT wakes the process (and returns EINVAL if the process was not already stopped).</p>
+
+<p>The program was also absolutely necessary during development -- a process that was stopped in <i>stopevent() </i>could not be killed, which made it very difficult to regain control of the system.</p>
+
+<p>Two obvious improvements to procctl present themselves: "unsticking" all processes owned by a specified user, and having the program, itself, search the /proc filesystem, rather than having the user specify the process IDs.</p>
+
+<h3>The truss Program</h3>
+
+<p>The next application, truss, is of more general use. At its simplest, truss is invoked as <i>truss program args</i>. This will trace the system calls made by a program. <a name="re1"><a href="9803de1.htm">Example 1</A> shows typical truss output. However, it may be desirable to have the output of truss stored in a file somewhere; the -o option will do that. Also, you may wish to ignore certain events; the -S option will ignore delivered signals. (This could be extended to other options in a straightforward manner.)</p>
+
+<p>Lastly, truss can be used to trace an already-running process, with the -p option. This can be used, for example, to help debug a daemon process that cannot be easily or conveniently restarted.</p>
+
+<p>After going through the options, if a process ID was not specified, truss needs to set up the process itself. It does this in <i>setup_and_wait()</i>, whose sole purpose is to create a process, execute the desired program, and leave that process in a stopped state. Note that it sets the event mask to S_EXEC | S_EXIT initially, and applies that to itself after the <i>vfork()</i> and before the <i>execvp()</i>.</p>
+
+<p>In the event that the specified program is unable to be executed, then the process will exit, and stop; if, on the other hand, it succeeds, then the process will stop before returning from executing inside the kernel. (In both cases, by "stop," I mean that the process will wait in <i>stopevent()</i> to awaken.)</p>
+
+<p>In <i>start_tracing()</i>, truss opens up the mem file for the given process (for example, /proc/45/mem), and sets up the event mask for the target process. (The event mask may or may not set S_SIG, depending on the options given to truss.)</p>
+
+<p>Next, truss determines the emulation type of the target process. FreeBSD supports emulation of different operating systems (such as Linux and SCO). In many cases, the system call numbers are different for the different operating systems, so truss needs to know which mapping to use. It determines this by reading the procfs etype file; by default, this is "FreeBSD a.out", although "Linux ELF" and "IBCS2 COFF" are also common possibilities. For the time being, truss supports native FreeBSD programs and Linux ELF binaries, although I will concentrate only on the native (i386_syscall) versions in this discussion.</p>
+
+<p>Next, truss enters the main loop: It waits for the process to stop (and finds out why it stopped); prints the desired information; and restarts the process. It stops when the process has died (<i>pfs.why == S_EXIT</i>).</p>
+
+<p>When a system call is entered or exited, truss calls two processor-specific and OS-specific functions. For FreeBSD/a.out executables (that is, native binaries), the two functions are <i>i386_syscall_entry()</i> and <i>i386_syscall_exit()</i>. The Linux equivalents get the system call number and arguments through different means.</p>
+
+<p>Under FreeBSD on the x86 architecture, the system call number is contained in the EAX register; success or failure is indicated by setting the carry bit in the process status register, and the return value is in EAX (and, sometimes, EDX as well -- some system calls, such as <i>fork(), </i>return two values). </p>
+
+<p>The first thing <i>i386_syscall_entry()</i> and <i>i386_syscall_exit()</i> do is to determine whether they need to reopen the register file. After the first call, they should not need to. Then, they seek to the beginning of the register file and read the entire register set.</p>
+
+<p>The system-call names are generated automatically in syscalls.c. This file contains an array of all of the system-call names available on the system and is generated automatically from the system-call configuration file, which is part of the kernel. It fills the need to translate system-call numbers to system-call names, but fails to address the need to know the types of the arguments. However, the number of arguments is listed in the <i>nargs</i> parameter to <i>i386_syscall_entry()</i>. You can, therefore, get the arguments by looking in the process' memory space -- the arguments are at <i>ESP + sizeof(int)</i>.</p>
+
+<p><i>i386_syscall_exit()</i>'s job is easier -- it determines if the system call failed or succeeded (by checking the carry bit of the PSW), and prints out the value of EAX accordingly (either as an error or as a return value). This does not check for system calls that return multiple values.</p>
+
+<p>If you are interested in further experimenting with truss code, additional listings are available at http://www.freebsd.org/ ~sef/truss/index.html.</p>
+
+<p><b>DDJ</b></p>
+
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>/* stopevent() * Stop a process because of a procfs event; stay stopped until p-&gt;p_step is 
+ * cleared (cleared by PIOCCONT in procfs).
+ */
+void
+stopevent(struct proc *p, unsigned int event, unsigned int val) {
+  p-&gt;p_step = 1;
+  do {
+    p-&gt;p_xstat = val;
+    p-&gt;p_stype = event;   /* Which event caused the stop? */
+    wakeup(&amp;p-&gt;p_stype);  /* Wake up any PIOCWAIT'ing procs */
+    tsleep(&amp;p-&gt;p_step, PWAIT, "stopevent", 0);
+  } while (p-&gt;p_step);
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>/* New file sys/pioctl.h */#include &lt;sys/ioctl.h&gt;
+#if 0
+struct procfs_status {
+    int state;  /* 0 for running, 1 for stopped */
+    int why;    /* what event, if any, proc stopped on */
+    unsigned int    val;    /* Any extra data */
+};
+#else
+struct procfs_status {
+    int state;  /* Running, stopped, something else? */
+    int flags;  /* Any flags */
+    unsigned long   events; /* Events to stop on */
+    int why;    /* What event, if any, proc stopped on */
+    unsigned long   val;    /* Any extra data */
+};
+#endif
+<p></p>
+#define PIOCBIS _IOW('p', 1, unsigned int)  /* Set event flag */
+#define PIOCBIC _IOW('p', 2, unsigned int)  /* Clear event flag */
+#define PIOCSFL _IOW('p', 3, unsigned int)  /* Set flags */
+            /* wait for proc to stop */
+#define PIOCWAIT    _IOR('p', 4, struct procfs_status)
+#define PIOCCONT    _IOW('p', 5, int)   /* Continue a process */
+            /* Get proc status */
+#define PIOCSTATUS  _IOR('p', 6, struct procfs_status)
+<p></p>
+#define S_EXEC  0x00000001  /* stop-on-exec */
+#define S_SIG   0x00000002  /* stop-on-signal */
+#define S_SCE   0x00000004  /* stop on syscall entry */
+#define S_SCX   0x00000008  /* stop on syscall exit */
+#define S_CORE  0x00000010  /* stop on coredump */
+#define S_EXIT  0x00000020  /* stop on exit */
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three</H4>
+
+<pre>/* Part of procfs_vnops.c */procfs_ioctl(ap)
+    struct vop_ioctl_args *ap;
+{
+    struct pfsnode *pfs = VTOPFS(ap-&gt;a_vp);
+    struct proc *procp;
+    int error;
+    int signo;
+    struct procfs_status *psp;
+<p></p>
+    procp = pfind(pfs-&gt;pfs_pid);
+    if (procp == NULL) {
+        return ENOTTY;
+    }
+    switch (ap-&gt;a_command) {
+    case PIOCBIS:
+      procp-&gt;p_stops |= *(unsigned int*)ap-&gt;a_data;
+      break;
+    case PIOCBIC:
+      procp-&gt;p_stops &amp;= ~*(unsigned int*)ap-&gt;a_data;
+      break;
+    case PIOCSFL:
+      procp-&gt;p_pfsflags = (unsigned char)*(unsigned int*)ap-&gt;a_data;
+      *(unsigned int*)ap-&gt;a_data = procp-&gt;p_stops;
+      break;
+    case PIOCSTATUS:
+      psp = (struct procfs_status *)ap-&gt;a_data;
+      psp-&gt;state = (procp-&gt;p_step == 0);
+      psp-&gt;flags = procp-&gt;p_pfsflags;
+      psp-&gt;events = procp-&gt;p_stops;
+      if (procp-&gt;p_step) {
+        psp-&gt;why = procp-&gt;p_stype;
+        psp-&gt;val = procp-&gt;p_xstat;
+      } else {
+        psp-&gt;why = psp-&gt;val = 0;    /* Not defined values */
+      }
+      break;
+    case PIOCWAIT:
+      psp = (struct procfs_status *)ap-&gt;a_data;
+      if (procp-&gt;p_step == 0) {
+        error = tsleep(&amp;procp-&gt;p_stype, PWAIT | PCATCH, "piocwait", 0);
+        if (error)
+          return error;
+      }
+      psp-&gt;state = 1;   /* It stopped */
+      psp-&gt;flags = procp-&gt;p_pfsflags;
+      psp-&gt;events = procp-&gt;p_stops;
+      psp-&gt;why = procp-&gt;p_stype;    /* why it stopped */
+      psp-&gt;val = procp-&gt;p_xstat;    /* any extra info */
+      break;
+    case PIOCCONT:  /* Restart a proc */
+      if (procp-&gt;p_step == 0)
+        return EINVAL;  /* Can only start a stopped process */
+      if (ap-&gt;a_data &amp;&amp; (signo = *(int*)ap-&gt;a_data)) {
+        if (signo &gt;= NSIG || signo &lt;= 0)
+          return EINVAL;
+        if (error = psignal(procp, signo))
+          return error;
+      }
+      procp-&gt;p_step = 0;
+      wakeup(&amp;procp-&gt;p_step);
+      break;
+    default:
+      return (ENOTTY);
+    }
+    return 0;
+ }
+<p></p>
+<p></p>
+</pre>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1998, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

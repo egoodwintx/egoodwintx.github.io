@@ -1,0 +1,360 @@
+
+<html>
+<head>
+<title>February, 2005: Keeping Up with  The World, Part II</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Keeping Up with  The World, Part II</h1>
+<p><i>The Perl Journal</i> February, 2005</p>
+<h2></h2>
+
+
+<h3>By Simon Cozens</h3>
+
+
+<I>Simon is a freelance programmer and author, whose titles include Beginning Perl (Wrox Press, 2000) and Extending and Embedding Perl (Manning Publications, 2002). He's the creator of over 30 CPAN modules and a former Parrot pumpking. Simon can be reached at simon@ simon-cozens.org.</I>
+
+<hr>
+
+
+
+
+
+<p>In last month's column, we saw how to put together a Curses-based RSS feed reader. We began by looking around on CPAN and assembling a collection of modules that did most of the job for us, and spent the rest of the article merrily plugging them together. When it comes to the second part of the problem&#151;making the RSS reader talk to existing databases of feed information&#151;then things are a little different. We're on our own.</p>
+<h3>Where We Are Now</h3>
+
+<p>At the moment, our copy of press has a hard-coded list of RSS feeds that we want it to read. Each time we restart press, it forgets what we've already read; if you remember the original point of writing press, it was to enable me to take home the data from my normal RSS reader, NetNewsWire, to use its caching and record of which articles had been read, and then return to my usual network source and have NetNewsWire carry on as if I'd been reading all the time.</p>
+
+<p>To do this, we'll need to both read and write the format used by NetNewsWire, and then alter our press program to use the NetNewsWire files as a data source instead of our hard-coded list. To make this a generic change, we'll split off the data-store parsing code into a module, <i>Press::NNW1</i>; this means that if I later move to a new version of NNW, or indeed any other news reader, I can simply create a module to read and write its data stores, and slot that in with no changes to press.</p>
+
+<p>NNW uses two sources of information about what we're reading: The first is an XML "plist" file of the feeds we're subscribed to, and the second is a SQLite database of which articles we have seen.</p>
+
+<p>A plist is an XML data serialization format invented by Apple, and is capable of storing more complex kinds of data than our simple list of URLs and titles. In fact, NNW stores a hierarchy of feeds, allowing us to group feeds into categories and subcategories. So part of my preferences file looks like this:</p>
+
+<blockquote>
+<pre>
+&lt;dict&gt;
+  &lt;key&gt;isContainer&lt;/key&gt;
+  &lt;string&gt;1&lt;/string&gt;
+  &lt;key&gt;name&lt;/key&gt;
+  &lt;string&gt;Tech News&lt;/string&gt;
+  &lt;array&gt;
+    &lt;dict&gt;
+      &lt;key&gt;home&lt;/key&gt;
+      &lt;string&gt;
+      http://www.google.com/googleblog/
+      &lt;/string&gt;
+      &lt;key&gt;name&lt;/key&gt;
+      &lt;string&gt;Google Blog&lt;/string&gt;
+      &lt;key&gt;rss&lt;/key&gt;
+      &lt;string&gt;
+  http://www.google.com/googleblog/atom.xml
+      &lt;/string&gt;
+      ...
+    &lt;/dict&gt;
+    &lt;dict&gt;
+      &lt;key&gt;home&lt;/key&gt;
+      &lt;string&gt;
+      http://www.groklaw.net
+      &lt;/string&gt;
+      ...
+    &lt;/dict&gt;
+  &lt;/array&gt;
+&lt;/dict&gt;
+
+</pre>
+</blockquote>
+
+<p>Plist <i>dict</i> elements, or dictionaries, are a bit like hashes (and <i>array</i> elements are, well, arrays) so here we have a hash that is a container, called "Tech News," which contains some feeds, themselves expressed as hashes. We can use the <i>Mac::PropertyList</i> module to turn this into a Perl data structure:</p>
+
+<blockquote>
+<pre>
+use constant PREFS =&gt; 
+  "Library/Preferences/
+   com.ranchero.NetNewsWire.plist";
+my $file ||= (getpwuid $&lt;)[7]."/".PREFS;
+my $stuff = 
+  Mac::PropertyList::parse_plist_file($file);
+
+</pre>
+</blockquote>
+
+<p>To get the effect of supporting groups of feeds, we'll actually turn this into a flat list of titles, some of which will only be used for display purposes. That is, something like:</p>
+
+<blockquote>
+<pre>
+@titles = (
+  "Torgo-X zhoornal",
+  "[ Tech News ]",
+  " Slashdot",
+  " Planet Perl",
+  " Groklaw",
+  "[ Friends ]",
+  " No-sword",
+  ...
+);
+
+</pre>
+</blockquote>
+
+<p>Notice that those entries in brackets are not real RSS feeds&#151;they're just titles for the relevant group. Also note that we've indented the feeds inside each group by a space.</p>
+
+<p>The second piece of information we have from NetNewsWire is a file in Library/Application Support/NetNewsWire called "History.db." Looking at this file, it contains a piece of useful information:</p>
+
+<blockquote>
+<pre>
+% head -1 ~/Library/Application\ Support/
+           NetNewsWire/History.db
+** This file contains an SQLite 2.1 database **
+
+</pre>
+</blockquote>
+
+<p>Looking at it with the ever-so-handy <i>DBI::Shell</i>, we find that it is very simply constructed: one <i>history</i> table, which contains the columns <i>link</i>, <i>flRead</i> and <i>flFollowed</i> (flags to signify if the link was read or followed), and <i>dateMarked</i>. The link is, obviously, the link of each item in the feed, although it is munged a little from being merely a URL: It has a number in front of the URL and one at the end. We can guess that these are related to the ability to detect when the content of an article has changed, and indeed, with a little playing around, we find that the first number is the length of the headline and the second number is the length of the content. We're going to have to both read and write these rows in the <i>history</i> table to ensure that the history file is kept updated when we're using press. Now that we've seen what we want, how do we get there?</p>
+<h3>Easy is in the Eye of the Beholder</h3>
+
+<p>I used to have long talks with people about the usefulness (or lack thereof) of "design patterns" and what patterns there are for Perl programming. It took me a while to realize that I used many design patterns in my Perl programming, but I did so unconsciously and instinctively. So for me, a list of Perl design patterns wouldn't make sense because I automatically recognize the pattern I need when the situation calls for it.</p>
+
+<p>The situation we have with turning the nested XML structure into a flat array is one such case. When I was confronted with this, I was already halfway through writing a recursive closure, and suddenly the problem was solved. Here's how I did it. We'll start with the outline of the code:</p>
+
+<blockquote>
+<pre>
+use constant PREFS =&gt; "Library/Preferences/
+               com.ranchero.NetNewsWire.plist";
+use constant DBPATH =&gt; 
+  "Library/Application Support/NetNewsWire/";
+
+sub get_feedlist {
+  my ($self, $file, $db) = @_;
+  my $file ||= (getpwuid $&lt;)[7]."/".PREFS;
+  my $db   ||= 
+     (getpwuid $&lt;)[7]."/".DBPATH."History.db";
+  my (%labels, @values);
+
+  my $stuff = 
+    Mac::PropertyList::parse_plist_file($file);
+  # Do some magic with $stuff here
+  return (\@values, \%labels);
+}
+
+</pre>
+</blockquote>
+
+<p>As with last time, <i>@values</i> will be the list of blog names and group names, and <i>%labels</i> is the mapping between names and feed objects. For the moment, we'll only think about filling <i>@values</i> by extracting the names from the plist. Since the data structure is intrinsically recursive, we should already be thinking of a recursive walk over the plist tree. Something like this:</p>
+
+<blockquote>
+<pre>
+sub walk_plist {
+  my ($data, $depth) = @_;
+  my @rv;
+  for my $feed (@$data) {
+    if ($feed-&gt;{isContainer}) { 
+      # It's a group, not a feed, 
+      # so note it and recurse.
+      push @rv, (" "x $depth). 
+         "[".$feed-&gt;{name}-&gt;value."]",
+        walk_plist($feed-&gt;{childrenArray}, 
+                   $depth + 1);
+    } else {
+      # It's an ordinary feed
+      push @rv, (" "x $depth). 
+         $feed-&gt;{name}-&gt;value;
+    }
+  }
+  return @rv;
+}
+
+</pre>
+</blockquote>
+
+<p>This is great, except for two things: First, we have to deal with two variables (<i>@values</i> and <i>%labels</i>); and second, we're passing around a lot of values as we build up the various lists. Isn't there an easier way to do it? Well, "easier" is rather subjective, but by turning this subroutine into a closure, we can avoid passing around the variables, and keep everything tidily in one place.</p>
+
+<blockquote>
+<pre>
+sub get_feedlist {
+  my ($self, $file, $db) = @_;
+  my $file ||= (getpwuid $&lt;)[7]."/".PREFS;
+  my $db   ||= 
+    (getpwuid $&lt;)[7]."/".DBPATH."History.db";
+  my (%labels, @values, $walker);
+
+  my $stuff = 
+    Mac::PropertyList::parse_plist_file($file);
+
+  $walker = sub {
+    my ($stuff, $depth) = @_;
+    for my $feed (@$stuff) {
+      if ($feed-&gt;{isContainer}) {
+        push @values, (" "x $depth). 
+          "[".$feed-&gt;{name}-&gt;value."]";
+        $walker-&gt;($feed-&gt;{childrenArray}, 
+                  $depth + 1);
+      } else {
+        # Make an appropriate XML::RSS object
+        $rss = ...; 
+        push @values, $rss;
+        $labels{$rss} = (" " x $depth).$name;
+      }
+    } 
+  }
+  $walker-&gt;($stuff, 0);
+  return (\@values, \%labels);
+}
+
+</pre>
+</blockquote>
+
+<p>Since we're using a closure, we've got access to the <i>@values</i> and <i>%labels</i> hashes in the enclosing scope&#151;we don't need to pass anything around because it's all there. And as it's a closure, the recursion works just fine, too. Of course, we skipped over a little bit&#151;making the <i>XML::RSS</i> objects. This is where the history database comes in.</p>
+<h3>History Repeating</h3>
+
+<p>Just as we needed a special subclass of <i>XML::Feed</i> to handle feeds while controlling when articles get marked as read, we'll need another subclass of that to control reading and writing the marked-read status to the NetNewsWire database.</p>
+
+<blockquote>
+<pre>
+package XML::Feed::NNW1;
+use base 'XML::Feed::Manual';
+
+</pre>
+</blockquote>
+
+<p>First, we'll create an accessor for the history database file, so that we can tell each feed where to look to find its database:</p>
+
+<blockquote>
+<pre>
+sub history { 
+  my $self = shift @_;
+  $self-&gt;{history} = shift if @_;
+  $self-&gt;{history};
+} 
+
+</pre>
+</blockquote>
+
+<p>We need this because the constructor calls an accessor for each of the options passed to it. Next, we need to hook into the headline-loading process, to mark the items that the database says are read. <i>_load_cached_headlines</i> is a sensible place to do this:</p>
+
+<blockquote>
+<pre>
+sub _load_cached_headlines {
+  my $self = shift;
+  $self-&gt;SUPER::_load_cached_headlines;
+  # Now load the history
+  my $dbh = DBI-&gt;connect(
+    "dbi:SQLite2:$self-&gt;{history}"
+  ) or return;
+
+</pre>
+</blockquote>
+
+<p>At this stage, we have a list of headlines. We check the database for each one to see if they've been seen before:</p>
+
+<blockquote>
+<pre>
+  my $sth = $dbh-&gt;prepare(
+    "SELECT * from history where link = ?"
+  );
+  for my $head ($self-&gt;headlines) {
+    $sth-&gt;execute($self-&gt;encode_headline($head));
+    $self-&gt;SUPER::mark_seen($head) 
+      if @{$sth-&gt;fetchall_arrayref};
+  }
+}
+
+</pre>
+</blockquote>
+
+<p>The <i>encode_headline</i> method will be used to transform the article's URL into the encoded form used by NetNewsWire in its storage. We call the superclass' <i>mark_seen</i>, because our own <i>mark_seen</i> is going to look like this:</p>
+
+<blockquote>
+<pre>
+use Time::Piece;
+sub mark_seen {
+  my ($self, $head) = @_;
+  $self-&gt;SUPER::mark_seen($head);
+  my $dbh = DBI-&gt;connect(
+    "dbi:SQLite2:$self-&gt;{history}"
+  ) or return;
+  $dbh-&gt;do("
+    insert into history (link, flRead, 
+                flFollowed, dateMarked) 
+          values (?, 1, 0, ?)
+  ", {}, $self-&gt;encode_headline($head),
+       localtime-&gt;strftime("%Y%m%d"));
+}
+
+</pre>
+</blockquote>
+
+<p><i>Time::Piece</i> is a handy little module that allows us to parse and format the current time in various ways, and we can use that to spit out the date in the format used by the history database. Again, we need to encode the headline. Once we've done that, we put a row into the history file so that it's marked when we go back to using NetNewsWire.</p>
+
+<p>Finally, we need to do two things: The first is to implement <i>encode_headline.</i> We need to prepare the headline and description by trimming leading and trailing space from them:</p>
+
+<blockquote>
+<pre>
+sub encode_headline {
+  my ($self, $head) = @_;
+  my $d = $head-&gt;description;
+  my $h = $head-&gt;headline; 
+  chomp ($d, $h);
+  $d =~s/^[\n\s]+//; $d =~ s/\s+$//; 
+  $h =~s/^\s+//; $h =~ s/\s+$//; 
+
+</pre>
+</blockquote>
+
+<p>Then we return the URL bracketed with the length of the description and then length of the headline:</p>
+
+<blockquote>
+<pre>
+  return $d.$head-&gt;url.$h;
+}
+
+</pre>
+</blockquote>
+
+<p>Finally, we can create these <i>XML::Feed::NNW1</i> objects in our recursive closure:</p>
+
+<blockquote>
+<pre>
+my $url = $feed-&gt;{rss}-&gt;value;
+my $name = $feed-&gt;{name}-&gt;value;
+my $rss = XML::RSS::Feed::NNW1-&gt;new(
+    url =&gt; $url, 
+    history =&gt; $db
+);
+$labels{$rss} = (" " x $depth).$name;
+
+</pre>
+</blockquote>
+
+<p>And we have to tell press not to use our static list of feeds, but instead to use the <i>Press::NNW1</i> module to get its list:</p>
+
+<blockquote>
+<pre>
+use Press::NNW1;
+my ($values, $labels) = 
+   Press::NNW1-&gt;get_feedlist();
+$feedbox-&gt;values($values); 
+$feedbox-&gt;labels($labels); 
+bolden_news();
+
+</pre>
+</blockquote>
+
+<p>And now press can read and write NetNewsWire 1 histories!</p>
+<h3>Moving On</h3>
+
+<p>Let's take a step back and look at what we have: As we mentioned earlier, we now have a main program (press) and a separate library that handles everything about the subscription and history information. When NetNewsWire 2 hits the big time, all we need to do is create a <i>Press::NNW2</i> library, which reads the plist files and formats for that application. Someone is working on having a <i>Press::Bloglines</i> library to interface to that as well; by making press modular, anyone can create back ends to whatever RSS syndication service they like.</p>
+
+<p>Using the same modular system, it would be easy to create a program that read-in syndication data from any source and reproduced it in another format, to aid migration between RSS applications. But that's not really what I had in mind for press&#151;I just wanted something to keep me up-to-date with the world.</p>
+
+
+<p><b>TPJ</b></p>
+
+
+
+
+</body>
+</html>

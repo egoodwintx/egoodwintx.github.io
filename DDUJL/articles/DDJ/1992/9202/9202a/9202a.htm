@@ -1,0 +1,443 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>FEB92: USING DPMI TO HOOK INTERRUPTS IN WINDOWS 3</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>USING DPMI TO HOOK INTERRUPTS IN WINDOWS 3<a name="005d_0003"></h1><P>
+<h2><a name="005d_0001"><a name="005d_0000">You can get there from here with DPMI</h2><P>
+ This article contains the following executables: INTHOOK.ARC<P>
+<h3>Walter Oney</h3><P>
+<p><i><a name="005d_0002"><a name="005d_0000">Walter is a principal software engineer at Rational Systems Inc.  He is responsible for architecting and developing Windows-related products.  Rational Systems' address is 220 N. Main St., Natick, MA 01760.</i></p><hr><P>
+A classic technique for communicating between two DOS applications uses a software interrupt.  One program, which I'll call the &quot;responder&quot; in this article, uses the DOS Set Vector function to establish itself as the handler for an interrupt.  The other program, the signaler, uses the INT instruction to signal that interrupt, thereby invoking the responder's service routine.  This article shows you how a DOS application (a &quot;DosApp&quot;) running in the enhanced 386 mode of Microsoft Windows 3.0 can signal a Windows application (a &quot;WinApp&quot;).  You could use the technique, for example, to allow a DosApp that you haven't hosted directly under Windows to gather user input using the Windows interfaces.<P>
+<h3><a name="005d_0004">Roadblocks<a name="005d_0004"></h3><P>
+When you first try to establish the interrupt-based communication path under Windows, you quickly find a series of roadblocks that leave you thinking, &quot;You can't get there from here.&quot;<P>
+The first roadblock you encounter is that there are actually two interrupt vectors--a protected-mode vector and a real-mode vector--and you can't easily get at the right one.  In enhanced mode, Windows runs Windows applications in the protected mode of the Intel processor.  An interrupt that occurs while the processor is in protected mode gets routed through an Interrupt Descriptor Table to a protected-mode service routine.  In contrast, when the processor is in real mode at the time of an interrupt, the address of a real-mode service routine is located by indexing the interrupt vector table that begins at address 0:0.<P>
+If a Windows application uses the normal DOS Set Vector function (INT 21h, function 25h) to establish itself as an interrupt handler, Windows intercepts the request and only changes the protected-mode vector.  Because a DosApp signaler doesn't run in protected mode (as explained in the accompanying text box entitled, &quot;V86 Mode&quot;), its signal can't reach the WinApp responder.<P>
+Once you find a way to hook the real-mode interrupt vector, you encounter the next roadblock: You can't just point the real-mode vector to your protected-mode WinApp handler because they belong to two different address spaces.  The real-mode interrupt vector contains segment:offset addresses of real-mode service routines, whereas the WinApp responder routine has a selector:offset address that makes sense only in protected mode.<P>
+When you use a DOS extender, the existence of two interrupt vectors and the problem of reaching a protected-mode handler for a real-mode interrupt can be largely covered up.  When a program executes a DOS Set Vector request, the extender can install a real-mode handler instead of, or in addition to, a protected-mode handler for the interrupt.  The real-mode handler will actually be a stub in the extender kernel that switches the processor to protected mode and then transfers control to the protected-mode responder routine.  This is called &quot;passing up&quot; the interrupt.  Windows doesn't simulate the Set Vector function at this level of detail, however, and more heroic measures are required to install pass-up handlers.<P>
+The third obstacle in the way of a DosApp that wants to signal a WinApp arises from the way Windows uses different virtual machines to accomplish its multitasking.  Each virtual machine has its own real-mode interrupt vector.  Once you succeed in hooking a real-mode interrupt and arranging for the WinApp responder to get control in protected mode, you discover that you can only trap interrupts that occur in the system virtual machine.  The DosApp signaler executes in a different virtual machine and therefore can't reach the responder.<P>
+<h3><a name="005d_0005">Architecture for Success<a name="005d_0005"></h3><P>
+You can get around these problems by using some arcane features of the DOS Protected Mode Interface (DPMI) and an obscure task-switching function of the multiplex interrupt (INT 2Fh). Although the Windows 3.0 implementation of DPMI was intended to allow DOS extenders to work in a virtual machine created by Windows, WinApps can also issue many of the DPMI interface calls.  You can use the Set Real-Mode Interrupt Vector and Allocate Real-Mode Callback Address functions to hook a real-mode interrupt and provide for passing it up to a protected-mode responder.  Subfunction 1685h of INT 2Fh can be called from the signaler's virtual machine to schedule a program, which I'll call the forwarder, in the system virtual machine.<P>
+<a href="1992005f.htm">Figure 1</A> shows a concrete example of this technique.  In a DOS window, we run the signaler program, INT60.COM.  The signaler uses 2F/1685 to execute the forwarder, INT61.COM.  (The address of the forwarder is stored in the interrupt vector for INT 61h; no interrupt 61h is actually signalled in this example.)  The forwarder in turn issues an INT 60h instruction.  The interrupt vectors through the real-mode callback address to the operating system, which switches to protected mode and invokes a protected-mode responder routine within a small WinApp named INTHOOK.  The responder calls PostMessage, and INTHOOK's window procedure thereafter displays a message box announcing receipt of the signal.  Thus, there are three pieces to the example--INT60.COM, INT61.COM, and INTHOOK.EXE.  <a href="#005d_000c">Listing One</A> (page 78) shows a sample MAKE file for creating all three pieces; I'll soon describe each piece in more detail.<P>
+INTHOOK.C (see <a href="#005d_000e">Listing Two</A>, page 78) is a simple Windows application that has the usual parts, including a standard WinMain, a window procedure named MainWndProc, and several helper functions that I'll describe further on.  <a href="#005d_0010"> Listing Three</A> (page 80) shows the minimal module definition file needed to actually build the application.  When INTHOOK starts up, it calls hook60() to hook interrupt 60h.  When it terminates, it calls unhook60() to clean up.  While the application is active, it displays a dialog box each time an INT 60h occurs.<P>
+DPMI function 0303h (Allocate Real-Mode Callback Address) is used by hook60() to derive the segment:offset address of a real-mode stub belonging to Windows.  There are three parameters to this function, passed via registers, as follows: First, AX contains 0303h, the function code for this DPMI request.  Second, DS:SI contains the address of the protected-mode program (namely, int60(), a routine local to INTHOOK.C) to which Windows is to pass control when real-mode code attempts to execute at the real-mode callback address.  Lastly, ES:DI holds the address of a static Real-Mode Callback Structure (cb60, in this example) that will be used at callback time to store the state of the real-mode program.<P>
+Windows returns the segment:offset address of the callback in CX:DX, and hook60() saves this address in the callback variable.  Then hook60() uses DPMI function 0200h (Get Real-Mode Interrupt Vector) to preserve the original INT 60h vector for later restoration and function 0201h (Set Real-Mode Interrupt Vector) to install the real-mode callback address as the handler for INT 60h.<P>
+<h3><a name="005d_0006">Fielding the Real-Mode Callback<a name="005d_0006"></h3><P>
+The business end of INTHOOK is the local subroutine named int60(), which gains control via the DPMI real-mode callback mechanism and which must exit with an IRET instruction.<P>
+When this subroutine is called, the register contents are as follows.  DS:SI contains the protected-mode (selector:offset) address of the interrupting real-mode stack.  ES:DI holds the selector:offset address of the real-mode callback structure.  We're using the static structure cb60 in this example, so we don't actually need to use this pointer to access it.  Finally, SS:SP points to a special locked stack that's used just for interrupt handlers and callback routines.  This has no relation to the interrupting stack or to the data segment for an instance of INTHOOK.<P>
+Because int60() is declared with the &quot;interrupt&quot; keyword, the Microsoft C compiler generates a stylized function prolog and epilog, as shown in <a href="#005d_0007">Example 1</A>.<P>
+<h4><a name="005d_0007">Example 1: The prolog and epilog for a function declared with the &quot;interrupt&quot; keyword</h4><P>
+<pre>
+  pusha
+  push   ds
+  push   es
+  mov    bp,sp
+  mov    ax,DGROUP
+  mov    ds,ax
+  cld
+
+  [function body]
+
+  pop    es
+  pop    ds    popa
+  iret</pre><P>
+<P>
+int60() is declared as having a single argument, &quot;f,&quot; an instance of the IFRAME structure declared just before the function.  The IFRAME structure maps the registers pushed by the function prolog.  To refer to, say, the SI register passed by DPMI, you would code f.si. Notice also that the function prolog reloads the DS register from an immediate operand that corresponds to the first instance of INTHOOK.  As the example is coded therefore, there's no provision for a &quot;thunk&quot; to set up a different DS for a second or subsequent instance.  This is just as well, because there's only one interrupt vector entry for 60h to start with!  This is the reason the WinMain function in INTHOOK returns immediately if called for a second instance.<P>
+int60() has two responsibilities.  First of all, it must arrange for control to return properly to the instruction following the INT 60h instruction in the forwarder by simulating an IRET instruction on behalf of the real-mode process.  <a href="19920060.htm">Figure 2</A> diagrams this simulation, which involves copying the flags and CS:IP from the interrupting stack into the real-mode callback structure and adjusting the saved Stack Pointer register up by 6 bytes.  The program addresses the interrupting real-mode stack using the original contents of DS:SI, which are provided by DPMI for just this purpose.<P>
+The other responsibility of int60() is to respond to the interrupt signal.  In an ordinary DOS program, a software interrupt handler gets control in the same system context as the program which signaled its interrupt.  Therefore, there aren't any unusual restrictions on the system calls or other functions it can perform.  The WinApp responder in this example, unfortunately, gets control in a somewhat fragile state because of the intervention of DPMI and the real-mode callback mechanism.  PostMessage is a safe call in this and other interrupt handling situations within Windows, but many (if not most) other Windows API calls are not safe.  In coding the example, I opted for utmost safety and restricted int60() to doing a PostMessage call that sends a WM_USER message to the INTHOOK window procedure.  That message elicits a suitable call to MessageBox to demonstrate receipt of the interrupt signal.<P>
+<h3><a name="005d_0008">The Signaling and Forwarding Partnership<a name="005d_0008"></h3><P>
+The signaling program, INT60.COM (see <a href="#005d_0012">Listing Four</A>, page 80), is invoked from the command level in a DOS window.  It uses INT 2Fh, function 1685h, to make sure that the INT 60h instruction is executed within the system virtual machine.<P>
+The parameters to this function are passed in four registers, as follows: First, the AX register holds 1685h, the code for this function.  Second, BX holds the index of the virtual machine in which a program is to be scheduled.  In Windows 3.0, the system virtual machine is numbered &quot;1,&quot; but this may change in future releases.  The third parameter is passed in CX, and holds flag bits.  Flag bit 0 is set to 1 if the scheduler should wait for the target machine to enable interrupts, 0 otherwise.  Flag bit 1 is set to 1 if the scheduler should wait until the critical section isn't claimed by anyone, 0 otherwise.  The fourth parameter is in DX:SI, and is a 32-bit priority boost to be given the target virtual machine.  Finally, the ES:DI register holds the CS:IP address of the program to be scheduled in the target virtual machine.<P>
+To use the interface, we need to know the index of the system virtual machine and the address of the forwarder program.  This is an example and not a product-grade program, so I relied on the fact that the system virtual machine is number 1 in Windows 3.0.  To put the forwarder where INT60.COM could easily find it, I decided to install it as the service routine for interrupt 61h.  But note that we don't actually execute an INT 61h to call the forwarder; instead, we load the address kept in the INT 61h vector into ES:DI before calling the 2F/1685 function.<P>
+The actual INT 60h signal is sent by the forwarding program, INT61.COM (<a href="#005d_0014"> Listing Five</A>, page 80).  INT61.COM is a TSR utility because it must be present in memory when you start Windows in order to be part of the system virtual machine.<P>
+<h3><a name="005d_0009">Discussion<a name="005d_0009"></h3><P>
+There are some obvious limitations to the technique I've described.  The most formidable is the absence of any provision for passing data from the signaling DosApp to the responding WinApp.  The 2F/1685 interface doesn't allow the signaler to pass any data to the forwarder, and it isn't very easy for the forwarder to pass data along to the WinApp responder, either. You could overcome the first part of the problem by reserving a data buffer area within the forwarder.  This data area would be part of the address space shared by all DOS virtual machines because it would exist when Windows started, and the signaler could copy data into it before executing the INT 2Fh.  If you don't need to pass much data to the responder, the forwarder could load up the general registers before issuing the INT 60h, and the responder could read the data out of the real-mode callback structure and pass it along in the message it posts.<P>
+<a href="#005d_000a">More Details.</A><P>
+If you want to pass a large amount of data to the WinApp responder, you can either use the clipboard (with an INT 2F interface described in Microsoft's documentation) or you can create a protected-mode pointer to the forwarder's data area.  There is no documented way to create the pointer in Windows.  My experience shows that DPMI functions such as 000Ch (Set Descriptor) operate correctly when issued by a WinApp, but Microsoft discourages their use. (In contrast, the other DPMI calls described in this article are approved for use by WinApps.)  Whether Microsoft's policy is motivated by concerns about system integrity, planned &quot;desupport&quot; in upcoming releases, or lack of portability to non-Intel environments isn't apparent.  There are also some undocumented descriptor management interface calls in the Windows kernel, but I would guess that they are less permanent than the DPMI functions.<P>
+Another limitation is that the WinApp can't actually do very much when it wakes up after an interrupt.  Though I haven't made an extensive check, I would expect PostMessage and GetCurrentTask to just about fill the list.  This has implications for data sharing too, because it may be unsafe for the responder program to do memory allocation calls in order to copy data from the forwarder buffer into the Windows address space.<P>
+Finally, the interrupt management scheme described in the article doesn't provide for the WinApp passing any information back to the signaler.  There are actually two problems here. One is that the WinApp can't use this mechanism to originate a call to a DosApp in any particular virtual machine.  A second, and perhaps more crippling problem is that there aren't any synchronization tools built into Windows that would let a signaling DosApp suspend execution until the WinApp responder completes some task.  A barely passable solution uses a shared data word as a semaphore; the DosApp alternately tests the semaphore and yields its time slice.  Overall performance suffers with this hand-rolled semaphore, however, and it's only suitable for low-frequency use.  There are better techniques for doing these more advanced functions, but elaboration is beyond the scope of this article.<P>
+Despite its complexity and limitations, the interrupt hooking and signaling technique outlined here will serve a class of applications.  A suitable application runs primarily as a DosApp and needs to exchange a small amount of data with a WinApp on an occasional basis. There are many potential applications that fit this profile, however, so you may find the technique useful.<P>
+<h3><a name="005d_000a"><a name="005d_000b">V86 Mode<a name="005d_000b"></h3><P>
+A DOS application, sometimes called a &quot;non-Windows&quot; application in the Microsoft documentation, executes in the virtual 8086 (V86) mode of the Intel processor.  With the help of system software, the processor closely mimics real mode in this situation.  In actual fact, the processor is executing in protected mode, but the Virtual Machine (VM) bit in the extended flags register is on.  In V86 mode, addresses are interpreted as segment:offset values instead of selector:offset values.  Certain instructions that control critical hardware and other system resources in real mode cause General-Protection (code 0D) Faults in V86 mode.  These faults allow the operating system to virtualize functions that need to be shared by all concurrent applications.<P>
+As an example of virtualization, consider what happens when a DosApp executes an INT instruction.  The instruction causes a General-Protection Fault, which Windows disambiguates to discover its cause.  Windows will dispatch the appropriate handler in V86 mode.  The handler may issue an STI instruction (because real-mode handlers normally get control with interrupts disabled) and will end with an IRET instruction.  Both the STI and IRET instructions will also cause General-Protection Faults so that Windows can maintain a virtual Interrupt Flag.  The real processor will be enabled for interrupts during most of the process (except during the initial handling of the General-Protection Fault) so that multitasking won't suffer.<P>
+There are additional details to the interrupt handling process that matter only to operating systems programmers.  For instance, the DosApp runs in protection ring 3 (least privileged), whereas the Windows kernel runs in protection ring 0 (most privileged), and the Input/Output Privilege Level is set to 0 to prevent the DosApp from executing I/O instructions or affecting the real Interrupt Flag in any way.  Handling the General-Protection Faults described in the previous paragraph requires the processor to switch stacks and save additional state information beyond that required for a purely real-mode process.<P>
+None of these details is apparent to the application programmer trying to signal a software interrupt, however.  At the level described in this article, it appears that the DosApp runs in real mode and that a totally normal real-mode interrupt service routine gains control directly from the INT instruction.<P>
+--W.O.<P>
+<P>
+
+
+<PRE>
+
+_USING DPMI TO HOOK INTERRUPTS IN WINDOWS 3_
+by Walter Oney
+
+<a name="005d_000c">
+<a name="005d_000d"></pre><B>[LISTING ONE]</B><pre><a name="005d_000d">
+
+###########################################################################
+#  MAKE file for INTHOOK example and helper programs.
+#  By Walter Oney.    Use with Microsoft C 6.0A &amp; MASM 5.1 (or compatibles)
+###########################################################################
+
+all: inthook.exe int60.com int61.com
+
+inthook.obj: inthook.c
+    cl -AS -Zlipe -c -Gsw2 -Ows -W3 inthook.c &gt;inthook.err
+inthook.exe: inthook.obj
+    link /noe /nod /co /m inthook,inthook,inthook,slibcaw libw,inthook;
+    rc inthook.exe
+    mapsym inthook
+int60.com: int60.asm
+    masm int60;
+    link int60;
+    exe2bin int60 int60.com
+int61.com: int61.asm
+    masm int61;
+    link int61;
+    exe2bin int61 int61.com
+
+
+
+
+
+<a name="005d_000e">
+<a name="005d_000f"></pre><B>[LISTING TWO]</B><pre><a name="005d_000f">
+
+/**************************************************************************
+ * INTHOOK.C   -- by Walter Oney                  Use with Microsoft C 6.0A.
+ * Sample app illustrating interrupt hooking in Win3 using DPMI 0.9 services
+ *************************************************************************/
+
+/* Include files */
+#include &quot;windows.h&quot;            /* MS windows dcls */
+#include &quot;dos.h&quot;                /* for FP_SEG, FP_OFF */
+
+/* Local procedures and data */
+     static HANDLE hInst ;  /* current instance handle */
+     static HWND hMyWindow ;    /* handle for our window */
+     static void (interrupt far *org60)() ; /* original INT 60 handler */
+     static void (far *callback)() ; /* real mode callback address */
+     typedef struct
+    {           /* real mode callback */
+    unsigned long edi, esi, ebp, junk, ebx, edx, ecx, eax ;
+    unsigned short flags, es, ds, fs, gs, ip, cs, sp, ss ;
+    } CBSTRUCT ;        /* real mode callback */
+     CBSTRUCT cb60 ;        /* callback for INT 60 handling */
+
+     static void hook60(void) ; /* hook INT 60 */
+     static void unhook60(void) ; /* unhook INT 60 */
+     static void interrupt far int60() ; /* interrupt handler */
+
+/**********************************************************************/
+/* Main window procedure: */
+     LONG FAR PASCAL MainWndProc
+    (HWND hWnd,     /* window handle */
+    WORD iMessage,      /* message code */
+    WORD wParam,        /* 1st parameter */
+    LONG lParam)        /* 2d parameter */
+    {           /* MainWndProc */
+/* Local variables */
+    long retcode = 0 ;  /* return code */
+/* Text */
+    switch(iMessage)
+       {            /* process message */
+    case WM_CREATE:
+       hMyWindow = hWnd ;   /* so INT60 can find it */
+       hook60() ;
+       break ;
+    case WM_USER:       /* posted by int60() */
+       MessageBox(GetFocus(), &quot;Wake up!&quot;, &quot;Salutations&quot;,
+          MB_ICONEXCLAMATION | MB_OK) ;
+       break ;
+    case WM_DESTROY:    /* window being destroyed */
+       unhook60() ;
+       PostQuitMessage(0) ;
+       break ;
+    default:        /* some other message */
+       retcode = DefWindowProc(hWnd, iMessage, wParam, lParam) ;
+       break ;
+       }            /* process message */
+    return retcode ;
+    }           /* MainWndProc */
+
+/**********************************************************************/
+/* Window message loop: */
+     int PASCAL WinMain
+    (HANDLE hInstance,  /* current instance */
+    HANDLE hPrevInstance,   /* previous instance (if any) */
+    LPSTR lpCmdLine,    /* command line */
+    int nCmdShow)       /* show window type (open/icon) */
+    {           /* WinMain */
+/* Local variables */
+    HWND hWnd ;     /* window handle */
+    MSG msg ;       /* current message */
+    WNDCLASS wc ;       /* template for this class */
+/* Text */
+/* Only allow one instance of the application at a time -- there's only
+   one interrupt vector to hook! */
+    if (hPrevInstance)
+       return FALSE ;
+/* Create the window class. */
+    wc.style = 0 ;      /* default styles */
+    wc.lpfnWndProc = MainWndProc ; /* window proc */
+    wc.cbClsExtra = 0 ; /* no extra bytes for class */
+    wc.cbWndExtra = 0 ; /* no extra bytes for instance */
+    wc.hInstance = hInstance ; /* who created the class */
+    wc.hIcon = LoadIcon(NULL, IDI_APPLICATION) ;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW) ; /* default cursor */
+    wc.hbrBackground = (HBRUSH) GetStockObject(WHITE_BRUSH) ;
+    wc.lpszMenuName = NULL ; /* no menu */
+    wc.lpszClassName = &quot;AppWClass&quot; ; /* name of window class */
+    if (!RegisterClass(&amp;wc))
+       return FALSE ;
+/* Create an instance of the class (i.e., our own window) */
+    hInst = hInstance ; /* so window proc can access it */
+    hWnd = CreateWindow(&quot;AppWClass&quot;,
+       &quot;Interrupt Hook Sample Application&quot;,
+       WS_OVERLAPPEDWINDOW,
+       CW_USEDEFAULT,
+       CW_USEDEFAULT,
+       CW_USEDEFAULT,
+       CW_USEDEFAULT,
+       NULL, NULL, hInstance, NULL) ;
+    if (!hWnd)
+       return FALSE ;
+    ShowWindow(hWnd, SW_SHOWMINIMIZED) ;
+    UpdateWindow(hWnd) ;
+/* Main message loop */
+    while (GetMessage(&amp;msg, NULL, NULL, NULL))
+       {             /* until WM_QUIT message */
+       TranslateMessage(&amp;msg) ; /* xlate virtual key codes */
+       DispatchMessage(&amp;msg) ; /* dispatch handler */
+       }             /* until WM_QUIT message */
+    return msg.wParam ; /* PostQuitMessage's arg */
+    }           /* WinMain */
+
+/**********************************************************************/
+/* HOOK60 hooks software interrupt 60h in real mode, using a real-mode
+   callback to get control passed to int60(). */
+     static void hook60()
+    {           /* hook60 */
+    _asm
+       {
+       push  ds     ; save DS across call
+
+       mov   ax, ds     ; ES:DI -&gt; callback structure
+       mov   es, ax     ;   ..
+       mov   di, offset cb60;   ..
+       mov   ax, cs     ; DS:SI -&gt; routine to call
+       mov   ds, ax     ;   ..
+       mov   si, offset int60 ; ..
+       mov   ax, 0303h  ; fcn 0303: allocate real mode callback
+       int   31h        ; issue DPMI function request
+
+       pop   ds     ; restore DS
+       mov   callback, dx   ; CX:DX = callback address
+       mov   callback+2, cx ;   ..
+
+       mov   bl, 60h    ; BL = interrupt number (60h)
+       mov   ax, 0200h  ; fcn 0200: get real mode interrupt vector
+       int   31h        ; issue DPMI function request
+       mov   org60, dx  ; CX:DX = original real mode vector
+       mov   org60+2, cx    ;   ..
+
+       mov   dx, callback   ; CX:DX = new REAL MODE handler address
+       mov   cx, callback+2 ;   ..
+       mov   ax, 0201h  ; fcn 0201: set real mode interrupt vector
+       int   31h        ; issue DPMI fcn request
+       }
+    }           /* hook60 */
+
+/**********************************************************************/
+/* UNHOOK60 restores the original interrupt 60h vector. */
+     static void unhook60()
+    {           /* unhook60 */
+    _asm
+       {
+       mov   dx, org60  ; CX:DX = original INT 60 vector
+       mov   cx, org60+2    ;   ..
+       mov   bl, 60h    ; BL = interrupt number (60h)
+       mov   ax, 0201h  ; fcn 0201: set real mode interrupt vector
+       int   31h        ; issue DPMI fcn request
+
+       mov   dx, callback   ; CX:DX = real-mode callback address
+       mov   cx, callback+2 ;   ..
+       mov   ax, 0304h  ; fcn 0304: free real mode callback
+       int   31h        ; issue DPMI fcn request
+       }
+    }           /* unhook60 */
+
+/**********************************************************************/
+/* INT60 is the interrupt handler for interrupt 60h. It gains control from
+   the real-mode callback address allocated by HOOK60() and uses PostMessage
+   to send a message to the application's window procedure. */
+     typedef struct
+    {           /* interrupt register structure */
+    unsigned short es, ds ;
+    unsigned short di, si, bp, sp, bx, dx, cx, ax ;
+    unsigned short flags, ip, cs ;
+    } IFRAME ;      /* interrupt register structure */
+     static void interrupt far int60(IFRAME f)
+    {           /* int60 */
+    unsigned int far *isp ; /* interrupting stack pointer */
+/* Simulate IRET in signalling process. */
+    FP_SEG(isp) = f.ds ;
+    FP_OFF(isp) = f.si ;
+    cb60.ip = isp[0] ;
+    cb60.cs = isp[1] ;
+    cb60.flags = isp[2] ;
+    cb60.sp += 6 ;
+/* Post a private message leading to a message box. */
+    PostMessage(hMyWindow, WM_USER, NULL, NULL) ;
+    }           /* int60 */
+
+
+
+
+
+<a name="005d_0010">
+<a name="005d_0011"></pre><B>[LISTING THREE]</B><pre><a name="005d_0011">
+
+NAME        INTHOOK
+DESCRIPTION 'Interrupt Hook Sample Application'
+EXETYPE     WINDOWS
+STUB        'WINSTUB.EXE'
+CODE        PRELOAD MOVEABLE DISCARDABLE
+DATA        PRELOAD MOVEABLE MULTIPLE
+HEAPSIZE    1024
+STACKSIZE   5120
+EXPORTS
+    MainWndProc          @1
+
+
+
+
+
+<a name="005d_0012">
+<a name="005d_0013"></pre><B>[LISTING FOUR]</B><pre><a name="005d_0013">
+
+;---------------------------------------------------------------------------
+; INT60.ASM --  Signaller program for INTHOOK example app.  By Walter Oney.
+;---------------------------------------------------------------------------
+     name  int60
+int60    segment byte public 'code'
+     assume cs:int60, ds:int60
+     org   100h       ; required for .COM file usage
+
+; See if forwarder program is present by checking interrupt vector for 61h.
+begin:   mov   ax, 3561h      ; get int 61 vector address
+     int   21h        ;   ..
+     mov   ax, es         ; be sure there is one
+     or    ax, bx         ;   ..
+     jz    cantcall       ; if not, complain and quit
+
+; Use 2F/1685 to switch to system virtual machine and call forwarder program.
+; Note that no-one actually does an INT 61h--we simply use the vector as a
+; convenient (and facile) place to park the address of the callback
+     mov   ax, 1685h      ; fcn 1685: switch VM's and callback
+     mov   di, bx         ; ES:DI = callback address (int 61 hdlr)
+     mov   bx, 1      *    ; BX = VM to switch to (system VM)
+     mov   cx, 3          ; CX = .... .... .... ..11 -- wait until
+                  ;    interrupts enabled and critical
+                  ;    section unowned
+     xor   dx, dx         ; DX:SI = priority boost (zero)
+     xor   si, si         ;   ..
+     int   2Fh        ; switch to system VM &amp; do INT 60
+
+; If the forwarder found an INT 60 handler, it saved the address beginning
+; after a 3-byte JMP located at 100h. Check this in order to complain if
+; the responder WinApp isn't loaded. Note that this test will sometimes
+; fail because we're running asynchronously with the system VM.
+     mov   ax, word ptr es:[103h]; see if forwarder found an INT60 handler
+     or    ax, word ptr es:[105h];   ..
+     jz    no60       ; if not, complain about it
+goback:  mov   ax, 4C00h      ; terminate with errorlevel 0
+     int   21h        ; (does not return)
+cantmsg  db    'The forwarder program is not installed', 13, 10, '$'
+nomsg    db    'The responder WinApp is not running', 13, 10, '$'
+no60:    lea   dx, nomsg      ; responder not present
+     jmp   short complain     ;   ..
+cantcall:lea   dx, cantmsg    ; forwarder not present
+complain:mov   ah, 9          ; fcn 9: print msg in DS:DX on screen
+     int   21h        ;   ..
+     jmp   goback         ; exit
+int60    ends
+     end   begin
+
+
+
+
+
+<a name="005d_0014">
+<a name="005d_0015"></pre><B>[LISTING FIVE]</B><pre><a name="005d_0015">
+
+;--------------------------------------------------------------------------;
+;    INT61.ASM -- Forwarder program for the INTHOOK example application       ;
+;    Written by Walter Oney                           ;
+;--------------------------------------------------------------------------;
+
+     name  int61
+     .286p
+int61    segment byte public 'code'
+     assume cs:int61, ds:int61
+     org   100h       ; required for .COM file usage
+begin:   jmp   doit       ; jump around fixed data area
+
+vect60   dw    0, 0       ; for inspection by signaller
+
+doit:    mov   ax, 2561h      ; hook INT 61h so INT60 can find us
+     lea   dx, callback   ;   from another virtual machine
+     int   21h        ;   ..
+
+     lea   dx, endprog+15     ; point past all code in this module
+     shr   dx, 4          ; compute # paragraphs to keep
+     mov   ax, 3100h      ; terminate and stay resident
+     int   21h        ; (does not return)
+;    CALLBACK is reached circuitously when INT60 does a 2F/1685 to schedule
+;    it to run in the system virtual machine.
+callback:
+     push  es         ; save working registers
+     push  ds         ;   ..
+     pusha            ;   ..
+     mov   ax, cs         ; set DS == CS
+     mov   ds, ax         ;   ..
+
+     mov   ax, 3560h      ; get current INT 60 vector address
+     int   21h        ;   ..
+     mov   vect60, bx     ; save for debugging inspection
+     mov   vect60+2, es   ;   ..
+
+     mov   ax, es         ; is there a handler?
+     or    ax, bx         ;   ..
+     jz    done60         ; if not, don't signal it!
+     int   60h        ; issue INT 60 to wakeup WinApp
+done60:  popa             ; restore registers
+     pop   ds
+     pop   es         ;   ..
+     iret             ; return from callback to Windows
+endprog:              ; for 21/31 paragraph computation
+int61    ends
+     end   begin
+
+
+
+
+EXAMPLE 1.
+
+   pusha
+   push   ds
+   push   es
+   mov    bp,sp
+   mov    ax,DGROUP
+   mov    ds,ax
+   cld
+
+   [function body]
+
+   pop    es
+   pop    ds
+   popa
+   iret
+</pre>
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

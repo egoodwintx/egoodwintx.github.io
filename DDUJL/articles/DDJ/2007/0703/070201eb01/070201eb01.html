@@ -1,0 +1,405 @@
+<html>
+<head>
+<title>Image Manipulation With ASP.NET 2.0</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> March 2007</p>
+
+<h1>Image Manipulation With ASP.NET 2.0</h1>
+<h2>
+Displaying, manipulating, and protecting web site images </h2>
+
+
+<h3>By Eric Bergman-Terrell</h3>
+
+
+<I>Eric has developed everything from data reduction software for particle bombardment experiments to software for travel agencies. He can be contacted at ericterrell@comcast.net.</I>
+
+<hr>
+
+
+
+
+<p>Ever since learning how to use a 35mm rangefinder camera, I've dreamed of selling my photographs. Now that I've taken some decent pictures with my digital camera, it's time to showcase them on a web site and sell them as stock photographs. I plan to display each image in a variety of resolutions and quality levels, draw copyright notices on the pictures, add EXIF tags, prevent unauthorized users from downloading the full-resolution images, and prevent other web sites from linking to them. Fortunately, ASP.NET 2.0 makes all of this easy. </p>
+
+<p>In this article I show you how to display, manipulate, and protect web site images by taking advantage of the .NET <i>Bitmap</i> class and Http Handlers. Even though image manipulation can be computationally expensive, I display images without compromising on performance. I've included the full source code for a sample web site (available electronically; see "Resource Center," page 5). To build the web site, first extract the source code to a folder. Double-click StockPhotos.sln to launch Visual Studio 2005. Then press F5 or select Debug/Start Debugging to launch the web site. Click the links at the top of each page to see examples of the techniques covered in this article.</p>
+
+
+<h3>.NET Bitmap Manipulation</h3>
+
+<p>The web site uses a DLL named "GraphicsDLL" to scale images, draw copyright notices, add metadata to JPEG images, and reduce the quality of JPEG files to conserve bandwidth. GraphicsDLL operates on <i>Bitmap</i> objects because they're easy to manipulate and serve up in ASP.NET applications. The <i>AddWatermark</i> method (Listing One) draws a copyright notice in the middle of a <i>Bitmap</i> as a semitransparent "watermark" (Figure 1). The opacity of the watermark is calculated from the <i>OpacityPercent</i> parameter. The opacity can be any value between 0 (completely transparent) to 255 (completely opaque). After opacity is calculated, <i>Graphics</i>, <i>Font</i>, and <i>Brush</i> objects are instantiated. Then <i>DrawString</i> is called to draw the text.</p>
+
+	
+	
+
+<pre class="code" style="height:250">public static class BitmapUtils
+{
+  // Draw semi-transparent text in the middle of the Bitmap.
+  public static void AddWatermark(Bitmap Bitmap, 
+          string WatermarkText, Color TextColor, int OpacityPercent,
+          string FontFamily, FontStyle FontStyle, int FontSize)
+  {
+    int opacity = (int)((255.0f * OpacityPercent) / 100.0f);
+    using (Graphics gr = Graphics.FromImage(Bitmap))
+    using (Font font = new Font(FontFamily, FontSize, FontStyle, 
+                      GraphicsUnit.Pixel))
+    using (Brush semiTransparentBrush = new SolidBrush(
+                     Color.FromArgb(opacity, TextColor)))
+    {
+      // Determine the size of the bitmap that will contain the text.
+      SizeF size = gr.MeasureString(WatermarkText, font);
+
+      int xMargin = (int)(Bitmap.Width - size.Width) / 2;
+      int yMargin = (int)(Bitmap.Height - size.Height) / 2;
+      gr.DrawString(WatermarkText, font, semiTransparentBrush, 
+                    new Point(xMargin, yMargin));
+    }
+  }
+ ...
+  // Add the specified JPEG metadata tag to the Bitmap.
+  public static void WriteEXIFTag(Bitmap Bitmap, int TagNumber, 
+                                  string TagText)
+  {
+    Encoding asciiEncoding = new ASCIIEncoding();
+    System.Text.Encoder encoder = asciiEncoding.GetEncoder();
+    char[] tagTextChars = TagText.ToCharArray();
+    int byteCount = encoder.GetByteCount(tagTextChars, 0, 
+                                      tagTextChars.Length, true);
+    byte[] tagTextBytes = new byte[byteCount];
+    encoder.GetBytes(tagTextChars, 0, tagTextChars.Length, 
+                     tagTextBytes, 0, true);
+    // Cannot just instantiate a PropertyItem because the
+    // PropertyItem class does not have a public constructor.
+    // Grab the first property item and change its values.
+    if (Bitmap.PropertyItems != null &amp;&amp; 
+        Bitmap.PropertyItems.Length &gt; 0)
+    {
+      PropertyItem propertyItem = Bitmap.PropertyItems[0];
+      propertyItem.Id    = TagNumber;
+      propertyItem.Type  = 2;  // ASCII
+      propertyItem.Len   = tagTextBytes.Length;
+      propertyItem.Value = tagTextBytes;
+      Bitmap.SetPropertyItem(propertyItem);
+    }
+  }
+ ...
+  // Return an encoder of the specified Mime type
+  // (e.g. "image/jpeg").
+  private static ImageCodecInfo GetEncoderInfo(String MimeType)
+  {
+      ImageCodecInfo Result = null;
+      ImageCodecInfo[] Encoders = ImageCodecInfo.GetImageEncoders();
+      for (int i = 0; Result == null &amp;&amp; i &lt; Encoders.Length; i++)
+      {
+          if (Encoders[i].MimeType == MimeType)
+          {
+              Result = Encoders[i];
+          }
+      }
+      return Result;
+  }
+  // Save the Bitmap to the Stream. If it's in JPEG format, save
+  // with the specified Quality level.
+  private static void Save(Bitmap Bitmap, Stream Stream, 
+                           ImageFormat Format, int Quality)
+  {
+    if (Format != ImageFormat.Jpeg)
+    {
+      // Save non-JPEG images without changing the Quality level.
+      Bitmap.Save(Stream, Format);
+    }
+    else
+    {
+      // Adjust quality level of JPEG images.
+      // Create an EncoderParameters object
+      // containing the Quality level as a parameter.
+      EncoderParameters encoderParams = new EncoderParameters(1);
+      encoderParams.Param[0] = new EncoderParameter(
+              System.Drawing.Imaging.Encoder.Quality, Quality);
+      // Save the image using the JPEG encoder
+      // with the specified Quality level.
+      Bitmap.Save(Stream, GetEncoderInfo("image/jpeg"), 
+                  encoderParams);
+    }
+  }
+ ...
+}</pre>
+<div class="caption">
+Listing One
+
+</div>	
+
+
+<div>
+    
+<div class="smallcap">&#91;Click image to view at full size&#93;</div>
+<!--  -->    
+<img class="illowide" src="070201eb01_f1.jpg" onclick = "popimage(this,'www.ddj.com - Image Manipulation With ASP.NET 2.0 - Figure 1')">
+
+<div class="caption">
+Figure 1: Copyright watermark.
+</div>
+</div>
+
+
+
+<p>The <i>Graphics</i>, <i>Font</i>, and <i>Brush</i> classes implement the <i>IDisposable</i> interface because their objects include resources not managed by the .NET garbage collector. It's important to call an <i>IDisposable</i> object's <i>Dispose</i> method the moment the object is no longer used, so that the unmanaged resources are freed immediately. The objects are instantiated in using statements so their <i>Dispose</i> methods are automatically called the moment they go out of scope. Neglecting to call an <i>IDisposable</i> object's <i>Dispose</i> method reduces your application's performance and scalability.</p>
+
+<p>The JPEG file format lets metadata be embedded as EXIF (EXchangeable Image Format) tags. For example, the EXIF specification (www.exif.org/Exif2-1.PDF) includes defined tags such as Table 1. The <i>WriteEXIFTag</i> method inserts an <i>EXIF</i> tag into a JPEG bitmap. Because <i>EXIF</i> tag text must be in ASCII format, the <i>TagText</i> parameter is converted from Unicode to ASCII by calling <i>encoder.GetBytes</i>. <i>EXIF</i> tags are represented as <i>PropertyItem</i> objects. Because the <i>PropertyItem</i> class lacks a public constructor, you can't directly instantiate a <i>PropertyItem</i> object. Instead, the code takes the first <i>PropertyItem</i> object in the JPEG, changes it to the specified <i>EXIF</i> tag, and inserts it into the <i>Bitmap</i> by calling <i>Bitmap.SetPropertyItem</i>. (To see the <i>EXIF</i> tags in a JPEG file, run the web site. Click the EXIF Tags link. Right-click the image and save it as a file. Then run the DisplayEXIFTags program to display the tags. DisplayEXIFTags is part of the StockPhotos solution.)</p>
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+  <tr>
+    <td><b>Tag ID</b></td>
+    <td><b>Field Name</b></td>
+  </tr>
+  <tr>
+    <td>315</td>
+    <td>Artist (Person who created the image)</td>
+  </tr>
+  <tr>
+    <td>3432</td>
+    <td>Copyright (Copyright holder)</td>
+  </tr>
+  <tr>
+    <td>270</td>
+    <td>ImageDescription (Image title)</td>
+  </tr>
+</table>
+
+<div class="caption">
+Table 1: EXIF tags.
+</div>
+</div>
+
+
+<p>JPEG images are stored with lossy compression that degrades images slightly to reduce storage space. Your web site can save significant bandwidth by reducing JPEG image quality slightly. The <i>Save</i> method stores a JPEG <i>Bitmap</i> in a <i>Stream</i> at a specified quality level. The <i>Quality</i> parameter can range from 100 (best quality, largest size) to 0 (worst quality, smallest size). Saving a JPEG <i>Bitmap</i> to a <i>Stream</i> requires an <i>EncoderParameters</i> object that specifies the quality level. The <i>EncoderParameters</i> object is passed to <i>Bitmap.Save</i>, along with the JPEG <i>ImageCodecInfo</i> object returned by <i>GetEncoderInfo</i>. Click on the web site's Quality link to see the effect of different quality levels. Right-click the images and select Properties to compare their image sizes. The 100-percent quality image has a file size of 71,657 bytes. The 50-percent quality image looks almost identical, but is 60,902 bytes&#151;a savings of about 15 percent. The 30-percent quality image is still acceptable, at least to my eyes, and only takes up 55,006 bytes&#151;a savings of about 23 percent. Below 30-percent quality, the image degradation is excessive.</p>
+
+<p>After a <i>Bitmap</i> has been saved to a <i>Stream</i>, it can be recreated by calling <i>Bitmap.FromStream</i>. If you do this, be sure that the <i>Stream</i> object you used to create the <i>Bitmap</i> object is kept open for the <i>Bitmap</i>'s entire lifespan. If the <i>Stream</i> is closed or garbage collected while the <i>Bitmap</i> is still in use, the <i>Bitmap</i> cannot be rendered or saved to a <i>Stream</i>. To see this problem occur, add:</p>
+
+
+
+<pre class="code">
+memoryStream.Close();
+
+</pre>
+
+
+<p>after the call to <i>Bitmap.FromStream</i> in the second <i>EnhBitmap</i> constructor. Then rerun the web site and watch the exceptions. You'll see <i>ExternalException</i> objects being thrown with messages of "A generic error occurred in GDI+."</p>
+
+<p>The web site uses query string parameters to specify how an image appears. For example, if you type the following URL in your browser:</p>
+
+<pre class="code">
+http://localhost/stockphotos/
+  Images/PICT0746.JPG?q=
+    95&amp;sx=0.15&amp;sy=0.15&amp;w=&amp;m=False&amp;c
+      =True&amp;h=ztwIhRLCwz7m
+        ImpJtSkvs8iVBqk%3d
+
+
+</pre>
+<p>the PICT0746.JPG image is displayed and formatted based on the query string values. For example, the <i>q</i> parameter reduces the image's quality to 95 percent. The <i>sx</i> and <i>sy</i> parameters shrink the image width and height to 15 percent of their original values. The query string parameters in Table 2 can be used.</p>
+
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+  <tr>
+    <td><b>Query String Parameter</b></td>
+    <td><b>Description</b></td>
+  </tr>
+  <tr>
+    <td>q</td>
+    <td>JPEG image quality, 0 to 100.</td>
+  </tr>
+  <tr>
+    <td>sx</td>
+    <td>Width scale factor (e.g., specify 0.5 to shrink the width in half).</td>
+  </tr>
+  <tr>
+    <td>sy</td>
+    <td>Height scale factor.</td>
+  </tr>
+  <tr>
+    <td>w</td>
+    <td>Semitransparent text drawn in the middle of the image.</td>
+  </tr>
+  <tr>
+    <td>m</td>
+    <td>A value of true flips the image from left to right, which can be useful for graphics displayed in Arabic and Hebrew HTML pages.</td>
+  </tr>
+  <tr>
+    <td>c</td>
+    <td>Specify c=True to cache the image in the server's ASP.NET cache.</td>
+  </tr>
+  <tr>
+    <td>ex</td>
+    <td>JPEG metadata tags. Delimited by | characters.</td>
+  </tr>
+  <tr>
+    <td>h</td>
+    <td>Hash of query string parameters in the image URL.</td>
+  </tr>
+</table>
+
+<div class="caption">
+Table 2: Query string parameters.
+</div>
+</div>
+
+<p>The <i>ImgTagInfo</i> class simplifies creating &lt;<i>IMG</i>&gt; tags with the aforementioned query string parameters. For example, see the copyright page's code-behind (Copyright.aspx.cs):</p>
+
+<pre class="code">
+
+public partial class Copyright : 
+    System.Web.UI.Page
+{
+  protected ImgTagInfo imgTagInfo = 
+    new ImgTagInfo();
+  protected void Page_Load
+    (object sender, EventArgs e)
+  {
+    imgTagInfo.FileName  = 
+        "Images/2004_03_06_17_51_46.jpg";
+    imgTagInfo.Cache     = false;
+    imgTagInfo.ScaleX    = 0.50f;
+    imgTagInfo.ScaleY    = 0.50f;
+    imgTagInfo.Watermark = "(c) E B-T";
+  }
+}
+
+     
+
+</pre>
+<p>The code-behind instantiates an <i>ImageTagInfo</i> object and assigns values to its properties to specify various image-formatting options. For example, the <i>ScaleX</i> property, which corresponds to the <i>sx</i> query string parameter, specifies that the image width is 50 percent of its original value. The Copyright.aspx page contains a single &lt;<i>img</i>&gt; tag. The <i>src</i> attribute value is filled in by the <i>ImgTagInfo</i> object's <i>SrcAttributeValue</i> property:</p>
+
+<pre class="code">
+
+&lt;img src="&lt;%= imgTagInfo.SrcAttibuteValue %&gt;" /&gt;
+
+
+</pre>
+<p>When the HTML page is rendered, the &lt;<i>img</i>&gt; tag looks like this:</p>
+
+<pre class="code">
+
+&lt;img src="Images/2004_03_06_17_51_46.jpg?q=
+     100&amp;sx=0.5&amp;sy=0.5&amp;w=(c) E B-T&amp;m=False&amp;c=
+       False&amp;h=OcIHylhiGXegf%2b8prE%2fJPITy3sM%3d" /&gt;
+
+
+</pre>
+<p>The purpose of the <i>h</i> query string parameter is to prevent users from changing image URLs to remove copyright notices, increase the image resolution, and so on. For example, if your web site displays thumbnail images for free and charges users for full-resolution images, you don't want users to be able to access full-resolution images by changing the <i>sx</i> and <i>sy</i> query string parameters to 1. The <i>h</i> parameter is an SHA-1 hash of the query string parameters and values, plus a private key. When the image is requested from the web server, the hash is recomputed from the query string values. If it matches the original hash, the image is returned (because it's clear that the query string parameters weren't changed). If you click on the web site's Incorrect Hash link, you'll see what happens when the hash has been manipulated; no image is displayed. If this hashing scheme didn't exist, the web site would be vulnerable to Denial-of-Service (DoS) attacks. Flooding the web server with requests for images scaled to ludicrously large sizes would swamp the web server and drastically reduce the site's responsiveness.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Http Handlers</h3>
+
+<p>GraphicsDLL provides all the necessary bitmap manipulations, but how does the web site serve up images in response to HTTP requests? It uses an Http Handler. Http Handlers are classes that implement the <i>IHttpHandler</i> interface to return content to service HTTP requests. If you've programmed ASP.NET applications before, you've used at least one Http Handler&#151;the ASP.NET <i>Page</i> class is an Http Handler that serves up HTML content.</p>
+
+<p>Any class that implements the <i>IHttpHandler</i> interface must have a <i>ProcessRequest</i> method and an <i>IsReusable</i> property. The <i>ProcessRequest</i> method services requests and returns the requested content, along with an HTTP status code. The sample web site's <i>ImageHandler</i> class (Listing Two, Imagehandler.cs, available electronically) is an Http Handler that returns bitmaps manipulated by the GraphicsDLL assembly. The <i>ProcessRequest</i> method first calls <i>context.Response.Clear</i> to clear any HTTP headers and content that might be attached to the response. Then it specifies that it returns content in "image/jpeg" format. <i>ProcessRequest</i> returns a status code of 200 if the bitmap request is successful.</p>
+
+<p>It's rude for a web site to link to images hosted on your web site without your permission, because those links consume your server's bandwidth. But this problem is easy to avoid. The <i>InvalidImageLink</i> method returns <i>True</i> if someone else's web site is linking to your site's images. When <i>InvalidImageLink</i> returns <i>True</i>, <i>ProcessRequest</i> returns a status code of 403 (forbidden). If the link isn't invalid, <i>ProcessRequest</i> calls <i>ProcessBitmap</i> to serve up the requested image.</p>
+
+<p><i>ProcessBitmap</i> first instantiates an <i>ImgTagInfo</i> object based on the request's URL and query string values. Next, an SHA-1 hash is computed from the <i>ImgTagInfo</i> properties, which correspond to the URL's query string values. If this hash doesn't match the request's hash value, the original query string parameters were changed. In this case, no image is returned, and an HTTP status code of 403 is returned. If <i>ProcessBitmap</i> determines that the query string parameters were not changed, it returns a status code of 200 (success) unless the bitmap file can't be found. The <i>context.Response.Cache.SetExpires</i> call specifies that the image should be cached on the client computer for 60 minutes. Caching images on the user's machine dramatically improves your web site's performance and user experience, since a given image is not repeatedly downloaded as users navigate through your web site.</p>
+
+<p>If <i>ImgTagInfo's</i> <i>Cache</i> property is <i>True</i>, the image may be in the ASP.NET in-memory cache. If the bitmap isn't found in the cache, <i>RenderBitmap</i> is called to create the bitmap with the requested formatting options. The <i>Bitmap.Save</i> call sends the bitmap to the user by writing it to the response output stream. If the <i>Cache</i> property is <i>True</i>, and the image isn't already in the cache, <i>AddBitmapToCache</i> is called to cache the image. Since the image is an <i>EnhBitmap</i> object, which implements <i>IDisposable</i>, <i>AddBitmapToCache</i> uses a <i>CacheItemRemovedCallback</i> delegate to ensure that the object is properly disposed the moment it's removed from the cache. If the bitmap is not cached, its <i>Dispose</i> method is called.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Configuring Http Handlers</h3>
+
+<p>Http Handlers must be configured in the <i>web.config &lt;httpHandlers&gt;</i> section. For example, <i>ImageHandler</i> is configured like this:</p>
+
+<pre class="code">
+
+&lt;httpHandlers&gt;
+  &lt;add verb="*" 
+     path="*.jpg" 
+       type="ImageHandler"/&gt;
+&lt;/httpHandlers&gt;
+
+
+</pre>
+<p>Additionally, IIS must have a mapping for the type of the files that the Http Handler serves up. Since <i>ImageHandler</i> processes JPEG files, there must be a mapping for .jpg files. By default, IIS has no .jpg file type mapping. After using the Internet Information Services GUI to configure the sample web site, right-click the web site and select Properties. Go to the Virtual Directory tab and press the Configuration button. Then add a mapping for the .jpg file type (Figure 2). Specify aspnet_isapi.dll for the executable. On my machine, this file is located in the C:\WINDOWS\Microsoft.NET\Framework\v2.0.50727 folder. Specify .jpg in the Extension text box. Select All Verbs. Leave the "Script engine" and "Check that file exists" checkboxes checked. If the OK button stays disabled, you're experiencing an outrageous bug in the IIS configuration program. Click on the file path to enable the OK button.</p>
+
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2007/07/ -->    
+<img class="illowide" src="070201eb01_f2.gif" style="width:498">
+
+<div class="caption" style="width:496">
+Figure 2: Adding an extension mapping for an Http Handler.
+</div>
+</div>
+
+
+
+
+
+
+
+
+
+
+<h3>Rendering Bitmaps</h3>
+
+<p>On-the-fly image manipulation is easy but has some significant performance costs. If you intend to use this technique on your web site, be sure to test the performance under load to determine if you can achieve your performance goals. Caching images in the ASP.NET cache may improve performance, but only if a small percentage of images and formatting options are requested a large percentage of the time. If your web site doesn't require dynamic image manipulation, you'll achieve much better performance by rendering your images in advance, and deploying the image files to your web site. </p>
+
+<p>The web site project includes the console application <i>PreRenderBitmap</i>. Run this program in a Command prompt. If you run <i>PreRenderBitmap</i> without parameters, it displays a list of the parameters that it expects. The program has parameters for all of the formatting options that the <i>ImageHandler</i> accepts. <i>PreRenderBitmap</i> renders the image with the specified formatting, and then writes it to a .jpg file. If you use <i>PreRenderBitmap</i> to create all the bitmaps that your site displays, there's no need to use <i>ImageHandler</i>. Instead, you can rely on IIS to serve up images, or use the <i>PreRenderedImageHandler</i>. The <i>PreRenderedImageHandler just checks to</i> ensure that an image request is coming from your web site before it serves up the image. You'll need to change <i>web.config</i> to disable <i>ImageHandler</i> and enable <i>PreRenderedImageHandler</i>.</p>
+
+<p>If your web site is hosted on a server that's shared by multiple companies, you may not have access to the IIS configuration to configure mappings for Http Handlers. If you're in this situation, you can use Generic Http Handlers, which require no IIS and no <i>web.config</i> configuration. To add a Generic Handler to your project, right-click the project, select Add New Item, and choose Generic Handler. Unlike Http Handlers that serve up content based on a file type, Generic Handlers are accessed by directly specifying them in URLs. For example, if you create a Generic Handler named "Handler.ashx," refer to it in a URL:</p>
+
+<pre class="code">
+
+&lt;img src="Handler.ashx?filename= 
+   Images/2004_03_06_17_51_46.jpg?q=
+      100&amp;sx=0.5&amp;sy=0.5 ..." /&gt;
+
+
+</pre>
+<p>The .NET <i>Bitmap</i> class plus Http Handlers make on-the-fly image generation simple. While caching images in the ASP.NET cache may improve performance, dynamic bitmap rendering has a high performance cost. Unless your web site requires dynamic image generation, you'll achieve optimal performance by rendering all images in advance and copying the image files to your web site. If you use an Http Handler to serve up images, remember to call <i>Response.Cache.SetExpires</i> to ensure that the image is cached on the client machine. After I set up my stock photography web site, you might start seeing my pictures in annoying advertisements littered all over your favorite web sites. I really hope so!</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+	
+	
+
+
+
+</body>
+</html>

@@ -1,0 +1,219 @@
+
+<html>
+<head>
+<title>December, 2005: Memory Management &amp;  Embedded Databases</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Memory Management &amp;  Embedded Databases</h1>
+<p><i>Dr. Dobb's Journal</i> December, 2005</p>
+<h2>Building an infrastructure with optimization in mind</h2>
+
+
+<h3>By Andrei Gorine  and Konstantin Knizhnik</h3>
+
+
+<I>Andrei is principal architect of McObject. Konstantin is a software engineer with Borland. They can be reached at gor@mcobject.com and konstantin.knizhnik@ borland.com, respectively.</I>
+
+<hr>
+
+
+
+
+
+<p>Embedded databases in general, and in-memory databases in particular, are especially dependent on the quality of their memory-management algorithms. Designed for use in resource-constrained embedded systems, the features, performance, and predictability of these databases depend heavily on the efficiency of algorithms for allocating precious memory. The performance cost of general-purpose allocators, such as the Windows C runtime or glibc allocator, is prohibitive for many embedded applications, and the memory overhead is often excessive. As a result, many embedded applications, including database management systems, implement custom memory managers for optimization. (In this article, we use the term "application" to refer to various programming tasks. The application, for example, can be a filesystem or operating-system kernel.) A single database system often utilizes numerous allocation algorithms to address specific internal tasks such as infrastructure for data layout, heap management, and SQL parsers and optimizers.</p>
+
+<p>Generally speaking, allocators keep track of which parts of memory are used and which are free. The design goal of any allocator is to minimize wasted memory space, balancing the amount of wasted space against the processing time required to recover it. A major target of allocators is to limit or mitigate the fragmentation that occurs when applications free memory blocks in any order. Defragmentation strategies employed by general-purpose allocators impose CPU overhead that is often prohibitive for embedded systems, while custom memory managers can offer lightweight defragmentation more suited to embedded applications' resource constraints and required short response times.</p>
+
+<p>In this article, we examine general-purpose and custom memory-allocation strategies, illustrating their usage and advantages/disadvantages generally as well as their applicability for particular database management programming tasks. Many of the concepts derive from our experience creating the eXtremeDB in-memory database and its eXtremeSQL extension (http://www.mcobject.com/). </p>
+<h3>List Allocators</h3>
+
+<p>List allocators are perhaps the most widely used and well-known allocator algorithms, and often form the foundation for general-purpose memory managers that handle unpredictable allocation patterns. This type of algorithm organizes a pool of contiguous memory locations (often called "free holes") into a singly linked list. The allocator services a request for memory allocation by traversing the list looking for a large enough hole. Several strategies are possible when searching for an area that satisfies the request for memory allocation of a given size. These include first-fit searches, in which the allocator walks a linked-list to find the first available memory hole; next-fit, which begins searching where a previous search left off, rather than from the beginning of the list; and quick-fit, in which the allocator uses its own list of common memory sizes to quickly allocate a block of memory that is large enough (but perhaps larger than needed). </p>
+
+<p>Almost all list allocator implementations suffer from a fragmentation problem. If an application intensively allocates and frees objects of different sizes and different life-times, then, in time, the list will only contain a large number of small holes. To battle fragmentation, list algorithms usually implement techniques that merge small holes together, or that sort the list by hole size, enabling the first fit algorithm to quickly locate a free hole that best matches the allocation request size. But efficient defragmentation techniques come at the price of extra per-object overhead. Defragmentation's performance and per-object memory overhead must be balanced against any gains in efficient memory use. Often the more task-specific allocators we describe here can provide greater efficiency than generic list allocators.</p>
+<h3>Block Allocators</h3>
+
+<p>List-based allocators' per-object overhead can be prohibitive in resource-constrained embedded environments. Many applications tend to allocate a large number of small objects of the same size. Typical examples of such allocations include small scalar values such as date/time, and abstract syntax tree nodes used by various parsers. Block allocators handle such objects very efficiently with minimal overhead, and eliminate fragmentation by design.</p>
+
+<p>The idea of a block allocator is straightforward. A block allocator is given a quantity of memory (we'll call this the "large block"), divides it into equal-size pieces, and organizes them in a linked-list of free elements. To serve a request for memory, the allocator returns a pointer to one piece and removes it from the list. When there are no more elements in the "free list," a new large block is selected from the memory pool using some other allocator (such as a list allocator). The new large block gets divided by the block allocator, elements are put into a new linked-list, and allocation requests are handled from this newly created list. When an object is freed, it is placed back into its original "free list." Because all allocated objects in a given list are of the same size, there is no need for the block allocator to "remember" each element's size, or to locate neighboring chunks to merge them. <a name="rl1"></a><a href="#l1">Listing One</a> implements a simple block allocator.</p>
+
+<p>In other cases, more complex implementations of the block allocator algorithm are justified to improve memory-management efficiency. Often, application processing is divided into multiple stages. Objects allocated at each of these stages are not necessarily needed during subsequent stages. The block allocator used during each particular stage can be designed to return the unused blocks back to the memory pool.</p>
+
+<p>For example, a compiler includes three distinct processing phases:</p>
+
+<ul>
+    <li>Parsing, in which the compiler builds the abstract syntax tree (AST). </li>
+  <li>Analyzing language statements and mapping them to an internal representation. </li>
+  <li>Generating machine code. </li>
+</ul>
+
+
+
+<p>The block allocator is well suited to manage the compiler's allocations, which contain a large number of similar objects, such as AST nodes (parsing results). With the simplest block allocator, however, the compiler would not be able to reuse the space allocated for the AST nodes, even though they are not needed during the subsequent stages. However, a slightly more sophisticated implementation would free the AST at the end of the first phase, allowing the compiler to reuse the memory in the second and third phases.</p>
+
+<p>The most basic block allocators satisfy allocation requests only for objects that fit into their predetermined element size, making such algorithms useful only when the allocation pattern is known in advance (for example, when the application always allocates 16-byte objects). In practice, many memory managers, including database memory managers, need to satisfy requests of several allocation patterns. To utilize the simplicity advantage of the block allocator algorithm while meeting the application's need to allocate memory in variously sized chunks, a block allocator is often combined with some other technique into a hybrid memory manager. For example, the block allocator can maintain multiple lists of different-sized elements, choosing the list that is suited for a particular allocation request. Meanwhile, the blocks themselves and other large objects&#151;those that exceed the chunk size of any of the blocks&#151;are allocated using another general-purpose allocator (for example, a page allocator or a list allocator). In such an implementation, the number of allocations (objects) processed by the block algorithm is typically orders of magnitude times higher than those made by the general-purpose <i>malloc(),</i> resulting in startling performance improvements compared to using <i>malloc()</i> on its own.</p>
+
+<p>In such a hybrid memory manager, the large block size depends on the typical allocation request and can be chosen by the application. To better illustrate the algorithm's functioning and demonstrate one practical approach, assume the block size is 512 bytes. Also assume the minimum size ever desired for allocation is 16 bytes and that objects are aligned on 8-byte boundaries. This alignment assumption is reasonable since on many hardware architectures the data alignment is an absolute requirement, and many others perform aligned data access much faster.</p>
+
+<p>Objects that are larger than one-half of the block size are allocated by a general-purpose allocator. For objects smaller than one-half of the block size, the memory manager uses one of the block allocator chains. But how many blocks should the memory manager maintain, and what are the optimal sizes of the elements within these blocks? </p>
+
+<p>The maximum size of the object allocated by the block allocator is 256 and there can be exactly two such objects allocated from the block. Let's call this chain a "256 chain." To be able to allocate three objects out of a block, the element size would be 168&#151;let's call it a "168 chain." There is no sense in creating separate chains for 250 or 160 sizes, since they would require the same number of blocks as our 256 and 168 chains, respectively. If the process is continued further, it creates 13 chains with 512/4, 512/5,...512/16 chunk sizes (see <a name="rf1"></a><a href="0512mf1.html">Figure 1</a>). </p>
+
+<p>The two tables in <a name="re1"></a><a href="0512me1.html">Example 1</a> describe the data layout in <a name="rf1"></a><a href="0512mf1.html">Figure 1</a>. The first array specifies the block and the second specifies the sizes of the block elements. Note that since we assumed 8-byte alignment, it's possible to divide the aligned object size by 8 and reduce the dimension of the arrays to 32 instead of 256. </p>
+
+<p><a name="rl2"></a><a href="#l2">Listing Two</a> implements the <i>allocate()</i> and <i>free()</i> methods. Note that the allocator keeps the size of the object in a hidden header field within the object. This information allows the allocator to free the object by passing only the object pointer to the <i>free()</i> method.</p>
+
+<p>It is possible (although not necessarily practical) to avoid the extra object header overhead by requiring the blocks to be aligned on the block size (512 bytes in our example). It would also require reserving some space for each block within the block itself (<i>block_header</i> below) that would contain the block size. The size of the element would then be calculated like this:</p>
+
+<blockquote>
+void  free(object* obj){<br>
+  size_t size = ((block_header*)<br>
+        ((size_t)obj &amp; ~(block_size-1))-&gt;size;<br>
+ ... <br>
+}<br>
+
+</blockquote>
+
+<p>This would also reduce the maximum size of the object that could be allocated from a page&#151;it would only be possible to keep two 248-byte objects.</p>
+<h3>Stack-Based Allocators</h3>
+
+<p>Memory allocators would be much simpler to design and exhibit higher performance if they only had to allocate objects and not free them. Given a block of memory, such an allocator would just advance a pointer, verifying there is enough space left in the block to satisfy an allocation request. Moreover, such an allocator would impose no memory overhead. The downside of this policy is obvious&#151;if the memory manager is not guarding, the application could run out of memory. However, some embedded applications benefit from incorporating custom allocators that allocate objects but never release them. This approach is justified when the number of allocations and/or the total amount of required memory is known in advance and limited.</p>
+
+<p>A slight variation on this algorithm is particularly useful when memory requirements can be divided into a first phase in which objects are allocated, and a second in which they are deallocated. In this case, the stack pointer can simply be rewound, effectively deallocating the objects. This allocation pattern is typical for a SQL engine, which needs to free the memory allocated while parsing a SQL statement, but only deallocates once the statement is processed. </p>
+
+<p>A memory manager built on this two-phase strategy can be highly efficient, yet allows reuse of the memory pool. It maintains a pointer to the current position in a memory block to allocate objects within the block. To allocate an object, the pointer is incremented by the requested size, and the old value of the pointer is returned to reference the allocated memory. When there is no more space available in the current block, a new block is allocated out of the application's memory pool. This is done by some general-purpose allocator such as the standard <i>malloc/free</i>. Blocks used in this process are kept in a linked-list. </p>
+
+<p>The deallocation part of the algorithm is also quite trivial to implement, and fast in execution: All blocks are simply released using the general-purpose deallocator (for instance,<i> free()</i>).</p>
+
+<p>The simple stack allocator in Listing Three (available electronically; see "Resource Center," page 4) implements the two-phase strategy previously described. It starts with a fixed amount (block) of memory. The allocator maintains and the application marks (remembers) the current stack position pointer that identifies a segment on the stack associated with the processing. When the application completes the processing and no longer needs the objects, it releases (frees) the stack segment, causing the allocator to reset the stack pointer back to the mark. While the current process is still active, the application may initiate another operation that also uses the allocator. When this starts, the allocator marks the current stack position that identifies a new segment for use. The stack segments never overlap: The application never allocates more objects from the first segment until the second segment is removed from the stack (see <a name="rf2"></a><a href="0512mf2.html">Figure 2</a>). The deallocation of segments is done in LIFO order; the segments marked last must be deallocated first. </p>
+
+<p>The allocation/deallocation pattern just described may sound impractical for many applications, due to the rather narrow range of tasks that it can serve. However, in the context of a relational database engine, this pattern is typical. For example, when evaluating a condition, the temporary results of subexpression evaluations need only be kept until the condition evaluation is complete. The stack can be marked before starting to evaluate a condition, and reset to the mark after results are returned. </p>
+
+<p>Stack allocators are superior when an application, as a natural byproduct of its operation, keeps track of the order in which objects are allocated. For some applications, such as those that perform recursive processing, a stack-based allocator simplifies design and improves performance. A database engine is a vivid example, since many of its algorithms use recursion. If the engine uses an allocator that requires explicit deallocation of individual objects, it must track each object's lifespan, as well as references to the object by other objects. Failure to do this results in memory leaks and infamously "wild" dangling pointers. In contrast, setting a mark on the stack before processing a statement, and rewinding to the mark after processing, is as simple and fast as it gets.</p>
+
+<p>When the stack allocator is used, a SQL engine controls exactly how objects are allocated. Therefore, it is able to enforce the LIFO order of allocation/deallocation procedures. However, when it is necessary to use objects created inside the SQL engine outside its scope, it is not always possible to preserve the LIFO order. For example, in a SELECT statement, an application executes a query and starts iterating over the result set allocated by the engine via its stack allocator. While processing the result set, the application can execute another query, then close the first result set and start processing the second one. Two result sets overlap on the stack and the database is not capable of maintaining the LIFO order for allocation/deallocation procedures.</p>
+
+<p>To handle this scenario, the allocator algorithm can be extended by keeping an identifier (an integer number) of the stack segment that is currently being used (the second result set segment in our example). The allocator also maintains a count of the stack segments. When the application attempts to free one of the segments, the allocator compares the identifier of the current segment with the one being deallocated. If the identifiers are equal, the allocator resets the stack. Otherwise, the counter is decremented and the reset is postponed until the count is zero. In our example, the stack is only reset when both result sets are closed. Again, Listing Three illustrates the allocator.</p>
+
+<p>Stack-based allocators are fast and impose very little overhead. For data management, the stack model can be used to allocate short-lived objects that can be released all at once&#151;during SQL statement execution&#151;for example, when all memory is released upon the statement commit or rollback. A useful byproduct of this approach is improved safety: With a stack-based allocator, it is impossible to accidentally introduce a memory leak through improper deallocation because the application need not track individual allocations.</p>
+<h3>Thread-Local Allocators</h3>
+
+<p>Memory allocation performance in multithreaded environments is a challenge for any application. In particular, multithreaded applications running on multiprocessor systems can bog down when performing many allocations, with lock contention in the default allocator causing the bottleneck.</p>
+
+<p>To synchronize access to its internals, the C runtime allocator (<i>malloc()/free()</i>) uses a mutex that is signaled every time the allocator is used. By itself, the mutex is not all that expensive, in performance terms. On most OSs, it is implemented via an atomic check-and-set instruction. However, resource conflicts arise when multiple threads running on different CPUs attempt to access the allocator concurrently: Each thread attempts to acquire the mutex, creating a lock conflict. To resolve the conflict, the OS has to do a context switch, suspend the thread that attempted to access the allocator, and insert it into the kernel's waiting queue. When the allocator is released, the current thread is allowed to run and access the allocator. The large number of context switches degrades performance. (Without addressing the underlying issue, the same application would perform much better on a single CPU.)</p>
+
+<p>One way to resolve these conflicts is to create an allocator that simply avoids them. Most modern operating systems support the concept of per-thread storage, or a memory pool that is assigned to an individual thread. A thread allocator associates a memory block with each thread and services the thread's memory requests from this block, without interfering with other threads' allocation requests. When the thread allocator runs out of memory, the default allocator assigns it another block. Obviously, the number of lock conflicts is significantly decreased. </p>
+
+<p>One scenario requiring special attention is threads sharing objects: An object allocated in one thread is later freed in another. The thread allocator handles this by detecting the attempt to free the object and redirecting this request to the thread that performed the original allocation. This could take the form of linking all objects allocated by one thread into a linked-list. This would require a mutex to synchronize access to the list, so this mechanism would be efficient only if the number of objects migrating between threads is relatively small compared to the number of stationary objects. It should be mentioned that even intentionally allocating objects in one thread and freeing them in another can result in sharing of cache line among processors, and its attendant performance degradation.</p>
+
+<p>In database systems, the "stay-at-home" behavior of objects, discussed earlier, is usually enforced by the DBMS itself. Each thread performs its database access in the context of a database transaction, and these are isolated from one another by the database transaction manager. Thus, in database design, it is often possible to entirely skip the issue of migrating objects in the allocator. A stack-based allocator (such as those described in this article) usually represents a good choice for implementing a thread-local allocator. The combination of the stack and the thread-local storage allows development of synchronization-free memory managers that avoid lock contention when accessing memory, resulting in improved database performance on multiprocessor systems.</p>
+<h3>Bitmap Allocators</h3>
+
+<p>A bitmap allocator acts on a memory pool by allocating objects in prespecified units (an allocation quantum) such as a word or a double-word. A bitmap is a vector of bit-flags, with each bit corresponding to one quantum of memory. A bit value of 0 indicates a free quantum, while 1 indicates an allocated quantum. The memory overhead&#151;the space required to keep the bitmap itself&#151;is modest. For example, if the quantum size is 32 bytes, the required bitmap size is 256 times smaller. Thus, to map 1 GB of space, the required bitmap size is just 4 MB. Given this example, to allocate an object of size <i>S</i>, the allocator must locate a contiguous area of free memory that contains<i> QS</i>=(<i>S</i>+31)/32 quantum blocks. The allocator does that by searching its bitmap to find a zero bits sequence <i>QS</i> long and turning over the bits once this sequence is found (<a name="rf3"></a><a href="0512mf3.html">Figure 3</a>).</p>
+
+<p>One of the common ways to improve bitmap allocator performance is to search for free memory (a hole) by looking up the bitmap starting from the bitmap position where the previous lookup was left off, rather than from the beginning of the bitmap. When the allocator locates the free hole, the current bitmap position is updated. In addition to its speed advantage, this technique increases the locality of reference (objects allocated one after another are positioned sequentially in memory). Another way to speed up the bitmap lookup is to replace bit-by-bit scans with more efficient techniques. It is possible to scan the bitmap bit-by-bit (see Listing Four, available electronically).</p>
+
+<p>However, the bitmap can be more efficiently scanned one byte at a time using 256-way lookup tables to detect a free hole of the desired length (Listing Five, available electronically).</p>
+
+<p>The first table specifies the number of leading zeros in each byte; the second table represents the number of trailing zeros in each byte. The last two arrays specify the number and the offset of the longest sequence of clear bits in the byte. Using these tables, the allocator can scan the bitmap as in Listing Six (available electronically).</p>
+
+<p>Bitmap allocators have a number of advantages. One feature that is especially important in database development is that the bitmap mechanism can allocate a group of objects sequentially, thus maintaining locality of reference. In database development, the increased locality of reference means that objects allocated sequentially would be placed on the same database page. Consequently, these objects would be loaded into memory using just one read operation from disk, in contrast to multiple reads that would be required to fetch the objects if they were located in different parts of the storage. For a main memory database, locality of reference is less critical&#151;after all, memory is a randomly accessed device. However, modern systems often include a secondary cache (L2 cache) that benefits from increased locality of reference as well.</p>
+
+<p>Furthermore, the bitmap allocator can keep fragmentation at bay. When objects are allocated by a quantum that is comparable to their own size, small unused holes (such as those accumulated by linked-list allocators) are never created. </p>
+
+<p>Another performance advantage lies in the fact that bitmaps themselves are not interleaved with main storage, which improves the locality of searching. The locality of writes may also be improved because freeing objects only modifies the bitmap.</p>
+
+<p>Apart from database systems, bitmap allocators are quite commonly used in garbage collectors, database dump utilities, and filesystems' disk block managers&#151;areas where enforcing locality of reference and reduced fragmentation are imperative.</p>
+<h3>Conclusion</h3>
+
+<p>For developers of database systems, filesystems, compilers, and similar applications, creating custom memory managers rather than using an operating environment's existing allocators entails extra coding&#151;sometimes a great deal of it. But such allocators, once written, establish an infrastructure that permits optimization.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>template&lt;class T&gt;
+class fixed_size_object_allocator { 
+  protected:
+    T*          free_chain;
+  public:
+    T* allocate() {
+        T* obj = free_chain;
+        if (obj == NULL) {
+            obj = new T();
+        } else { 
+            free_chain = obj-&gt;next;
+        }
+        return obj;
+    }
+    void free(T* obj) {
+        obj-&gt;next = free_chain;
+        free_chain = obj;
+    }
+    fixed_size_object_allocator() {
+        free_chain = NULL;
+    }
+    ~fixed_size_object_allocator() { 
+        T *obj, *next;
+        for (obj = free_chain; obj != NULL; obj = next) { 
+            next = obj-&gt;next;
+            delete obj;
+        }
+    }
+};</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>class BlockAllocator
+{ 
+  void* allocate(size_t size)
+  { 
+    if (size + sizeof(object_header) &lt;= page_size/2)
+    {
+      int n = block_chain[((size+sizeof(object_header)+7)&gt;&gt;3)-1];
+      storage_free_block* bp = hdr-&gt;free_block_chain[n];
+      if (bp != NULL) { 
+        hdr-&gt;free_block_chain[n] = bp-&gt;next;
+        bp-&gt;size = size;
+        return (object_header*)bp+1;
+      }
+    }
+    // allocate a new block using some external allocator
+    return alloc_block(size); 
+  }
+
+  void  free(object* obj)
+  { 
+    object_header* hp = get_header(obj);
+    if (hp-&gt;size + sizeof(object_header) &lt;= page_size/2)
+    {
+      int n=block_chain[((hp-&gt;size+sizeof(object_header)+7)&gt;&gt;3)-1];
+      storage_free_block* bp = (storage_free_block*)hp;
+      bp-&gt;next = hdr-&gt;free_block_chain[n];
+      hdr-&gt;free_block_chain[n] = bp;
+    } else {
+      // return the block back to the memory pool          
+      free_block(hp);
+    }
+  }
+};</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

@@ -1,0 +1,350 @@
+
+<html>
+<head>
+<title>October, 2004: Launcher:  Mastering Your Own Domain</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Launcher:  Mastering Your Own Domain</h1>
+<p><i>Dr. Dobb's Journal</i> October, 2004</p>
+<h2>Loading and unloading managed programs into multiple domains</h2>
+
+
+<h3>By Gigi Sayfan</h3>
+
+
+<I>Gigi is a software developer specializing in object- and component-oriented programming using C++. He can be contacted at gigi_sayfanplaystation.sony.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Programmer productivity hinges on many factors, including talent,  problem-domain experience, programming language, and tools, quality of tools, and&#151;most importantly&#151;the level of focus and degree of concentration, which is in constant flux. The ideal state of mind to program in is in the "flow," where you are fully focused on the problem, time flies, and you perform amazing programming feats. Some people call this "being in the zone" or "deep hack mode." Unfortunately, the smallest interruption can break the flow. If you work with the wrong tools or programming language, you might never achieve flow&#151;you will instead fight your development environment, try to figure out obscure compiler messages, browse help files, and spend mental effort on side issues.</p>
+
+<p>For instance, a friend and I are developing an online game using C# for the .NET platform. There is a server and multiple clients that share interfaces and common data types through a shared assembly. My development cycle includes editing the code, building the solution, and launching the server/client programs for testing. However, it takes time to launch a process, load the CLR, load the necessary system assemblies, load the server/client assembly, and start running. This ceremony gets old really fast, interrupts my flow, and strikes me as unnecessary. I should only load/unload the modified code.</p>
+
+<p>The CLR provides the means to do this via <i>AppDomain</i>s. A single OS process can host multiple <i>AppDomain</i>s. The novel thing is that not only can DLLs be loaded into an <i>AppDomain</i>, but executable programs, too. Consequently, a single process can host multiple managed programs. In this article, I present Launcher, an application that loads/unloads other managed programs into multiple <i>AppDomain</i>s in its own process, executes them, and unloads them on demand. This application solves my problem because I can load/unload only my client and server assemblies into existing processes. Moreover, common system assemblies may already be loaded into the process, so the server and client programs don't have to load them again when they start executing. In addition to faster load/unload time, the memory footprint is reduced because the CLR and many assemblies that had to be loaded for each program in its own process can now be shared. While this discussion applies to CLR 1.1, I also mention some possible changes in Whidbey. </p>
+<h3>AppDomains, Processes, and Threads</h3>
+
+<p>The CLR is a managed runtime inside a managed runtime, which is the hosting OS. The OS has its own execution and isolation model for running code, which uses processes and OS threads. The CLR has a separate execution, security, and isolation model, which uses <i>AppDomain</i>s and CLR threads. <i>AppDomain</i>s are much lighter then OS processes. When a managed program starts executing, it is usually loaded into the default <i>AppDomain</i>. However, the code in the default <i>AppDomain</i> may create other <i>AppDomain</i>s in the same process, and load and execute other programs into them. The CLR verifies managed code upon just-in-time (JIT) compilation to be typesafe and guarantees that a fault in one <i>AppDomain</i> doesn't affect other ones in the same process.</p>
+
+<p>A managed program runs inside a regular Win32 process that hosts the CLR as a COM object, loads the managed program, and executes it. This means that the CLR is subjected to the rules and regulations of the OS. Specifically, code always executes in the context of some OS thread. The CLR has its own concept of threads that are separate from OS threads. The mapping between OS threads and CLR threads is not documented officially, and it is considered an implementation detail that may change in a future version of the CLR. CLR threads may cross <i>AppDomain</i>s, but they have a separate thread local storage (TLS) in each <i>AppDomain</i> (accessible through the <i>Thread.GetData</i> and <i>Thread.SetData</i> APIs). The TLS of the OS thread associated with the CLR thread has its own <i>AppDomain</i>-agnostic TLS, which never changes when crossing <i>AppDomain</i>s. In the current implementation (Version 1.1), the same CLR thread is associated with the same OS thread whenever the OS thread enters the same <i>AppDomain</i>, but don't count on it. </p>
+
+<p>When a program (executable assembly) is loaded and executed in an <i>AppDomain</i>, it usually loads many other assemblies. By default, each <i>AppDomain</i> maintains its own copy in memory of the loaded assemblies even if other <i>AppDomain</i>s in the same process have already loaded these assemblies. The only assembly that is always shared between all <i>AppDomain</i>s is <i>mscorlib</i>. </p>
+
+<p>The loader optimization attribute loads assemblies to be shared between <i>AppDomain</i>s. The benefit is a smaller working set and quicker load time if many assemblies are shared. The downside is that access to static fields is slightly slower for shared assemblies because an indirection is needed to find the static field address of the active <i>AppDomain</i>. Regardless of the sharing mode, every <i>AppDomain</i> always maintains a distinct copy of static fields to facilitate the isolation of <i>AppDomain</i>s. If static fields were shared, then code in one <i>AppDomain</i> that modified a shared static field might wreak havoc in another <i>AppDomain,</i> which might not suspect it. Another disadvantage of shared assemblies is that they cannot be unloaded. </p>
+
+<p>The loader optimization attribute tells the JIT compiler how assemblies should be loaded. There are three values: </p>
+
+
+
+<ul>
+  <li><i>SingleDomain</i> (the default) causes the <i>AppDomain</i> to load a private copy of each necessary assembly's code. </li>
+  <li><i>MultiDomain</i> loads one copy of each assembly per process. </li>
+  <li><i>MultiDomainHost</i> loads all strongly named assemblies per-process, although in future versions, it may only load assemblies from the global assembly cache (GAC) per-process. </li>
+</ul>
+
+
+
+<p>I recommend the <i>MultiDomainHost</i> option for most multidomain scenarios. Private assemblies that are used by a single program should not be shared (since the performance of static fields will suffer) at the process level. <i>MultiDomainHost</i> is reasonable since GAC assemblies are usually used by many programs. Because most applications use only the default <i>AppDomain</i>, it makes sense that the default is <i>SingleDomain</i> to get fast access to static fields.</p>
+<h3>Working with AppDomains</h3>
+
+<p>The <i>AppDomain</i> class exposes several methods, properties, and events for creating <i>AppDomain</i>s, getting information on their state, unloading <i>AppDomain</i>s, and communicating between <i>AppDomain</i>s. Here, I show how to create a new <i>AppDomain</i>, load a program into it, and execute it. Then I handle events, exchange data between <i>AppDomain</i>s, execute code, and create objects in another <i>AppDomain</i>.</p>
+
+<p>The first step is to create a strongly named assembly that can be shared in a process by multiple <i>AppDomain</i>s. I created a dummy key using the strong-name tool (sn.exe), added a postbuild event to the project of the shared assembly to install it to the GAC for easy resolution, and changed a couple of attributes in AssemblyInfo.cs; see <a name="rl1"></a><a href="#l1">Listing One</a> and the comments in AssemblyInfo.cs for details.</p>
+
+<p>Because I want my multidomain program to share assemblies, I set the loader optimization attribute to <i>MultiDomainHost</i> (<a name="rl2"></a><a href="#l2">Listing Two</a>). Shared assemblies must be strongly named. A strongly named assembly has a cryptographic signature that is useful in security-oriented code scenarios.</p>
+
+<p>Next, I create a new <i>AppDomain</i> by calling the <i>AppDomain.CreateDomain</i> static method. This method has several overloaded versions, the simplest one just accepts a domain name. There are many attributes that control the behavior of <i>AppDomain,</i> which can be specified through the <i>AppDomainSetup</i> class. Once an <i>AppDomain</i> has been created, it can also be destroyed or unloaded. The terminology is a little inconsistent, but it hints to asymmetry in the way code and resources are managed in the CLR. You can load specific assemblies into an <i>AppDomain</i>, but you cannot unload an assembly from an <i>AppDomain</i>. The only way to unload an assembly is to unload the entire <i>AppDomain</i> (with all the other assemblies that are loaded into it). <a name="rl3"></a><a href="#l3">Listing Three</a> shows how to create an <i>AppDomain</i> and immediately unload it. </p>
+
+<p>But just creating new <i>AppDomain</i>s and unloading them isn't very interesting&#151;I want to run some code in the new <i>AppDomain</i>. There are many ways to load code into the <i>AppDomain</i> and execute it. The simplest method is to call the <i>ExecuteAssembly</i> method of the new <i>AppDomain</i> (<a name="rl4"></a><a href="#l4">Listing Four</a>). This method loads the specified assembly and executes it immediately in the new <i>AppDomain</i>. The calling thread is blocked until the program in the new <i>AppDomain</i> exits. It is possible to use asynchronous method invocation to allow the calling thread to continue working. The DomainMaster library (available electronically; see "Resource Center," page 5) implements this approach.</p>
+
+<p>Okay, you can launch programs in new <i>AppDomain</i>s, but what if you want information on their execution? The <i>AppDomain</i> class exposes several events (see <a name="rt1"></a><a href="0410it1.html">Table 1</a>). You can register for these events just like any other CLR event. The important thing is, of course, to register the event handlers before loading the program because most events occur before the program actually starts executing (<a name="rl5"></a><a href="#l5">Listing Five</a>). The event handlers execute in the <i>AppDomain</i> they were registered in. This means that the code of the event handlers must be loaded into that <i>AppDomain</i>. The assembly loader must be able to locate the assembly that contains the event handlers. This is an involved process, but the bottom line is that the assembly must be either on the probe path (which is always under the application base directory), under the dynamic base directory (if specified), or in the GAC. </p>
+
+<p>Events are cool but they are handled in the context of the <i>AppDomain</i> that they occur in. You may want to communicate information between <i>AppDomain</i>s and there are various ways to do so. One category is through OS-level IPC (simple files, P/Invoke Win32 IPC); the other category is <i>AppDomain</i>-specific communication methods, which is what I focus on here. The simplest method is using the <i>GetData/SetData</i> methods. You can <i>Get/Set </i>a value or a full-fledged object from/to a different <i>AppDomain</i>. Objects are passed by value (a copy of the original object) or by reference (a proxy to the original object). <a name="rl6"></a><a href="#l6">Listing Six</a> demonstrates passing the creating <i>AppDomain</i> object to the created <i>AppDomain</i>. The <i>GetData/SetData</i> methods are intuitive to use and provide a dictionary API where each value/object is identified by a string.</p>
+
+<p>The CLR allows executing arbitrary code in a different <i>AppDomain</i> via the <i>DoCallback()</i> method. The code requires defining a delegate of type <i>CrossAppDomainDelegate</i>. <a name="rl7"></a><a href="#l7">Listing Seven</a> demonstrates an interaction between two <i>AppDomain</i>s. The default <i>AppDomain</i> creates another <i>AppDomain</i> and calls <i>SetData()</i> to pass itself to the other <i>AppDomain</i>. Then it executes some code in the other <i>AppDomain</i> that uses the data that was set earlier. The assembly that contains the <i>CrossAppDomainDelegate</i> code, as well as any other assemblies it references, must be loaded into the other <i>AppDomain</i> prior to calling the <i>DoCallback()</i> method.</p>
+
+<p>The most advanced way of communication is creating instances of objects in a different domain. When creating an instance using the <i>CreateInstance() </i>method, the return value is an <i>ObjectHandle.</i> which can't be used directly in the current <i>AppDomain</i> without unwrapping it first. The benefit of an <i>ObjectHandle</i> is that it does not require loading all the metadata of the wrapped object. It decouples the creation of the object from its use. The creating <i>AppDomain</i> <i>A</i> may blindly create an object instance <i>O</i> in <i>AppDomain B</i>, then pass <i>O</i> to <i>AppDomain C</i> where it is unwrapped and used. The metadata of object <i>O</i> does not have to be loaded into <i>AppDomain</i> <i>A</i>. A simpler scenario is when <i>AppDomain</i> A creates an object instance <i>O</i> in <i>AppDomain</i> <i>B</i> and would like to use it. <a name="rl8"></a><a href="#l8">Listing Eight</a> demonstrates that by using the<i> CreateInstanceAndUnwrap()</i> method to create an <i>AppDomainExplorer</i> instance in the other <i>AppDomain</i>. Since <i>AppDomainExplorer</i> is derived from <i>MarshalByRefObject</i>, the returned object is a proxy to an instance in the other <i>AppDomain</i> and not a local copy. Creating <i>AppDomain</i> loads the assembly, which contains the type and its metadata, into the other <i>AppDomain</i>.</p>
+
+<p>What actually happens when an <i>AppDomain</i> is unloaded? The <i>DomainUnload</i> event is called and all threads are aborted. However, due to the subtle interactions between OS threads and CLR threads, some threads cannot be aborted. In this case, an exception is thrown that claims that a thread cannot be unwound, but there is no good way to handle it. The <i>AppDomain</i> won't be unloaded along with all its assemblies and that's it. I encountered this situation when I called <i>Console.ReadLine()</i>. When a nondefault <i>AppDomain</i> is unloaded, an <i>AppDomainUnloadException</i> is thrown in the default <i>AppDomain</i> as an unhandled exception. I tried to catch it explicitly by wrapping the call to <i>AppDomain.Unload </i>with a <i>try-catch</i> block, but it didn't help. I guess the exception is thrown in the unloaded <i>AppDomain</i>, which is already in a state that doesn't let it handle it. The text of the unhandled exception is: "An unhandled exception of type 'System.AppDomainUnloadedException' occurred in Unknown Module." GUI applications cannot be unloaded cleanly without quitting first. If you try to unload an active GUI application, it crashes unpleasantly.</p>
+
+<p>In general, the Console doesn't play nicely with multidomain programs. The main reason is that there is one console per process and it is not trivial to share it properly between multiple console apps in various <i>AppDomain</i>s. This is a basic feature of the OS&#151;one console at most per one process. Even using Win32 APIs, you can just replace a console with another console or create a console for a GUI app (<i>AllocConsole()</i>), but you can't have more than one console per process. So, all the console apps in a multidomain program share the same console. If the default <i>AppDomain</i> contains a GUI app, then a console is created for the first console app that is loaded into another <i>AppDomain</i>. The title of the console always reflects the latest console application that was loaded. There is no way to switch "focus" between apps in different <i>AppDomains</i>. This leads to a serious problem with <i>Console.ReadLine()</i>. When users press the Enter key, which app in which <i>AppDomain()</i> should handle it? It turns out to be a moot point because, even if there is a single app that called <i>Console.ReadLine()</i>, pressing Enter has no effect. Threads that wait on <i>ReadLine()</i> cannot be aborted and their <i>AppDomain</i>s won't unload. Finally, if the app in your default <i>AppDomain</i> is a GUI app and you load a console app into another <i>AppDomain</i>, you will not be able to get rid of the console. Even if you never call <i>Console.ReadLine()</i> and unload all the <i>AppDomain</i>s that contain console apps, the console window will remain there. It sort of becomes your main window. A console window created by closing the main form doesn't terminate the program, while closing the console window does, regardless of whether there are still active <i>AppDomain</i>s that contain console apps. I reported all these issues to Chris Brumme (a senior architect on the CLR team), who provided me with invaluable inside information and said that he is aware that <i>Console.ReadLine()</i> is blocked in an OS API that cannot be safely interrupted (http://blogs.msdn.com/cbrumme/). These issues are not likely to be solved in Whidbey despite the serious overhaul the Console is getting. </p>
+<h3>Launcher</h3>
+
+<p>Launcher (available electronically) is a .NET GUI app that loads and executes other programs in multiple app domains and allows unloading and reloading them. It is an extraordinary deployment and debugging tool. Launcher's GUI lets users add new applications to the managed list. Applications on the list can be executed (loaded) or stopped (unloaded). The application list is stored in a file so Launcher remembers the applications across invocations. </p>
+
+<p>Launcher is really just a GUI front end to the DomainMaster engine, which lives in a separate assembly (DomainMasterLib). The DomainMaster engine is a Singleton. This modularization cleanly separates the core AppDomain management from the GUI front end. It also allows experimenting with different front ends or easily creating a dedicated custom Launcher. For example, always launch the BoogaBooga server, wait five seconds, launch three BoogaBooga clients, and finally launch the standalone Logger application.</p>
+
+<p>The public interface of the DomainMasterLib assembly is defined in the Interfaces.cs file (available electronically). You acquire the main interface (<i>IDomainMaster</i>) from the static property <i>DomainMaster.Instance</i>. This is the only way since the constructors are private. DomainMaster stores a little information about every application in the <i>AppInfo</i> class: the executable path, the <i>AppDomain</i> object it belongs to (null if the application is not running), and a state enumeration (IDLE, RUNNING, SHUTTING_DOWN, or NONE). It exposes an outgoing interface (<i>IDomainMasterEvents</i>) for notifying the front end on interesting events such as assembly load and <i>AppDomain</i> unload. The <i>IDomainMaster</i> interface is the active interface, which the front end uses to communicate with DomainMaster. The front end may add new applications to the managed list of DomainMaster, it may launch idle applications, terminate running applications, and get a collection of all the managed apps through the <i>Apps</i> property. To receive the events, the front end needs to implement the<i> IDomainMasterEvents</i> interface and call the <i>AttachSink()</i> method.</p>
+
+<p>The API is not perfect. You can't remove an application once it was added (except trough editing the persistent apps.txt file) and the fact that the DomainMaster is a Singleton allows only a single applications collection and a single sink (per process). However, it is good enough for my needs and it can be easily modified if necessary.</p>
+
+<p>The <i>DomainMaster</i> class operates much like the sample code previously discussed. The major difference is that the DomainMaster is using asynchronous method calls to avoid blocking its users. The <i>ExecuteAssemblyDelegate</i> is declared at the top, and in the <i>Launch()</i> method I wrap it around the new <i>AppDomain ExecuteAssembly</i> method and invoke it asynchronously using <i>BeginInvoke()</i>. I don't wait or check the result of the invocation. If something went wrong, I get an exception. The rest of the code is just bookkeeping of the apps collection. The event handlers notify the user through the <i>IDomainMasterEvents</i> interface about interesting events and the <i>Terminate()</i> method is used to unload running applications.</p>
+
+<p>I include two test applications called <i>Client</i> and <i>Server</i> (available electronically). These applications talk through Remoting and can be launched through Launcher. Remoting is the official way to communicate between applications in different <i>AppDomain</i>s, which may be in the same process, a different process on the same machine, or on a different machine altogether. The test applications are both console programs and demonstrate all the console-related issues I keep whining about.</p>
+<h3>Conclusion </h3>
+
+<p>In the future, Windows will likely move to direct mapping of OS concepts to CLR concepts. The current discrepancies are difficult to overcome&#151;this is clear when trying to fit AppDomains into the OS world of processes, hard threads, and consoles. This probably improves the performance because managed-unmanaged costs a lot today (about 50 CPU instructions). As more and more APIs are migrated to managed code, this becomes less of a problem because you will not have to leave the managed world most of the time. Still, for interoperability with legacy Win32 and COM code, it is important to improve this aspect of the CLR.</p>
+
+<p>How about Launcher? I hope that Whidbey solves the console issues I mentioned. But, in the meantime, a couple of possible directions I intend to follow include intercepting console events and output and writing them to a GUI console simulator, and hosting the CLR as a COM object and using the low-level interfaces it provides to improve the behavior of Launcher. </p>
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>// The post build event
+call "$(DevEnvDir)..\Tools\vsvars32.bat"
+sn -Vr $(TargetDir)$(TargetFileName)
+gacutil -u $(TargetName)
+gacutil -i $(TargetDir)$(TargetFileName)
+
+// From AssemblyInfo.cs
+[assembly: AssemblyKeyFileAttribute("..\\..\\public.snk")]
+[assembly: AssemblyDelaySignAttribute(true)]</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>namespace DomainMasterSample
+{
+   class MultiDomainApp
+   {
+      [LoaderOptimization(LoaderOptimization.MultiDomainHost)]
+      static void Main() 
+      {
+      }
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>namespace DomainMasterSample
+{
+   class MultiDomainApp
+   {
+      [LoaderOptimization(LoaderOptimization.MultiDomainHost)]
+      static void Main() 
+      {
+         // Create a new AppDoamin
+         AppDomain ad = AppDomain.CreateDomain("Playground Domain");         
+         // Unload the domain
+         AppDomain.Unload(ad);         
+      }
+
+   }
+}</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l4"></a>Listing Four</b><br>
+<pre>namespace DomainMasterSample
+{
+   class MultiDomainApp
+   {
+      [LoaderOptimization(LoaderOptimization.MultiDomainHost)]
+      static void Main() 
+      {
+         // Create a new AppDomain
+         Console.WriteLine(AppDomain.CurrentDomain.FriendlyName);
+         AppDomain ad = AppDomain.CreateDomain("Playground Domain");         
+         // Register domain event handlers
+         ad.AssemblyLoad += new AssemblyLoadEventHandler(AssemblyLoadHandler);
+         ad.DomainUnload += new EventHandler(DomainUnloadHandler);
+         // Load and execute assembly in domain         
+         ad.ExecuteAssembly("Playground.exe");
+         // Unload the domain
+         AppDomain.Unload(ad);         
+      }
+      static public void AssemblyLoadHandler(object sender, 
+                                                 AssemblyLoadEventArgs args) 
+      {
+         AppDomain ad = sender as AppDomain;
+         Debug.Assert(ad == AppDomain.CurrentDomain);
+         string a = args.LoadedAssembly.GetName().Name;         
+         AppDomain c = ad.GetData("Creator") as AppDomain;
+         Console.WriteLine("Assembly Loaded: '{0}' in '{1}' 
+                     created by '{2}'", a, ad.FriendlyName, c.FriendlyName);
+      }
+      static public void DomainUnloadHandler(object sender, EventArgs args) 
+      {
+         AppDomain ad = sender as AppDomain;
+         Debug.Assert(ad == AppDomain.CurrentDomain);         
+      }
+   }
+}</pre>
+<a href="#rl4">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l5"></a>Listing Five</b><br>
+<pre>namespace DomainMasterSample
+{
+   class MultiDomainApp
+   {
+      [LoaderOptimization(LoaderOptimization.MultiDomainHost)]
+      static void Main() 
+      {
+         // Create a new AppDomain
+         Console.WriteLine(AppDomain.CurrentDomain.FriendlyName);
+         AppDomain ad = AppDomain.CreateDomain("Playground Domain");         
+         // Register domain event handlers
+         ad.AssemblyLoad += new AssemblyLoadEventHandler(AssemblyLoadHandler);
+         ad.DomainUnload += new EventHandler(DomainUnloadHandler);
+         // Load and execute assembly in domain         
+         ad.ExecuteAssembly("Playground.exe");
+         // Unload the domain
+         AppDomain.Unload(ad);         
+      }
+      static public void AssemblyLoadHandler(object sender, 
+                                                  AssemblyLoadEventArgs args) 
+      {
+         AppDomain ad = sender as AppDomain;
+         Debug.Assert(ad == AppDomain.CurrentDomain);
+         string a = args.LoadedAssembly.GetName().Name;         
+         AppDomain c = ad.GetData("Creator") as AppDomain;
+         Console.WriteLine("Assembly Loaded: '{0}' in '{1}' 
+                      created by '{2}'", a, ad.FriendlyName, c.FriendlyName);
+      }
+      static public void DomainUnloadHandler(object sender, EventArgs args) 
+      {
+         AppDomain ad = sender as AppDomain;
+         Debug.Assert(ad == AppDomain.CurrentDomain);         
+      }
+   }
+}</pre>
+<a href="#rl5">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l6"></a>Listing Six</b><br>
+<pre>namespace DomainMasterSample
+{
+   class MultiDomainApp
+   {
+      [LoaderOptimization(LoaderOptimization.MultiDomainHost)]
+      static void Main() 
+      {
+         // Create a new AppDomain
+         Console.WriteLine(AppDomain.CurrentDomain.FriendlyName);
+         AppDomain ad = AppDomain.CreateDomain("Playground Domain");         
+         // Exchange data between AppDomains
+         ad.SetData("Creator", AppDomain.CurrentDomain);
+         AppDomain creator = ad.GetData("Creator") as AppDomain;
+         Debug.Assert(creator == AppDomain.CurrentDomain);
+         // Unload the domain
+         AppDomain.Unload(ad);         
+      }
+   }
+}</pre>
+<a href="#rl6">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l7"></a>Listing Seven</b><br>
+<pre>namespace DomainMasterSample
+{
+   class MultiDomainApp
+   {
+      [LoaderOptimization(LoaderOptimization.MultiDomainHost)]
+      static void Main() 
+      {
+         // Create a new AppDomain
+         Console.WriteLine(AppDomain.CurrentDomain.FriendlyName);
+         AppDomain ad = AppDomain.CreateDomain("Playground Domain");         
+         // Exchange data between AppDomains
+         ad.SetData("Creator", AppDomain.CurrentDomain);
+         // Execute some code in a different AppDomain
+         CrossAppDomainDelegate cadd = 
+                     new CrossAppDomainDelegate(CrossAppDomainCallback);
+         ad.DoCallBack(cadd);
+         // Unload the domain
+         AppDomain.Unload(ad);         
+      }
+      static public void CrossAppDomainCallback()
+      {
+         AppDomain ad = AppDomain.CurrentDomain;
+         AppDomain c = ad.GetData("Creator") as AppDomain;
+         Console.WriteLine("CrossAppDomainCallback() running in '{0}' 
+                       created by '{1}'", ad.FriendlyName, c.FriendlyName);
+      }
+   }
+}</pre>
+<a href="#rl7">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l8"></a>Listing Eight</b><br>
+<pre>namespace DomainMasterSample
+{
+   public class AppDomainExplorer : MarshalByRefObject
+   {
+      public void Explore()
+      {
+         AppDomain ad = AppDomain.CurrentDomain;
+         Console.WriteLine("----- AppDomainExplorer.Explore() -----");
+         Console.WriteLine("Name: {0}", ad.FriendlyName);
+         Console.WriteLine("Setup Info: {0}", ad.SetupInformation.ToString());
+         Console.WriteLine("Assemblies:");
+         foreach (Assembly a in ad.GetAssemblies())
+         {
+            Console.WriteLine(a.FullName);
+         }
+      }
+   }
+   class MultiDomainApp
+   {
+      [LoaderOptimization(LoaderOptimization.MultiDomainHost)]
+      static void Main() 
+      {
+         // Create a new AppDomain
+         Console.WriteLine(AppDomain.CurrentDomain.FriendlyName);
+         AppDomain ad = AppDomain.CreateDomain("Playground Domain");
+         // Create object in another AppDomain
+         string path = Path.Combine(Directory.GetCurrentDirectory(), 
+                                                 "DomainMasterSample.exe");
+         Assembly a = Assembly.LoadFile(path);
+         ad.Load(a.GetName());
+         AppDomainExplorer ade = 
+                ad.CreateInstanceAndUnwrap(a.GetName().FullName, 
+                "DomainMasterSample.AppDomainExplorer") as AppDomainExplorer;
+         ade.Explore();
+         // Unload the domain
+         AppDomain.Unload(ad);
+         Console.ReadLine();
+      }
+   }
+}</pre>
+<a href="#rl8">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

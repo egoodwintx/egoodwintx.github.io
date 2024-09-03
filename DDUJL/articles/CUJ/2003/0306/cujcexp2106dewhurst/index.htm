@@ -1,0 +1,269 @@
+<html><title>June 2003/N-Ary Nibbling</title>
+<body>
+<hr>
+
+<h2 ALIGN="center"><font COLOR="#800000">N-Ary Nibbling</font></h2>
+<h3 ALIGN="center"><font COLOR="#800000">Stephen C. Dewhurst</font></h3>
+
+<hr>
+
+<blockquote>
+<p>Last time, we looked at improving performance of typeint multiplication through application of a couple of simple template metaprogramming techniques. In this installment, we'll take up the problem of compiler limitations on template instantiation depth.
+
+<h3><font COLOR="#000080">Cursing and Recursing</font></h3>
+
+<p>Many template metaprogramming techniques rely heavily on recursion. For example, in the February installment of this column <a href="#1">[1]</a>, we implemented a left-shift operation on typeints with a simple recursion.
+
+<pre>
+template &lt;typename T, int n>
+struct LShift {
+    typedef typename LShift&lt;T,n-1>::R *R; // recurse
+};
+
+template &lt;typename T>
+struct LShift&lt;T,0> {
+    typedef T R;
+};
+</pre>
+
+<p>This is the metaprogramming analog of the following recursive run-time implementation:
+
+<pre>
+unsigned lshift( unsigned t, int n ) {
+	if( n )
+		return lshift( t, n-1 ) &lt;&lt; 1;
+	else
+		return t;
+}
+</pre>
+
+<p>This approach works well for small values of <b>n</b>, but fails when <b>n</b> is large.
+
+<pre>
+typedef TypeInt<42>::R N;
+typedef LShift&lt;N,5>::R NLS5; // works&#8230;
+typedef LShift&lt;N,1000>::R NLS1000; // likely error!
+</pre>
+
+<p>The problem is that the second instantiation of <b>LShift</b> above is likely to cause the compiler to exceed its maximum template instantiation depth. That is, instantiation of LShift for the values <b>N</b> and <b>1000</b> will (recursively) cause an instantiation of <b>LShift</b> for the values <b>N</b> and <b>999</b>, which will, in turn, cause the instantiation of <b>LShift</b> with the values <b>N</b> and <b>998</b>, and so on, and on and on. Compilers vary widely in their ability to handle deeply nested template instantiations. In Annex B of the C++ Standard, we find a suggested minimum instantiation depth capability of only 17. However, most compilers seem to be able to handle instantiation depths of at least 60, and others can manage more than 1000, depending on available resources.
+
+<p>We can improve this miserable situation by recognizing that there's no need to recurse in a single, deep thrust as we have above. We can "nibble" a fixed, modest recursion depth, back out, and nibble again.
+
+<pre>
+const int nbl = 10; // depth of a nibble
+//&#8230;
+template &lt;typename T, int n>
+struct LShiftNbl {
+    typedef typename LShiftImpl&lt;(n>=nbl),T,n>::R R;
+};
+</pre>
+
+<p>Here, we select the recursion approach based on the shift length. If the shift length is at least the size of a nibble, we nibble and try again. Otherwise, we employ the original, deep recursion because the depth of the recursion is reasonably bounded.
+
+<pre>
+template &lt;bool, typename T, int n>
+struct LShiftImpl { // nibble&#8230;
+    typedef typename
+LShiftImpl&lt;(n-nbl>=nbl),T,n-nbl>::R **********R;
+};
+template &lt;typename T, int n>
+struct LShiftImpl&lt;false,T,n> { // finish up any crumbs
+    typedef typename LShiftImpl&lt;false,T,n-1>::R *R;
+};
+
+template &lt;typename T>
+struct LShiftImpl&lt;false,T,0> {
+    typedef T R;
+};
+</pre>
+
+<p>With this approach, we can process left shifts an order of magnitude greater in length than we could previously.
+
+<pre>
+typedef LShiftNbl&lt;N,1000>::R NLS1000; // works!
+</pre>
+
+<h3><font COLOR="#000080">Systematic Base N Nibbling</font></h3>
+
+<p>The nibble approach is effective, but ad hoc. It would be preferable to employ it uniformly throughout the design of the typeint implementation. Let's do that.
+
+<p>The original typeint implementation uses a binary representation; a const-qualified pointer modifier represents a 1 bit, and an unqualified pointer modifier a zero bit. For example, we can represent the binary integer <b>1011</b> (decimal 11) as <b>char *const * *const *const</b>. We could improve matters somewhat by moving to a base three or base four implementation. For base four we could represent the digit 2 as a volatile-qualified pointer modifier, and 3 as a const volatile-qualified pointer modifier. For example, the base four integer <b>1203</b> (decimal 99) could be represented as <b>char *const *volatile * *const volatile</b>.
+
+<p>Rather than move the implementation from binary to ternary or base 4, let's move it from binary to base 2<sup>L</sup>. We'll abandon use of the pointer modifier in preference to the array modifier. For example, we can represent the integer <b>0xBEEF</b> (decimal 48879) as the type <b>char [11][14][14][15]</b> if <b>L</b> is chosen to be 4 (base 16), or <b>char [11][59][47]</b> if <b>L</b> is chosen to be 6 (base 64).
+
+<p>We must, however, make a couple of adjustments to this simple transformation. First, in order to avoid the potential of an illegal zero array bound, we'll add one to each "digit" in the representation. Therefore, the representation of decimal 48879 is rendered as <b>char [12][15][15][16]</b> if <b>L</b> is 4, and as <b>char [12][60][48]</b> if <b>L</b> is 6.
+
+<p>Second, it is likely that the compiler will impose a maximum object size, which in turn implies that the <b>sizeof</b> operator applied to a type must be similarly limited. <a href="#2">[2]</a> In other words, it is likely that the maximum size of a type is the same as that of an object. In Annex B, the C++ Standard suggests that a compiler allows an object of at least size 262144 bytes (256x1024, or 2<sup>18</sup>). This limit can be exceeded quite quickly by a multidimensional array; for instance, the integer <b>0xDEADBEEF</b> rendered as <b>char [14][15][11][14][12][15][15][16]</b> is well over this limit.
+
+<p>We can circumvent this difficulty by the use of pointers to arrays, rather than arrays. For example, we can render 48879 as <b>char (*(*(*(*)[0xF +1])[0xE +1])[0xE +1])[0xB +1]</b>; a pointer to an array of 16 pointers to arrays of 15 pointers to arrays of 15 pointers to arrays of 12 pointers to <b>char</b>.
+
+<pre>
+typedef char (*(*(*(*Beef)[0xF +1])[0xE +1])[0xE +1])[0xB +1];
+Beef beef;
+</pre>
+
+<p>Say what you will about about its complexity, but <b>sizeof(Beef)</b> is the size of a simple pointer. It's still necessary to show some caution to ensure that the size of any subsidiary type is still within the compiler's object size constraints. For example, <b>sizeof(*beef)</b> or <b>sizeof(*(*beef)[0])</b> should still be less than 2<sup>18</sup>. Effectively, this means that an array bound in the representation must be no greater than 2<sup>18</sup> divided by the <b>sizeof</b> a pointer to data, or (probably) 2<sup>16</sup>. Since we must augment the bound by one, a safe maximum value for <b>L</b> might be 15, allowing us to perform arithmetic in base 32768. However, the implementation will work for any value of <b>L</b> in the range of 1 to 15 (or whatever the local maximum might be).
+
+<h3><font COLOR="#000080">N-Ary Typeints</font></h3>
+
+<p>Of course, no rational person would want to construct such a type by hand (I'm not always completely rational).  Fortunately, it's straightforward to modify our earlier binary typeint implementation to perform the construction for us:
+
+<pre>
+template &lt;int n>
+struct TypeInt {
+	typedef typename TypeInt&lt;(n>>L)>::R (*R) [(n&MASK(L))+1];
+};
+
+template &lt;>
+struct TypeInt&lt;0> {
+	typedef char R;
+};
+</pre>
+
+<p>Our earlier implementation recursively converted the value <b>n>>1</b> to a binary typeint, then appended the appropriate pointer modifier depending on whether the low-order bit was a one or zero. In this n-ary implementation, we're using base 2<sup>L</sup>, not binary (unless <b>L==1</b>), so we recursively find the typeint representation for <b>n>>L</b>, then append a pointer to array modifier to the result. The array bound is the lower-order <b>L</b> bits of <b>n</b>, incremented by one (again, to avoid the possibility of a zero array bound). We've effectively applied the "nibbling" technique described earlier, where the size of the nibble is <b>L</b>.
+
+<p>The conversion from an n-ary typeint to an integer (assuming the typeint can fit in a predefined integer) is essentially the reverse operation:
+
+<pre>
+template &lt;typename T>
+struct Value {
+    enum { r = 0 };
+};
+
+template &lt;typename T, int bound>
+struct Value&lt;T (*) [bound]> {
+    enum { r = (Value&lt;T>::r &lt;&lt; L) + bound-1 };
+};
+</pre>
+
+<p>We strip the outermost pointer-to-array from the typeint and recursively convert the remaining typeint to an integer. We then shift that result left by <b>L</b> bits, and add in the adjusted (that is, we subtract the 1 we added when constructing the typeint) lower <b>L</b>-bit digit. Again, this is identical to the binary typeint implementation, but we are proceeding in <b>L</b>-bit nibbles, with concomitant savings in recursion depth. In general, we will be able to handle integers that are on the order of <b>L</b> times larger than we could previously. Note that we employ two different, effective conceptualizations of the typeint structure. Often it's convenient to consider an n-ary typeint as a simple sequence of digits <a href="#3">[3]</a> in base 2<sup>L</sup>, and at other times as a binary representation whose bits are manipulated in groups of <b>L</b>. Either conceptualization is accurate, so we will use both in the description below.
+
+<h3><font COLOR="#000080">Shifting N-Ary Typeints</font></h3>
+
+<p>Let's consider performing a left shift. <a href="#4">[4]</a> In implementing the shift operations, it's convenient to view the typeint as a sequence of groups of <b>L</b> bits.
+
+<p>If the length of the shift, <b>n</b>, is less than <b>L</b>, then we must simply shift left by <b>n</b> bits the values of the array bounds that comprise the typeint. Any bits that "fall off the end" of one bound will be ored on to the lower <b>n</b> bit positions of the shifted result of the next bound.
+
+<pre>
+template &lt;typename T, int n, int lostbits>
+struct LShiftShort {
+	typedef T R;
+};
+
+template &lt;typename T, int n, int bound, int lostbits>
+struct LShiftShort&lt;T(*)[bound],n,lostbits> {
+	enum {
+		mylostbits = LSLOST(bound-1,n),
+		newb = (BOUND((bound-1)&lt;&lt;n) // limit result to L bits!
+			| lostbits) // add in bits lost from prev digit
+				+ 1 // avoid zero bound
+	};
+	// If mylostbits is non-zero, and this is the last
+	// modifier (prev bound==0), then we have to add a
+	// new last modifier with the lost bits (otherwise we'd
+	// lose the high-order digit).
+	typedef typename LShiftShort&lt;T,n,mylostbits>::R Temp;
+	typedef Temp (*RR)[newb];
+	typedef typename Select&lt;
+		(mylostbits && (IsAry&lt;typename Deref&lt;T>::R>::bound==0)),
+		RR (*)[mylostbits+1],
+		RR
+	>::R R;
+};
+</pre>
+
+<p>The facilities <b>BOUND</b> and <b>LSLOST</b> are (I'm sorry to say) implemented as preprocessor macros, and are typical bit-twiddling implementations. <a href="#5">[5]</a> <b>BOUND</b> is used to truncate a shifted result to <b>L</b> bits. <b>LSLOST</b> determines what bits will be lost in shifting an <b>L</b>-bit quantity left by <b>n</b> bits:
+
+<pre>
+#define MASK( n ) ((1&lt;&lt;(n))-1)
+#define BOUND( b ) ((b)& MASK(L))
+#define END( b, n ) ((b) & (MASK(n)&lt;&lt;(L-(n))))
+#define LSLOST( b, n ) (END(b,n)>>(L-(n)))
+</pre>
+
+<p>In order to handle shift lengths that are longer than <b>L</b>, we first shift the typeint by <b>n%L</b> bits, then append <b>n/L</b> "zero" digits to the end of the typeint:
+
+<pre>
+template &lt;typename T, int n>
+struct LShift {
+	typedef typename LShiftShort&lt;T,n%L,0>::R Temp;
+	typedef typename AddPtrAryN&lt;Temp,n/L>::R R;
+};
+</pre>
+
+<p>The <b>AddPtrAryN</b> facility is just one of a number of simple ad hoc utilities that make it easier to work with the n-ary representation of typeints.
+
+<pre>
+template &lt;typename T, int n>
+struct AddPtrAryN {
+	// append "zero" digit
+	typedef typename AddPtrAryN&lt;T,n-1>::R (*R)[1];
+};
+
+template &lt;typename T>
+struct AddPtrAryN&lt;T,0> {
+	typedef T R;
+};
+</pre>
+
+<h3><font COLOR="#000080">Bitwise Operations</font></h3>
+
+<p>The implementations of the various bitwise operations on n-ary typeints are similar. Let's examine the implementation of bitwise or as a representative example. The primary template is declared but not defined. All legal cases are covered by specializations of the primary, and any ill-formed typeints will cause attempted instantiation of the primary and a compile time error.
+
+<pre>
+template &lt;typename T1, typename T2>
+struct Or; // no definition
+</pre>
+
+<p>A complete specialization takes care of the case where both arguments are zero:
+
+<pre>
+template &lt;>
+struct Or&lt;char,char> { // 0 | 0 == 0
+	typedef char R;
+};
+</pre>
+
+<p>The cases in which one argument is zero and the other nonzero are also straightforward:
+
+<pre>
+template &lt;typename T1, int b1>
+struct Or&lt;T1(*)[b1],char> {
+	typedef T1 (*R)[b1]; // T1 | 0 == T1
+};
+
+template &lt;typename T2, int b2>
+struct Or&lt;char, T2(*)[b2]> {
+	typedef T2 (*R)[b2]; // 0 | T2 == T2
+};
+</pre>
+
+<p>The interesting case occurs when both arguments are nonzero:
+
+<pre>
+template &lt;typename T1, int b1, typename T2, int b2>
+struct Or&lt;T1(*)[b1],T2(*)[b2]> {
+	typedef typename Or&lt;T1,T2>::R Temp;
+	enum { newbound = ((b1-1) | (b2-1)) + 1 };
+	typedef Temp (*R)[newbound];
+};
+</pre>
+
+<p>First we recurse to calculate the result of or-ing the higher level digits of the two typeints (the calculation of <b>Temp</b>, above). We then calculate the value of the low-order digit by or-ing the values of the outermost array bounds of the typeint arguments. Note that we had to adjust the bounds before or-ing their values to take into account the earlier addition of one to each bound, and increment the result by one to avoid the possibility of a zero array bound. Finally, we append a pointer-to-array modifier with the new bound to the value previously calculated (<b>Temp</b>).
+
+<p>The logic of this implementation is essentially the same as that of the binary typeint implementation, but we are performing the calculations in nibbles of length <b>L</b>. As a result, the depth of recursive template instantiation required is reduced by a factor of <b>L</b>.
+
+<h3><font COLOR="#000080">Results</font></h3>
+
+<p>Experience indicates that systematic use of nibbling to reduce recursive template instantiation depth in the tyepint implementation permits manipulation of significantly larger typeints than the simple binary implementation. Platforms that formerly were able to handle only typeints of approximately 60 bits are able to handle typeints of over 500 bits. Platforms that could previously handle typeints of approximately 500 bits are able to handle typeints of over 5000 bits.
+
+<h3><font COLOR="#000080">References</font></h3>
+
+<p><a name="1"></a>[1] S.C. Dewhurst, Typeints, CUJ online experts 21(2), February 2003.
+<p><a name="2"></a>[2] Thanks to Andrei Alexandrescu for making me see this as right and proper, rather than a bug in a compiler or the standard.
+<p><a name="3"></a>[3] The use of the term "digit" in anything but a base 10 number system is a bit of an oxymoron, but the terminology is commonly used in binary arithmetic, as in "binary digit," so I'm reemploying it here.
+<p><a name="4"></a>[4] The implementation of right shift is similar.  The full implementation of n-ary typeints is available from the author's web site at <a href="http://www.semantics.org/code.html">http://www.semantics.org/code.html</a>.
+<p><a name="5"></a>[5] This is a common problem in programming with templates. An integer argument to a class template must be a constant expression. Ordinarily, we prefer to use inline functions in preference to preprocessor macros, but the result of calling an inline function&#8212;even though it may be determinable at compile time&#8212;is not a constant expression, and cannot be used as an argument in template instantiation.
+</blockquote>
+</body>
+</html>

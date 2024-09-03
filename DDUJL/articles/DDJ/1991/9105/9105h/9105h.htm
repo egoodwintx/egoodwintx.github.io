@@ -1,0 +1,990 @@
+<HTML>
+<META NAME="year" CONTENT="1991">
+<HEAD>
+<TITLE>MAY91: ARRAY BOUNDS CHECKING WITH TURBO C</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>ARRAY BOUNDS CHECKING WITH TURBO C<a name="0123_0003"></h1><P>
+<h2><a name="0123_0001"><a name="0123_0000">Hardware assisted bounds checking thanks to a DOS extender</h2><P>
+<h3>Glenn Pearson</h3><P>
+<p><i><a name="0123_0002"><a name="0123_0000">Glenn has a Ph.D. in computer science from the University of Maryland, College Park, focusing on man-machine interfaces.  This article was inspired by experience with a software development project to enhance &quot;MLAB,&quot; a mathematical modeling system from Civilized Software Inc.  Glenn can be reached c/o CSI, 7735 Old Georgetown Rd., Bethesda, MD 20814.</i></p><hr><P>
+The premise behind DOS extenders is that most of the code in your program can run in &quot;protected mode.&quot;  As a side benefit, DOS extenders also make it possible for you to add array bounds checking to your programs.  Because the bounds checking is handled by the hardware, no runtime overhead is incurred when accessing the array; the only overhead is additional work during memory allocation and freeing.  Unfortunately, this additional workload will cause noticeable performance degradation with some programs, so it is best to arrange your code so that bounds checking can easily be turned on or off.<P>
+While some compilers offer array bounds checking as a compile-time option, Turbo C 2.0 does not.  However, the technique presented in this article lets you add array bounds checking to your Turbo C applications when used with the Ergo DOS extender.  Furthermore, the technique should still be applicable to Borland C++, and it can be adapted to other DOS extenders.<P>
+<h3><a name="0123_0004">Protected Mode Revisited<a name="0123_0004"></h3><P>
+Several thorough discussions of protected mode have appeared in DDJ in the past, so I'll just briefly hit the high points.  If you're interested in more detail on protected mode, refer to the &quot;Suggested Reading&quot; section at the end of this article.<P>
+Recall that real mode addresses with Intel chips consist of a segment number and an offset. On a 286, the segment register holds the 16-bit segment base value, and the offset (as might be stored in the Instruction Pointer, or as part of an assembly language instruction) is limited to 16 bits.  When composing the address, the segment &quot;base&quot; value is shifted left 4 bits and added to the offset, resulting in a 20-bit value (a 1-Mbyte range).<P>
+Protected-mode addresses use offsets identical to the real-mode offsets.  The change is to the segment numbers, which are replaced with 16-bit &quot;selectors.&quot;  This introduces a level of indirection.  The high-order 13 bits of a selector represent an offset into a &quot;Descriptor Table&quot; (as shown in <a href="#0123_0005">Table 1</A>), selecting a particular descriptor row.<P>
+<h4><a name="0123_0005">Table 1: Contents of each row in the descriptor table.  Both the 286 and 386/486 can specify an arbitrary 32-bit size bound, using bytes 0,1,7, and 8, but the 286 can access only memory within the first 64K of the Base Address.</h4><P>
+<pre>
+  Bytes  Contents
+  --------------------------------------------------------------------
+
+  0-1    Routinely zero for 286; Segment Size Limit extension for 386
+  3      Access Rights Bits:
+            7      Present
+            6-5    Descriptor Privilege Level
+            4-0    Other info (varies, field encoded)
+                      Identifies code versus data, writable, and so on
+  4-6    24-bit Base Address in Real Memory
+  7-8    16-bit Segment Size Limit</pre><P>
+<P>
+As a result, the real address space of an AT is limited to what can be specified in 24 bits (namely 16 Mbytes), and the maximum segment size is 64K.  On the 386 and 486 chips, the offset register is expanded to hold 32 bits, thus allowing a maximum segment size of 4 gigabytes.<P>
+There are actually two such tables maintained by the chip while in protected mode.  The Local Descriptor Table (LDT) is pointed to by the LDTR register, while the Global Descriptor Table (GDT) is pointed to by the GDTR register.  Each register also holds the size of its table.  The contents of the tables, which live in main memory, are preliminarily filled in by the compiler and linker, and are made final during loading immediately before execution begins.  Generally, each application has its memory allocation information stored in its own LDT.  Bit 2 of a selector address is 0 for access to the GDT and 1 for LDT access.  Bits 1-0 hold the &quot;Requested Privilege Level.&quot; If all goes smoothly, a C programmer would need to know only that a far pointer is really a selector:offset pair (sel).  Of course, things don't always go smoothly.<P>
+In any event, the availability of information in the tables allows the chip to perform checking automatically on every memory access in order to make sure the access is to a valid &quot;present&quot; segment and to a valid bounded region within that segment (an offset between 0 and (Size Limit-1), inclusively).  Furthermore, operations such as writing to a code segment can be forbidden through appropriate values in the Access Rights byte.  A General-Protection (GP) Fault is generated when an illegal access is detected.<P>
+The operating system and programs such as loaders need to be able to write to code segments.  This is handled through the use of a four-level privilege scheme provided by 2 bits in the chip's Process Status Word as well as in the descriptors and selectors.  Most commonly, the operating system (such as extended DOS) runs at the highest privilege of 0, while most applications run at the lowest privilege of 3.<P>
+<h3><a name="0123_0006">The Ergo DOS Extender<a name="0123_0006"></h3><P>
+Ergo supports a number of C and Fortran compilers.  As with all DOS extenders, the basic idea behind the Ergo extender is to allow an application, written using the standard DOS and BIOS calls (usually embedded within calls to the compiler's libraries), to be converted to run in protected mode.  In the ideal case, this requires no reprogramming--you compile and link the program using the normal compiler and linker.  The resulting &quot;real mode&quot; executable is then input to a conversion routine.  The conversion routine looks for every memory access using an absolute memory address (which in &quot;real mode&quot; explicitly or implicity involves a pair of numbers, the segment and the offset) and converts it to a protected-mode &quot;selector,&quot; a form of logical address.<P>
+Ergo performs this conversion using its &quot;EXPress&quot; utility.  Thus, if hello.exe is our executable file, EXPress reads the file and generates &quot;hello.exp.&quot;  The generated result is ready to be run, but not directly.  Instead, Ergo provides a loader, called UP, to switch to protected mode, map the selectors to actual memory locations (usually in extended memory), and begin execution.  When &quot;hello&quot; terminates, the loader restores real mode and returns to the DOS prompt.<P>
+In order for this magic to work, Ergo requires that a TSR program (OS286) be installed in the system.  As its name implies, OS286 uses only 16-bit instructions and will thus work with 286 machines (as well as 386/486 machines).  Ergo also provides OS386, which uses 32-bit instructions and is compatible with 32-bit compilers.  This limits the application to running on the latter machines, but resulting code will run up to twice as fast.  When installed, OS286 has two main parts, a &quot;real-mode kernel&quot; that lives below 640 Kbytes, and a &quot;protected-mode kernel&quot; that usually resides in extended memory.  During installation, this TSR investigates the memory allocation of the system, inquiring as to total physical memory and looking for other TSRs (such as RAM disks) that have reserved space.  Unused space in extended (and optionally low) memory is considered fair game for use as the protected-mode heap.<P>
+When the protected-mode loader is invoked, UP communicates with the kernels, informing them of the amount of space needed for the load image of the executable.  This space is then allocated in the protected-mode heap, and the image is loaded.  The processor's memory mapping abilities are tapped to create the correct correspondence between selectors and actual segment-offset locations.<P>
+In addition, software-interrupt calls in the executable to DOS or BIOS system services that are routed by the protected-mode interrupt table to the protected-mode kernel.  In some cases, the kernel carries out the requested function directly in protected mode.  Often, though, there is a momentary switch into real mode, allowing the function to be performed by the real-mode kernel, usually through a real-mode software interrupt to DOS/BIOS itself.  Switches between modes involve a modest amount of overhead on the 286 (on the order of 0.1 second), so routine mode switching is not desirable.  On 386/486 processors, on the other hand, just a single bit in the Process Status Word need be twiddled.<P>
+The kernel TSR remains resident after the application returns to DOS, so subsequent invocations of the application start more quickly and exhibit a somewhat different initial on-screen message.  The TSR is unloaded using -remove switch.  The loading procedure can thus be encapsulated as shown in <a href="#0123_0007">Figure 1(a)</A>.<P>
+<h4><a name="0123_0007">Figure 1: (a) Batch file to automate the loading procedure; (b) using the bind utility to bind OS286 and the loader into an application; (c) a typical GP fault message.</h4><P>
+<pre>
+  (a)  os286
+       up hello
+       os286 -remove
+
+  (b)  bind -k os286.exe -1 tinyup.exe -i hello.exp -o hello.exe
+
+  (c)  GP at XXXX YYYY EC ZZZZ
+</pre><P>
+<P>
+This message should be read as &quot;general-protection fault occurred in Code Segment (CS) XXXX with Instruction Pointer (IP) of YYYY, with Ergo error code of EC and chip-generated error code of ZZZZ&quot;<P>
+This loading procedure, which is useful during product development, is not necessarily one to present to the end user.  An alternative often employed for end distribution is to &quot;bind&quot; the kernel, the loader, and the application into the executable.  Ergo provides the bind utility for this purpose.  The command line, shown in <a href="#0123_0007">Figure 1(b)</A>, uses bind to create heflo.exe.  In this case, another loader, Tinyup, is used (instead of up) with bind.  Now when hello is run, it first installs the OS286 kernel, which is now installed as an overlay, not as a true TSR.  If available memory space is insufficient to load the kernel and application, a message reports the failure and returns you to the DOS prompt. Otherwise, the application is loaded, run, and returned to DOS.  Unlike the unbound case, removal of the bound kernel from memory occurs automatically when the application returns normally to DOS.  (Additional controls exist to determine what happens if a bound application is started up in a system that separately has an unbound kernel resident.)<P>
+<h3><a name="0123_0008">Symptoms of GP Faults<a name="0123_0008"></h3><P>
+With a nontrivial program, problems can arise following conversion to protected mode.  These usually manifest themselves at runtime by a general-protection fault, a fatal error that prints some information and dumps you back into DOS.  <a href="#0123_0007">Figure 1(c)</A>  shows the sort of message you'll see when a GP fault occurs.  This message gives you the contents of the two most important processor registers.  The CS and IP values, in conjunction with the .XMP extended map file produced during conversion, will identify the individual module (.OBJ) name, and the appropriate location within the module that generated the GP fault.<P>
+A GP error in a bound application started from the DOS prompt will generate only the error message just described.  But under other circumstances you can get an additional full dump of all the registers, courtesy of a special GP handler provided as part of up.exe and cp.exe. The full dump is available when running unbound programs (with the UP loader) or when executing a program under the CP debugger.  The full dump will not always occur, because events such as real-mode memory corruption can kill it.  But in any event, the Ergo kernel will regain control of the CPU, issue the one-line GP message, kill the program, and return to DOS.<P>
+<h3><a name="0123_0009">Causes of GP Faults<a name="0123_0009"></h3><P>
+Problems can arise from interrupt-driven code and from code that attempts direct access tb memory.  I will not consider these sources of difficulties here.  Instead, the focus will be faults due to faulty pointers, array overruns, or related address arithmetic.<P>
+Some compilers provide runtime checking of array bounds (often as a compile-time option) but, as mentioned earlier, Turbo C 2.0 does not.  These often-elusive errors can generate a general-protection fault, as can dereferencing of uninitialized or dangling pointers, such as that shown in <a href="#0123_000a">Example 1(a)</A>.  The problem is that you can't count on the dereference to point to an illegal selector:offset location and thus trigger the fault.<P>
+<h4><a name="0123_000a">Example 1: (a) Dereferencing an uninitialized or dangling pointer; (b) creating a file global table; (c) toggling bounds checking to either on or off (d) a decentralized method for global or external static array &quot;str1&quot;.</h4><P>
+<pre>
+  (a) char *bad1, *bad2, *bad3;
+
+      strcpy (bad1, &quot;hello&quot;); /* GP Candidate: Uninitialized */
+      bad2 = (char *) calloc(20);
+             free(bad2);
+      strcpy (bad2, &quot;hello&quot;);/* GP Candidate: Dangling */
+      bad3 = (char *)calloc(2);
+      strcpy(bad3, &quot;hello&quot;);/* GP Candidate: Array Overrun */
+
+  (b) #define LDTSIZE 1024 /* Ergo default LDT size */
+      unsigned long malloclist [LDTSIZE]
+
+  (c) void *mycalloc(int size)
+      {void *results;
+
+      #ifdef BOUNDS_ON
+        results = pcalloc(size);
+      #else
+        results = calloc(size);
+      #endif
+       if (results == NULL) .../* complain &amp; exit */
+        return(results)
+      }
+
+  (d) char str1[] = &quot;Hello&quot;
+      char *str2;
+
+      {...
+      /* Before first use of &quot;Hello&quot;: */
+      str2 = (char *)createDataWindow(str1,strlen(str1)+1);
+                                      /* +1 for terminal \O */
+      /* Use str2 from now on instead of str1 */
+      ...}
+
+      A similar approach is applicable to internal statics:
+
+      somefunc( ) {
+        static char str1[] = &quot;Hello&quot;
+        static char *str2;
+
+        ...
+        /* Before first use of &quot;Hello&quot; in somefunc: */
+        if (str2 == NULL)
+        str2 = (char *) createBoundedWindow (str1, strlen(str1)+1);
+                                             /* +1 for terminal \0 */
+        /* Use str2 from now on instead of str1 */
+               ...}</pre><P>
+<P>
+Overruns of static arrays such as string constants are less likely to be detected because these are lumped into one data segment per .OBJ for the huge model, or just one data segment for the large model.  The bounds checking is applied to the group overall, not to individual arrays.<P>
+Dynamically allocated arrays, on the other hand, may or may not get a private sel, depending upon the runtime library provided with the compiler.  If not, malloc when first called will ask for a large block of memory from DOS (a 64K segment) and return a pointer to the start of it; subsequent mallocs will allocate from the same segment, if possible.<P>
+<h3><a name="0123_000b">Heap Structure<a name="0123_000b"></h3><P>
+For further insight, consider the Turbo C/Ergo heap--that area of memory under Turbo C's management from which calls to malloc, calloc, and farmalloc draw.  When a Turbo C executable begins, it requests from DOS (with OS286 intervention) all available memory for its heap. This memory in real address space could be either a single range of low memory, a single range of extended memory, or both, depending upon how the OS286 kernel was precon-figured.  (You can also limit the heap space size by reserving space for other purposes.  This consideration doesn't change the aspects discussed here.  The situation with the Microsoft C compiler is similar with respect to their normal, so-called far, heap.  There is also a 64K near heap, which is contained within the DGROUP.)<P>
+The heap block is then covered (internally by Ergo's implementation) by an overall &quot;data window&quot; selector, spanning the whole heap.  This window, which is not strictly required, simplifies the next step by providing a convenient place to store the 32-bit whole-heap size. Although the 286 chip can specify an arbitrary 32-bit bound, it can access only contents stored within the first 64K of a selector's base.  To make the entire heap accessible, a series of child data windows is created, represented by a single set of consecutive entries in the LDT.  The fact that the entries are consecutive (they &quot;tile&quot; a region of the LDT) is very important.  Each selector in the tiled region, except perhaps the last one, references a &quot;stride&quot; of 32K of memory.  Any address arithmetic done on a selector:offset pair (such as implicitly done during an array element access) will invoke the Turbo C address-adjustment routines, which Ergo has adjusted to be cognizant of tile boundaries.  Thus, memory references can overflow from one selector to the next within this LDT region without faulting, so that data objects larger than 64K can be properly accessed and manipulated.  Address arithmetic overflows will generate a hardware bounds fault only if the result goes outside the overall heap.  (Why doesn't each tiled selector reference the maximum size piece of memory possible, namely 64K?  Because overflows of 64K do not consistently invoke the Turbo C address-arithmetic routines.  32K was chosen to make overflow checking and adjustment arithmetic both reliable and easy.)<P>
+The Turbo C heap is structured in the usual way for memory management by malloc/farmalloc and free/farfree calls.  When a farmalloc request is issued (or farcalloc, or farrealloc), the sel returned has a selector from within the set of &quot;tiled&quot; selectors.  Ergo makes the reasonable assumption that if you use farmalloc instead of malloc for your allocation, it is because the object is (or could be) larger than 64K, and you intend to use a huge or normalized pointer to access it, rather than a far pointer.  When address arithmetic is performed on a huge pointer, regular Turbo C calls a subroutine to make sure the result is normalized.  Ergo changes this routine so that, for instance, an increment of the offset that causes it to overflow will be propagated as an addition of eight to the selector, thus pointing properly to the next tiled descriptor in the LDT.  Similarly, a decrement resulting in underflow subtracts eight from the selector.<P>
+With a malloc call, the situation is a little more complicated (and undocumented).  It must be guaranteed that a malloced object resides in a single segment, so that far pointers, which behave badly at segment boundaries, can be safely used.  Malloc starts out by calling farmalloc.  If the returned sel is such that the block would straddle a boundary in the LDT (an infrequent occurrence), then a separate data window -- a private selector on the underlying real memory area chosen in the heap -- is created and returned to the user.  This private selector, with its private size limit, is an instance of automatic bounds checking that we will extend to all dynamic memory allocations.<P>
+When free is called, it must check for this special situation and delete the data window if present; then farfree is called to actually update the heap.  It is permissible to call free rather than farfree with sels allocated originally by farmalloc, so if you choose to use only one of these calls for all deallocations, make it free, not farfree.<P>
+The Ergo developers report that the Microsoft C heap structure and heap-handling library routines are, in general, better structured internally than Turbo C's.  We have found that Turbo C/OS286 works well for mid-sized large-model projects (say, 30 modules).  Unfortunately, we have been unsuccessful so far with a 100-module project that just barely fits within the large-model (single data segment, for statics) paradigm.  In this case, the LDT appears to be corrupted, and the cause remains elusive.  At this time, we would suggest a different compiler, such as Microsoft C, be used with OS286 for numerous-moduled projects.<P>
+<h3><a name="0123_000c">Adding Bounds Checking<a name="0123_000c"></h3><P>
+To guarantee a private sel for a dynamic array, you ask the Ergo system to provide a data window over the array.  The private sel is then used for subsequent array accesses, so that bounds checking is performed with no runtime overhead (the chip hardware does it).  We will need to remember the correspondence between this private sel and the sel returned by the allocator.  For this, we introduce a file global table, as shown in <a href="#0123_000a"> Example 1(b)</A>.<P>
+The stored values in this table are the allocator segment:offset values.  The index value to access the table is derived from a private sel value.  The size chosen for our table reflects the fact that the lowest three bits of the selector are always of a fixed value.  With Ergo, these three bits are all in the 1 state, because we are using the LDT, not GDT, and the priority level is 3.  Thus, we must shift the selector by three bits to make malloclist close-packed.<P>
+The most general way to provide bounds checking is to write your own version of all of Turbo C's allocation and freeing routines, so that all your nonstatic arrays have this ability.  The convention adopted here is to stick a p prefix onto the corresponding Turbo C function name. A straightforward version of pmalloc and pfree is shown in <a href="#0123_0011">Listing One</A> , page 104.  The error routine in  <a href="#0123_0011">Listing One</A> is used for fatal errors, and concludes with an exit call.  File global array malloclist is of size LDTSIZE, a value that must match the LDT size of the OS286 kernel, as discussed later.<P>
+In pmalloc, createBoundedWindow calls a function that first locates the selector representing the start of the heap, and calculates the 32-bit offset from that to the start of the allocated space.  Using this information, one or more calls to createDataWindow are then used to create the bounding sels.  &quot;One or more?&quot;  you ask.  Yes.  If the allocated space is greater than 64K, it is necessary to set up your own tiling.  createDataWindow simply contains a call to an Ergo &quot;extended service&quot; routine, accessed through software interrupt 21h, function E8h, and subfunction O1h.  Windows so created are disposed of in pfree with a call to deleteSegOrWin, the Ergo-enhanced DOS interrupt 49h.  In practice, the deleteSegOrWin call has to be placed inside a small loop to handle deletion of tiled bounding windows.<P>
+<a href="#0123_0013">Listing Two</A>, page 104, provides a full set of allocation and free routines.  These are a bit more complex than we have discussed.  They have an added &quot;fail soft&quot; feature: If the LDT table becomes &quot;full&quot; as defined in the program by the high-water mark, MAXLDTSIZE, then a private sel is foregone, and bounds checking is not done on that array.   <a href="#0123_0013">Listing Two</A> also features error reporting and flow-trace macros, which you can modify to meet your needs.  When a fatal error occurs, two strings are passed as parameters.  Only the second string is understandable to the end user, but the developer will wish to see both.  The simple error routine shown is for the developer, and is appropriate for text mode but not necessarily graphics mode.<P>
+As mentioned at the outset, you will want to arrange to toggle bounds checking on and off easily.  An elaboration of the scheme shown in <a href="#0123_000a">Example 1(c)</A> does the job.  If you are already using OS286, note that in mid-February a bug was discovered that affects the zeroing of large arrays by Turbo C's calloc and farcalloc.  Contact Ergo for a patch.<P>
+Ergo's default LDT size is 1024.  The low end of the LDT will already be taken up by code and data sels before any dynamic data allocation occurs.  If the program doesn't do much mallocing, the default may be sufficient.  Otherwise, you take a generous guess at the maximum number of memory requests active at any time, round up to the next power of 2, and set LDTSIZE to that value.  A 286 machine, however, can have at most 8192 entries in its LDT.  Thus, a program that has, say, 10,000 simultaneously active dynamic arrays would have to use a more selective method of assigning private sels than simply universal use of pmalloc and pfree. (Note that while Ergo uses the LDT for user sels, Rational Systems uses the GDT; however, the latter is likewise limited to 8192 entries.)<P>
+If LDTSIZE is changed from the default to some other valid value ranging from 128 to 8192, OS286 must be told how large to make the LDT when your program begins execution.  For bound applications, this is done by modifying the kernel's disk file prior to binding it with the distributed program.  The current value of LDTSIZE (and all other setable parameters) can be viewed or modified using 286 SETUP.<P>
+For unbound applications, you can specify the LDTSIZE on the command line during loading of the kernel TSR.  In the latter case, the load image of the kernel, not the disk file, is altered so the change is not sticky across reboots.<P>
+In addition to the LDT, the operating system also maintains for each task a Local Working Table (LWT) which is identical in size to the LDT.  Thus, each unit increase in LDT size ties up 16 bytes of real memory during task execution.  As for other space requirements, the task's Task State Segment (TSS) consumes under 4K, and the operating system needs 1K each for the GDT and the Interrupt Descriptor Table (IDT).<P>
+<h3><a name="0123_000d">Static Arrays and Structures<a name="0123_000d"></h3><P>
+For nondynamic arrays, such as constant strings, there is no convenient centralized mechanism for adding hardware bounds checking.  A decentralized method is shown in <a href="#0123_000a"> Example 1(d)</A>.  It is not necessary to free the sel for a global or explicit static array.  In such cases, the array is allocated at compile time from the data segment (for the huge model the data segment associated with the code module) and never goes away.<P>
+<h3><a name="0123_000e">Conclusion<a name="0123_000e"></h3><P>
+The foregoing methods are adaptable to other static data structures.  In a large program, extensive use of this methodology requires a fair amount of programmer effort, perhaps suggesting use as a debugging tool, to be applied temporarily to suspect data objects.<P>
+For an automatic array of fixed size, whose pointer (and presumably array space) is allocated off the stack, you would at least have to explicitly free the sel at procedure exit.  That is, a call to free(str2) would free up the slot in the LDT.  However, there are additional complexities involving initialization that make this bounds checking technique inconvenient to apply to automatic arrays.<P>
+<h3><a name="0123_000f">Suggested Reading<a name="0123_000f"></h3><P>
+Duncan, Ray, ed.  Extending DOS.  Reading, Mass.: Addison-Wesley, 1990.<P>
+Fried, Stephen.  &quot;Accessing Hardware From 80386 Protected Mode.&quot;  DDJ (May/June, 1990).<P>
+iAPx 286 Programmer's Reference Manual.  Santa Clara, Calif.: Intel Corporation, 1985.<P>
+Williams, Al.  &quot;Roll Your Own DOS Extender.&quot;  DDJ (October/November 1990).<P>
+Williams, Al.  &quot;DOS + 386 = 4 Gigabytes.&quot;  DDJ (July 1990).<P>
+<h3><a name="0123_0010">Products Mentioned<a name="0123_0010"></h3><P>
+OS/286 &amp; OS/386 DOS Extenders ERGO Computing-Extenders One Intercontinental Way Peabody, MA 01960 508-535-7510 Standard version: $695 Virtual memory version: $1490<P>
+Turbo C 2.0 and Borland C++ Borland International 1800 Green Hills Road P.O. Box 660001 Scotts Valley, CA 95067-0001 408-438-5300 Turbo C $149.95 Borland C++ $495<P>
+
+<PRE>
+
+_ARRAY BOUNDS CHECKING WITH TURBO C_
+by Glenn Pearson
+
+
+<a name="0123_0011">
+<a name="0123_0012"></pre><B>[LISTING ONE]</B><pre><a name="0123_0012">
+
+         void *p;
+         void *q;
+
+       /* Make life easier when dealing with segment and offset pointers. */
+          static union {void *A;
+                 struct {unsigned Offset,Segment;} Word; } LrgPtr;
+
+         p = malloc(bytes);
+         if (p EQ NULL) error(&quot;pmalloc: Out of memory space on heap&quot;);
+         LrgPtr.A = q = createBoundedWindow(p,bytes);
+         /* Lower 3 bits are ALWAYS ON; so we can restore them later: */
+         /* Shift to make array smaller, and its length &lt;= LDTSIZE */
+         /* Remember the p-q correspondence: */
+         malloclist[(LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3] = p;
+         return(q); /* q's Offset is zero */
+       }
+
+/*=====================================*/
+       void pfree(void *q)
+         {unsigned i;
+
+         /* Make life easier when dealing with segment and offset pointers. */
+         static union {void *A;
+               struct {unsigned Offset,Segment;} Word; } LrgPtr;
+
+         if (q EQ NULL) return;
+
+         LrgPtr.A = q;
+         if (LrgPtr.Word.Offset != 0)
+           error(&quot;pfree: Attempt to free improper selector&quot;);
+         /* Lower 3 bits of a selector are ALWAYS ON: */
+         i = (LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3;
+         if (malloclist[i] == NULL)
+           error(&quot;pfree: Attempt to free unknown window&quot;);
+         deleteSegOrWin(q); /* First remove bounds-checking window */
+         free(malloclist[i]); /* Then free memory */
+         malloclist[i] = NULL; /* Prevent screw ups */
+       }
+
+
+
+
+<a name="0123_0013">
+<a name="0123_0014"></pre><B>[LISTING TWO]</B><pre><a name="0123_0014">
+
+/*
+* Hardware-assisted Bounds Checking of Dynamic Arrays and Structures:
+* Dynamically allocated arrays and structures do not automatically get a private
+* sel with Turboc C 2.0/Ergo (or Microsoft C/Ergo).  To guarantee a private
+* sel, this routine sets what Ergo calls a &quot;window&quot; over the array.  The private
+* sel is then used for subsequent array accesses, so that bounds checking
+* is performed with no run-time overhead (because the chip hardware does it). By
+* building this functionality into the &quot;pmalloc&quot; (and calloc, etc.) and &quot;pfree&quot;
+* and &quot;pfarfree&quot; routines, all non-static arrays get this ability.
+*
+* NOTE 1: Code shown is for the far memory model, so all pointers are far;
+* Additional explicit casting will be needed for smaller models.
+* NOTE 2: If using Turbo C huge model with osx86, any function call that
+* passes the address of an automatic (stack) variable must have that
+* address explicitly normalized first.  Recommendation: use Microsoft C instead.
+*
+****************************************************************************
+* --- The following bounds-related utility functions are currently private to
+* --- this file, but could be made public as needed:
+*              errorstrcat()
+*          deleteSegOrWin()
+*          createDataWindow()
+*              allocateMultipleWindows()
+*              deleteMultipleWindows()
+*              createBoundedWindow()
+*              checksize()
+*              markPtoQ()
+* --- The following routines provide runtime bounds checking for
+* --- protected mode heap memory allocation.  Each routine has the
+* --- same syntax as the corresponding Turbo C 2.0 call (except &quot;p&quot; prefix)...
+*              pmalloc()
+*              pcalloc()
+*              prealloc()
+*              pfarmalloc()
+*              pfarcalloc()
+*              pfarrealloc()
+*          pfree()
+*              pfarfree()
+***************************************************************************/
+
+#include &lt;alloc.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;dos.h&gt;
+
+/**********************FILE GLOBALS********************************************/
+
+#define private static
+#define forward extern
+#define import extern
+#define export
+#define uint16 unsigned short
+#define uint32 unsigned long int
+#define int16 short
+#define int32 long int
+#define EQ ==
+#define ERRORSTRCAT
+#define ERROR(A,B) errorstrcat(A,B)
+#define ERROUT(A) {printf(&quot;Fatal Error %s.\n&quot;,A);exit(-1);}
+
+/* Compile time debug tracing */
+/* #define TRACE(A) A */
+#define TRACE(A)
+
+#define LDTSIZE 1024
+/* Reserve arbitary slot space at extreme of LDT table for Ergo work
+   space, such as extra windows sometimes needed for malloc */
+#define MAXLDTNUM (LDTSIZE-25)
+/* Assert: MAXLDTNUM &lt;= LDTSIZE */
+#define MAXSEGNUM ((MAXLDTNUM &lt;&lt; 3) &amp; 7)
+
+
+/* Eclipse's default LDT size (in units of number of entries) is 1024.  The low
+end of the LDT will already be taken up by code and data sels, before any
+dynamic data allocation occurs.  If the program doesn't do much mallocing, the
+default may be sufficient.  Otherwise, you take a generous guess as to the
+maximum number of memory requests active at any time, round up to the next
+power of 2, and set LDTSIZE to that value.  However, a 286 machine can have at
+most 8192 entries in its Local Descriptor Table.  Thus, a program that has, say,
+10,000 simultaneously active dynamic arrays would have to use a more selective
+method of assigning private sels than simply universal use of &quot;pmalloc&quot; and
+&quot;pfree&quot;.
+
+LDTSIZE should match the value stored in the os286 kernel.  A larger LDT is
+requested by modifying the kernel (the developer's on-disk .EXE file) by
+specifying, for example:
+     286setup ldtsize 2048
+Valid ldtsize values range from 128 to 8192.  This kernel can be subsequently
+bound in with the distributed program.  The current value of ldtsize (and all
+other settable parameters) can be viewed by:
+     286setup -help
+Alternatively, for unbound applications, one may specify the ldtsize on the
+command line during loading of the kernel TSR:
+     os286 ldtsize 2048
+This would typically be part of a batch file.  Here, the load image of the
+kernel is altered, not the disk file, so the change is not &quot;sticky&quot;. */
+
+void *malloclist[LDTSIZE]; /* K&amp;R promises all values are
+                  initially zero (i.e., NULL) */
+
+/* For createBoundedWindow funtion: */
+#define SEGMENT 0
+#define WINDOW  1
+#define REALSEGMENT 2
+#define REALWINDOW 3
+
+/***************************************************************************/
+
+#ifdef ERRORSTRCAT
+/*======================================================================== */
+void errorstrcat(char *stringA, char *stringB)
+{char sss[90];
+
+ strcpy(sss,&quot;In &quot;);
+ strcat(sss,stringA); strcat(sss,&quot;, &quot;);
+ strcat(sss,stringB); gxerror(sss);
+}
+#endif
+
+/*======================================================================= */
+void private deleteSegOrWin(void *selector)
+/*---------------------------------------------------------------------------
+* Call to DOS delete-segment service, extended by Ergo to include
+* memory &quot;windows&quot; as well.  (Note: Turbo C's free &amp; farfree DO NOT
+* use this call).  Memory must have been allocated by DOS interrrupts
+* 0x48, 0xe7, or 0xe8; 0xe8 is used by createDataWindow routine here.
+* Deleting a window also deletes any child windows.
+*------------------------------------------------------------------------- */
+{ /* regs, sregs, and LrgPtr are declared static to put them into common
+     DATA segment */
+  static union REGS regs;
+  static struct SREGS sregs;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  LrgPtr.A = selector;
+  sregs.es = LrgPtr.Word.Segment; /* Offset doesn't matter */
+  regs.h.ah = 0x49; /* Delete segment or window */
+  intdosx(&amp;regs, &amp;regs, &amp;sregs);
+  if (regs.h.al EQ 7)
+    ERROR(&quot;deleteSegOrWin&quot;,&quot;Delete Segment; Bad Memory Map&quot;);
+  if (regs.h.al EQ 9)
+    ERROR(&quot;deleteSegOrWin&quot;,&quot;Delete Segment; Bad Selector&quot;);
+}
+/* ==================================================================== */
+void private *createDataWindow(char *base, uint32 length)
+/*-------------------------------------------------------------------------
+&quot;createDataWindow&quot; is a call to an Eclipse &quot;extended service&quot; routine,
+accessed through software interrupt E8, Function 01.
+--------------------------------------------------------------------------*/
+{ /* regs, sregs, and LrgPtr are declared static to put them into common
+     DATA segment */
+  static union REGS regs;
+  static struct SREGS sregs;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  regs.h.ah = 0xe8;
+  regs.h.al=1; /* Create Data window */
+  /* si:bx=base; ds=parent selector */
+  LrgPtr.A = base;
+  sregs.ds = LrgPtr.Word.Segment;
+  regs.x.si = 0L; /* parent selector takes care of high-order base */
+  regs.x.bx = LrgPtr.Word.Offset;
+  regs.x.cx = (uint16)((length &gt;&gt; 16) &amp; 0x0000ffff);  /* cx:dx=length in bytes */
+  regs.x.dx = (uint16)(length &amp; 0x0000ffff);
+  intdosx(&amp;regs,&amp;regs,&amp;sregs);
+  LrgPtr.Word.Segment = regs.x.ax; /* Selector or error */
+  LrgPtr.Word.Offset = 0;
+  if (LrgPtr.Word.Segment &gt; MAXSEGNUM)
+    {/* We reserve a little work space at extreme of LDT table; if we've
+     encrouched upon it, back off: */
+     deleteSegOrWin(LrgPtr.A);
+     /* Table is &quot;full&quot; as far as we're concerned */
+     LrgPtr.Word.Segment = regs.x.ax = 21U;
+    }
+  if (regs.x.ax &gt; 26U || regs.x.ax == 21U)
+    return (LrgPtr.A); /* Let caller handle &quot;Descriptor Table Full&quot; error */
+
+  switch (regs.x.ax) {
+   case 9U:
+    ERROR(&quot;createDataWindow&quot;,&quot;Memory allocation; Bad Selector&quot;); break;
+   case 20U:
+    ERROR(&quot;createDataWindow&quot;,&quot;Memory allocation; Bad Type&quot;); break;
+   /* case 21U:  Handled by caller...
+    ERROR(&quot;createDataWindow&quot;,&quot;Memory allocation; Descriptor Table Full&quot;); break;
+    */
+   case 23U:
+    ERROR(&quot;createDataWindow&quot;,&quot;Memory allocation; Need Local Descriptor&quot;); break;
+   case 25U:
+    ERROR(&quot;createDataWindow&quot;,&quot;Memory allocation; Bad Base&quot;); break;
+   case 26U:
+    ERROR(&quot;createDataWindow&quot;,&quot;Memory allocation; Bad Size&quot;); break;
+   default:
+    ERROR(&quot;createDataWindow&quot;,&quot;Memory allocation; Unknown Error&quot;);break;
+  }
+  return(NULL); /* should never get here; quiet compiler warning */
+}
+/* =====================================================================*/
+void private deleteMultipleWindows(char *base, uint16 count)
+/*-----------------------------------------------------------------------
+ * Called with the pointer representing the first (lowest LDT) selector
+ * in a consecutive set of selectors to be deleted, and the count
+ * of the number of selectors in the set.
+ * See deleteSegOrWin for possible errors.
+ *----------------------------------------------------------------------*/
+{ int i;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  if (count == 0) ERROR(&quot;deleteMultipleWindows&quot;,&quot;zero count not valid&quot;);
+
+  LrgPtr.A = base;
+  /* Undocumented Ergo recommendation for tiled windows: delete from
+     highest to lowest.  8 is increment from one LDT entry to next: */
+  LrgPtr.Word.Segment += (count - 1) * 8;
+  for (i=0; i &lt; count; i++) {
+       deleteSegOrWin(LrgPtr.A);
+       LrgPtr.Word.Segment -= 8;
+  }
+}
+/* ==================================================================== */
+void private *allocateMultipleWindows(char *base, uint32 length)
+/*-------------------------------------------------------------------------
+&quot;allocateMultipleWindows&quot; is a call to an Eclipse &quot;extended service&quot; routine,
+accessed through software interrupt 0xEA.  It creates tiled windows,
+using 32K tiles.  The pointer for the first tile is returned.
+(The total number of tiles created is also known, but not returned
+ to the caller at this time.)
+--------------------------------------------------------------------------*/
+{ uint16 numSelectors;
+  /* regs, sregs, and LrgPtr are declared static to put them into common
+     DATA segment */
+  static union REGS regs;
+  static struct SREGS sregs;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  regs.h.ah = 0xea; /* Allocate multiple windows */
+  /* si:bx and cx:dx are 32-bit offsets, not a paragraph address &amp; offset */
+  /* si:bx = stride in bytes = 32K (32K makes for fast math,
+     64K has problems with Turbo C) */
+  /* Maximum legal value is 64K (si = 1, bx = 0) */
+  regs.x.si = 0;
+  regs.x.bx = 0x8000; /* 32K */
+  /* ds is parent selector */
+  LrgPtr.A = base;
+  sregs.ds = LrgPtr.Word.Segment; /*(uint16)((((uint32)base) &gt;&gt; 16) &amp; 0x0000ffff);*/
+  /* cx:dx=length in bytes: */
+  regs.x.cx = (uint16)((length &gt;&gt; 16) &amp; 0x0000ffff);
+  regs.x.dx = (uint16)(length &amp; 0x0000ffff);
+  intdosx(&amp;regs,&amp;regs,&amp;sregs);
+
+  LrgPtr.Word.Segment = regs.x.ax; /* Selector or error */
+  LrgPtr.Word.Offset = 0;
+  if (regs.x.ax == 21U)
+    return (LrgPtr.A); /* Let caller handle &quot;Descriptor Table Full&quot; error */
+
+  numSelectors = regs.x.bx;
+  /* 8 is increment between successive LDT entries: */
+  if ((LrgPtr.Word.Segment + ((numSelectors-1)*8) ) &gt; MAXSEGNUM)
+    {/* We reserve a little work space at extreme of LDT table; if we've
+     encrouched upon it, back off: */
+     deleteMultipleWindows(LrgPtr.A,numSelectors);
+     /* Table is &quot;full&quot; as far as we're concerned */
+     LrgPtr.Word.Segment = 21U;
+     return (LrgPtr.A); /* Let caller handle &quot;Descriptor Table Full&quot; error */
+    }
+
+  if (regs.x.ax &gt; 26U) return (LrgPtr.A); /* Everything OK */
+
+  switch (regs.x.ax) {
+   case 9U:
+    ERROR(&quot;allocateMultipleWindows&quot;,&quot;Memory allocation; Bad Selector&quot;); break;
+   /* case 21U:  Handled by caller...
+    ERROR(&quot;allocateMultipleWindows&quot;,&quot;Memory allocation; Descriptor Table Full&quot;); break;
+    */
+   case 23U:
+    ERROR(&quot;allocateMultipleWindows&quot;,&quot;Memory allocation; Need Local Descriptor&quot;); break;
+   case 27U:
+    ERROR(&quot;allocateMultipleWindows&quot;,&quot;Memory allocation; Bad Stride&quot;); break;
+  }
+  return(NULL); /* should never get here; quiet compiler warning */
+}
+/* ==================================================================== */
+void private *createBoundedWindow(char *base, uint32 length)
+/*-------------------------------------------------------------------------
+&quot;createBoundedWindow&quot; is used with the &quot;pmalloc&quot; and &quot;pfree&quot; routines for
+adding bounds-checking to dynamically-allocated objects.  It features an
+embedded loop of calls to Ergo's &quot;extended DOS&quot; function 0xED, &quot;Get Segment
+or Window Information&quot;.
+
+Besided dynamic allocation checking, this function can also be used for
+bounds-checking of static arrays and structures, such as constant strings.
+There is no centralized mechanism (see article).
+--------------------------------------------------------------------------*/
+{ /* regs, sregs, and LrgPtr are declared static to put them into common
+     DATA segment */
+  static union REGS regs;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+  uint16 type;
+  uint32 offset = 0; /* Offset will accumulate total offset */
+
+  TRACE(printf(&quot;Call to createBoundedWindow\n&quot;);)
+  /* Start with initial selector */
+  LrgPtr.A = base;
+  regs.x.bx = LrgPtr.Word.Segment;
+  /* Work up the inheritence tree until a non-WINDOW is found: */
+  while (TRUE) {
+    /* Next line must be within this loop, since ah is not preserved across
+       the subsequent intdos call: */
+    regs.h.ah = 0xed; /* Call to Get segment or window information */
+    intdos(&amp;regs,&amp;regs);
+    switch (regs.h.al) {
+    case 9U:
+      ERROR(&quot;createBoundedWindow&quot;,&quot;Memory allocation; Bad Selector&quot;);break;
+    case 23U:
+      ERROR(&quot;createBoundedWindow&quot;,&quot;Memory allocation; Need Local Descriptor&quot;);
+      break;
+    }
+    type = regs.h.al;
+    if (type == REALSEGMENT OR type == REALWINDOW)
+      ERROR(&quot;createBoundedWindow&quot;,&quot;Real segment or window found&quot;);
+    /* if ERROR, we will not continue here */
+    /* Assert: type is either SEGMENT or WINDOW  */
+    /* Length in bytes = cx:dx  */
+    length = (((uint32)regs.x.cx) &lt;&lt; 16) + (uint32)regs.x.dx;
+    if (type != WINDOW) break; /* from while */
+    /* For WINDOW type, di has it's parent selector: */
+    regs.x.bx = regs.x.di;
+    /* For WINDOW type, si:bx is the 32 bit offset within the parent: */
+    offset += (((uint32)regs.x.si) &lt;&lt; 16) + (uint32)regs.x.bx;
+  }
+  /* For SEGMENT type, si:bx is the 32-bit linear address of the base of
+     the segment. */
+  /* Add accumulated offset as well */
+  base = (char *)((uint32)regs.x.si &lt;&lt; 16) + (uint32)regs.x.bx + offset;
+
+  /* Now we have the underlying selector:offset location; next,
+     build a new window of just the right size on top of it. */
+
+  if (length &gt; 0x0000ffff)
+    /* If length is greater than 64K, use tiling with 32K windows */
+    return(allocateMultipleWindows(base,length));
+  else
+    return(createDataWindow(base,length));
+}
+/*==========================================================================*/
+void private checksize(uint32 size)
+/*--------------------------------------------------------------------------
+* Unfortunately, Turbo C/Ergo's version of malloc ( &amp; calloc &amp; realloc)
+* delivers a block with a header of 8 bytes (i.e., returns with an offset of
+* 0x0008), so the full 64K is not available.  If we don't check for this,
+* block descriptor header could be overwritten... disaster!
+---------------------------------------------------------------------------*/
+{
+  if (size &gt; 0x0000fff7)
+    ERROR(&quot;checksize&quot;,&quot;Attempt to allocate more than 64K - 8 bytes&quot;);
+}
+/*========================================================================*/
+void private markPtoQ (void *p, uint32 bytes, void *q)
+/*--------------------------------------------------------------------------
+ * This utility routine is used by the allocators to mark the
+ * correspondence between p and q
+ *-------------------------------------------------------------------------*/
+{ /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  void *ptile;
+  uint32 qspot;
+/* 32K: */
+#define TILESIZE 0x00010000
+
+  LrgPtr.A = q;
+  /* Lower 3 bits are ALWAYS ON; so we can restore them later: */
+  /* Shift to make array smaller, and its length &lt;= LDTSIZE */
+  qspot = (LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3;
+  if (bytes &gt; 0x0000ffff) {
+    /* Tiling is indicated by multiple adjacent entries with the
+       same value of p: */
+    while (bytes &gt; TILESIZE) {
+      malloclist[qspot++] = p; /* Remember the p-q correspondence*/
+      bytes = bytes - TILESIZE;
+    }
+    /* Conclude with last partial tile below */
+  }
+  malloclist[qspot] = p; /* Remember the p-q correspondence*/
+  TRACE(printf(&quot;index: %u &quot;,(LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3);)
+  TRACE(printf(&quot;returns 0x%lx\n&quot;,q);)
+}
+/* =========================================================================*/
+void *pmalloc(uint16 bytes)
+{
+  void *p;
+  void *p2;
+  void *q;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot;[pmalloc] want: %u, &quot;,bytes);)
+  checksize((uint32)bytes);
+  p = malloc(bytes);
+
+  if (p EQ NULL) ERROR(&quot;pmalloc&quot;,&quot;Out of memory space on heap&quot;);
+
+  LrgPtr.A = q = createBoundedWindow(p,bytes);
+  if (LrgPtr.Word.Segment == 21U)
+    {/* The local descriptor table is full; &quot;fail soft&quot; by
+       foregoing the pleasure of bounds checking.  When freeing occurs,
+       the decision about whether the pointer refers to a bounds-checking
+       data window like q or just a direct alloc like p is made by viewing the
+       offset.  A data window always has a zero offset.  The odds are
+       1 in 64K that p has a zero offset. */
+    if (((uint32)p &amp; 0x0000ffff) == 0)
+      {/* We have to make sure that p doesn't have a zero offset! */
+   p2 = malloc((uint16)(bytes &amp; 0x0000ffff));
+   /* If we don't succeed next time, periodicity suggests we won't
+     succeed n times.  Just complain and fail */
+   if (((uint32)p2 &amp; 0x0000ffff) == 0)
+     ERROR(&quot;pmalloc&quot;,&quot;Unlikely memory error&quot;);
+
+   free(p);
+   p = p2;
+      }
+    TRACE(printf(&quot;returns 0x%lx\n&quot;,p);)
+    return(p);
+  }
+  markPtoQ(p, (uint32)bytes, q);
+  return(q);
+}
+/* =========================================================================*/
+void *pcalloc(uint16 nitems, uint16 bytes)
+{
+  void *p;
+  void *p2;
+  void *q;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot;[pcalloc] want: %u * %u = %lu, &quot;,
+    nitems,bytes,(uint32)nitems*(uint32)bytes);)
+  checksize((uint32)nitems*(uint32)bytes); /*Could be way over 64K - 8 bytes */
+  p = calloc(nitems,bytes);
+
+  if (p EQ NULL) ERROR(&quot;pcalloc&quot;,&quot;Out of memory space on heap&quot;);
+
+  LrgPtr.A = q = createBoundedWindow(p,(uint32)nitems*(uint32)bytes);
+  if (LrgPtr.Word.Segment == 21U)
+    {/* The local descriptor table is full; &quot;fail soft&quot; by
+       foregoing the pleasure of bounds checking.  When freeing occurs,
+       the decision about whether the pointer refers to a bounds-checking
+       data window like q or just a direct alloc like p is made by viewing the
+       offset.  A data window always has a zero offset.  The odds are
+       1 in 64K that p has a zero offset. */
+    if (((uint32)p &amp; 0x0000ffff) == 0)
+      {/* We have to make sure that p doesn't have a zero offset! */
+   p2 = calloc(nitems,bytes);
+   /* If we don't succeed next time, periodicity suggests we won't
+     succeed n times.  Just complain and fail */
+   if (((uint32)p2 &amp; 0x0000ffff) == 0) ERROR(&quot;pcalloc&quot;,&quot;Unlikely memory error&quot;);
+
+   free(p);
+   p = p2;
+      }
+    TRACE(printf(&quot;returns 0x%lx\n&quot;,p);)
+    return(p);
+  }
+
+  markPtoQ(p, (uint32)bytes, q);
+  return(q);
+}
+/*=========================================================================*/
+void *prealloc(void *block, uint16 newsize)
+{ void *p;
+  void *p2;
+  void *q;
+  int16 i;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot; [prealloc] with: 0xlx, want: %u, &quot;,block,newsize);)
+  if (block == NULL) return(NULL);
+
+  checksize((uint32)newsize);
+  LrgPtr.A = block;
+  if (LrgPtr.Word.Offset != 0)
+     /* Assume no bounds protection for this allocation */
+     return(realloc(block,newsize));
+
+  /* Lower 3 bits of a selector are ALWAYS ON: */
+  i = (LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3;
+  TRACE(printf(&quot;index: %u &quot;,i);)
+  if (malloclist[i] == NULL)
+    ERROR(&quot;prealloc&quot;,&quot;Attempt to reallocate unknown window&quot;);
+
+  if (newsize == 0)
+    {deleteSegOrWin(block); /* First remove bounds-checking window */
+     realloc(malloclist[i],newsize); /* Should return NULL */
+     malloclist[i] = NULL; /* Prevent screw ups */
+     TRACE(printf(&quot;returns NULL\n&quot;);)
+     return(NULL);
+     }
+
+  p = realloc(malloclist[i],newsize); /* adjust memory */
+  if (p == NULL)
+    {TRACE(printf(&quot;returns NULL\n&quot;);)
+    return(NULL); /* Couldn't do it */
+    }
+
+  malloclist[i] = NULL; /* Prevent screw ups */
+  /* Since realloc may change pointer location as well as size, we'll
+     just throw away the old bounds window and get a new one */
+  deleteSegOrWin(block);
+  LrgPtr.A = q = createBoundedWindow(p,newsize);
+  if (LrgPtr.Word.Segment == 21U)
+    {/* The local descriptor table is full; &quot;fail soft&quot; by
+       foregoing the pleasure of bounds checking.  When freeing occurs,
+       the decision about whether the pointer refers to a bounds-checking
+       data window like q or just a direct alloc like p is made by viewing the
+       offset.  A data window always has a zero offset.  The odds are
+       1 in 64K that p has a zero offset. */
+    if (((uint32)p &amp; 0x0000ffff) == 0)
+      {/* We have to make sure that p doesn't have a zero offset! */
+   p2 = malloc(newsize);
+   /* If we don't succeed next time, periodicity suggests we won't
+     succeed n times.  Just complain and fail */
+   if (((uint32)p2 &amp; 0x0000ffff) == 0) ERROR(&quot;prealloc&quot;,&quot;Unlikely memory error&quot;);
+
+   free(p);
+   p = p2;
+      }
+    TRACE(printf(&quot;returns 0x%lx\n&quot;,p);)
+    return(p);
+  }
+
+  markPtoQ(p, (uint32)newsize, q);
+  return(q);
+}
+/*==========================================================================*/
+void *pfarmalloc(uint32 bytes)
+{
+  void *p;
+  void *p2;
+  void *q;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot;[pfarmalloc] want: %lu, &quot;,bytes);)
+  p = farmalloc(bytes);
+  if (p EQ NULL) ERROR(&quot;pfarmalloc&quot;,&quot;Out of memory space on heap&quot;);
+
+  LrgPtr.A = q = createBoundedWindow(p,bytes);
+  if (LrgPtr.Word.Segment == 21U)
+    {/* The local descriptor table is full; &quot;fail soft&quot; by
+       foregoing the pleasure of bounds checking.  When freeing occurs,
+       the decision about whether the pointer refers to a bounds-checking
+       data window like q or just a direct alloc like p is made by viewing the
+       offset.  A data window always has a zero offset.  The odds are
+       1 in 64K that p has a zero offset. */
+    if (((uint32)p &amp; 0x0000ffff) == 0)
+      {/* We have to make sure that p doesn't have a zero offset! */
+   p2 = farmalloc(bytes);
+   /* If we don't succeed next time, periodicity suggests we won't
+     succeed n times.  Just complain and fail */
+   if (((uint32)p2 &amp; 0x0000ffff) == 0)
+     ERROR(&quot;pfarmalloc&quot;,&quot;Unlikely memory error&quot;);
+
+   free(p);
+   p = p2;
+      }
+    TRACE(printf(&quot;returns 0x%lx\n&quot;,p);)
+    return(p);
+  }
+  markPtoQ(p, bytes, q);
+  return(q);
+}
+/*==========================================================================*/
+void *pfarcalloc(uint32 nitems, uint32 bytes)
+{
+  void *p;
+  void *p2;
+  void *q;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot;[pfarcalloc] want: %lu * %lu = %lu, &quot;,nitems,bytes,nitems*bytes);)
+  /*  We won't check to see if (nitems * bytes) overflows uint32;
+      we'll let farcalloc do that job */
+  p = farcalloc(nitems, bytes);
+  if (p EQ NULL) ERROR(&quot;pfarcalloc&quot;,&quot;Out of memory space on heap&quot;);
+
+  LrgPtr.A = q = createBoundedWindow(p,nitems*bytes);
+  if (LrgPtr.Word.Segment == 21U)
+    {/* The local descriptor table is full; &quot;fail soft&quot; by
+       foregoing the pleasure of bounds checking.  When freeing occurs,
+       the decision about whether the pointer refers to a bounds-checking
+       data window like q or just a direct alloc like p is made by viewing the
+       offset.  A data window always has a zero offset.  The odds are
+       1 in 64K that p has a zero offset. */
+    if (((uint32)p &amp; 0x0000ffff) == 0)
+      {/* We have to make sure that p doesn't have a zero offset! */
+   p2 = farcalloc(nitems, bytes);
+   /* If we don't succeed next time, periodicity suggests we won't
+     succeed n times.  Just complain and fail */
+   if (((uint32)p2 &amp; 0x0000ffff) == 0)
+     ERROR(&quot;pfarmalloc&quot;,&quot;Unlikely memory error&quot;);
+
+   free(p);
+   p = p2;
+      }
+    TRACE(printf(&quot;returns 0x%lx\n&quot;,p);)
+    return(p);
+  }
+  markPtoQ(p, bytes, q);
+  return(q);
+}
+
+/*=========================================================================*/
+void *pfarrealloc(void *block, uint32 newsize)
+{ void *p;
+  void *p2;
+  void *q;
+  int16 i;
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot;[pfarrealloc] with 0x%lx, want: %lu, &quot;,block, newsize);)
+  if (block EQ NULL) return(NULL);
+
+  LrgPtr.A = block;
+  if (LrgPtr.Word.Offset != 0)
+     /* Assume no bounds protection for this allocation */
+     return(farrealloc(block,newsize));
+
+  /* Lower 3 bits of a selector are ALWAYS ON: */
+  i = (LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3;
+  TRACE(printf(&quot;index: %u &quot;,i);)
+  if (malloclist[i] == NULL)
+    ERROR(&quot;pfarrealloc&quot;,&quot;Attempt to reallocate unknown window&quot;);
+
+  if (newsize == 0)
+    {deleteSegOrWin(block); /* First remove bounds-checking window */
+     farrealloc(malloclist[i],newsize); /* Should return NULL */
+     malloclist[i] = NULL; /* Prevent screw ups */
+     TRACE(printf(&quot;returns NULL\n&quot;);)
+     return(NULL);
+     }
+
+  p = (void *)farrealloc(malloclist[i],newsize); /* adjust memory */
+  if (p == NULL)
+    {TRACE(printf(&quot;returns NULL\n&quot;);)
+     return(NULL); /* Couldn't do it */
+     }
+
+  malloclist[i] = NULL; /* Prevent screw ups */
+  /* Since realloc may change pointer location as well as size, we'll
+     just throw away the old bounds window and get a new one */
+  deleteSegOrWin(block);
+  LrgPtr.A = q = createBoundedWindow(p,newsize);
+  if (LrgPtr.Word.Segment == 21U)
+    {/* The local descriptor table is full; &quot;fail soft&quot; by
+       foregoing the pleasure of bounds checking.  When freeing occurs,
+       the decision about whether the pointer refers to a bounds-checking
+       data window like q or just a direct alloc like p is made by viewing the
+       offset.  A data window always has a zero offset.  The odds are
+       1 in 64K that p has a zero offset. */
+    if (((int32)p &amp; 0x0000ffff) == 0)
+      {/* We have to make sure that p doesn't have a zero offset! */
+   p2 = farmalloc(newsize);
+   /* If we don't succeed next time, periodicity suggests we won't
+     succeed n times.  Just complain and fail */
+   if (((int32)p2 &amp; 0x0000ffff) == 0) ERROR(&quot;pfarrealloc&quot;,&quot;Unlikely memory error&quot;);
+
+   free(p);
+   p = p2;
+      }
+    TRACE(printf(&quot;returns 0x%lx\n&quot;,p);)
+    return(p);
+  }
+  markPtoQ(p, newsize, q);
+  return(q);
+}
+/*==========================================================================*/
+void pfree(void *q)
+/*--------------------------------------------------------------------------
+&quot;pfree&quot; is called with a selector q, which is either an Ergo data window
+pointer used for bounds checking, or (less routinely) simply the pointer
+returned directly by malloc.  Examining the low 16 bits determines
+which.  For a window, we look up the stored value of the corresponding
+malloc pointer (which is a selector, not the real physical address), and
+q's slot in the Local Descriptor Table is freed for use by subsequent
+allocations.
+
+In any event, Turbo C's &quot;free&quot; is called with the malloc pointer.
+--------------------------------------------------------------------------- */
+  {uint16 i;
+   void *p;
+
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot;[pfree] with: 0x%lx, &quot;,q);)
+  if (q EQ NULL) return;
+
+  LrgPtr.A = q;
+  if (LrgPtr.Word.Offset != 0)
+     /* Assume no bounds protection for this allocation */
+    {free(q); /* free memory */
+     TRACE(printf(&quot;\n&quot;);)
+     return;
+     }
+  /* Lower 3 bits of a selector are ALWAYS ON: */
+  i = (LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3;
+  TRACE(printf(&quot;index: %u\n&quot;,i);)
+  if ((p = malloclist[i]) == NULL)
+    ERROR(&quot;pfree&quot;,&quot;Attempt to free unknown window&quot;);
+
+ /* First remove bounds-checking window(s): */
+  while (p == malloclist[i]) {
+    deleteSegOrWin(LrgPtr.A);
+    LrgPtr.Word.Segment++; /* q may be made of multiple tiles */
+    malloclist[i++] = NULL; /* Prevent screw ups */
+  }
+  /* Turbo C's &quot;free&quot; call does not call DOS 0x49 (the equivalent of
+     deleteSegOrWin); if it did, then the deleteSegOrWin(q) call might
+     be unnecessary, since q is in some sense a child of malloclist[i].addr) */
+  free(p); /* free memory */
+}
+/*==========================================================================*/
+void pfarfree(void *q)
+/*--------------------------------------------------------------------------
+&quot;pfarfree&quot; is called with a selector q, which is either an Eclipse data window
+pointer used for bounds checking, or (less routinely) simply the pointer
+returned directly by farmalloc.  Examining the low 16 bits determines
+which.  For a window, we look up the stored value of the corresponding
+farmalloc pointer (which is a selector, not the real physical address), and
+q's slot in the Local Descriptor Table is freed for use by subsequent
+allocations.
+
+In any event, Turbo C's &quot;farfree&quot; is called with the farmalloc pointer.
+--------------------------------------------------------------------------- */
+  {uint16 i;
+   void *p;
+
+  /* Make life easier when dealing with segment and offset pointers. */
+  static union {void *A;
+    struct {uint16 Offset,Segment;} Word; } LrgPtr;
+
+  TRACE(printf(&quot;[pfarfree] with: 0x%lx, &quot;,q);)
+  if (q EQ NULL) return;
+
+  LrgPtr.A = q;
+  if (LrgPtr.Word.Offset != 0)
+     /* Assume no bounds protection for this allocation */
+    {farfree(q); /* free memory */
+     TRACE(printf(&quot;\n&quot;);)
+     return;
+     }
+  /* Lower 3 bits of a selector are ALWAYS ON: */
+  i = (LrgPtr.Word.Segment &amp; ~7) &gt;&gt; 3;
+  TRACE(printf(&quot;index: %u\n&quot;,i);)
+  if ((p = malloclist[i]) == NULL)
+    ERROR(&quot;pfarfree&quot;,&quot;Attempt to free unknown window&quot;);
+
+ /* First remove bounds-checking window(s): */
+  while (p == malloclist[i]) {
+    deleteSegOrWin(LrgPtr.A);
+    LrgPtr.Word.Segment++; /* q may be made of multiple tiles */
+    malloclist[i++] = NULL; /* Prevent screw ups */
+  }
+  /* Turbo C's &quot;free&quot; call does not call DOS 0x49 (the equivalent of
+     deleteSegOrWin); if it did, then the deleteSegOrWin(q) call might
+     be unnecessary, since q is in some sense a child of malloclist[i].addr) */
+  farfree(p); /* free memory */
+}
+/*==========================================================================*/
+</pre>
+
+<HR><P>Copyright &copy; 1991, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

@@ -1,0 +1,105 @@
+<html>
+<META NAME="year" CONTENT="1998">
+<head>
+<title>Interrupt Behavior in Windows NT</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Interrupt Behavior in Windows NT</h1>
+
+<p><i>Dr. Dobb's Journal</i> April 1998
+</p>
+<h2>Implications for real-time systems</h2>
+
+<h3>By Dale Roberts</h3>
+
+<I>Dale works with data acquisition and control software at the Ocular Motor Vestibular Laboratory of The Johns Hopkins University School of Medicine. He can be reached at roberts@ishtar.med.jhu.edu.</I>
+
+<hr>
+
+<p>Debates over Windows NT's suitability to real-time applications are ongoing in the programming community. Unfortunately, hard data regarding NT's real-time responsiveness is not readily available. Documentation indicates that hardware interrupts have a fixed priority hierarchy. Empirical testing on a particular platform indicates otherwise. While NT's average interrupt latency is quite good (on the order of a few microseconds on a fast Pentium), its worst-case latency is not easily predictable and can be on the order of several milliseconds, depending on which NT platform (80x86, Alpha, single processor, multiprocessor, and so on) and which system drivers you use. If a device requires consistent, prompt response to its interrupts, then long latencies, even if they occur only occasionally, will cause big problems.</p>
+
+<p>To help clear up the confusion surrounding NT's interrupt handling abilities, I developed DOIRQ, a software tool that does a black-box analysis of NT's interrupt system and illuminates its problems and limitations, as well as its great potential. The tool (available electronically; see "Resource Center," page 3) can be used to demonstrate two bugs in NT's single-processor, 80x86 Hardware Abstraction Layer (HAL) that, under certain conditions, cause interrupts to be delayed or handled out of order. This is important because the bugs can cause high-priority interrupts to be delayed by low-priority interrupts and, therefore, reduce NT's usefulness for drivers that require quick, deterministic interrupt handling.</p>
+
+<h3>Background</h3>
+
+<p>NT attempts to impose fixed priorities on hardware interrupts: from IRQ0 highest to IRQ15 lowest. This differs from hardware-imposed priorities: IRQ0 (highest), 1, 8, 9,...,14, 15, 3, 4, 5, 6, 7. In my early testing of NT's interrupt latency, I put my driver on IRQ3 (the highest available to a driver), and noticed that it experienced occasional delays on the order of several milliseconds (several hundred times longer than expected). Tracing through the interrupts revealed that the high-priority IRQ3 service routine was sometimes being delayed by the low-priority IRQ14, which belonged to the ATAPI driver (NT's commonly used IDE driver). The cause of this mix-up in priorities was not clear, but it looked like it occurred when several interrupts were requesting service simultaneously.</p>
+
+<p>To recreate the overlapped-interrupts situation, I needed to generate hardware interrupts under software control while I monitored the status of the interrupt controllers. I came across the interrupt edge/level registers in the PCI chipset data book. These registers, present on EISA and PCI machines, allow the operating system to select the hardware interrupt triggering method individually for each interrupt. Experimentation showed that I could generate interrupts by twiddling the bits back and forth between edge and level mode. Using this quirk of the PCI chipset, the accompanying DOIRQ driver and GENIRQ application (both available electronically) can generate just about any hardware interrupt under software control.</p>
+
+<p>DOIRQ is necessarily platform specific, since the bug that it highlights is in NT's HAL. The HAL is essentially the device driver for the system motherboard. It isolates the NT kernel from platform dependencies. Each hardware platform has its own HAL version. The multiprocessor HAL, for example, is different from the single-processor 80x86 HAL discussed in this article. Although no knowledge of NT internals is used, the programs do make assumptions about the 80x86 processor and standard PC motherboard architectures.</p>
+
+<p>The DOIRQ driver should not be taken as an example of a proper NT device driver. It serves no useful purpose, other than as a diagnostic tool. In fact, DOIRQ could be taken as an example of all the things you should not do in an NT driver. Seasoned NT driver writers will cringe at sight of the code: It is highly nonportable, doesn't register all resources, doesn't check for or handle all possible errors, directly accesses peripheral hardware that may be in use by another driver, accesses system/motherboard registers, boosts the priority of an arbitrary interrupt, hooks the Interrupt Descriptor Table (IDT) to redirect interrupts to its own assembly-language handler, assumes the presence of certain hardware, makes use of an undocumented quirk in a specific motherboard chip, and more. I'm guessing that DOIRQ would not meet the requirements of the Microsoft logo program.</p>
+
+<h3>The 8259 Interrupt Controller</h3>
+
+<p>The 8259 interrupt controller has several internal registers that affect its operation. The three important registers for this application are the Interrupt Request Register (IRR), In Service Register (ISR), and Interrupt Mask Register (IMR). The bits in the IRR always indicate when one of the eight interrupt lines is signaled (when a hardware peripheral is requesting service), regardless of the state of the other registers. </p>
+
+<p>By setting a bit in the IMR, service for an IRQ can be inhibited. The bits in the IRR will still reflect the presence of a pending request for service, but if the interrupt is masked, nothing further happens; the 8259 will not respond until the mask is cleared. </p>
+
+<p>Bits in the ISR are set after the 8259 activates the processor's interrupt line and the processor has acknowledged an interrupt. The interrupt acknowledgment occurs entirely in hardware and is not under software control, except that software can suspend acknowledgment of all interrupts by clearing the processor's interrupt flag. The bits in the ISR are cleared when software issues an End Of Interrupt (EOI) command to the 8259. The ISR is referenced by the 8259's internal priority controller. It keeps track of which interrupts are in service so that when an IRQ comes in, it will not cause an interrupt to the processor until all higher-priority interrupt service routines have issued an EOI.</p>
+
+<h3>The Output</h3>
+
+<p>All of the trace messages that GENIRQ displays originate within the DOIRQ interrupt handler. DOIRQ simply puts the trace information into a buffer, and GENIRQ displays the traces after all interrupt activity has completed. It is helpful to see the location of the <i>Trace()</i> calls within the interrupt handler. In <a name="re1"><a href="9804ge1.htm">Example 1</A>, which is a pseudocode representation of the interrupt handler, you can see that the interrupt handler generates more interrupts, thus recreating the overlapped-interrupts situation.</p>
+
+<p>The first run is an example of how NT correctly preempts lower-priority interrupts when higher-priority interrupts are generated. The first column in <a name="rf1"><a href="9804gf1.htm">Figure 1</A> indicates which of the <i>Trace()</i> calls originated the trace entry. The second column, which is only present in a <i>Gen</i> message, shows the hexadecimal bitmask for the interrupt that was generated. The third column shows which IRQ was being serviced when the trace was generated. The next three columns show the pertinent registers from the 8259 in hexadecimal format. The eight-bit port values from the two chips are concatenated into one 16-bit value for easy display. The lower eight bits are from the first 8259 (which handles IRQ0 to IRQ7), and the upper eight bits are from the second 8259 (which handles IRQ8 to IRQ15). The "IF" column shows the status of the interrupt flag when the trace was entered: A zero indicates that interrupts were disabled. The last column shows the time between the trace calls (including approximately 6.5 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec of overhead for the trace call itself), giving you a rough gauge of the time taken by NT's interrupt-handling code. These runs were performed on a Pentium 120.</p>
+
+<p>The first line in <a href="9804gf1.htm">Figure 1</A> shows that the service routine for IRQ10 is called. This trace is generated upon entering the interrupt handler, after NT has done its initial handling of the interrupt. While looking through the output, keep in mind that when an interrupt occurs, control does not transfer directly to the driver's interrupt handler. Rather, NT gets control first and does some bookkeeping and interaction with the 8259s, then calls the driver's interrupt handler with a regular function call. NT also gains control when the handler completes, and when it generates other interrupts. This is reflected in the longer intertrace times.</p>
+
+<p>The ISR on the first line is all zeros, which indicates that NT already acknowledged the interrupt with an EOI command to the 8259. If the EOI had not been issued, the bits in the ISR would still be set. By issuing the EOI before the interrupt service routine starts, NT attempts to impose its own priorities. Since the ISR is cleared out, during the IRQ10 service routine, any incoming interrupt that isn't masked by the IMR will receive the immediate attention of the NT interrupt-handling code. NT can then determine whether the interrupt should be serviced, rather than letting the 8259 hardware determine the priorities. The IRR is clear, indicating that no interrupt request lines are active. You can see from the IMR that interrupts 6, 12, and 13 are masked off by NT (since there are no drivers using them). The "IF" column indicates that interrupts were enabled during this trace.</p>
+
+<p>The second line shows the trace just after IRQ9 is generated, but while interrupts are still disabled (note IF 0). The <i>Gen</i> line shows the effect of the interrupt on the IRR. The IRR shows IRQ2 and IRQ9 active. Since IRQ9 is on the second 8259, it is cascaded through IRQ2, which causes IRQ2 to also become active. No bits are set in the ISR yet, because interrupts are still disabled and the processor has not yet acknowledged the interrupt request. Just after the <i>Gen</i> trace, the interrupts are enabled. This causes the processor to see the IRQ9 request, acknowledge it, and transfer control to NT's interrupt code. NT correctly determines that IRQ9 has higher priority than IRQ10, so it gets serviced immediately, interrupting the IRQ10 service routine, as in the third line.</p>
+
+<p>IRQ9 generates an IRQ7. IRQ7 immediately interrupts IRQ9. Then IRQ7 generates an IRQ3 that is immediately serviced. There are no more entries in the interrupt queue, so IRQ3 simply ends, transferring control back to IRQ7, which terminates and returns control to IRQ9, which ends and finally lets poor IRQ10 finish.</p>
+
+<h3>The IRQ2 Bug</h3>
+
+<p><a name="rf2"><a href="9804gf2.htm">Figure 2</A> is an example of what can go wrong when the 8259 hardware priorities interfere with NT's desired software priorities.</p>
+
+<p>IRQ5 first generates the IRQ10, which, since it is of lower priority, does not get immediate service. Next, IRQ5 generates an IRQ3. The IRQ3 bit is active in the IRR. You can see that the IRQ10 has moved to the ISR, and interrupts at and below IRQ5 have been masked off. Next comes the <i>Leave</i> line. Whoops! What happened here? IRQ3 should have been serviced immediately, before the IRQ5 service routine completed, because IRQ3 has a higher priority than IRQ5. </p>
+
+<p>On the second <i>Gen</i> line (for IRQ3), the IRR shows that IRQ3 is requesting service. But the ISR shows that IRQ2 (the cascade from the second 8259, triggered by the IRQ10) has not yet received an EOI command. This prevents all interrupts on the second 8259 and interrupts above IRQ2 on the first 8259 from receiving service. This means that the IRQ3 request will not generate an interrupt until IRQ10 (and thus also IRQ2) receives an EOI command. After the <i>Gen</i> line for IRQ3, the processor (and therefore NT) has no idea that IRQ3 has requested service. You can see that the time between the second <i>Gen</i> and the <i>Leave</i> traces is short (just long enough to account for the overhead of the trace itself); NT has not seen or serviced the IRQ3 interrupt. The 8259 has blocked IRQ3 from being serviced, because the higher-priority IRQ2 (caused by IRQ10 on the second 8259) has not finished service yet. On the <i>Leave</i> IRQ5 line, nothing has changed in the 8259 registers. IRQ3 has not yet been acknowledged. NT has not taken control. Only after IRQ5 exits and NT gets control again do IRQ10 and IRQ2 receive the EOI command from NT. This clears out the bits in the ISR, which then allows IRQ3 to proceed. After the IRQ3 service is complete, IRQ10 is serviced.</p>
+
+<p>The higher-priority IRQ3 was delayed until the lower-priority IRQ5 was complete. This example highlights the basic problem. Since NT does not immediately mask off and acknowledge the lower-priority interrupts on the second 8259, IRQ3 through IRQ15 are effectively masked off in hardware by the IRQ2 bit left set in the ISR.</p>
+
+<p>Two more examples that you might want to try are <i>genirq 7 10 11 3</i>. You'll see that IRQ10 is serviced and completes before IRQ3 is ever called. <i>genirq 10 10 3</i> shows that it takes only one long interrupt routine to cause problems.</p>
+
+<h3>The Boosted-Priority Bug</h3>
+
+<p>If you try to boost the priority of your interrupt to the highest-available level, you will run up against a different problem and still will be vulnerable to the IRQ2 bug. If you place an exclamation point after an IRQ number on the GENIRQ command line, the IRQ is boosted to the highest priority, above even the system timer and keyboard. Try <i>genirq 3 5!</i> to see that the boosted IRQ5 correctly preempts IRQ3. And <i>genirq 5! 3</i> shows that IRQ3 correctly does not preempt the boosted IRQ5. If a third interrupt source is added, a problem emerges; see <a name="rf3"><a href="9804gf3.htm">Figure 3</A>.</p>
+
+<p>As with the IRQ2 bug, the problem occurs when a same- or lower-priority interrupt is received during the execution of an interrupt routine. In this case, the boosted-priority IRQ5 should have been serviced immediately, preempting IRQ3. However, the IMR registers show that when IRQ7 was received, NT masked off all interrupts of priority less than or equal to IRQ3, including, incorrectly, IRQ5. NT did not take into account the boosted priority of IRQ5 when it masked off interrupts. This problem occurs without involving the second 8259 at all. NT is responsible for updating the IMRs, so this is entirely a software problem. When IRQ5 was allocated with the boosted priority, the interrupt masks should have been recalculated to take this into account.</p>
+
+<p>Again, a single, overlapping interrupt can cause the problem, as <i>genirq 3 3 5!</i> shows. <i>genirq 10 10 5!</i> shows that boosting an interrupt's priority does not get around the IRQ2 bug.</p>
+
+<h3>The Delay</h3>
+
+<p>The aforementioned traces show the underlying source of the problem but don't illustrate the resulting performance penalty. It might seem that the chances of two interrupts overlapping are remote. But, as the timer function demonstrates, overlaps are likely to occur. To highlight the impact of the IRQ2 problem, I included an interrupt timer in DOIRQ/GENIRQ that allows you to detect worst-case interrupt delays by using the serial port as a periodic interrupt source.</p>
+
+<p>The timer function (which is started after the interrupt traces are complete) really shows interrupt "delays," not interrupt latency. Because it can't determine exactly when the interrupt was triggered, it can't measure the latency directly. You can get a good idea of worst-case interrupt latencies by noting the time <i>between</i> two consecutive interrupts. This time should remain relatively constant if there are no significant interrupt latencies. Large, spurious latencies will show up as a gap between two consecutive interrupts, and we'll see it reflected in the <i>Max</i> value in the GENIRQ output.</p>
+
+<p>The serial port is set for an interrupt speed of 5760 times per second, yielding an inter-interrupt interval of about 173 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec. NT handles this with no problem, for the most part. <i>Max</i> usually works its way up to about 210 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec pretty quickly. If I initiate some disk drive activity by copying a multimegabyte file, the <i>Max</i> value invariably shoots up above 1000 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec. This is due to the IRQ2 bug in conjunction with the long time that the ATAPI driver spends in its interrupt routine at IRQ14 or IRQ15. A surefire way to get the <i>Max</i> value to go up is to copy a large file from the IDE CD-ROM to the IDE hard drive. <i>Max </i>will quickly go above 2000 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec. If NT's interrupt priorities were handled correctly, then the IRQ3 routine should never see these long latencies.</p>
+
+<p>The delay timer also keeps track of the number of delays above 400 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec, and above 1000 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec (the count for &gt;400 includes those that were &gt;1000). This gives you an idea of how frequently the delays occur. <a name="re2"><a href="9804ge2.htm">Example 2</A>(a) is a snapshot of the timer information line while the system is otherwise idle.</p>
+
+<p>The <i>Cur</i> time is near the expected value, and the <i>Max</i> time is about 40 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec higher. There have been no long delays yet, so the &gt;400 and &gt;1000 counters are zero. The next snapshot was taken after copying an 8.3-MB file from the CD-ROM to the hard drive. The transfer took about 17 seconds. </p>
+
+<p><a href="9804ge2.htm">Example 2</A>(b) shows a maximum delay of around 2000 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec, with 187 delays above 400 <img src="mu.gif" alt="[mu/micro]" align=absmiddle width="8" height="13">sec, and 122 delays over one millisecond. The long delays occurred in bursts, during hard drive activity. If you have a SCSI disk drive and CD-ROM, you probably won't see such large delays. Most SCSI device drivers probably don't spend too much time in their interrupt routines, and the interrupt might be on the first 8259, avoiding the IRQ2 bug. Some motherboard vendors supply alternate IDE drivers that are tuned to their specific PCI chipsets. These replacement drivers may also have better interrupt characteristics than the ATAPI driver.</p>
+
+<h3>The Solution?</h3>
+
+<p>Clearly, the bugs are a problem for real-time systems that require fast, deterministic interrupt response. Interrupts are not dropped; all interrupts receive service eventually. The bugs only cause temporal failures, but in a hard real-time system, this is a serious problem. Still, NT is not marketed as a hard real-time system, and the documentation never actually claims that NT delivers deterministic, predictable interrupt latencies.</p>
+
+<p>It could be argued that the priority-boost "bug" isn't really a bug at all, since the documentation does not state that you can boost the priority of any interrupt arbitrarily high. It claims only that using this mechanism will keep a driver's interrupt routines internally synchronized -- which it does. But as long as the priority-boost mechanism is not fully implemented, it will not be possible to get deterministic interrupt response for an arbitrary interrupt line: You'll be stuck with the interrupt priorities dictated by NT.</p>
+
+<p>The diagnostic tool I've presented lets you monitor NT's interrupt behavior in current and future releases of NT, and to view worst-case interrupt delays to help you determine whether or not NT will suit your needs. It will be interesting to see if these problems remain in the forthcoming NT 5.0. Whether you choose to call these problems "bugs" is beside the point. Clearly, NT would be a more widely useful operating system if these problems were eliminated.</p>
+
+<p><b>DDJ</b></p>
+
+
+<HR><I>Copyright &copy; 1998, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

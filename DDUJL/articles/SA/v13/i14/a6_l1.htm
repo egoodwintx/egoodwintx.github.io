@@ -1,0 +1,191 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v13, i14: Listing 1 svm.finish</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a6.htm">Article</a></span></td>
+		<td><span class="navbarLink">Listing 1</span></td>
+		<td><a href="../../../../source/SA/2004/dec2004.tar"><b class=codeListing>dec2004.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> <h2><B>Listing 1 </B><I>svm.finish</i></h2>
+            <p> 
+            <pre>#/sbin/sh
+#
+# svm.finish: Custom JumpStart Finish script to convert the root disk 40
+#             Solaris Volume Manager (a.k.a. Solstice DiskSuite or SDS)
+#
+
+#
+# Enviroment Variables &amp; Setup
+#
+PATH=/usr/sbin:/usr/bin
+
+ROOT_SLICE=s0
+SWAP_SLICE=s1
+VAR_SLICE=s3
+METADB_SLICE=s7
+
+ROOT_MIRROR=d10
+ROOT_PLEX=d11
+ROOTMIRROR_PLEX=d12
+SWAP_MIRROR=d20
+SWAP_PLEX=d21
+SWAPMIRROR_PLEX=d22
+VAR_MIRROR=d30
+VAR_PLEX=d31
+VARMIRROR_PLEX=d32
+
+BOOTDISK=`echo ${SI_ROOTDISK} | sed "s/..$//"`
+DISKLIST=`echo ${SI_DISKLIST} | sed "s/,/ /g"`
+
+# Select first non-rootdisk as the mirrordisk
+for item in `echo ${DISKLIST}`
+do
+    if [ ${item} != ${BOOTDISK} ]; then
+        MIRRORDISK=${item}
+        break
+    fi
+done
+
+# Create RC Script
+
+cat &lt;&lt; EndOfMainScript &gt; /a/etc/rc3.d/S99svm_initial_config
+#!/bin/sh
+#
+# /etc/rc3.d/S99svm_initial_config
+#
+
+#
+# Enviroment Variables &amp; Setup
+#
+PATH=/usr/sbin:/usr/bin
+
+# Add the pre-Solaris 8 SDS location to the path if necessary
+if [ -x /usr/opt/SUNWmd/sbin/metainit ]; then
+    PATH=\$PATH:/usr/opt/SUNWmd/sbin
+fi
+
+#
+# function: _Exit()
+#
+_Exit()
+{
+    # Move this script out of the way
+    mv \$0 /var/tmp
+
+    # Reboot
+    init 6
+}
+
+# Copy the boot disk's volume table of contents to the mirror disk
+prtvtoc /dev/rdsk/${BOOTDISK}${ROOT_SLICE} | grep -v '2  *5' | \
+         fmthard -s - /dev/rdsk/${MIRRORDISK}${ROOT_SLICE} &gt; /dev/null
+
+# Create three SVM state database replicas per disk
+metadb -a -f -c 3 ${BOOTDISK}${METADB_SLICE} 2&gt; /dev/null
+RC1=\$?
+metadb -a -f -c 3 ${MIRRORDISK}${METADB_SLICE} 2&gt; /dev/null
+RC2=\$?
+if [ \$RC1 != 0 -o \$RC2 != 0 ]; then
+    echo "ERROR: Unable to create SVM state database replicas. Aborting."
+    _Exit
+fi
+
+# Create the primary swap metadevices
+metainit -f ${SWAP_PLEX} 1 1 ${BOOTDISK}${SWAP_SLICE}
+metainit -f ${SWAPMIRROR_PLEX} 1 1 ${MIRRORDISK}${SWAP_SLICE}
+metainit ${SWAP_MIRROR} -m ${SWAP_PLEX} 0
+
+# Create the var metadevices
+metainit -f ${VAR_PLEX} 1 1 ${BOOTDISK}${VAR_SLICE}
+metainit -f ${VARMIRROR_PLEX} 1 1 ${MIRRORDISK}${VAR_SLICE}
+metainit ${VAR_MIRROR} -m ${VAR_PLEX}
+
+# Save the original vfstab
+cp /etc/vfstab /etc/vfstab.preSVM
+
+# Update vfstab
+sed "s/\/dsk\/${BOOTDISK}${SWAP_SLICE}/\/md\/dsk\/${SWAP_MIRROR}/
+s/\/dsk\/${BOOTDISK}${VAR_SLICE}/\/md\/dsk\/${VAR_MIRROR}/
+s/\/rdsk\/${BOOTDISK}${VAR_SLICE}/\/md\/rdsk\/${VAR_MIRROR}/
+" /etc/vfstab.preSVM &gt; /etc/vfstab
+
+# create the secondary script that runs after the reboot to attach the 
+# mirrors
+
+cat &lt;&lt; EndOfSecScript &gt;&gt; /etc/rc3.d/S99svm_attach_mirrors
+#!/bin/sh
+#
+# /etc/rc3.d/S99svm_attach_mirrors
+#
+
+#
+# Enviroment Variables &amp; Setup
+#
+PATH=/usr/sbin:/usr/bin
+
+# Add the pre-Solaris 8 SDS location to the path if necessary
+if [ -x /usr/opt/SUNWmd/sbin/metainit ]; then
+    PATH=\$PATH:/usr/opt/SUNWmd/sbin
+fi
+
+# run metattach
+metattach ${ROOT_MIRROR} ${ROOTMIRROR_PLEX}
+sleep 10
+metattach ${SWAP_MIRROR} ${SWAPMIRROR_PLEX}
+sleep 10
+metattach ${VAR_MIRROR} ${VARMIRROR_PLEX}
+sleep 10
+
+# clean up 
+mv \\\$0 /var/tmp
+
+EndOfSecScript
+
+# Create and activate the root metadevice
+metainit -f ${ROOT_PLEX} 1 1 ${BOOTDISK}${ROOT_SLICE}
+metainit -f ${ROOTMIRROR_PLEX} 1 1 ${MIRRORDISK}${ROOT_SLICE}
+metainit ${ROOT_MIRROR} -m ${ROOT_PLEX}
+metaroot ${ROOT_MIRROR}
+lockfs -fa
+
+_Exit
+
+EndOfMainScript</pre>
+            <h1>&nbsp; </h1>
+            </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

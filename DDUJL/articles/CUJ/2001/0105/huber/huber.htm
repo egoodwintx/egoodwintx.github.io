@@ -1,0 +1,237 @@
+<HTML>   
+     <HEAD>
+<TITLE>May 2001/Elegant Function Call Wrappers</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocmay.htm"></A><FONT COLOR="#FF0000">   Multithreading</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Elegant Function Call Wrappers</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Andreas Huber</FONT></H3>
+
+<BLOCKQUOTE>
+<p>Scheduling functions for later execution is an obvious requirement in multithreaded programs. How to do that and preserve both type safety and modularity is not so obvious. The author combines an old pattern and some new template techniques to pull it off rather nicely.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>Today&#146;s software systems are increasingly being constructed employing many concurrent threads of execution. A thread has its own CPU registers and stack but shares other resources (e.g., heap memory, files, and so forth) with other threads in the same process. Cross-thread communication is frequently realized via asynchronous calls: instead of calling a function directly, the calling thread pushes a structure containing a function identifier along with the parameters into a queue and then continues execution. The other thread (called the worker thread) later pops the structure out of the queue and uses the information in it to call the function. The process of wrapping a function call for later execution is easy and straightforward. However, it can be a major source of code duplication in any program that makes asynchronous calls to a lot of different functions. In this article I present a mechanism that completely eliminates the duplication and makes asynchronous calls almost as easy to use as synchronous ones. This comes at the run-time cost of only one additional indirection per call.</p>
+<p>This mechanism builds on a foundation laid by earlier work, so I&#146;ll describe my solution in a bottom-up approach. I will compare the following options:</p>
+<p>1)  The C-style approach, which lacks type safety and tightly couples the worker thread to the calling thread;</p>
+<p>2)  The Command pattern <a href="#1">[1]</a>, which makes function call wrapping type-safe and also decouples the worker from the caller but requires the programmer to implement a class for each function to be called asynchronously;</p>
+<p>3)  Option No. 2) enhanced with functor subclass templates, adapted from Andrei Alexandrescu&#146;s &#147;Generalized Functors&#148; <a href="#2">[2]</a>, which greatly reduce the amount of code necessary but require a somewhat difficult syntax; and</p>
+<p>4)  Option No. 3) enhanced with creator function templates to finally provide ease of use.</p>
+
+<H3><FONT COLOR="#000080">1) The C-style Approach</FONT></H3>
+
+<p>For projects using an object-oriented language this is not really a practical option anymore, but I give a quick overview so that the merits of the other options become more obvious: in C, the queued structure typically contains a number identifying the function accompanied by a void pointer referencing a second structure, a wrapper for the function arguments. Depending on the value of the number, the worker thread casts the void pointer to the right type and then calls the right function, passing the contents of the wrapper as arguments.</p>
+<p>Obviously, there is a serious problem: in order to function correctly, the caller must push exactly what the worker expects. However, because of the casting involved, the compiler cannot help the programmer keep the two sides in sync. For example, if the number and the type of the wrapper pushed by the calling thread don&#146;t match, the worker thread will likely crash. Moreover, the worker is tightly coupled to the caller so that both have to be modified whenever a new function is introduced. I show in the next section how the Command pattern solves both problems.</p>
+
+<H3><FONT COLOR="#000080">2) The Command Pattern</FONT></H3>
+
+<p>Ideally, the worker thread should not &#147;know&#148; anything about the calls it executes. The Command pattern enables this by providing an abstract base class that defines a minimal interface to execute calls. An example follows (with the name of the class changed to reflect common C++ usage):</p>
+
+<pre>
+class Functor
+{
+  public:
+    virtual ~Functor() {}
+    virtual void operator()() = 0;
+};
+</pre>
+
+<p>Whenever you introduce a new function to be called asynchronously, you do the following:</p>
+<p>1.  Derive a new class from class <B>Functor</B>. The new class should have one data member for each function parameter.</p>
+<p>2.  Provide an additional data member in the derived class that stores a pointer to the object whose member function is to be called.</p>
+<p>3.  Define a constructor for the derived class that initializes (copy constructs) each data member with values passes as arguments to the constructor.</p>
+<p>4.  Override <B>operator()</B> to call the function, supplying the data member values as arguments.</p>
+<p>For each function call, the caller then does the following:</p>
+<p>1.  Allocate a new object of the previously defined class. </p>
+<p>2.  Pass all the function arguments to the constructor. </p>
+<p>3.  Push a pointer to the object into a queue. </p>
+<p>4.  Resume normal operation.</p>
+<p>The worker thread later pops the pointer to the object out of the queue, calls <B>operator()</B>, and deletes the object.</p>
+<p>As mentioned above, the Command pattern solves the worst problems of the C-style approach. However, there is one problem with the C-style approach that the Command pattern does not solve either: code duplication. You have to derive a new class from <B>Functor</B> every time you want to introduce a new asynchronously called function. In a large program you may well end up with hundreds of these tiny classes. They all have the same semantics but differ in the names of the functions called, the types of the function parameters, and the number of parameters. As I show in the next section, C++ templates are perfectly suited to generalize these differences and to eliminate the need for hand-coding subclasses of <B>Functor</B>.</p>
+
+<H3><FONT COLOR="#000080">3) Functor Subclass Templates</FONT></H3>
+<p>Have a look at the following class template derived from <B>Functor</B>. (Yes, the code examples in this section look a bit ugly, but I will clean that up in the next section).</p>
+
+<pre>
+template&lt; class CalleePtr, class
+  MemFunPtr, class Parm1 &gt;
+class MemberFunctor1 : public Functor
+{
+  public:
+    MemberFunctor1
+    (
+      const CalleePtr &amp; pCallee,
+      const MemFunPtr &amp; pFunction,
+      Parm1 aParm1
+    ) :
+      pCallee( pCallee ),
+      pFunction( pFunction ),
+      aParm1( aParm1 )
+    {
+    }
+
+    virtual void operator()()
+    {
+      if ( ( pCallee != NULL ) &amp;&amp; 
+           ( pFunction != NULL ) )
+      {
+        ((*pCallee).*pFunction)(aParm1);
+      }
+    }
+
+  private:
+    CalleePtr pCallee;
+    MemFunPtr pFunction;
+    Parm1 aParm1;
+};
+</pre>
+
+<p>Please note that in <B>operator()</B> I could also have written <B>( pCallee-&gt;*pFunction )( aParm1 )</B> to make the call through the function pointer, but then <B>pCallee</B> could not be a typical smart pointer, because most smart pointers do not define an <B>operator-&gt;*</B> <a href="#3">[3]</a>.</p>
+<p><B>MemberFunctor1</B> offers a universal solution for calls to member functions with one parameter. In the online code (<B>www.cuj.com/code</B>) you will find versions for zero to six parameters for all C++ function types, seven class templates for member functions, and seven more for free functions and static members.</p>
+<p>The template could be used as follows:</p>
+
+<pre>
+#include &lt;iostream&gt;
+
+class Foo
+{
+  public:
+    void Bar( const int &amp; rVal ) { std::cout &lt;&lt; rVal; }
+};
+
+int main( int argc, char* argv[] )
+{
+  Foo aFoo;
+  float aValue = 1.0;
+
+  // really ugly!
+  typedef MemberFunctor1
+    &lt; Foo *, void ( Foo::* )( const int &amp; ), float &gt;
+    FooBarFunctor;
+  Functor * pCall = 
+      new FooBarFunctor( &amp;aFoo, &amp;Foo::Bar, aValue );
+
+  ++aValue;
+
+  // the following would be done by the worker thread
+  // pop call out of queue
+  ( *pCall )();
+
+  return 0;
+}
+</pre>
+
+<p>Now, this doesn&#146;t look too promising, does it? Especially the second template parameter in the typedef, a pointer to a member function of <B>Foo</B> accepting a <B>const int &amp;</B> and returning <B>void</B>, is a syntactic nightmare (see <a href="#4">[4]</a> for a complete discussion). I&#146;ll clean that up in a minute. Because I am dealing with pointers to <B>Functor</B>, the worker thread has to call <B>operator()</B> with the somewhat unusual syntax <B>( *pCall )()</B>. I could encapsulate the pointer into a handle object (see <a href="#2">[2]</a>), which then would behave exactly like an STL functor, but since this call is only made once within the worker thread, I decided to stick to the slightly more unhandy pointers.</p>
+
+<H3><FONT COLOR="#000080">4) Creator Function Templates</FONT></H3>
+
+<p>To facilitate the creation of objects from class templates, the STL supplies function templates like <B>std::make_pair</B>. The <B>make_pair</B> template takes two parameters of some types <B>T</B> and <B>U</B>, which it uses to construct an object of type <B>std::pair&lt; T, U &gt;</B>. It returns this object to its caller. The nice thing about <B>make_pair</B> is that you can call it without having to explicitly specify the types <B>T</B> and <B>U</B> &#151; <B>make_pair</B> deduces these types from the arguments passed to it.</p>
+<p>I provide the same sort of function template below. (I prefer the name <B>DeferCall</B> instead of something like <B>MakeFunctor</B> because it describes much better what really happens.)</p>
+
+<pre>
+template&lt; class CalleePtr, class Callee, class Ret,
+   class Type1, class Parm1 &gt;
+inline Functor * DeferCall
+(
+  const CalleePtr &amp; pCallee,
+  Ret ( Callee::*pFunction )( Type1 ),
+  const Parm1 &amp; rParm1
+)
+{
+  return new
+     MemberFunctor1&lt; CalleePtr,
+       Ret ( Callee::* )( Type1 ), Parm1 &gt;
+         ( pCallee, pFunction, rParm1 );
+}
+</pre>
+
+<p>Using <B>DeferCall</B>, function templates don&#146;t have to be explicitly specified (that is, you don&#146;t have to fill in the template arguments corresponding to <B>CalleePtr</B>, <B>Callee</B>, <B>Ret</B>, <B>Type1</B>, and <B>Parm1</B>). You can call them like normal functions and the compiler automatically instantiates them for you:</p>
+
+<pre>
+// the following line replaces the new 
+// expression AND the ugly typedef
+Functor * pCall = 
+  DeferCall( &amp;aFoo, &amp;Foo::Bar, aValue );
+</pre>
+
+<p>Some implementation details:</p>
+
+<UL><LI>   Three arguments are passed to the <B>DeferCall</B> function template. The compiler then deduces five template parameters from them. This is possible because the function pointer combines multiple types. A standards-conforming compiler is required to make such a deduction.</LI>
+<LI>   The last argument passed to <B>DeferCall</B> is a <B>float</B> variable, a copy of which is stored inside the returned object. The type conversion from <B>float</B> to <B>int</B> takes place right before the actual execution of the call.</LI>
+<LI>   The name of the class template describes the type of the function (member function call with one parameter). This is because there are fourteen different versions of the class template and they must all be identified by a unique name. Much like normal functions, function templates can be overloaded. So, the creator function templates can all be named <B>DeferCall</B>. You can simply pass the object (for member function calls only), the function name, and the parameters to <B>DeferCall</B> and the compiler takes care about the rest.</LI>
+<LI>   Member function pointers are const-aware; that is, had I declared <B>Foo::Bar</B> as a const member function, a pointer to it would have had the following type: <B>void ( Foo::* )( const int &amp; ) const</B>. (Please note the additional <B>const</B> at the end.) So, in order to defer calls to const member functions as well, it is necessary to define a second function template with exactly the same name and the same code as shown above, except for two additional const qualifiers. Each <B>MemberFunctor</B> class template is therefore accompanied by two <B>DeferCall</B> templates.</LI></UL>
+
+<p>There is one last problem to solve: in the example code, a copy of the last parameter to <B>DeferCall</B> is made and stored inside the wrapper object. Function <B>Foo::Bar</B> thus works with a copy made at the time the call was deferred. This is not always appropriate since <B>aValue</B> changes before the call is actually executed and it might be necessary to use the most up-to-date value.</p>
+<p>There are two different solutions for this problem. First, there is a relatively simple solution. It provides complete control over how the originally passed arguments are stored but at the same time also imposes some restrictions on what kind of arguments can be passed to an asynchronously called function (see Technicalities). The second solution is more general. It does not have such limitations, but complicates the syntax a little bit. For the sake of simplicity I show the first solution:</p>
+
+<pre>
+template&lt; class Type &gt;
+class Referencer
+{
+  public:
+    Referencer( Type &amp; rType ) 
+      : rType( rType ) {}
+
+    operator Type &amp;() const 
+    { return rType; }
+
+  private:
+    Type &amp; rType;
+};
+
+template&lt; class Type &gt;
+inline Referencer&lt; Type &gt; Reference(
+  Type &amp; rType
+)
+{
+  return Referencer&lt; Type &gt;( rType );
+}
+</pre>
+
+<p>When the following line of code is used to generate a deferred call, <B>Foo::Bar</B> works with the most up-to-date value:</p>
+
+<pre>
+Functor * pCall =
+  DeferCall( &amp;aFoo, &amp;Foo::Bar,
+    Reference( aValue ) );
+</pre>
+
+<p>Referencer&lt; float &gt;</B> stores a reference to the <B>float</B> value passed to its constructor. The conversion operator later allows <B>Referencer&lt; float &gt;</B> to be implicitly converted to a <B>float</B> reference. From this the compiler generates a temporary instance of an <B>int</B>, which is finally passed to <B>Foo::Bar</B>. That&#146;s it. In the online code, you will find several examples including a multithreaded test program for Microsoft&#146;s Visual Studio 6.0.</p>
+
+<H3><FONT COLOR="#000080">Technicalities</FONT></H3>
+
+<UL><LI>   Due to the nature of the employed function templates no argument matching can take place; that is, <B>DeferCall</B> cannot distinguish between overloaded functions (functions with the same name but different parameters) in the same scope. If you try to defer calls to such functions, the compiler will run into ambiguities. When I introduced a similar mechanism in a project, I feared that users could be put off because they might run into too many such errors. However, I have not received a single complaint so far. My conclusion is that asynchronously called functions are not normally overloaded.</LI>
+<LI>   Any default values a function declaration might specify are not taken into account. You always have to pass as many arguments to <B>DeferCall</B> as there are parameters in the function declaration.</LI>
+<LI>   A continuing concern about templates is that their incorrect usage frequently leads to compile-time errors inside template code. Programmers not accustomed to templates often experience difficulties in tracking down such errors, especially if the compiler does not supply backtracking information. Moreover, because of the easy function-like syntax of <B>DeferCall</B>, it is not immediately clear that templates are involved. Therefore, programmers using the mechanism should at least have a basic understanding of C++ templates.</LI>
+<LI>   Concerning run-time overhead: the overhead introduced with the function pointers is typically negligible compared to the cost of the mutex synchronization for queue insertions and extractions and should therefore never be a problem.</LI>
+<LI>   C++ at most uses one user-defined conversion when it tries to convert a value. <B>Referencer</B> already has a user-defined conversion operator. So, a variable passed via the <B>Reference</B> template must be convertible to the function parameter type without further user-defined conversions. As mentioned before, this limitation can be circumvented; it complicates the <B>DeferCall</B> syntax a little bit, though. Instead of giving <B>Referencer</B> a conversion operator you add a member function <B>Get</B>, which also returns the stored reference. You then create a class template <B>Copier</B> and a corresponding function template <B>Copy</B>, which both look exactly like their reference counterparts, except that <B>Copier</B> stores a value instead of a reference. In all the <B>Functor</B> subclass templates you then use <B>.Get()</B> whenever you access or pass a function argument. This way, all function arguments have to be passed with either <B>Reference</B> or <B>Copy</B>.<br> 
+The reference/copy solution in the online source code is slightly modified so that only the creator function templates have to be modified instead of the <B>Functor</B> subclass templates. If all your target platforms support partial template specialization then you can get rid of the mentioned limitation even without introducing the <B>Copy</B> template. My platform does not support partial template specialization, so I leave it at mentioning the possibility.</LI>
+<LI>   Template support in compilers still varies a great deal. So, the first question about a template solution is always: &#147;Will this work on my platform?&#148; Most probably it will, because the features used are also used in the STL template function <B>mem_fun1</B> and compiler manufacturers have put quite an effort into making the STL work. The code for this article was developed with Microsoft&#146;s Visual Studio 6.0.</LI>
+<LI>   Finally, templates have always been blamed for code bloat. However, if the templates presented in this article were not used, programmers would write <I>all</I> the code otherwise generated by the compiler.</LI></UL>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+<p>With just one line of C++ code, any kind of function call can be put together and wrapped into a <B>Functor</B> object. This is done in a completely type-safe manner; that is, any type mismatches are flagged with an error at compile time. The biggest application for this technique is in multithreaded programs where cross-thread communication is often realized with asynchronous calls. The calling thread uses <B>DeferCall</B> to wrap up the call and pushes the returned <B>Functor</B> object into a queue. The worker thread later pops the object out of the queue, calls <B>Functor::operator()</B> and deletes the object.</p>
+
+<H3><FONT COLOR="#000080">Notes and References</FONT></H3>
+<p><a name="1"></a>[1]  Erich Gamma, Richard Helm, Ralph Johnson and John Vlissides. <I>Design Patterns: Elements of Reusable Object-Oriented Software</I> (Addison-Wesley, 1995).</p>
+<p><a name="2"></a>[2]  Andrei Alexandrescu. <I>Modern C++ Design: Generic Programming and Design Patterns Applied</I> (Addison-Wesley, 2001). See the chapter, &#147;Generalized functors.&#148;</p>
+<p><a name="3"></a>[3]  Smart pointers with pointer-to-member operators are possible, but not yet very common. For a good discussion on this topic, see Scott Meyers&#146; article, &#147;Implementing operator-&gt;* for Smart Pointers,&#148; <I>Dr. Dobb&#146;s Journal,</I> October 1999. Also available at <B>http://www.ddj.com/articles/1999/9910/9910b/9910b.htm</B>.</p>
+<p><a name="4"></a>[4]  Bjarne Stroustrup. <I>The C++ Programming Language,</I> Third Edition (Addison-Wesley, 1997), pp. 418-421.</p>
+
+<H3><FONT COLOR="#000080">Acknowledgements</FONT></H3>
+
+<p>First and foremost, I would like to thank Herb Sutter and Marc Briand. This article would be considerably less readable without their help during the publishing process. Thanks also to Andrei Alexandrescu, who was so kind to send me his then not yet published work on Generalized Functors, which turned out to have a lot of similarities with what I was doing. Andrei offers sort of an extremely flexible and STL-compatible callback mechanism, which happens to cover all the issues discussed under option no. 2) and 3), and a lot more. His work greatly helped me to streamline and generalize the code for this article. Last but not least, thanks to Philipp Sutter, J&ouml;rg Keller, Simon Br&uuml;lisauer and Michael Koster of Z&uuml;hlke Engineering for further reviews and comments.</p>
+
+<p><i><B>Andreas Huber</B> is a software engineer at Z&uuml;hlke Engineering AG (<B>www.zuehlke.com</B>) based in Zurich, Switzerland. He has seven years of experience in software development with C++ on the Windows NT/2000 platform. He specializes in generic and object-oriented programming, software architecture, and consulting. He may be contacted at <B>andreas.huber@zuehlke.com</B> or <B>andreas@huber.net</B>.</i></p>
+
+<h4><a href="../../../source/2001/may01/huber.zip"></a></h4>
+
+</blockquote></body></html>

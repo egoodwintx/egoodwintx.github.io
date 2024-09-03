@@ -1,0 +1,595 @@
+<HTML>
+<META NAME="year" CONTENT="1989">
+<HEAD>
+
+<TITLE>SEP89: 80386 PROTECTED MODE AND MULTITASKING</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>80386 PROTECTED MODE AND MULTITASKING<a name="01de_0003"><a name="01de_0003"></h1><P>
+<h2><a name="01de_0001"><a name="01de_0000">Putting the 386 to work under MS-DOS</h2><P>
+<h3>Tom Green</h3><P>
+<p><i><a name="01de_0002"><a name="01de_0000">Tom is an engineer at Central Data Corp. in Champaign, Ill.  He can be reached at 217-359-8010.</i></p><hr><P>
+Protected mode on the 80386 (and on the 80286 as well) provides built-in memory protection and hardware support for multitasking.  There are not many examples of protected-mode programming because most of the world uses the 8Ox86 family to run MS-DOS.  I recently built a small symbolic debugger and multitasking kernel for the 80386, and learned a great deal about protected-mode programming in the process.  For this article, I developed some basic 80386 tools that can be used with most MS-DOS C compilers.  I used Turbo C 2.0 and TASM 1.0, and the code should be portable to most compilers and assemblers.  (The assemblers must support the 80386 instruction set.<P>
+The biggest drawback to this code is that it runs in 16-bit mode.  The 80386 allows a segment to be marked as either a 32-bit segment or a 16-bit segment.  Turbo C 2.0 produces code that uses only 16-bit registers and does not take full advantage of the 32-bit registered CPU.  (When you develop a large application, this factor is a big drawback.)  The code does allow you to learn more about 80386 protected mode without resorting to lots of assembly language or investing in expensive new tools.<P>
+The 80386 has 32-bit registers and allows access to a 4-gigabyte address space.  Both of these features offer a big improvement over the 8086.  I think that the most important improvement in the 80386 is its hardware support for multitasking.  The ability of the 80386 to save and restore the state of a task is a big plus when you write operating systems and debuggers.  All of these new features support 16-bit and 32-bit code.  As a result, the code presented in this article has few limitations.  You could use this code to develop a small multitasking kernel just by adding a timer interrupt and the necessary algorithms.<P>
+A warning before you get started: This program only runs on an MS-DOS machine with an 80386 CPU that is running MS-DOS in real mode.  (Some 80386 machines run MS-DOS as a virtual-mode task in protected mode.  You should be able to turn this off, so check the documentation for your machine and operating system.)  The machine must support and use video modes 2, 3, or 7. (This program writes directly to video RAM and locates video RAM via the mode.  If the program finds a video mode it cannot use, the program simply exits.)<P>
+<h3><a name="01de_0004">The Global Descriptor Table<a name="01de_0004"></h3><P>
+When the 80386 runs in protected mode, the segment registers (CS, DS, ES, SS, FS, and GS) are loaded with selectors.  Each selector points to an 8-byte descriptor in either the Local Descriptor Table or the Global Descriptor Table.  Each selector also contains a privilege level.  In this case, all of the code and data run at privilege level 0( the highest privilege level).  The process of calculating the selector for a given descriptor is easy when privilege level 0 is used and a Local Descriptor Table is not used.  The selector is the offset of the descriptor in the Global Descriptor Table.  (Remember that a descriptor is an 8-byte data structure.)  To use descriptor 2, for example, load the segment register with selector 10h. To determine the appropriate selector, multiply the descriptor by 8, starting with descriptor 1.  8h, 10h, 18h, 20h and 28h are examples of typical Global Descriptor Table selectors. Descriptor 0 is the NULL descriptor and cannot be used.<P>
+<a href="198901e0.htm">Figure 1</A> shows the layout of the three types of descriptors in this code.  To avoid confusion, a Local Descriptor Table is not used.  The Global Descriptor Table, which can reside anywhere in physical memory, is located within an array of structures in the C data space.  The structure called &quot;descriptor&quot; in <a href="8909f.htm#01de_000a"> Listing One</A> (386.h) shows how the descriptors in <a href="198901e1.htm">Figure 1</A> look when written in C.  An array of ten descriptors, called gdt, is declared in <a href="8909f.htm#01de_000c">Listing Two</A> (task.c).  This array can be larger or smaller, depending upon how many descriptors are needed for the code.  The Global Descriptor Table can contain up to 8192 descriptors.<P>
+Next, set up the descriptors to run the C program.  The program will start running in real mode, so the segment addresses of the C code and data must be translated to physical addresses.  This program will run in the 8086 Small model, which means it will have 64K of code space and 64K for data, heap, and stack.  (See <a href="198901e2.htm">Figure 2</A>  for the layout of a Turbo C Small model program.)  The segment addresses in this code and data can easily be converted into 20-bit physical addresses.  To do so, left shift each 16-bit segment by 4.<P>
+The code uses the three types of descriptors shown in <a href="198901e3.htm">Figure 1</A>: Data Segment Descriptors, Executable Segment Descriptors, and TSS Descriptors.  To initialize a descriptor, call the routine init_gdt_descriptor.  This routine is located in the file task.c (<a href="8909f.htm#01de_000c">Listing Two</A>).  The first parameter passed to this routine is a descriptor structure pointer, which is the address of one of the descriptors in the gdt array.  The second parameter passed to the routine is&lt;/entry&gt; a 32-bit (unsigned long) physical base for the segment.  This 32-bit physical address is the location where the segment that is being created will start.  The third parameter passed to the routine is a 32-bit (unsigned long) limit of the segment.  This limit indicates the length of the segment measured in bytes.  The process of setting up the limit in a descriptor gets a little complicated because only 20 bits are available to contain a 32-bit value.  In this situation, use the G bit or &quot;granularity bit.&quot;  This process (which would require a long description) is handled by the C routine.  The fourth parameter passed to the routine is an 8-bit (unsigned char) descriptor type (either a code, data, or TSS descriptor).<P>
+Six segments -- a code segment, a data segment, three Task State Segments (TSS), and a video memory segment -- must be created in order to run this code.  First, the Turbo C pseudovariables _CS and _DS, which contain the segment addresses of both the code and the data segments, are used to create the code and data segments.  During the process, the segment addresses are left shifted 4 bits and turned into physical addresses.  A 64K limit is assigned to each of these descriptors, so that each descriptor appears to the program just like a real-mode segment would appear.  Next, the three Task State Segments are set up.  (Task State Segments are described in more detail later in this article.)  Each Task State Segment is a global data structure with a 64h-byte limit.  The physical address of each Task State Segment is determined by adding the offset in the corresponding data segment to that data segment's physical address.<P>
+The last segment that must be created is the video memory segment.  This 4000-byte data segment allows you to write directly to video RAM.  When the program runs in protected mode, no MS-DOS functions can be accessed, so the print routine must write directly to video RAM. After BIOS is called to determine the video mode, a segment is set up for color or monochrome memory.  The vid_mem_putchar routine writes characters and attributes to video RAM by using a far pointer that contains the selector for the newly created video RAM segment.<P>
+<h3><a name="01de_0005">Task State Segments<a name="01de_0005"></h3><P>
+A Task State Segment is used by the 80386 when a task switch occurs.  The 80386 has a special task register that holds the selector for the TSS that corresponds to the task that is currently running.  <a href="198901e4.htm">Figure 3</A> shows a TSS.<P>
+When a task switch occurs, the current values of all of the CPU registers are saved into the task's TSS.  As you can see in <a href="198901e5.htm">Figure 3</A>, there is a place to store all general-purpose registers and segment registers.  The complete state of the task can be saved so that the next time the task executes, it can pick up where it left off.  After the current task's state is saved in that task's TSS, the state of the new task is loaded into the CPU registers from the new task's TSS.  The CPU begins execution at the address loaded into cs:eip from the TSS.  The new task picks up right where it left off the last time it was switched out (or it picks up the values to which the TSS is initialized).<P>
+<a href="8909f.htm#01de_000a">Listing One</A> contains a structure, called &quot;tss,&quot; that can be used to set up a TSS.  This structure contains several fields that begin with fill and are not used by the CPU, but must be zeroed.  With this structure a TSS can be initialized and installed in the Global Descriptor Table.<P>
+The routine init_tss in <a href="8909f.htm#01de_000c">Listing Two</A> creates a TSS for a task.  This routine sets up the starting selector value for all segment registers with the code and data selectors passed (cseg and dseg parameters).  The eip (instruction pointer) is set up to point to the code of the task.  The esp and ebp registers are set up to point to the stack for the new task.  At this point, TSS has starting values for execution, data, and stack.  The func_ptr ip parameter, which contains the address in the code segment where execution begins, is passed.  In this code, pass the address of the C function that will be used for the tasks (task1 and task 2).<P>
+A TSS must be installed in the Global Descriptor Table just as a code or data segment is installed.  To install a TSS, find its physical address in memory and set up the size limit of 64h bytes.  The type field of the descriptor indicates to the CPU that a TSS is a special kind of segment.<P>
+<h3><a name="01de_0006">Assembly Language Routines<a name="01de_0006"></h3><P>
+Four assembly language routines (see <a href="8909f.htm#01de_000e">Listing Three</A>) are required in order to use the 80386 code.  These routines are described later, and are called from C with parameters passed on the stack.  It would be a good idea to examine <a href="8909f.htm#01de_000e"> Listing Three</A> carefully while you read these descriptions.<P>
+void protected_mode(unsigned long gdt_ptr,unsigned int cseg, unsigned int dseg).  This routine sets everything up and makes the switch to protected mode.  The first parameter is gdt_ptr, which is the 32-bit physical address of the Global Descriptor Table.  (Pass the physical address of the descriptor array gdt in this parameter.)  The next two parameters, cseg and dseg, are the selectors for the descriptors set up for the selector in the array gdt.  (In these parameters, pass the selector for the code segment and for the data segment, respectively.)  Next, the cs register is loaded by a jmp instruction with the code segment selector.  The rest of the segment registers are loaded with the data segment selector. During the entire process, the code and data descriptors have been set up to match the way that the segments would appear if the CPU was running in real mode.  At this point, the routine can set everything up and return to the C code.  The code, data, and stack are all the same as they would be in real mode.  The jmp DWORD PTR p_mode instruction flushes the CPU instruction prefetch queue and ensures that the cs register is loaded with the correct selector.  Because the code jumps through a pointer, the data p_mode is set up to point to the protect label.  It may seem strange to jump to the next instruction, but it must be done.<P>
+void real_mode(unsigned int dseg).  This routine switches back to real mode.  The routine reloads all of the segment registers with the correct real-mode segments, and assumes that the code is executing from a 64K segment.  (A complete description of the process of switching back to real mode, is presented on page 14-4 of the Intel 80386 Programmer's Reference Manual, so I will not discuss this process in detail here.) Each segment register must be loaded with the selector of a segment that has a 64K limit before returning to real mode.  The parameter dseg is loaded into all of the segment registers except the segment register cs.  The routine then performs another jump to the next instruction via jmp FAR PTR flush.  This step flushes the instruction prefetch queue, and loads the cs register with the original code segment that runs in real mode.<P>
+void load_task_register(unsigned int tss_selector).  This routine loads the CPU task register with the TSS selector that is passed.  When the CPU performs the first task switch, it must have an available TSS where the current task state can be stored.  Before the routine switches to the first task, the task register must be loaded with a valid TSS selector.<P>
+void jump_to_task(unsigned int task).  This routine switches to a new task.  Pass the selector of the TSS you want to switch to.  If the task that calls jump_to_task is switched back to, the task resumes execution immediately after the jmp DWORD PTR new_task instruction and will return to the C code that called jump_to_task.  The code can then switch back and forth between tasks, starting where it left off at the task switch.  In this routine, the code is jumping through a pointer, so new_task data must be set up with the selector of the new task.  The address offset to jump to is not used for new tasks.  The task gets the address to start running from its TSS when the registers are loaded.<P>
+<h3><a name="01de_0007">Using the Code<a name="01de_0007"></h3><P>
+The code is contained in three files: task.c, 386.h, and mode.asm.  The following Turbo C 2.0 and TASM 1.0 instructions assemble, compile, and link the code:<P>
+<pre>
+   tasm /MX mode.asm
+   tcc -I. .\include -L. .\lib task.c mode.obj
+</pre><P>
+This code can easily be ported to other MS-DOS C compilers.  The Turbo C pseudovariables _CS and _DS are used to create the Global Descriptor Table and Task State Segments.  If your C compiler does not support these pseudovariables, you can create two small assembly language routines to place the values into the cs and ds registers.  If your compiler expects the return value of a function to be located in the ax register (which is usually the case) the routines can be as simple as this:<P>
+<pre>
+  Get current value of cs register
+
+  mov ax,cs
+  ret
+
+  Get current value of ds register
+
+  mov ax,ds
+  ret
+</pre><P>
+Some Turbo C-specific screen I/O routines have also been used in this code.  If you port the code to another C compiler, check that compiler's manual for similar routines.<P>
+The assembly language portion of the code must be used with an assembler that supports the 80386 instruction set and some of the new features in Microsoft MASM 5.0.  Parameters are expected on the stack, as described for the Turbo C Small C memory model.  You may have to adjust these parameters before the code can be used with your compiler.<P>
+The code in its present form must be compiled under the Small C memory model in order to work properly.  In addition, the code expects only two segments: A code segment and a data segment.  If you use a memory model with multiple code segments and a function tries to perform a far jump to another function, the first function will jump to a different segment, which will be an invalid selector.  With a lot of work, descriptors could be created for all code and data segments for larger C memory models, but I would recommend starting with the Small model.<P>
+To run the program, type TASK.  Note that the program prompts you to press Return to enter protected mode.  After you press Return, several hello messages from task 1 and task 2 appear on the screen.  Next, you are returned first to the main task and finally to real mode.  You are then prompted to press Return in order to exit to DOS.<P>
+The 80386 allows a task switch to occur when an interrupt handler is called.  (This feature comes in handy when you develop a debugger.)  When a processor exception occurs, the interrupt handler can cause a task switch.  To determine exactly what was contained in all of the registers at the time of the exception, examine the TSS of the task that caused the exception.  In addition, because the 80386 supports breakpoints in hardware, your debugger can also use an interrupt handler that causes a task switch to the debugger.  Breakpoint handling is easy when supported by hardware breakpoints and multitasking.  I recommend a complete reading of the Intel 80386 Programmer's Reference Manual to see all of the features of the 80386. Although this code does not do very much, it provides a set of tools that can be easily expanded into a multitasking kernel.<P>
+As mentioned before, there are some drawbacks to this code.  Because Turbo C 2.0 cannot produce real 32-bit code, the 32-bit registers in the 80386 are not used.  A solution is to write assembly language subroutines that take advantage of the 80386 capabilities.  In addition, you cannot use many of the C library routines or BIOS or MS-DOS calls with this code.  These routines and calls expect information to be located in certain segments, and will load the segment registers with invalid selectors in protected mode.  Also, when the switch is made to protected mode, interrupts are turned off; the 80386 then handles interrupts with a special Interrupt Descriptor Table.  The process of implementing this step would have added too much to the code, so interrupts must be turned off when the code runs in protected mode. To run the code in protected mode, new interrupt handlers would need to be developed.  If you develop an Interrupt Descriptor Table, use the code in a Global Descriptor Table as a guide (the two tables are similar).<P>
+I hope that this article has provided some insights into 80386 protected-mode programming. If you examine this code with the help of the article and the Intel 80386 Programmer's Reference Manual, you should be able to use protected mode.  In general, most examples of protected-mode routines are written in assembly language and are difficult to understand. When the Global Descriptor Table and Task State Segments are created using C, protected-mode programs are much simpler to set up and to install.<P>
+<h3><a name="01de_0008">Suggested Reading<a name="01de_0008"></h3><P>
+80386 Programmer's Reference Manual, Intel Corporation, 1987.<P>
+Nelson, Ross.  &quot;Programming on the 80386,&quot; Dr. Dobbs Journal: October 1986.<P>
+<h3><a name="01de_0009">Availability<a name="01de_0009"></h3><P>
+All source code for articles in this issue is available on a single disk.  To order, send $14.95 (Calif. residents add sales tax) to Dr. Dobb's Journal, 501 Galveston Dr., Redwood City, CA 94063, or call 800-356-2002 (from inside Calif.)  or 800-533-4372 (from outside Calif.).  Please specify the issue number and format (MS-DOS, Macintosh, Kaypro).<P>
+
+
+_80386 PROTECTED MODE AND MULTITASKING_
+by Tom Green
+
+<a name="01de_000a"><a name="01de_000a">
+<a name="01de_000b"></pre><B>[LISTING ONE]</B><pre><a name="01de_000b">
+
+/************************************************************************/
+/*      386.H - structures etc. for the 80386                           */
+/*      By Tom Green                                                    */
+/************************************************************************/
+
+/* all of these structures are processor dependant, so  */
+/* you must set code generation for byte alignment */
+
+
+/* generic descriptor - data, code, system, TSS */
+
+typedef struct descriptor{
+    unsigned int limit_lo;
+    unsigned int base_lo;
+    unsigned char base_mid;
+    unsigned char type_dpl;
+    unsigned char limit_hi;
+    unsigned char base_hi;
+}descriptor;
+
+/* call, task, interrupt, trap gate */
+
+typedef struct gate{
+    unsigned int offset_lo;
+    unsigned int selector;
+    unsigned char count;
+    unsigned char type_dpl;
+    unsigned int offset_hi;
+}gate;
+
+/* this is the layout for a task state segment  (TSS) */
+/* the fill fields of structures are not used by the 80386 */
+/* but must be there */
+
+typedef struct tss{
+    unsigned int back_link;     /* selector for last task */
+    unsigned int fill1;
+    unsigned long esp0;         /* stack pointer privilege level 0 */
+    unsigned int ss0;           /* stack segment privilege level 0 */
+    unsigned int fill2;
+    unsigned long esp1;         /* stack pointer privilege level 1 */
+    unsigned int ss1;           /* stack segment privilege level 1 */
+    unsigned int fill3;
+    unsigned long esp2;         /* stack pointer privilege level 2 */
+    unsigned int ss2;           /* stack segment privilege level 2 */
+    unsigned int fill4;
+    unsigned long cr3;          /* control register 3, page table */
+    unsigned long eip;          /* instruction pointer */
+    unsigned long eflags;
+    unsigned long eax;
+    unsigned long ecx;
+    unsigned long edx;
+    unsigned long ebx;
+    unsigned long esp;
+    unsigned long ebp;
+    unsigned long esi;
+    unsigned long edi;
+    unsigned int es;
+    unsigned int fill5;
+    unsigned int cs;
+    unsigned int fill6;
+    unsigned int ss;
+    unsigned int fill7;
+    unsigned int ds;
+    unsigned int fill8;
+    unsigned int fs;
+    unsigned int fill9;
+    unsigned int gs;
+    unsigned int filla;
+    unsigned int ldt;
+    unsigned int fillb;
+    unsigned int tbit;          /* exception on task switch bit */
+    unsigned int iomap;
+}tss;
+
+#define TSS_SIZE            (sizeof(tss))
+#define DESCRIPTOR_SIZE     (sizeof(descriptor))
+#define GATE_SIZE           (sizeof(gate))
+#define DPL(x)              (x&lt;&lt;5)
+#define TYPE_CODE_DESCR     0x18
+#define TYPE_DATA_DESCR     0x10
+#define TYPE_TSS_DESCR      0x09
+#define TYPE_CALL_GATE      0x0c
+#define TYPE_TASK_GATE      0x05
+#define TYPE_INTERRUPT_GATE 0x0e
+#define TYPE_TRAP_GATE      0x0f
+#define SEG_WRITABLE        0x02
+#define SEG_READABLE        0x02
+#define SEG_EXPAND_DOWN     0x04
+#define SEG_CONFORMING      0x04
+#define SEG_ACCESSED        0x01
+#define SEG_TASK_BUSY_BIT   0x02
+#define SEG_PRESENT_BIT     0x80
+#define SEG_GRANULARITY_BIT 0x80
+#define SEG_DEFAULT_BIT     0x40
+#define SELECTOR_MASK       0xfff8
+
+
+
+
+
+
+<a name="01de_000c"><a name="01de_000c">
+<a name="01de_000d"></pre><B>[LISTING TWO]</B><pre><a name="01de_000d">
+
+/************************************************************************/
+/*      TASK.C - this code creates and sets up the Global Descriptor    */
+/*      Table and Task State Segments. the code switches to protected   */
+/*      mode, runs tasks, and returns to real mode.                     */
+/*      Compile with Turbo C 2.0                                        */
+/*      By Tom Green                                                    */
+/************************************************************************/
+
+#include &lt;stdio.h&gt;
+#include &lt;dos.h&gt;
+#include &lt;conio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &quot;386.h&quot;
+
+/* selectors for entries in our GDT */
+#define CODE_SELECTOR       0x08
+#define DATA_SELECTOR       0x10
+#define TASK_1_SELECTOR     0x18
+#define TASK_2_SELECTOR     0x20
+#define MAIN_TASK_SELECTOR  0x28
+#define VID_MEM_SELECTOR    0x30
+
+/* physical address of video ram, mono and color */
+#define COLOR_VID_MEM       0xb8000L
+#define MONO_VID_MEM        0xb0000L
+
+/* video modes returned by BIOS call */
+#define MONO_MODE           0x07
+#define BW_80_MODE          0x02
+#define COLOR_80_MODE       0x03
+
+/* pointer to a function */
+typedef void (func_ptr)(void);
+
+/* extern stuff in mode.asm */
+void protected_mode(unsigned long gdt_ptr,unsigned int cseg,unsigned int dseg);
+unsigned int load_task_register(unsigned int tss_selector);
+void real_mode(unsigned int dseg);
+void jump_to_task(unsigned int tss_selector);
+
+
+/* prototypes for local functions */
+void task1(void);
+void task2(void);
+void init_tss(tss *t,unsigned int cs,unsigned int ds,unsigned char *sp,
+                func_ptr ip);
+void init_gdt_descriptor(descriptor *descr,unsigned long base,unsigned long
+                            limit,unsigned char type);
+void print(unsigned int x,unsigned int y,char *s);
+void vid_mem_putchar(unsigned int x,unsigned int y,char c);
+
+/* this array of descriptors will be our Global Descriptor Table */
+descriptor gdt[10];
+
+/* these are the TSS's for our tasks */
+tss main_tss;
+tss task_1_tss;
+tss task_2_tss;
+
+/* seperate stacks for each task */
+unsigned char task_1_stack[1024];
+unsigned char task_2_stack[1024];
+
+
+/* global y location for protected mode screen writes */
+/* using descriptor for video ram */
+unsigned int y=0;
+
+void main(void)
+{
+    unsigned long base;
+    unsigned char type;
+    union REGS r;
+
+    /* setup code and data descriptors in GDT */
+
+    /* code GDT entry 1 */
+
+    /* turn code segment into 20 (and 32) bit physical base address */
+    base=((unsigned long)_CS)&lt;&lt;4;
+    /* set descriptor type for a readable code segment */
+    type=TYPE_CODE_DESCR | SEG_PRESENT_BIT | SEG_READABLE;
+    init_gdt_descriptor(&amp;gdt[1],base,0xffffL,type);
+
+    /* data GDT entry 2 */
+
+    /* turn data segment into 20 (and 32) bit physical base address */
+    base=((unsigned long)_DS)&lt;&lt;4;
+    /* set descriptor type for a writeable data segment */
+    type=TYPE_DATA_DESCR | SEG_PRESENT_BIT | SEG_WRITABLE;
+    init_gdt_descriptor(&amp;gdt[2],base,0xffffL,type);
+
+    /* set up TSS's for tasks here */
+
+    /* set descriptor type for a TSS */
+    type=TYPE_TSS_DESCR | SEG_PRESENT_BIT;
+
+    /* put a descriptor for each TSS in the GDT */
+
+    /* TSS GDT entry 3, TSS for task1 */
+    /* turn segment:offset of task1 TSS into physical base address */
+    base=(((unsigned long)_DS)&lt;&lt;4)+(unsigned int)&amp;task_1_tss;
+    init_gdt_descriptor(&amp;gdt[3],base,(unsigned long)TSS_SIZE-1,type);
+
+    /* TSS GDT entry 4, TSS for task2 */
+    /* turn segment:offset of task2 TSS into physical base address */
+    base=(((unsigned long)_DS)&lt;&lt;4)+(unsigned int)&amp;task_2_tss;
+    init_gdt_descriptor(&amp;gdt[4],base,(unsigned long)TSS_SIZE-1,type);
+
+    /* TSS GDT entry 5, TSS for main starting task */
+    /* turn segment:offset of main TSS into physical base address */
+    base=(((unsigned long)_DS)&lt;&lt;4)+(unsigned int)&amp;main_tss;
+    init_gdt_descriptor(&amp;gdt[5],base,(unsigned long)TSS_SIZE-1,type);
+
+    /* init the TSS with starting values for each task */
+
+    /* task 1 */
+    init_tss(&amp;task_1_tss,CODE_SELECTOR,DATA_SELECTOR,task_1_stack+
+                sizeof(task_1_stack),task1);
+
+    /* task 2 */
+    init_tss(&amp;task_2_tss,CODE_SELECTOR,DATA_SELECTOR,task_2_stack+
+                sizeof(task_2_stack),task2);
+
+    /* video ram descriptor GDT entry 6 */
+
+    /* set descriptor for a writeable data segment */
+    type=TYPE_DATA_DESCR | SEG_PRESENT_BIT | SEG_WRITABLE;
+    r.h.ah=15;      /* get video mode BIOS */
+    int86(0x10,&amp;r,&amp;r);
+    /* check if mono mode */
+    if(r.h.al==MONO_MODE)
+        init_gdt_descriptor(&amp;gdt[6],MONO_VID_MEM,3999,type);
+    /* check if color mode */
+    else if(r.h.al==BW_80_MODE || r.h.al==COLOR_80_MODE)
+        init_gdt_descriptor(&amp;gdt[6],COLOR_VID_MEM,3999,type);
+    else{
+        printf(&quot;\nThis video mode is not supported.&quot;);
+        exit(1);
+    }
+
+    /* we are now ready to enter protected mode */
+
+    clrscr();
+    cprintf(&quot;\nPress return to enter protected mode.&quot;);
+    getchar();
+
+    /* turn segment:offset of GDT into 20 bit physical address */
+    base=(((unsigned long)_DS)&lt;&lt;4)+(unsigned int)&amp;gdt;
+
+    /* this puts us in protected mode */
+    protected_mode(base,CODE_SELECTOR,DATA_SELECTOR);
+
+    /* this loads the task register for the first task */
+    load_task_register(MAIN_TASK_SELECTOR);
+
+    y=3;    /* this is line we will start printing on in protected mode */
+            /* using our descriptor to write to video ram */
+
+    print(0,y++,&quot;Entered protected mode in main task&quot;);
+
+    /* this jumps to first task (which will jump back here eventually) */
+    jump_to_task(TASK_1_SELECTOR);
+
+    print(0,y++,&quot;Returned to main task, leaving protected mode&quot;);
+
+    /* return us to real mode */
+    real_mode(DATA_SELECTOR);
+
+    gotoxy(1,22);
+    cprintf(&quot;Returned to real mode. Press return to exit to DOS&quot;);
+    getchar();
+    clrscr();
+}
+
+/* code for task 1 */
+
+void task1(void)
+{
+    while(1){
+        print(0,y++,&quot;Hello from task1&quot;);
+        jump_to_task(TASK_2_SELECTOR);
+        /* return to original task (in main()) after several task switches */
+        if(y&gt;18)
+            jump_to_task(MAIN_TASK_SELECTOR);
+    }
+}
+
+/* code for task 2 */
+
+void task2(void)
+{
+    while(1){
+        print(0,y++,&quot;Hello from task2&quot;);
+        jump_to_task(TASK_1_SELECTOR);
+    }
+}
+
+/* this initializes a TSS */
+/* inits segment registers, eip, and stack stuff to starting values */
+
+void init_tss(tss *t,unsigned int cs,unsigned int ds,unsigned char *sp,
+                func_ptr ip)
+{
+    t-&gt;cs=cs;                   /* code selector */
+    t-&gt;ds=ds;                   /* set these to the data selector */
+    t-&gt;es=ds;
+    t-&gt;ss=ds;
+    t-&gt;fs=ds;
+    t-&gt;gs=ds;
+    t-&gt;eip=(unsigned int)ip;    /* address of first instruction to execute */
+    t-&gt;esp=(unsigned int)sp;    /* offset of stack in data */
+    t-&gt;ebp=(unsigned int)sp;
+}
+
+/* this initializes a descriptor in the Global Decsriptor Table */
+/* sets up the base, limit, type, and granularity */
+
+void init_gdt_descriptor(descriptor *descr,unsigned long base,unsigned long
+                            limit,unsigned char type)
+{
+    descr-&gt;base_lo=(unsigned int)base;
+    descr-&gt;base_mid=(unsigned char)(base &gt;&gt; 16);
+    descr-&gt;type_dpl=type;
+    /* if limit &gt; 0xfffffL then we have to set granularity bit and shift */
+    if(limit &gt; 0xfffffL){
+        limit = limit &gt;&gt; 12;
+        descr-&gt;limit_hi=((unsigned char)(limit &gt;&gt; 16) &amp; 0xff) |
+            SEG_GRANULARITY_BIT;
+    }
+    else
+        descr-&gt;limit_hi=((unsigned char)(limit &gt;&gt; 16) &amp; 0xff);
+    descr-&gt;limit_lo=(unsigned int)limit;
+    descr-&gt;base_hi=(unsigned char)(base &gt;&gt; 24);
+}
+
+/* this routine prints a string using vid_mem_putchar */
+
+void print(unsigned int x,unsigned int y,char *s)
+{
+    while(*s)
+        vid_mem_putchar(x++,y,*s++);
+}
+
+/* this routine writes a character directly to video ram */
+/* uses the selector for the descriptor we set up in main */
+/* for video ram */
+
+void vid_mem_putchar(unsigned int x,unsigned int y,char c)
+{
+    register unsigned int offset;
+    char far *vid_ptr;
+
+    offset=(y*160) + (x*2);
+    /* make our far pointer use our special video ram descriptor */
+    /* yes, we can even use far pointers with selectors */
+    vid_ptr=MK_FP(VID_MEM_SELECTOR,offset);
+    *vid_ptr++=c;       /* write character */
+    *vid_ptr=0x07;      /* write attribute byte */
+}
+
+
+
+
+
+<a name="01de_000e"><a name="01de_000e">
+<a name="01de_000f"></pre><B>[LISTING THREE]</B><pre><a name="01de_000f">
+
+;*****************************************************************
+;   MODE.ASM
+;   Routines for switching to protected and real mode. Also includes
+;   routines for loading task register and jumping to a task.
+;   Assemble with Turbo TASM 1.0
+;   By Tom Green
+;*****************************************************************
+
+    .MODEL SMALL
+
+    .386P
+
+    .DATA
+
+;this is where we stuff address of GDT that is passed
+gdtptr  LABEL   PWORD
+    dw  50h             ;size in bytes of GDT, enough for 10 entries
+    dd  ?               ;this is where we will put physical address of GDT
+
+;this is where we will store the address of a task (the selector) that
+;we will jump to in jump_to_task
+new_task    LABEL   DWORD
+    dw  00h
+new_select  LABEL   WORD
+    dw  00h
+
+;this is where we store address to jump to when we enter protected mode
+;in protected_mode
+;offset of code where we will jump
+p_mode          LABEL   DWORD
+    dw  OFFSET protect
+;put selector of protected mode code segment here
+p_mode_select   LABEL   WORD
+    dw  0
+
+    .CODE
+
+    PUBLIC  _real_mode,_protected_mode,_jump_to_task
+    PUBLIC  _load_task_register
+
+;*****************************************************************
+;   void protected_mode(unsigned long gdt_ptr,unsigned int cseg,
+;   unsigned int dseg) - puts 386 in protected mode and loads segment
+;   registers with code and data selectors passed (cs and ds
+;   parameters). pass this routine a 32 bit physical address of the
+;   Global Descriptor Table (gdt_ptr parameter). Turns interrupts
+;   off while we run in protected mode.
+;*****************************************************************
+_protected_mode PROC    NEAR
+        push    bp
+        mov     bp,sp
+        mov     ax,[bp+4]               ;get low word of address of GDT
+        mov     dx,[bp+6]               ;get high word of address of GDT
+        mov     WORD PTR gdtptr+4,dx    ;store high word of address of GDT
+        mov     WORD PTR gdtptr+2,ax    ;store low word of address of GDT
+        mov     ax,[bp+8]               ;get selector for code descriptor
+        mov     dx,[bp+10]              ;get selector for data descriptor
+        mov     p_mode_select,ax        ;put code selector in our jmp pointer
+        mov     eax,0                   ;prepare to zero out eflags
+        push    eax
+        popfd                           ;zero out eflags
+        lgdt    PWORD PTR gdtptr        ;load gdt register with limit and ptr
+        mov     eax,cr0
+        or      eax,1
+        mov     cr0,eax                 ;turn protected mode on
+        jmp     DWORD PTR p_mode        ;this will jump to protect through ptr
+                                        ;(cs will be loaded with code selector)
+protect:
+;we are now running in protected mode, and we will load segment registers
+;with selectors that look like our code is still in real mode
+        mov     ss,dx           ;load segment registers with data selector
+        mov     ds,dx
+        mov     es,dx
+        mov     fs,dx
+        mov     gs,dx
+        mov     ax,0
+        lldt    ax              ;make sure ldt register has 0
+        pop     bp
+        ret
+_protected_mode ENDP
+
+;*****************************************************************
+;   void load_task_register(unsigned int tss_selector) -
+;   loads task register with TSS selector
+;*****************************************************************
+_load_task_register PROC    NEAR
+        push    bp
+        mov     bp,sp
+        ltr     [bp+4]      ;load task register with selector for current task
+        pop     bp
+        ret
+_load_task_register ENDP
+
+;*****************************************************************
+;   void real_mode(unsigned int dseg) -
+;   returns 386 to real mode. pass this routine the selector for
+;   a 64k data segment so we can return to real mode. this
+;   routine assumes we are executing from a 64k data segment.
+;   (80386 segment registers must have selector of segment with
+;   64k limit to return to real mode)
+;*****************************************************************
+_real_mode  PROC    NEAR
+        push    bp
+        mov     bp,sp
+        mov     ax,[bp+4]           ;get selector for data segment
+        mov     ds,ax               ;now make sure all segment registers
+        mov     es,ax               ;contain selector to 64k segment
+        mov     fs,ax               ;must have this to return to real mode
+        mov     gs,ax
+        mov     ss,ax
+        mov     eax,cr0
+        and     eax,07ffffffeh
+        mov     cr0,eax             ;protected mode off
+        jmp     FAR PTR flush       ;flush queue and set cs for real mode
+                                    ;now cs will be loaded with correct
+                                    ;segment for real mode
+flush:
+        mov     ax,DGROUP           ;restore data seg registers for real mode
+        mov     ds,ax
+        mov     ss,ax
+        mov     es,ax
+        sti                         ;interrupts back on for real mode
+        pop     bp
+        ret
+_real_mode  ENDP
+
+;*****************************************************************
+;   void jump_to_task(unsigned int tss_selector) -
+;   jumps to 386 TSS task. pass this routine the selector of the
+;   TSS of the task you want to jump to.
+;*****************************************************************
+_jump_to_task   PROC    NEAR
+        push    bp
+        mov     bp,sp
+        mov     ax,[bp+4]           ;get selector of new task
+        mov     new_select,ax       ;store it in pointer
+        jmp     DWORD PTR new_task  ;jump to task through selector:offset ptr
+        pop     bp
+        ret
+_jump_to_task   ENDP
+
+                END
+
+
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1989, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

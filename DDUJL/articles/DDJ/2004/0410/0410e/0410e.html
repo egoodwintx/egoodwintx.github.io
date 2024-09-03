@@ -1,0 +1,184 @@
+
+<html>
+<head>
+<title>October, 2004: Optimizing Pixomatic For Modern x86 Processors: Part III</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Optimizing Pixomatic For Modern x86 Processors: Part III</h1>
+<p><i>Dr. Dobb's Journal</i> October, 2004</p>
+<h2>Challenging  assumptions about  optimization</h2>
+
+
+<h3>By Michael Abrash</h3>
+
+
+<I>Michael is a developer at RAD Games Tools and author of several legendary programming books, including Graphics Programming Black Book. He can be contacted at mikearadgametools.com.</I>
+
+<hr>
+
+
+
+
+
+<p>In the first two installments of this three-part article, I introduced the optimization challenges we faced with Pixomatic, the 3D software rasterizer that Mike Sartain and I developed for RAD Games Tools, and examined tools such as the welder and Speedboy. This month, I'll wrap up by examining the big performance effect of small code changes.</p>
+<h3>Out-of-Order Processing</h3>
+
+<p>Out-of-order processing complicates optimization quite a bit, but otherwise, it's a huge win and enabled us to simplify Pixomatic in some important ways.</p>
+
+<p>For one thing, we contemplated swizzling textures; that is, reordering texture address bits in order to get better cache coherency and reduce memory latency. However, it turned out that the P4's ability to have a large number of memory fetches in flight without halting processing, together with large L2 caches, got most of the benefit of swizzling with none of the complications. When I tried swizzling back in the 486 days, I got a pretty big win; on the Pentium 4, though, things generally got a little slower due to the extra code.</p>
+
+<p>There was one case, however, in which swizzling made Pixomatic run a lot slower on the Pentium 4: when the textures didn't fit in the L2 cache and were rotated exactly 90 degrees. The 90-degree case is special because the most common L2 cache is only eight-way set-associative rather than fully associative. This means that for 90-degree-rotated textures larger than the cache&#151;generally, larger than 256&times;256&#151;the cache thrashes during rasterization of each scan line, as the cache lines storing the scan line's texels contend for the eight available slots in their set.</p>
+
+<p>Similarly, when I worked on <i>Quake</i>, we got a big win by carefully arranging the code so divides could overlap with other processing. On a Pentium 4, however, out-of-order processing automatically lets divides overlap, and there was no improvement at all when I redid the code to explicitly allow time for divides to complete before the results were needed.</p>
+
+<p>Finally, when we went to a full DX7-class feature set, I was faced with a choice between either occasionally adding superfluous moves to the welded code or adding a lot more code to the welder to eliminate those moves. I started to add the code to eliminate the extra moves, but when I tested the results, I found that there was no reason to bother because those moves were effectively free. It was the MMX code that contained the critical dependency paths and, hence, gated system performance; thanks to out-of-order processing and multiple execution units, the extra moves simply executed in parallel with the MMX instructions and had no impact on performance.</p>
+
+<p>In fact, it turned out that MMX and SSE code gated performance much more than we would have expected, for an unanticipated reason. The Pentium 4's reorder buffer is big enough to contain all the instructions in a typical pixel-processing loop, and each loop is independent of the previous one. Consequently, we expected that the Pentium 4 would be able to overlap one loop with the next, rather than bottlenecking on the dependency chain within a single loop, but that proved not to be the case.</p>
+
+<p>Normally, the reorder buffer is fed instructions from a variety of reservation stations&#151;integer, move, MMX/SSE, and so on. However, Pixomatic's pixel loop is very heavily weighted toward MMX, and there's only one reservation station for MMX instructions (this station handles SSE instructions as well), and the reorder window for that station is much smaller than the reorder buffer itself&#151;only about a dozen instructions. This window isn't big enough to reach around to the next loop iteration most of the time, so the pixel pipeline spends a lot of time waiting on MMX dependency chains, even though the reorder buffer isn't full.</p>
+
+<p>The limited size of the reservation stations is one reason why, despite out-of-order processing, code reordering can still improve performance on Pentium 4s. Another reason is simply that the order in which instructions reach execution units can change the critical path and alter performance considerably, as we saw in Part II (<i>DDJ</i>, September 2004) in the case of the code that was faster with an extra multiply.</p>
+
+<p>The size of the reservation stations is increasing in newer processors, so this situation should improve. If nothing else, however, this is a reminder of how difficult it can be to assess all the factors that affect the performance of x86 code.</p>
+
+<p>Once again, the best way to deal with this is to just try stuff and see what works, rather than overanalyzing and talking yourself out of what might turn out to be a big win.</p>
+
+<p>For example, in Pixomatic 1.0, a sizeable chunk of time was spent doing attribute setup&#151;calculating texture and color gradients and initial interpolator values&#151;for triangles that turned out to be completely z occluded. After we finished Version 1.0, Mike Sartain pelted me with ideas for reducing that cost&#151;hierarchical z buffers, coarse z buffers, bounding box testing, bounding rectangle testing, you name it. I was a little burned out from finishing the 1.0 code and then writing the documentation, and I didn't really want to think about new complications, so I just kept pointing out why his ideas wouldn't work.</p>
+
+<p>A few days later and a bit better rested, I felt kind of bad about having been so negative, so I stopped thinking about what wouldn't work and started thinking about what might work. And suddenly I realized that I could easily separate out the z-buffer code and run it first, lazily setting up the rest of the triangle only if I found a pixel that passed the z test. In fact, it fell out so cleanly that the whole thing required only a few dozen new lines of code; furthermore, with z testing split out separately, it was easy to use a bit of assembly code to speed it up further. All in all, the implementation took only a day and resulted in a speedup of about 10 percent for<i> Quake 2</i>.</p>
+<h3>Branch Prediction</h3>
+
+<p>In the old days, loop unrolling was a standard optimization technique. What we found with Pixomatic is that because branch prediction works well for loops, unrolling generally doesn't help much and sometimes even hurts, due to limited code cache space. On occasion, we did find that unrolling a loop once&#151;just doubling it&#151;did help.</p>
+
+<p>In general, as you might expect, branch prediction works remarkably well when a branch is reasonably predictable&#151;which, fortunately, is most of the time. However, there are some places in Pixomatic (for example, in the edge-stepping code) where branches are, if not truly random, certainly not fully predictable. Since we've measured penalties of 24 clocks and up for mispredicted branches on Pentium 4s, this is a concern, and raises the question of whether anything can be done to improve performance in such cases.</p>
+
+<p>The primary way we've addressed this in Pixomatic is by using two-element lookup tables in place of branches that choose between adding two different values; this solves the problem for edge stepping, although extra setup is required to construct the tables. However, we've come up with a different and highly nonintuitive way to deal with branch misprediction in certain circumstances in RAD's Granny data compressor.</p>
+
+<p>In Granny, there are places where numbers in the range 0 to 1 are processed, and the nature of the processing depends on the quartile&#151;0 to .25, .25 to .5, and so on&#151;in which the number falls. This is effectively just a switch statement that breaks the full range into four equally sized bins. The values tested are totally random. The question then becomes: What's the best way to route execution to the proper bin?</p>
+
+<p>The obvious solution is a linear search, with three tests, as shown in <a name="rl4"></a><a href="#l4">Listing Four</a>. (Listings One through Three appeared in last month's installment.) This will result in four possible branching patterns. Either the first test succeeds and we're done, or the first test fails, in which case either the second test succeeds and we're done, or the second test fails, in which case the third test either succeeds or fails, and we're done either way. What's interesting about this is how the tests are biased for the purposes of prediction.</p>
+
+<p>Given random data, the first test will fail three-quarters of the time and will typically predict correctly each of those times. One out of four times, it will succeed; in those cases, it will typically mispredict. Similarly, the second test will fail two-thirds of the time, predicting correctly, and succeed a third of the time, mispredicting. Finally, the third test will succeed and fail an equal number of times, and consequently will mispredict about half the time, on average. Of particular note is the fact that typically only the last test performed should mispredict, so there should be at most one mispredicted branch.</p>
+
+<p>What all this adds up to, assuming 24 clocks for a mispredicted branch and 1 clock for a predicted branch, is 19.5 clocks and 2.25 branching instructions on average for the linear search code.</p>
+
+<p>A more sophisticated way to approach this is to do a binary search, with each branch reducing the candidates by half, as shown in <a name="rl5"></a><a href="#l5">Listing Five</a>. In this case, all paths perform <i>log</i>2<i>(N)</i> tests; for the case of a four-bin search, this reduces the average number of branches from 2.25 to 2. Given random data, however, all the branches now mispredict half the time on average, the result being that the binary search code takes 25 clocks. Surprisingly, this means that the brute force linear search code is about 1.3 times faster than the binary search for the four-bin case.</p>
+
+<p>That's somewhat unexpected, but maybe it's because the number of bins is so small, so let's try a larger number, say eight rather than four bins. Predictably, the binary search requires 50 percent more branches and clocks, for a total of 37.5 clocks and 3 branches per iteration. The linear search, in contrast, jumps to 4.375 branches&#151;but requires only 24.5 clocks per iteration. The linear search code is now more than 1.5 times faster!</p>
+
+<p>How can this be? The key is that mispredicted branches are 24 times as expensive as predicted branches, and all the branches in the binary search code mispredict half the time. Most of the linear search branches, on the other hand, are heavily biased; although many more of them are executed, they mispredict very rarely&#151;less than once per iteration, on average. Thus, although bigger searches require larger increases in the number of tests with the linear search code than with binary search code, the additional branches in the linear search code don't increase the misprediction burden.</p>
+
+<p>Surely, though, at some point the <i>log(N)</i> nature of the binary search wins?</p>
+
+<p>It does, but it's startling how large the number of bins has to get before this is true. The break-even point is around 64 bins, as in <a name="rf3"></a><a href="0410ef3.html">Figure 3</a> (Figures 1 and 2 appeared last month). We've tested this with real code, and our results were in line with these calculations. So it's clearly worth structuring code and data to let branch prediction work as well as possible, even though that sometimes requires extra tests&#151;and this is only going to become more true as CPU pipelines lengthen and misprediction costs rise in the future.</p>
+
+<p>Of course, the linear approach, as used in an actual program, incurs costs in terms of code size and use of branch prediction entries, so you'd have to try both approaches to know which is really best in any particular scenario. Still, there's an important lesson to be learned here in terms of thinking flexibly and questioning your assumptions.</p>
+<h3>Latency</h3>
+
+<p>Another area in which costs are high and rising is the latency of random, uncached memory accesses. Each level of memory hierarchy increases latency by an order of magnitude or more; access to main memory can take literally hundreds of cycles. Usually, the cache and out-of-order processing hide this, or at least reduce it to a tolerable level, but when that's not the case, performance can drop dramatically.</p>
+
+<p>For example, it's important not to chase sparse pointers through memory. If you have a structure that's, say, 1 KB in size, stored as a linked list of 1000 structures, when you walk the list, you're going to pull a whole new cache line into memory for each structure you touch (and will often touch a new page as well with an additional performance cost). You'd be far better off having two parallel structures, one containing the pointers and any keys you search on, and a second, pointed to by the first, containing the rest of the data. Better still, if possible, would be to have the keys stored in an array that can be walked in order, so that each cache line would be fully used as soon as it was loaded.</p>
+
+<p>The same sort of caution should be exercised with sparse access to any sizeable data structure; for example, sparse access to large arrays should be avoided whenever possible.</p>
+
+<p>Latency is now a factor even within the CPU; it takes quite a few clocks&#151;sometimes into the double digits&#151;to move data between the SSE, MMX, and general- purpose units. This has significant implications for code such as the texture mapper I showed in Part II, which calculated the texture offset in an MMX register, then moved it to a general-purpose register for use in addressing memory. When there are multiple nondependent operations going at once, this isn't a problem because the latency is hidden while other operations execute, but in our code&#151;particularly given the size of the reorder window, as mentioned earlier&#151;the latencies are on the critical path, and quite costly.</p>
+
+<p>One place this bit us was when we wanted to perform some floating-point operations, then convert the result to an integer, clamp it to a 16-bit value, and store the value to a 16-bit memory variable. We ended up doing the floating-point work in SSE registers, then converting to integer and clamping to a 16-bit value in an MMX register, and finally copying the result to a general-purpose register in order to save it, since there's no 16-bit MMX store instruction. This was faster than any of the alternatives, but by much less than we had expected because of the latency in transferring from SSE to MMX, then MMX to general purpose.</p>
+
+<p>Of course, we could have used SSE2 and skipped using MMX altogether, and that would probably have helped somewhat, but there are two reasons we did not. First, the win would have been reduced because integer SSE2 instructions take twice as many clocks as equivalent MMX instructions.</p>
+
+<p>Second, because we can't count on the presence of SSE2, implementing this would have required us to support a third code path (we also have to handle the nonSSE case), and wouldn't have helped performance on any but high-end machines.</p>
+
+<p>We did end up using SSE2 in one place (some color-conversion code) where a dozen lines of assembly code produced a measurable speedup in <i>Quake 2</i>. Otherwise, however, we were unable to find any cases in which SSE2 was worth the extra overhead of adding an extra code path. That's not to say that SSE2 can't be a win but, in our experience, your data and algorithms have to have just the right kind of inherent parallelism for SSE2 to pay off.</p>
+<h3>Small Changes, Big Effects</h3>
+
+<p>One of the most frustrating aspects of optimizing Pixomatic was that often just a small change would produce a performance delta of 5, 10, 20, or even 50 percent. Once, in fact, we got a four times slowdown in a large-triangle performance test just from moving the definitions of some variables into another file. This made it difficult to be sure of the actual performance effects of changes, and also made it a challenge to maintain top performance. We wound up running performance tests frequently and tweaking the code appropriately whenever we spotted a regression.</p>
+
+<p>We found two primary causes for these huge variations in performance.</p>
+
+<p>The first cause was double alignment on the stack. Normally, the compiler aligns doubles to 8-byte boundaries, but it does not do the extra work that would be required to 8-byte-align doubles on the stack, and this was causing slowdowns of up to 40 percent overall in some timing tests.</p>
+
+<p>Double alignment on the stack can normally be fixed by using static doubles or by allocating 12 bytes and then calculating an aligned pointer to a double within that space. It's also possible to use <i>declspec</i> to force alignment of stack variables, although then the compiler uses another register, usually EBX, to address the stack, which often reduces performance. Unfortunately, none of those solutions solved our particular problem because our unaligned stack doubles were compiler-created temporaries, and there was no way to tell the compiler to align them or to keep it from creating them. Our solution was to insert a small assembly function in the call chain just above the routines that used temporary doubles on the stack; this function actually modifies the stack pointer so that the doubles are 8-byte aligned.</p>
+
+<p>The other cause of erratic performance&#151;and by far the worst&#151;was 64K aliasing. On most Pentium 4s, if two data items in the L1 cache are at the same address modulo 64K, then a massive slowdown often occurs. Intel's documentation explains this by saying that the instruction that accesses the second piece of 64K-aliasing data has to wait until the first piece is written from the cache, which is to say until the first instruction is completely finished. As you might expect, this can wreak havoc with out-of-order processing. It was 64K aliasing that caused the aforementioned four-times slowdown in our large-triangle drawing benchmark.</p>
+
+<p>The truly insidious thing about 64K aliasing is that it is very hard to reliably eliminate it. Sure, it helps to avoid obvious problems. For example, pixel buffers and 32-bit z buffers are accessed at the same intrabuffer offsets for any given pixel, so if they encounter 64K aliasing at all, it will happen constantly; to avoid this, Pixomatic makes sure the two buffers never start at the same address modulo 64K (and also not at the same address modulo 4K, to avoid cache contention). But time after time, we've tweaked our data to get rid of 64K aliasing, only to have it pop up again a few days later after more changes were made. About all you can do is run VTune periodically to see if the number of 64K-aliasing events has spiked and, if it has, start backing out changes to figure out what variables or buffers need to be tweaked so they're not 64K aligned.</p>
+
+<p>On newer Pentium 4s, 64K aliasing changes to 1M aliasing, and in the most recent versions to 4M aliasing, which should reduce the problem considerably. Older Pentium 4s that have 64K aliasing also have 1M aliasing, which introduces an additional penalty on top of the cost of 64K aliasing, so beware of 1M aliasing even more than 64K.</p>
+
+<p>By the way, on Pentium 4s that have 1M aliasing but not 64K aliasing, the aliasing event counter still fires on 64K-aliasing events, even though they don't affect performance on those chips, so VTune will report incorrect results in such cases. On newer P4s that only have 4M aliasing, VTune will correctly report only 4M-aliasing events.</p>
+<h3>Hyperthreading</h3>
+
+<p>Finally, we come to hyperthreading. We racked our brains on this one, but we just couldn't get hyperthreading to work well for Pixomatic. Pixomatic consists of several serially dependent modules with asymmetric loads, which makes it hard to keep two threads busy all the time. Also, the sequence in which pixels are drawn is key&#151;alpha blending in the wrong order would be bad&#151;and z<i> </i>buffer tests and modifications have to be atomic; this makes it very hard to efficiently hyperthread any of the pipeline levels. Finally, it turns out that it's very expensive to start and stop a hyperthread on the kind of fine-grained basis that would have been required to make it workable for Pixomatic.</p>
+
+<p>That doesn't mean a Pixomatic-based app can't benefit from hyperthreading; it just means that it's up to the app to manage the hyperthreading. Ideally, the application would use one thread to do all the game processing, and a second thread to walk the graphics database and call Pixomatic. It would be nice if Pixomatic could automatically take advantage of hyperthreading without the app even knowing it, but there's just not a good fit there. In general, hyperthreading has the potential to help performance considerably; for example, RAD Game Tools' Bink video compressor, which lends itself nicely to parallel threads, runs about 1.5 times faster with hyperthreading&#151;but, much as with SSE2, unless your data and algorithms map directly to what the hardware demands, it's difficult to tap that potential.</p>
+<h3>Conclusion</h3>
+
+<p>Not so long ago, it seemed certain that better compilers and out-of-order processing would soon render processor-level x86 hand-tuning obsolete. Today's x86 optimization techniques are in many ways dramatically different from those of just a few years ago, but they're just as capable of producing remarkable increases in performance. In short, I'm pleased to be able to report that pedal-to-the-metal x86 optimization lives! </p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l4"></a>Listing Four</b><br>
+<pre>if (condition 1)
+{
+    &lt;handler 1&gt;
+}
+else if (condition 2)
+{
+    &lt;handler 2&gt;
+}
+else if (condition 3)
+{
+    &lt;handler 3&gt;
+}
+else
+{
+    &lt;handler 4&gt;
+}</pre>
+<a href="#rl4">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l5"></a>Listing Five</b><br>
+<pre>if (condition 2)
+{
+    if (condition 1)
+    {
+            &lt;handler 1&gt;
+    }
+    else
+    {
+            &lt;handler 2&gt;
+    }
+}
+else
+{
+    if (condition 3)
+    {
+            &lt;handler 3&gt;
+    }
+    else
+    {
+            &lt;handler 4&gt;
+    }
+}</pre>
+<a href="#rl5">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

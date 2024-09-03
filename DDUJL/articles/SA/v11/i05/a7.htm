@@ -1,0 +1,331 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v11, i05: Doing Many Things, Like pings</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><a href="../../../../source/SA/2002/may2002.tar"><b class=codeListing>may2002.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b><img src="../../resource/perl.gif" width="150" height="150" align="right">Doing 
+              Many Things, Like pings</b></h1>
+            <p> <i>Randal L. Schwartz</i>
+            <p> As a UNIX systems administrator, I'm often faced with those 
+              little mundane tasks that seem so trivial to me but so important 
+              to the community I'm supporting. Little things like "hey, 
+              is that host up and responding to pings?". Such tasks generally 
+              have a very repetitive nature to them, and scripting them seems 
+              to be the only way to have time to concentrate on the tasks that 
+              really need my attention.
+            <p> Let's look at the specific task of pinging a number of hosts 
+              on a subnet. Now, there are tools to do this quickly (like <b>nmap</b>), 
+              and there are even Perl modules to perform the <b>ping</b> (as in 
+              <b>Net::Ping</b>), but I wanted to focus on something familar that 
+              can be launched from Perl as an external process, and the system 
+              C&lt;<b>ping</b>&gt; command seems mighty appropriate for that.
+            <p> First, let's look at how to ping one host, on my BSD-ish 
+              system:
+            <p> 
+            <pre>
+sub ping_a_host {
+  my $host = shift;
+  'ping -i 1 -c 1 $host 2&gt;/dev/null' =~ /0 packets rec/ ? 0 : 1;
+}
+</pre>
+            Here, I'm firing up a subshell to execute the <b>ping -i 1 -c 
+            1</b> command, which on my system requests that <i>ping</i> have a 
+            1-second timeout, and selects (as Sean Connery's character so 
+            eloquently said in <i>The Hunt for Red October</i>) "one ping 
+            only". Your ping parameters may vary: check your manpage.
+            <p> The output is scanned for the string <b>0 packets rec</b>, which 
+              if absent means we got a good ping. So if the match is found, we 
+              return 0 (the ping was bad); otherwise, we'll return 1. The 
+              <b>ping</b> command spits out some diagnostics on standard error, 
+              which we'll toss using Bourne-shell syntax.
+            <p> Note that the value of <b>$host</b> is not checked here for sanity. 
+              We certainly wouldn't want to accept a random command-line 
+              parameter or (gasp) a Web form value here without some serious validation. 
+              However, as we use this in our program, all of the values will be 
+              internally generated, so we've got some degree of safety.
+            <p> To scan a particular subnet, looking for hosts that are alive, 
+              we would add to that subroutine something like:
+            <p> 
+            <pre>
+print "ping $_ is ", ping_a_host($_), "\n"
+  for map "10.0.1.$_", 1..254;
+</pre>
+            This routine completes very quickly for hosts that are alive, but 
+            is slow as molasses for hosts that aren't present, because the 
+            TCP protocol demands that the host have a chance to respond.
+            <p> So, how can we speed that up? This is not a CPU-intensive loop: 
+              practically the entire time is spent waiting for some remote host 
+              to respond. We'll leave the <b>ping_a_host</b> subroutine alone, 
+              because that's not where we have a problem -- it's 
+              doing its job as fast as it can. So we need to do more of these 
+              at a time.
+            <p> One approach is to fork a separate process for each host we want 
+              to ping. We'll then sit back in a wait loop. As each child 
+              process completes, we'll note its exit status, and when there 
+              are no more kids, we'll spit out a report.
+            <p> First, we'll define the host list for the task:
+            <p> 
+            <pre>
+my @hosts = map "10.0.1.$_", "001".."010";
+</pre>
+            The numbers here are padded to three digits so that they sort as strings 
+            in a numeric sequence -- a cheap but effective trick. Note also 
+            that I'm only selecting the first 10 hosts this time. I'll 
+            explain that shortly.
+            <p> Next, we'll want a hash to keep track of the kids:
+            <p> 
+            <pre>
+my %pid_to_host;
+</pre>
+            The keys of this hash will be the child process ID (PID), and the 
+            value will be the corresponding host that the child is processing. 
+            Then, we'll want to loop over the host list, firing up a child 
+            for each:
+            <p> 
+            <pre>
+for (@hosts) {
+  if (my $pid = fork) {
+  ## parent does...
+  $pid_to_host{$pid} = $_;
+  warn "$pid is processing $_\n";
+  } else { # child does
+  ## child does...
+  exit !ping_a_host($_);
+  }
+</pre>
+            As each host is placed into <b>$_</b>, we'll fork. The result 
+            of fork is a child process running in parallel with the parent process. 
+            These processes are distinguished only by the return value of <b>fork</b>, 
+            which is 0 in the child, but the child's PID in the parent. So, 
+            if we get back a non-zero value, we're the parent, and we'll 
+            store the PID into the hash, along with the host that particular child 
+            is processing. If we're the child, then we'll call the <b>ping_a_host</b> 
+            routine, and arrange for our exit status to be good (0) if that routine 
+            gives a thumbs up.
+            <p> The <b>warn</b> in the loop is merely for diagnostic purposes 
+              so that you can see what's happening. In a production program, 
+              I'd certainly remove that.
+            <p> At the end of this loop, we'll have a number of processes 
+              -- far too many, in fact. For each host to check, we'll 
+              have two processes running: the shell forked by the backquotes, 
+              and the ping process itself. Perl has to fork a shell because we 
+              needed that child to have its standard error output redirected. 
+              If I could have gotten the redirection out of those backquotes somehow, 
+              we'd have only one child process per host, not two.
+            <p> Launching 20 processes to check 10 hosts will start pushing us 
+              up against the typical per-user process limit. So you can see why 
+              I didn't do all 254 hosts at once!
+            <p> Now it's time to wait for the results. A simple "wait" 
+              loop will reap the children as fast as they complete their task, 
+              and we'll declare a hash to hold the results:
+            <p> 
+            <pre>
+my %host_result;
+</pre>
+            The key will be the host, and the value will be 1 if the child said 
+            it was pingable, otherwise 0.
+            <p> 
+            <pre>
+    while (keys %pid_to_host) {
+      my $pid = wait;
+      last if $pid &lt; 0;
+      my $host = delete $pid_to_host{$pid}
+or warn("Why did I see $pid ($?)\n"), next;
+      warn "reaping $pid for $host\n";
+      $host_result{$host} = $? ? 0 : 1;
+    }
+</pre>
+            As long as we've got kids (indicated by the ever-decreasing size 
+            of the <b>%pid_to_host</b> hash), we'll wait for them. The child 
+            process ID comes back from <b>wait</b>, which we'll stick into 
+            <b>$pid</b>. At this point, the exit status of that particular child 
+            is in <b>$?</b>. If the return value of <b>wait</b> is negative, then 
+            we don't have any more kids. This is an unexpected result, which 
+            we could check later by noticing that <b>%pid_to_host</b> is not yet 
+            empty, or we could have simply died here.
+            <p> We'll use the <b>%pid_to_host</b> hash to map the PID into 
+              the host for which it was processing. Again, we might have accidentally 
+              reaped a completed child that wasn't one of ours, so defensive 
+              programming requires checking for that. This won't happen unless 
+              other parts of this program are also forking children somehow, but 
+              I'm a cautious programmer most of the time.
+            <p> Finally, we'll take the exit status in <b>$?</b>, and map 
+              it into the appropriate good/bad value for the result hash.
+            <p> When this loop completes, we have no more kids performing tasks, 
+              and it's time to show the result:
+            <p> 
+            <pre>
+for (sort keys %host_result) {
+  print "$_ is ", ($host_result{$_} ? "good" : "bad"), "\n";
+}
+</pre>
+            For each key of the result table, we'll say whether the result 
+            was good or bad.
+            <p> Putting this all together makes a nice little demo of forking 
+              20 kids to check 10 hosts, but it won't scale to 254 hosts, 
+              because that would require more process slots than we typically 
+              have (or want to use, actually). We need to perform the forking 
+              gradually, so that we never have more than 20 kids at a time. One 
+              naive approach is to chunk the data into bite-size bits:
+            <p> 
+            <pre>
+my @all_hosts = ...;
+my %host_results;
+while (my @hosts = splice @all_hosts, 0, 10) {
+  ... process @hosts, adding into %host_results ...
+}
+... show results ...
+</pre>
+            Here, most of the code above gets wrapped into an outer loop that 
+            hands 10 hosts at a time to be processed, using C&lt;<b>splice</b>&gt; 
+            to peel them off the master list. While this strategy certainly solves 
+            the "no more than 10 at a time" condition, each batch of 
+            10 has to wait for the slowest of the 10 to complete.
+            <p> A better way would be to fork until we hit the limit of active 
+              children, then wait for any one child to finish before we need to 
+              fork again. First, we'll need to factor out "waiting for 
+              a kid" into a subroutine so we can call it in two different 
+              places: while forking a new task, and at the end to reap all the 
+              remaining children:
+            <p> 
+            <pre>
+    sub wait_for_a_kid {
+      my $pid = wait;
+      return 0 if $pid &lt; 0;
+      my $host = delete $pid_to_host{$pid}
+or warn("Why did I see $pid ($?)\n"), next;
+      warn "reaping $pid for $host\n";
+      $host_result{$host} = $? ? 0 : 1;
+      1;
+    }
+</pre>
+            Note that we're accessing <b>%pid_to_host</b> and <b>%host_result</b> 
+            directly here, so those variables must be in scope before the subroutine 
+            definition. The subroutine now returns 1 if a kid was reaped, and 
+            0 otherwise. The final reap loop now becomes:
+            <p> 
+            <pre>
+## final reap:
+1 while wait_for_a_kid();
+</pre>
+            At this point, the program functions identically to the prior one, 
+            except that I've re-factored the kid reaping. The magic happens 
+            next. We'll put <b>wait_for_a_kid</b> in the middle of the forking 
+            loop as well, just before we're about to fork, conditionally 
+            if the number of kids is already at the maximum we chose:
+            <p> 
+            <pre>
+for (@hosts) {
+  wait_for_a_kid() if keys %pid_to_host &gt;= 10;
+  ...
+</pre>
+            Ahh. That does it. We can now crank <b>@hosts</b> back up to our 254 
+            items. As we fire off the first 10, this new statement has no effect. 
+            But when it comes time for the 11th, we'll wait for at least 
+            one of the other 10 to complete first. So, at no time do we have more 
+            than 10 hosts active (using 20 child processes for reasons explained 
+            earlier). The entire program is given here in case you want to see 
+            it all in context:
+            <p> 
+            <pre>
+sub ping_a_host {
+  my $host = shift;
+  'ping -i 1 -c 1 $host 2&gt;/dev/null' =~ /0 packets rec/ ? 0 : 1;
+  }
+
+  my %pid_to_host;
+  my %host_result;
+
+  sub wait_for_a_kid {
+    my $pid = wait;
+    return 0 if $pid &lt; 0;
+    my $host = delete $pid_to_host{$pid}
+    or warn("Why did I see $pid ($?)\n"), next;
+    warn "reaping $pid for $host\n";
+    $host_result{$host} = $? ? 0 : 1;
+    1;
+  }
+
+  my @hosts = map "10.0.1.$_", "001".."254";
+
+  for (@hosts) {
+    wait_for_a_kid() if keys %pid_to_host &gt; 10;
+    if (my $pid = fork) {
+    ## parent does...
+    $pid_to_host{$pid} = $_;
+    warn "$pid is processing $_\n";
+    } else { # child does
+    ## child does...
+    exit !ping_a_host($_);
+    }
+  }
+
+  ## final reap:
+  1 while wait_for_a_kid();
+
+  for (sort keys %host_result) {
+    print "$_ is ", ($host_result{$_} ? "good" : "bad"), "\n";
+  }
+</pre>
+            As a working program, this does pretty well, although it could be 
+            made a bit more robust, and is very specific to the particular <b>ping</b> 
+            program on my machine. If you don't want to write this pattern 
+            of code into each program that wants to do parallel things, look at 
+            <b>Parallel::ForkManager</b> in the CPAN, which does pretty much the 
+            same thing with a friendly interface.
+            <p> One improvement to this program might be to pre-fork and re-use 
+              the children, using some sort of IPC (pipes or sockets) to communicate 
+              additional tasks to perform as each task completes, but I've 
+              run out of space to talk about that here. Until next time, enjoy!
+            <p> <i>Randal L. Schwartz is a two-decade veteran of the software 
+              industry -- skilled in software design, system administration, 
+              security, technical writing, and training. He has coauthored the 
+              "must-have" standards: </i>Programming Perl<i>, </i>Learning 
+              Perl<i>, </i>Learning Perl for Win32 Systems<i>, and </i>Effective 
+              Perl Programming<i>, as well as writing regular columns for </i>WebTechniques<i> 
+              and </i>Unix Review<i> magazines. He's also a frequent contributor 
+              to the Perl newsgroups, and has moderated comp.lang.perl.announce 
+              since its inception. Since 1985, Randal has owned and operated Stonehenge 
+              Consulting Services, Inc.</i>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

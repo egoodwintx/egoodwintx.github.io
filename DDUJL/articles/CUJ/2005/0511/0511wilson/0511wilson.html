@@ -1,0 +1,361 @@
+
+
+
+<html>
+<head>
+<title>November, 2005: Argument-Dependent Return-Type Variance</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>Argument-Dependent Return-Type Variance</h1>
+<p><i>C/C++ Users Journal</i> November, 2005</p>
+<h2>Overloading with a twist</h2>
+
+
+<h3>By Matthew Wilson</h3>
+
+
+<I>Matthew Wilson is a software-development consultant for Synesis Software, creator of the STLSoft libraries, and author of Imperfect C++ (Addison-Wesley, 2004). He can be contacted at http://imperfectcplusplus.com/.</I>
+
+<hr>
+
+
+
+<p>[This month's column is, in part, an extract from Matthew's forthcoming book on STL extension, called <i>Extended STL</i>, which will be published by Addison-Wesley in 2006.]</p>
+
+
+<p>Q: How do you double a function's potential return value semantics? </p>
+
+<p>       A: ARV it!</p>
+
+
+
+<p>This month's installment takes the column on a sideways tack from its major remit, the investigation of integrating different languages and technologies with C and C++, into looking at how other languages&#151;in this case, Python and Ruby&#151;might be seen to influence the idioms of C++. I'll be looking at how a type may act as both an array and an associative array/dictionary/map, which requires that different functions of the same name return different types based on the type(s) of their argument(s). Now, you're probably thinking at this point, Well Duh! That's just overloading. And so it is. But there's more to it than that, and that's our story.</p>
+<h3>Borrowing a  Jewel from Ruby</h3>
+
+<p>Consider the following Ruby code, which uses the Open-RJ/Ruby mapping:</p>
+
+<pre>
+# Open the database in the given file
+db = OpenRJ::FileDatabase(
+  'pets.orj', OpenRJ::ELIDE_BLANK_RECORDS)
+
+# Access the first record
+rec = db[0]
+
+# Print the fields in this record
+(0 ... rec.numFields).each \
+{ |i|
+    fld = rec[i]
+    puts "Field#{i}: name=#{fld.name}; 
+	           value=#{fld.value}"
+}
+
+</pre>
+
+
+
+<p>That's pretty regular Ruby, and quite typical of code using the Open-RJ/Ruby mapping. (I could have more easily used <b>each_with_index</b>, but this way suits my purposes a little better.) Using the pets sample database that comes with the Open-RJ distribution, this prints out:</p>
+
+<pre>
+Field0: name=Name; value=Barney
+Field1: name=Species; value=Dog
+Field2: name=Breed; value=Bijon Frieze 
+
+</pre>
+
+<p>Consider now that rather than accessing the fields by index, we access them by name:</p>
+
+<pre>
+. . . # as before
+
+# Print the fields in this record
+puts "Name="    + name=rec["Name"]
+puts "Species=" + name=rec["Species"]
+puts "Breed="   + name=rec["Breed"] if 
+                   rec.include?("Breed")
+
+</pre>
+
+<p>This style is more useful when you have an expectation as to the contents of the record, since there's no explicit testing involved, and it serves as a verification of the structure, throwing an exception if a given field does not exist [1]. This prints out:</p>
+
+<pre>
+Name=Barney
+Species=Dog
+Breed=Bijon Frieze
+
+</pre>
+
+<p>Look again carefully at the two uses of the subscript operator. In the first case, the argument to the operator is an integer, and in the second case it is a string. Note the return types associated with these different calls. In the case of an integral argument, the return value is a <b>Field</b> instance. Thus, the record has acted like an array. In the case of a string argument, the return value is a string (representing the <b>value</b> member of the named <b>Field</b>). Thus, the record has acted like an associative array (also known as map, hash, or dictionary). When appropriate, this duality is a remarkably useful facility. It's appropriate in the case of Open-RJ records because Open-RJ database contents are immutable, fields are represented as name+value string pairs, and arrays of pointers to field structures are maintained in each record structure. Indeed, any database/recordset analogy lends itself to this technique to improve data accessibility.</p>
+
+<p>This functionality is implemented in the Open-RJ/Ruby mapping (written in C) via the <b>Record_subscript()</b> function, and its two worker functions <b>Record_subscript_string()</b> and <b>Record_subscript_fixnum()</b> (see <a href="0511wilsonl1.html" target="_BLANK">Listing 1</a>). If the index argument is a string (<b>T_STRING</b>), then <b>Record_subscript_string()</b> is invoked and either returns a string representing the value of the named field, if found, or fails. If index is an integer (<b>T_FIXNUM</b>), then an instance of the field at the given index is returned if within range, or fails. If index is another type, then a <b>TypeError</b> is raised to the caller.</p>
+<h3>Dual-Semantic  Subscripting in C++</h3>
+
+<p>I wanted to emulate this in C++. A simplistic form of this would be as follows:</p>
+
+<pre>
+class Record
+{
+public:
+  . . .
+  const Field  operator [](size_t 
+     index) const;
+  const String operator [](char const 
+     *name) const;
+};
+
+</pre>
+
+<p>(The <b>String</b>, <b>Field</b>, and <b>Record</b> types are all lightweight C++ wrappers for the underlying Open-RJ C-API types <b>ORJStringA</b>, <b>ORJFieldA</b>, and <b>ORJRecordA</b>, shown in <a href="0511wilsonl2.html" target="_BLANK">Listing 2</a>.)</p>
+
+<p>This works well, up to a point:</p>
+
+<pre>
+Record r;
+
+r["Species"]; // Returns value (a String) 
+	      // of field named "Species"
+r[1];         // Return second field 
+	      // instance (a Field)
+
+</pre>
+
+<p>Alas, there are several drawbacks to this approach. First, consider what happens in the following case:</p>
+
+<pre>
+r[0]; // Compile error
+
+</pre>
+
+<p>The problem is that literal 0 is just as convertible to an integral type that is not <b>int</b>, as it is to a pointer type. We might solve this by changing the integral form to use <b>int</b>, but then we have the possibility of negative indices, which are not meaningful with an Open-RJ record. (I'm not going to get into the debate about the notion that use of signed integers is always preferable, as it avoids C/C++'s occasionally surprising integral conversions; I just use high warning levels.)</p>
+
+<pre>
+class Record
+{
+public:
+  . . .
+  const Field  operator [](int index) const;
+  const String operator [](char const *name) const;
+};
+
+</pre>
+
+<p>In any case, there's a much bigger issue here. The only string type with which the other overload is compatible is a C-style string (<b>char const*</b>)&#151;those of you familiar with my predilection for generalized programming by manipulation of types by what they do, rather than what they strictly are, will not be surprised that I don't find that at all satisfying. Maximally flexible classes should work with all string types, not just <b>char const*</b> versus <b>std::string const&amp;</b>.</p>
+<h3>Generalized Compatibility  Via String Access Shims</h3>
+
+<p>The Shims concept (described in my article "Generalized String Manipulation: Access Shims and Type Tunneling," from the August 2003 issue of <i>CUJ</i>, and in Chapter 20 of <i>Imperfect C++</i>) defines a mechanism for generalized manipulation of types with incompatible interfaces but that have the same, or similar, logical types, or may be meaningfully converted into the same type. The most obvious, and widely used, are the string access shims, which are a suite of five related shims: <b>c_str_data</b>, <b>c_str_len</b>, <b>c_str_ptr</b>, <b>c_str_size</b>, and <b>c_str_ptr_null</b>. In this case, we are concerned only about the <b>c_str_ptr shim</b>, which is an unbounded set of overloaded functions, named <b>c_str_ptr()</b> and in the <b>stlsoft</b> namespace, that return <b>char const*</b> or an instance of a type implicitly convertible to <b>char const*</b>. Members of the <b>c_str_ptr</b> shim from the STLSoft libraries include the following:</p>
+
+<pre>
+// From stlsoft/string_access.hpp
+char const *c_str_ptr(char const *);
+char const *c_str_ptr(std::string const &amp;);
+char const *c_str_ptr(stlsoft::basic_simple_string&lt;char&gt; const &amp;);
+char const *c_str_ptr(stlsoft::basic_string_view&lt;char&gt; const &amp;);
+
+// From winstl/time_string_access.hpp
+shim_string&lt;char&gt; c_str_ptr(FILETIME const &amp;t);
+shim_string&lt;char&gt; c_str_ptr(SYSTEMTIME const &amp;t);
+
+// From unixstl/string_access.hpp
+char const *c_str_ptr(struct dirent const *d);
+char const *c_str_ptr(struct dirent const &amp;d);
+
+// From mfcstl/string_access.hpp
+c_str_ptr_CWnd_proxy c_str_ptr(CWnd const &amp;w);
+
+</pre>
+
+<p>Other libraries, including Open-RJ, also define string access shims for their types that can be meaningfully represented as strings (and "export" them, via using declarations, to the <b>stlsoft</b> namespace), such as:</p>
+
+<pre>
+// From openrj/openrj.h (which does not include any STLSoft headers!)
+char const *c_str_ptr(ORJStringA const &amp;s);
+char const *c_str_ptr(ORJRC rc);
+char const *c_str_ptr(ORJ_PARSE_ERROR pe);
+
+</pre>
+
+<p>We can rewrite the named subscript operator of <b>Record</b> to work with any type for which the <b>c_str_ptr</b> string access shim is defined:</p>
+
+<pre>
+class Record
+{
+public:
+  . . .
+  const Field  operator [](size_t index) const;
+  const String operator [](char const *name) const;
+  template &lt;typename S&gt;
+  const String operator [](S const &amp;name) const
+  {
+    return operator [](c_str_ptr(name));
+  }
+};
+
+</pre>
+
+<p>and access named field values with a multitude of types, as in:</p>
+
+<pre>
+std::string s("Species");
+CWnd const  &amp;wnd = get_some_window_or_other();
+FILETIME    ft = . . .;
+
+r[s];
+r[wnd];
+r[ft];
+
+</pre>
+
+<p>(C++ is sometimes accused of having hidden costs. Note that shims do not have any costs over and above what would be required to elicit the string form in handwritten code, even in cases where a conversion is applied. But being efficient and powerful does have its costs: I couldn't imagine programming without them now!)</p>
+<h3>A Fly  In the int-ment</h3>
+
+<p>The picture's not quite complete. Looking again at the definition of <b>Record</b>, we see that we have three overloads of the subscript operator. If the argument is <b>char const*</b> or <b>size_t</b> (or <b>int</b>, if we'd elected to use that form), then the requisite nontemplate overload is selected. If the argument is any other type, then the string access shim wielding template overload is selected. This causes a problem if the argument is a different integer type, as in:</p>
+
+<pre>
+long l = 1;
+
+r[l]; // Error: no c_str_ptr() overload matches 'long'
+
+</pre>
+
+<p>Naturally, having a <b>long</b> interpreted as something convertible to a field name string is quite against the intent of the <b>Record</b> subscript operators. One way of fixing this is to define nontemplate overloads for all integral types (see <a href="0511wilsonl3.html" target="_BLANK">Listing 3</a>).</p>
+
+<p>Not exactly a pretty picture is it? Lots of repeated code, and ugly preprocessor discrimination to boot [2]. There has to be a better way, and so there is. What's required is a way for the compiler to "react" to an integral argument type by selecting the integral indexing operator, and to use the string lookup operator for everything else.</p>
+
+<p>We can't simply add a member function template for handling integer types:</p>
+
+<pre>
+  template &lt;typename I&gt;
+  const Field operator [](I const &amp;index) const
+  {
+    return operator [](static_cast&lt;unsigned int&gt;(index));
+  }
+
+</pre>
+
+<p>This is because we already have one for the strings, and the compiler would be understandably confused. We need to join the behavior of the two into one. This would be straightforward if they had the same return type, but since they don't, a dash of TMP (Template Meta Programming) is called for.</p>
+<h3>Selecting  Return Type and Overload</h3>
+
+<p>We need to select the right overload and select the right return type, which is achieved by combining two TMP techniques: type detection and type selection. The type detection&#151;is it an integer?&#151;is performed by the <b>is_integral_type</b> template, whose member constant <b>value</b> is nonzero when the template is specialized with an integral type, or zero otherwise:</p>
+
+<pre>
+assert(0 != is_integral_type&lt;int&gt;::value);
+assert(0 == is_integral_type&lt;char const*&gt;::value);
+
+</pre>
+
+<p>Specializations of <b>is_integral_type</b> also define a member type <b>type</b> to either the metaBoolean types <b>yes_type</b> or <b>no_type</b>.</p>
+
+<p>The type selection is performed using the <b>select_first_type_if</b> template, whose member type <b>type</b> is the first type parameter when its (third) Boolean parameter is nonzero, or is the second type parameter when zero:</p>
+
+<pre>
+template&lt; typename T1
+        , typename T2
+        , bool     B //!&lt; Selects T1
+        &gt;
+struct select_first_type_if
+{
+  typedef T1  type;   
+};
+
+template&lt; typename T1
+        , typename T2
+        &gt;
+struct select_first_type_if&lt;T1, T2, false&gt;
+{
+  typedef T2  type;
+};
+
+</pre>
+
+<p>Hence, the return selection looks like:</p>
+
+<pre>
+template &lt;typename T&gt;
+typename select_first_type_if&lt;Field
+                            , String
+                            , is_integral_type&lt;T&gt;::value
+                            &gt;::type
+
+</pre>
+
+<p>Overloads of a private worker method, <b>subscript_operator_()</b>, are defined as follows:</p>
+
+<pre>
+  template &lt;typename S&gt;
+  String subscript_operator_(S const &amp;name, no_type) const
+  {
+    return operator [](c_str_ptr(name));
+  }
+  template &lt;typename I&gt;
+  Field subscript_operator_(I const &amp;index, yes_type) const
+  {
+    return operator [](static_cast&lt;size_t&gt;(index));
+  }
+
+</pre>
+
+<p>They are selected, by overload, within the implementation of the subscript member function template via a temporary instance of the <b>type</b> member type of <b>is_integral_type</b>: </p>
+
+<pre>
+  template &lt;typename T&gt;
+  typename select_first_type_if&lt;Field
+            , String
+            , is_integral_type&lt;T&gt;::value
+            &gt;::type operator [](S const &amp;name) const
+  {
+    typedef typename is_integral_type&lt;T&gt;::type   yesno_type;
+    return subscript_operator_(name, yesno_type());
+  }
+
+</pre>
+
+<p>Note the unavoidable duplication of the <b>is_integral_type</b> specialization: in the method signature for deducing return type and in the method body for selecting the worker function overload.</p>
+<h3>Conclusion</h3>
+
+<p>And that's it! I call the technique Argument-dependent Return-type Variance (ARV) because the return type of a function is not selected by the author of the code, but rather by the compiler on behalf of the user. The features of ARV are: avoiding fatuous language and warty ambiguities; being able to truly overload on concept without having to write a large number of identical overload method bodies; and being able to deduce a return type of a member function template based on argument type. To be sure, this is a nontrivial amount of TMP to write or digest, and is not to all tastes (including those of this author). But it leads to extremely efficient, flexible, and capable library code, supporting a minimum of fuss in client code, and so is worth the complexity. There are no runtime costs. This technique was introduced into the Open-RJ/C++ mapping in Version 1.3.2 of Open-RJ.</p>
+
+<p>Note that we could add constraints to the integral overload if we wanted to proscribe the use of certain types:</p>
+
+<pre>
+  template &lt;typename I&gt;
+  Field subscript_operator_(I const &amp;index, yes_type) const
+  {
+    STLSOFT_STATIC_ASSERT(0 == is_signed_type&lt;I&gt;::value);
+    return operator [](static_cast&lt;size_t&gt;(index));
+  }
+
+</pre>
+
+<p>Such constraints are applied after the type has been detected to be integral, so there's no chance of it falling through into the string-side of things. Additional discrimination and/or constraints may be added to refine the selection of return-type and/or overload as required.</p>
+
+<p>Three final points to bear in mind: First, there are no failure modes for the subscript method selection in and of itself; everything that is not an integral type should be directed to the shim-using string overload. Whether or not shims are defined for the parameterizing type is a separate matter, part of the "idiomology" of the shims concept. Second, there's nothing to prevent the technique being used to support three or more return type "groups." Finally, it's possible to use <b>void</b> as a return type, to proscribe a particular set of return types from compatibility.</p>
+<h3>Recls  Efficiency Recap</h3>
+
+<p>Since last time, I've enhanced the WinSTL <b>basic_findfile_sequence</b> facade class template, so that it, too, performs multipart pattern searching within its iterator class. This has resulted in a further drop of about 5 KB from the size of the binary code, and an updated version of recls (1.6.4) is available from http://recls.org/downloads .html. Notwithstanding, the much improved recls2 project will still be coming out and nipping at its heels in a few months' time, once I've got my next book&#151;<i>Extended STL</i>&#151;out of the way.</p>
+<h3>Acknowledgments</h3>
+
+<p>Thanks to Bjorn Karlsson for helping me avoid nomenclatural ignominy by suggesting a meaningful name for the technique, and for telling me it's "nice." Thanks to Garth Lancaster for pointing out where my vague and meandering tale meandered vaguely beyond mortal tolerance.</p>
+<h3>References</h3>
+
+<ol>
+  <li>If you wanted to supply a default value for the optional field <b>Breed</b>, that's easily done with the following:</li>
+
+
+<pre>
+puts "Breed="   + name=rec["Breed", "Mongrel"]
+
+</pre>
+
+
+  <li>If you want to understand the full mess involved with integral type conversions and overloads over a broad range of C++ compilers, check out Chapter 14 of <i>Imperfect C++</i> (Addison-Wesley, 2004). </li></ol>
+
+<h5>CUJ</h5>
+
+
+
+
+</body>
+</html>

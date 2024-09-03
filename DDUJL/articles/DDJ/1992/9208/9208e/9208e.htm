@@ -1,0 +1,138 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>AUG92: INSIDE THE WINDOWS SCHEDULER</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>INSIDE THE WINDOWS SCHEDULER<a name="01bd_0003"></h1><P>
+<h2><a name="01bd_0001"><a name="01bd_0000">Making a black box transparent</h2><P>
+<h3>Matt Pietrek</h3><P>
+<p><i><a name="01bd_0002"><a name="01bd_0000">Matt works for a California programming-tools vendor, specializing in debuggers and file-format programming.  He can be reached at CIS 76117, 1720.</i></p><hr><P>
+The Microsoft Windows API is full of &quot;black boxes.&quot;  The SDK documentation tells programmers how to call the various Windows functions, but rarely explains why you must do something.  All too often, we're told, &quot;You must do this for your program to work,&quot; or &quot; You can't do that in this particular situation.&quot;  But seldom is there any description of what is going on beneath the surface.<P>
+A principal &quot;black box&quot; in Windows is the scheduler.  In this article, I examine how the Windows scheduler is implemented, and how it interacts with the rest of the Windows.  In explaining the scheduler, I refer to data structures internal to Windows.  It will help your understanding of the scheduler if you are at least somewhat familiar with structures such as the task database, the module table, and the message queue.  Many of these structures have never been publicly documented, but fortunately some information is now starting to appear in print (see &quot;References&quot;).<P>
+<h3><a name="01bd_0004">The Two Schedulers<a name="01bd_0004"></h3><P>
+Please note that, in this article, I discuss the Windows scheduler as implemented in the KERNEL module.  (As you may recall, Windows is principally composed of three DLLs: KERNEL, USER, and GDI.)  The Windows scheduler is the entity that controls execution of individual Windows apps.  This scheduler should not be confused with another scheduler that exists at a lower level within the Windows environment.  That other scheduler is the time-slicing virtual machine (VM) scheduler implemented by WIN386.EXE.  The WIN386 scheduler only exists in Enhanced mode, and is used to preemptively switch from one VM to another.  A VM is a hardware-supported task that can contain a DOS session or the entire set of Windows apps.  The Windows scheduler runs within the system VM; the system VM is the first VM to be created, and contains all the Windows apps.  The Windows scheduler is therefore only active when the WIN386 scheduler has given a timeslice to the system VM.<P>
+Because there is no time-slicing at the level of KERNEL, the Windows scheduler is conceptually rather simple (although complicated in its implementation).  Unlike the OS/2 scheduler which manages a hierarchy of thread classes (further subdivided into priority levels within each class), the Windows scheduler is fairly &quot;flat.&quot;  Because there is no preemption, a Windows app will continue to run until it gives up the CPU to another program.  If a program enters a tight loop, or otherwise &quot;hogs&quot; the CPU, the system will effectively be deadlocked until the application yields the CPU.  The act of yielding is either done explicitly, or by calling a Windows-API function that causes a yield to occur.<P>
+<h3><a name="01bd_0005">Scheduler Overview<a name="01bd_0005"></h3><P>
+The basic idea of how a Windows app gets the CPU is relatively simple, and can be summarized as: &quot;The first person in line who has a dime gets to use the phone next.&quot;  The &quot;line&quot; in this case is the linked list of Windows tasks.  The &quot;dime&quot; is a nonzero value in the &quot;event-count&quot; field (offset 6) of the task database.  Of course, the actual implementation of the scheduler is more complex than that, but it's a good first-order approximation.<P>
+So how do tasks get these events?  The event-count field is incremented by calls to PostEvent(), an undocumented function called by routines such as PostMessage() and SendMessage().  Additionally, it is called when there are events in the &quot;system queue&quot; destined for the task, and when invalid regions need to be repainted.  The system queue is a &quot;holding area&quot; for input from hardware devices such as the mouse and keyboard.  In addition, each task has its own message-queue segment for handling messages posted to it.  The handle for this segment is stored at offset 20H in the task database.  It is important to note that the event-count field in the task database does not correlate directly to a message sitting in the task's message-queue segment, waiting to be retrieved.  Instead, the event count is an indicator to the scheduler that the task needs to be woken up, because something is waiting to be processed.<P>
+<h3><a name="01bd_0006">How do You Get into the Scheduler?<a name="01bd_0006"></h3><P>
+Most applications are written without a thought as to how the application will give up control of the CPU, and how it can be a good citizen in the Windows environment.  The reason is that the basic structure of most Windows applications is based upon the GetMessage()/DispatchMessage() loop.  Inside GetMessage(), if no messages are waiting to be processed, and if no &quot;hardware&quot; or Paint messages are waiting to be synthesized, then the task is put to &quot;sleep.&quot;  When the task wakes up, there is input for it, waiting to be processed.<P>
+The act of sleeping consists of looping around, waiting for a particular set of wakeup flags to be set in the message queue of the task.  The waiting is accomplished by calling the semi-documented WaitEvent() function, which calls the core scheduling routine.  We'll discuss this core routine in exhaustive detail later.  If the event count in the task database is nonzero upon entry to WaitEvent(), then WaitEvent() doesn't call the core scheduling routine, but instead returns without yielding.  Each time it's called, WaitEvent() decrements the event-count field in the task database by 1.<P>
+Besides GetMessage(), several other functions result in the scheduler getting invoked:<P>
+<UL>
+<li>SendMessage().  If the message to be sent is destined for a task other than the current one, SendMessage() calls DirectedYield(), which forces the destination task to be woken up and become the current task.  By calling PostEvent(), SendMessage() ensures that the destination task will be scheduled by the call to DirectedYield(),</li>
+<li>PeekMessage().  Much of the code in PeekMessage() repeats that in GetMessage().  The PM_NOYIELD flag can be used with PeekMessage() to prevent a task switch from occurring. PeekMessage() is commonly used to allow other tasks to execute while your program is performing a lengthy chunk of work.  The perfect example of this is doing a compile within one of the Windows-based integrated-development environments, such as Turbo Pascal for Windows, or Microsoft QuickC for Windows.</li>
+<li>The dialog-box functions.  These include all the variations of DialogBox(), as well as MessageBox().  These routines all use a PeekMessage()/DispatchMessage() loop inside the USER module.  When you call one of these functions, it is entirely possible that your task may be switched away from for a while.</li>
+<li>The Yield() family of functions.  Yield() and DirectedYield() are &quot;layers&quot; on top of the undocumented OldYield() function.  OldYield() calls the core scheduling routine.  The key difference between DirectedYield() and Yield() is that DirectedYield() sets a field in the current task database that specifies which hTask the scheduler should attempt to transfer control to.  Besides SendMessage(), DirectedYield() is also used by the WINDEBUG/CVWIN/TDWIN DLLs to switch between the debugger and the debuggee.  It is also used by the Toolhelp TaskSwitch() and TerminateApp() functions.</li>
+</UL>
+<h3><a name="01bd_0007">Inside the Core Scheduling Routine<a name="01bd_0007"></h3><P>
+At this point, we'll dive into details of the actual Windows scheduler.  The function is called Reschedule() and is not exported by the KERNEL module.  In this article, I will be discussing the implementation of Reschedule() as it appears in Windows 3.1 KRNL386.EXE. Except as otherwise noted, KRNL286.EXE has the same code.  <a href="#01bd_0008">Figure 1</A>  provides pseudocode for the scheduler.  It is reasonably close to what actually occurs in Reschedule().  I suggest you examine it with parmesan cheese close at hand, because it's a spaghetti coder's dream!<P>
+<h4><a name="01bd_0008">Figure 1: Pseudocode for RescheduleO.</h4><P>
+<pre>
+          //------------------STARTUP SECTION------------------
+          Save registers on stack of outgoing task
+          Update task profiles
+          If ( TDB signature not OK)
+              goto Walk_through_task_list
+          Get DirectedYield field in TDB into AX; zero it out in TDB
+          If ( DirectedYield hTask == 0 )
+              goto Walk_through_task_list
+          If ( event count in DirectedYield TDB ! = 0 )
+              goto startup_this_task
+          //---------------TOP HALF OF TASK WALK-------------
+  Walk_through_task_list:
+          Point to the first task in the linked list of tasks
+  Try_next_task:
+          if ( not pointing past the end of the task list)
+              goto Does_this_task_have_an_event?
+          //---------------THE IDLE LOOP--------------------
+          ShrinkHeap ()           // In KRNL386 only
+          DiscardFreeBlocks()    // In KRNL386 only
+          IsUserIdle()
+          if ( fPokeAtSegments ! = 0 )
+              if ( USER is idle )
+                  Call routine to load a boot time module segment
+                  goto Walk_through_task_list
+          INT 28h
+          INT 2Fh, AX = 1689h
+          goto Walk_through_task_list
+          //-------------BOTTOM HALF OF TASK WALK-------------------
+  Does_this_task_have_an_event?:
+          if ( event count field == 0 )
+              point to next TDB
+              goto Try_next_task
+          //-------------TASK SWITCHING CODE---------------------
+          // Found a potential task to switch to
+          // Make sure it's OK to switch
+          if ( found task == current task )
+              goto Reschedule_done
+  startup_this_task:
+          if ( there is a locked task, and it's not the current task )
+              goto Reschedule_done
+          If ( InDOS flag )
+              goto Try_next_task
+          // It's OK to switch tasks now
+          Increment InScheduler flag
+          Delete &amp; re-insert task into TDB list to give it proper priority.
+          Lock the global heap
+          Save SS:SP in current TDB
+          Call function that checks the following
+               if ( 80x87 present )
+                   save control word in outgoing TDB
+               if ( Current disk not set in TDB )
+                   Save the current DOS disk/directory in the TDB
+          Call routine that sends task switch out notification
+          Set new Windows current TDB value
+          Set new Windows PDB value from the PDB value in the incoming TDB
+          if ( 80x87 present )
+              load control word from incoming TDB
+          Call routine that sends task switch in notification
+          Switch to SS:SP from incoming TDB
+          Decrement InScheduler flag
+          Tell the display driver that we've switched // In KRNL386 only
+          Unlock the global heap
+  Reschedule_done:
+          Restore registers from stack
+  Return to caller</pre><P>
+<P>
+Reschedule() takes no parameters, and returns no values.  Any routine that calls Reschedule() has no idea of what happens between the time Reschedule() is CALLed and when the next instruction begins executing.  Reschedule() may decide that there is no reason to switch tasks, and simply return.  Alternatively, it may switch away from a task for hours on end.  To the caller, Reschedule() is an atomic operation.  Time effectively does not exist for the task when it is in Reschedule().<P>
+To provide this transparency of operation, as well as keep the system flowing smoothly, Reschedule() has to accomplish four things:<P>
+<UL>
+<li>Find the next task that should be scheduled, and make sure no &quot;extraordinary&quot; conditions prevent it from being switched to.</li>
+<li>Save the complete state of the &quot;outgoing&quot; task, and restore the state of the &quot;incoming&quot; task.  Not doing so results in chaos.</li>
+<li>If no task needs to be scheduled, go into an &quot;idle loop&quot; that allows background actions to take place.</li>
+<li>Update the values that Windows maintains for the current task.</li>
+</UL>
+Unfortunately, the code to do each of these things is not broken up into distinct sections. Instead, the work for each of the above items is completely intermeshed, and lies in various states of completion throughout much of Reschedule().  In the following section, I'll cover each of the steps taken by Reschedule(), while also trying to keep the big picture in mind.<P>
+<h3><a name="01bd_0009">Entering the Scheduler<a name="01bd_0009"></h3><P>
+Upon entry to Reschedule(), the following registers are saved on the stack of the calling task: BP, DS, SI, DI, AX, CX, ES, BX, DX.  Furthermore, the act of calling Reschedule() causes the CS and IP registers to be placed on the stack.  The ToolHelp routines TaskGetCSIP() and TaskSetCSIP() rely upon the stack frame created by Reschedule() to obtain and set the CS:IP values to be used when the task starts up again.  The 32-bit registers are not saved across task switches.  If your code uses the 32-bit registers, then it's important that you be aware of when a task switch might occur and plan accordingly.<P>
+After saving the registers on the stack, a routine is called that updates the profile (.INI) files if they have been changed since the task was last switched to.  Following that, the current hTask value maintained by Windows is loaded into DS, and the task-database signature found at offset OFAH is verified to be correct.  If the task database (TDB) looks incorrect, then Reschedule() immediately jumps to the code that begins looking for a new task to switch to.  If the signature bytes in the TDB look okay, then the WORD at offset OAAH is zeroed out, but not before retrieving its value into AX. This value is nonzero if DirectedYield() was called, and indicates which hTask the caller wants scheduled next.  However, Reschedule() will not blindly schedule this new hTask; it first verifies that the event count in the potential new TDB is not 0.  If it is, then Reschedule() treats this invocation as if it were invoked by a regular Yield() call.  All this implies that the task specified in a DirectedYield() call may not be the one that's scheduled next.  As stated in the Windows 3.1 documentation, if you really want to make sure a particular task is scheduled, then use a PostAppMessage() to ensure that the event-count field in the TDB is nonzero.<P>
+The next major section of code following this &quot;startup&quot; sequence is the heart of Reschedule(), and is responsible for finding a suitable task to switch to.  As mentioned earlier, all the task databases in the system are kept in a linked list.  Reschedule() starts at the head of the chain, and iterates through each TDB, looking for one with a nonzero event count in the WORD at offset 6.  Note that this field is not the same as the message-count value stored in the message queue of each task.  For the remainder of this article, I'll refer to this walking of the task list as the &quot;walk-through-task-list&quot; code.  When a TDB with a nonzero event count is found, Reschedule() attempts to switch the current task to that TDB.<P>
+<h3><a name="01bd_000a">The Idle Loop<a name="01bd_000a"></h3><P>
+If no events are waiting to be processed and all the tasks have been iterated through, then the walk-through-task-list code falls into the idle-loop section.  The actions of this section of code depend on whether you're running in Standard or Enhanced mode windows, and on whether you're using virtual memory.  The code described in the next two paragraphs exists only in the KRNL386 .EXE version.<P>
+Upon entering the idle loop, the code checks the values in some of the KERNEL paging flags, and if conditions are right, calls an internal routine called ShrinkHeap() which walks the global heap.  If it finds enough free memory, it unlinks the free blocks from the global heap.<P>
+If the paging system is in use, and if certain other paging flags are set, then the idle loop proceeds to call another internal routine: DiscardFreeBlocks().  The job of DiscardFreeBlocks() is to find free blocks of paged memory and give them back to the DPMI server.  During the call to DiscardFreeBlocks(), hardware events may have occurred.  To deal with this, Reschedule() JMPs back to the walk-through-task-list code and starts anew the process of looking for a suitable task to switch to.<P>
+Having done the previous heap housekeeping, Reschedule() makes a call to the USER routine IsUserIdle().  In Windows 3.1, this is where USER places its checks to see if a screen saver should be activated.  The return value from IsUserIdle() is a BOOL, and is True if a mouse button is held down, False otherwise.<P>
+If the return from IsUserIdle() is True, and if a flag called fPokeAtSegments is nonzero, then once every 20h times through the idle loop, an internal routine called PokeAtSegments() is called.  This routine walks the module list, and loads any discardable segments that haven't been previously loaded.  The module-list walk stops when it encounters the SHELL module.  This presumably causes PokeAtSegments() to load segments only for the modules required for Windows to boot up.  Once all the segments have been loaded, the fPokeAtSegments flag is set to 0, so that the idle loop doesn't try to call PokeAtSegments() any more.  If PokeAtSegments loaded a segment during a particular iteration of the idle loop, then the code JMPs back to the walk-through-task-list code.<P>
+Two things remain to be done in the idle loop.  The return value from IsUserIdle() is saved away on the stack before calling INT 28, the MS-DOS idle interrupt.  When the INT 28h returns, the IsUserIdle() return value is retrieved from the stack and used to decide what will be in the BX register for an INT 2Fh, AX = 1689h call.  If IsUserIdle() returned True, then BX = 0, otherwise BX = 1.  The INT 2Fh, 1689H call is documented in the INT2FAPI.INC file in the DDK, as the &quot;Windows kernel idle call.&quot;  When the INT2Fh returns, the idle loop JMPs to the walk-through-task-list code.<P>
+<h3><a name="01bd_000b">We've Found a Task ... Now What?<a name="01bd_000b"></h3><P>
+Upon finding a TDB that has a nonzero event count, Reschedule() starts the process of saving away the &quot;context&quot; of the outgoing task and restoring the context of the incoming task. Before this can be done, though, a few things need to be checked.  If the incoming task is the current task, then there's no reason to go through the full process of saving and restoring the task context.  Instead, Reschedule() restores the registers saved on the stack upon entry and returns.<P>
+The next important thing to check is whether there are any &quot;locked&quot; tasks in the system.  A locked task is the only task in the system allowed to receive messages.  All other tasks are shut out until the task is unlocked.  A task can be locked by the LockCurrentTask() in KERNEL, or by the LockMyTask() function in USER.  A system modal message box is an example of a locked task in action.  Reschedule() checks whether any tasks in the system are locked.  If the incoming task is not the same as the locked task, then the saved registers on the stack are restored, and Reschedule() returns without having switched tasks.<P>
+The last thing checked before starting the process of switching tasks is a check to see if KERNEL is currently in its INT 21 handler.  This is accomplished by checking the KERNEL_INDOS flag, which is also checked in other &quot;critical sections&quot; of code elsewhere in KERNEL.  If KERNEL is currently in its INT 21 handler, the walk of the task list is resumed at the next task in the list of tasks, rather than at the start of the task list.  It's not readily apparent why the walk doesn't start again at the head of the task list.<P>
+Once we've gotten past the above gauntlet of idle loops and other checks, Reschedule() now starts the actual process of saving away the context of the current task and waking up the incoming task in the same state in which it was left.  The switching code is as much of a &quot;critical section&quot; as any other piece of code, so it is only fitting that a global variable InScheduler is incremented to indicate that work is in progress.  The first thing that the switching section does is readjust the priority of the task.  The task priority is given by the WORD value at offset 8 in the TDB.  Tasks with a lower priority number will get an opportunity to run before tasks with higher priority numbers.  The priority of a typical task is 0, but it can range between -32 and 15.  The priority of a task can be set by the undocumented SetPriority() function in KERNEL.  Up until now, I haven't discussed how this priority system is implemented, at least not explicitly.  Earlier, I mentioned that the list of tasks is walked, looking for the first task that has at least one event waiting for it.  As it turns out, the task list is always kept in priority-sorted order.  The tasks with the lower-priority numbers come first in the list, thereby causing their TDB to be checked for events before tasks with higher-priority numbers.  Reschedule() causes the task list to be kept in order by momentarily deleting the incoming TDB from the task list and then reinserting it.  The function that inserts tasks into the list inserts the TDB in priority order.<P>
+Because most tasks share the same priority value, it is important to give them each a fair chance to be selected for scheduling.  This is done by incrementing the priority value in the incoming TDB before removing/reinserting it into the task list; after reinsertion, the priority is decremented back to its previous value.  This has the net effect of placing the incoming task later in the list than any other tasks that share the same priority value.  (A lower numerical value means a higher priority.)<P>
+Upon reprioritizing the TDB list, Reschedule() next sets a flag in the segment that manages the information for the global heap.  By setting this flag, the global heap LRU functions are prevented from changing the global heap during the remainder of the task-switching code.<P>
+At this point, it is time to finish saving the context of the outgoing task.  As you will recall, most of the 16-bit registers for the outgoing task were pushed onto the stack upon entering Reschedule().  The remainder of the job involves three steps.  First, the current SS:SP values are placed into the DWORD at offset 2 in the outgoing TDB.  Then, an internal routine called SaveState() is called.  Inside SaveState(), the FSTCW instruction is used to save the control word of the 80x87 into the outgoing TDB.  Of course, this is only done if an 80X87 is installed.  I use the word &quot;installed&quot; to mean that the math-coprocessor bit was set when KERNEL did an INT 11H at boot time.  Additionally, if the high bit of the current drive field in the outgoing TDB is not set, then INT 21h, AX = 19h, and INT 21h, AX = 47h are used to store the current drive and directory values into the outgoing TDB.  The final act of the outgoing process is to call a routine that causes the &quot;outgoing-task&quot; notification to be sent.  This notification can be caught by TOOLHELP.DLL as an NFY_TASKOUT notification, or by a RegisterPtrace()/ToolhelpHook() callback function with AX = 0Dh.<P>
+Reschedule() now turns to waking up the incoming task.  As you might expect, the steps to start it up are almost a mirror image of the steps to save away the outgoing task.  First, the global variable containing the current TDB is set to the value of the incoming TDB.  Next, the PDB (or PSP if you prefer) of the incoming task is retrieved from the incoming TDB, and stored in the global variable that Windows uses for its current PDB value.  If an 80x87 is installed, the control word for the incoming task is loaded from the TDB via an FLDCW instruction. Continuing on, the corresponding &quot;incoming notification&quot; is sent (NFY_TASKIN for Toolhelp, A = 0Eh for the RegisterPtrace()/ToolhelpHook() callbacks).<P>
+The SS:SP registers are switched to the values stored away in the incoming TDB. The InScheduler flag is decremented.  If we're running KRNL386.EXE, the UserRepaintDisable() function in the Display module is called with a 0 parameter, indicating that hardware updates are now okay.  The flag that prevents mucking with the global heap is decremented.  The final act of Reschedule() is to pop the register values for this task off the &quot;new&quot; stack.<P>
+<h3><a name="01bd_000c">Summary<a name="01bd_000c"></h3><P>
+As you might have guessed, the Windows scheduler is integrally tied to many parts of Windows. In our journey, we have glanced over many areas, including tasks, modules, the global heap, notifications, and interrupts.  All are worthy of study in their own right.  If you really wish to understand how Windows works, you must be familiar with all of them, as well as many other things.  It's a steep learning curve, but in the end, I believe it's worth it. Hopefully this article has given you some idea of what really goes on beneath the hood and inspired you to do more exploration on your own.<P>
+<h3><a name="01bd_000d">References<a name="01bd_000d"></h3><P>
+Schulman, Andrew, David Maxey, and Matt Pietrek.  Undocumented Windows.  Reading, MA: Addison-Wesley, 1992.<P>
+
+
+<PRE>
+
+
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

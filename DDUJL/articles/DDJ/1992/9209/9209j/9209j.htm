@@ -1,0 +1,555 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>SEP92: A VIDEO COMPATIBILITY INTERFACE FOR TURBO DEBUGGER</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>A VIDEO COMPATIBILITY INTERFACE FOR TURBO DEBUGGER<a name="0202_0003"></h1><P>
+<h2><a name="0202_0001"><a name="0202_0000">High-resolution graphics support for TDW</h2><P>
+<h3>Danny Thorpe</h3><P>
+<p><i><a name="0202_0002"><a name="0202_0000">Danny is a quality assurance engineer in the Turbo Pascal development team at Borland International.  He can be reached on CompuServe at 76646,1035.</i></p><hr><P>
+The Video Compatibility Interface (VCI) of Borland's Turbo Debugger for Windows 3.0 (TDW) allows an external DLL to handle all the video-mode switching for a particular video card or chipset.  This means that, among other benefits, if TDW's default VGA support can't handle your favorite high-resolution Windows graphics modes, VCI lets you create or install a custom video driver that can.<P>
+TDW ships with DLLs to support the ATI and Tseng chip sets and has built-in support for standard VGA mode (640x480 with 16 colors).  If you're familiar with your VGA card's modes and memory layout, you can write TDW video DLLs to suit specific needs.  This article describes services your video DLL must provide for TDW, showing code that supports the S3 graphics accelerator of the Orchid Fahrenheit 1280 card.<P>
+<h3><a name="0202_0004">A Little History<a name="0202_0004"></h3><P>
+TDW is a Windows application that runs in text mode.  As you debug Windows applications, TDW switches between text and graphics modes, preserving the video state each time.  Text mode normally uses the same video memory as graphics mode, so preserving the state of the video system frequently requires copying some or all of the graphics screen to an off-screen buffer.  This chore requires knowledge of the video system's internal architecture.<P>
+Saving the state of a VGA system running in a standard resolution with the stock Windows VGA driver is a reliable operation--the video registers, color palette, and video memory layout are all accepted industry standards.  But with Super-VGA, all bets are off from one video card to the next.  At super-VGA resolutions (800x600 or higher), each video card's memory can be laid out differently, or different numbers can be used to represent the various video modes that the card supports.  The Video Electronics Standards Association (VESA) Super-VGA standards have helped this situation, but those standards were not well established at the time TDW was in development.<P>
+As a result, TDW 2.5 officially supported only the standard VGA resolution on the stock Windows VGA driver.  Some video cards' 800x600 modes work in TDW 2.5, but not all, so little was said about them.  TDW 3.0 addresses this by providing an external DLL that TDW calls to perform mode switches and other video-related chores.  As a file separate from the TDW executable, the video DLL can be removed or replaced with a version specific to a particular brand of video hardware.<P>
+<h3><a name="0202_0005">Using a Video DLL<a name="0202_0005"></h3><P>
+When TDW 3.0 loads, it looks in the TDW directory and on the path for a file called TDVIDEO.DLL.  If it finds such a file, TDW loads it into memory and uses that file for all its video-mode switching.  Users can install a video DLL by simply renaming a distribution file to TDVIDEO.DLL.  For example, if you have an Orchid Prodesigner IIs and would like to run Windows in 800x600 mode with TDW, you rename the TSENG.DLL shipped with TDW to TDVIDEO.DLL.  (Note that TDW 3.01 reads the video DLL name from the TDW.INI file.)  The Tseng DLL should allow TDW to work with the high-resolution modes of most video cards built around the Tseng Labs chip set, such as the Orchid Prodesigner IIs.<P>
+<h3><a name="0202_0006">The Video DLL Interface<a name="0202_0006"></h3><P>
+<a href="#0202_0007">Table 1</A> lists the nine functions that TDW requires of a video DLL. The example code is in Turbo Pascal.  For conversions to C, just remember that an integer is a 16-bit signed int, a word is a 16-bit unsigned int, a procedure is a void function, and Pascal is case insensitive.<P>
+<h4><a name="0202_0007">Table 1: The TDW video-interface functions.</h4><P>
+<pre>
+  function  VideoInit: Word;
+  function  VideoDone: Word;
+  procedure VideoDebuggerScreen;
+  procedure VideoWindowsScreen;
+  function  VideoGetTextSelector
+               (Display: Integer): Word;
+  procedure VideoSetCursor(X, Y: Word);
+  function  VideoBigSize: Word;
+  procedure VideoSetSize(BigFlag: Word);
+  function  VideoIsColor: Word;</pre><P>
+<P>
+The VideoInit function is called by TDW to initialize the video DLL and to determine whether the DLL can support the video hardware and current graphics mode.  Note that this is not the DLL initialization code called by Windows when the DLL is loaded into memory.  (The DLL initialization code is the Begin..End block at the end of a Turbo Pascal library source file, or LibMain in C.)  TDW will call VideoInit some time after the DLL has been loaded.  It is recommended that all long-term memory allocations and initializations occur in VideoInit and not in the DLL initialization code.  Remember that the system will already be in graphics mode--an interesting reversal from most DOS programs.<P>
+The return value of VideoInit should indicate whether an error occurred during initialization of the DLL, or if the video system or current mode is not supported by the DLL.  The return values and their meanings are listed in <a href="#0202_0008">Table 2</A>.  Any nonzero return value is considered an error and will cause TDW to unload the video DLL. Except for the result code NoNeed, errors will be reported to the user, and TDW will terminate.  VideoDone will not be called if VideoInit fails, so clean up any memory allocations before failing VideoInit.<P>
+<h4><a name="0202_0008">Table 2: VideoInit return codes.</h4><P>
+<pre>
+  Success  = 0; { Success }
+  BadCard  = 1; { Incorrect video hardware was detected }
+  BadMode  = 2; { Unsupported video mode of supported card was detected }
+  NoMemory = 3; { Could not allocate the memory needed from Windows }
+  NoNeed   = 4; { Standard VGA detected (TDVIDEO.DLL not required }
+  Error    = 5; { Miscellaneous error }</pre><P>
+<P>
+You will probably wind up using BIOS services to query the video card and set modes.  Keep in mind that TDW and your video DLL run in protected mode, but most BIOS execution requires real mode.  Windows does a pretty good job of handling the protected-to-real mode switching, but sometimes you have to manually set up the BIOS request using special DPMI service requests.<P>
+BIOS functions that require a realmode buffer address to be passed in a segment register (such as ES or DS) will most likely require a DPMI Simulate Real Mode Interrupt call, because realmode addresses cannot be placed in a segment register in protected mode.  This is demonstrated in the Fahrenheit DLL code shown in <a href="#0202_0010">Listing One</A>, page 120.<P>
+The VideoDone function seen in <a href="#0202_0007">Table 1</A> is called by TDW to shut down the video DLL before TDW exits back to Windows.  It is not called if VideoInit has failed.  The return value should be 1 to indicate success or 0 to indicate failure.  All memory allocated by the DLL, presumably in VideoInit, should be disposed of in VideoDone.  Do not rely on the DLL's Windows Exit Procedure (WEP) as a means of freeing up resources. VideoWindowsScreen will be called before VideoDone, so VideoDone doesn't need to worry about screen modes or states.<P>
+The VideoDebuggerScreen procedure is responsible for switching the video system from graphics mode to text mode.  Any copying of video memory or registers should be done here before the switch to text mode.  For many systems, only a simple BIOS interrupt (Int $10, function $83) is needed to switch to text mode.  The preservation beforehand is the hardware-specific part.<P>
+The VideoWindowsScreen procedure is responsible for switching from text mode back to graphics mode and restoring anything saved away earlier.  If you're on a VESA-compatible video system, you should be able to use Int $10, function $4F02 to switch to your graphics mode. Again, restoring the video state is the challenging part, not the switch itself.<P>
+Your graphics mode shouldn't change during a TDW session, so the graphics-mode number should be noted in VideoInit.  If the graphics mode does change in a debugging session (probably because of an error in your video DLL), bail out fast!<P>
+<h3><a name="0202_0009">Call Sequences<a name="0202_0009"></h3><P>
+VideoInit will be the first DLL function called by TDW; VideoDone will be the last function TDW calls before unloading the DLL.  The last five functions listed in <a href="#0202_0007"> Table 1</A> may be called as TDW sets up for text-mode operation or at other times, but their call order is not particularly significant or interesting.<P>
+It is important that the VideoDebuggerScreen and VideoWindowsScreen procedures will be called frequently.  Except for lightweight instructions in the program under test (such as variable assignments or register operations), TDW will first call VideoWindowsScreen, execute the test code, and then call VideoDebuggerScreen to switch back to the debugger's text mode. This sequence of switch-to-graphics, execute, switch-to-text will be performed every time a CALL instruction is stepped over, or a &quot;Run to breakpoint&quot; is requested.<P>
+You should keep VideoDebuggerScreen and VideoWindowsScreen as lean and fast as possible.  If you have to copy graphics video memory to a main memory buffer, try to move only what's absolutely necessary.  For example, text mode certainly doesn't use the entire megabyte of video memory found in most Super-VGA cards.  You might be able to get by with saving just the first few kilobytes of each graphics color plane, depending upon the layout of your video card's memory.  You'll probably have to save the VGA registers and color palette, but those are relatively small and painless tasks.  Between calls to VideoWindowsScreen and VideoDebuggerScreen, of course, the graphics screen image may change, because Windows and the program under test are given an opportunity to execute.  VideoDebuggerScreen will have to save the current graphics screen every time it is called.<P>
+<h3><a name="0202_000a">The Other Support Functions<a name="0202_000a"></h3><P>
+The VideoGetTextSelector function is called when TDW needs the selector (protected-mode segment handle) of the tested mode's text-video memory.  If Display is 0, return the selector for the physical address 0xB800 (color).  If Display is 1, return the selector for the physical address 0xB000 (monochrome).  Use the Windows predefined selectors _B800H and _B000H.<P>
+The VideoSetCursor function is responsible for setting the cursor position on the text-mode screen.  The text-cursor position is controlled by a standard VGA register, so most VGA cards can use the sample code accompanying this article.  TDW will call this function to make the text cursor disappear by placing the cursor at an off-screen position.<P>
+The VideoBigSize function should return the highest number of text lines that the video hardware and video DLL support.  This will usually be 43 lines for EGA or 50 lines for VGA. TDW does not currently make use of modes higher than 80x50.<P>
+The VideoSetSize function is used to change the debugger text screen from 25-line mode to 43/50-line mode (BigFlag=1) or from 43/50-line mode to 25-line mode (BigFlag=0).  An appropriate text font for the indicated text mode must be loaded by this function.  This would be an 8x8 pixel font for 43/50-line mode, or the standard 8x14 pixel font for 25-line mode.<P>
+Finally, the VideoIsColor function should return 1 if the video system is running in color mode, or 0 if running in monochrome mode.<P>
+<h3><a name="0202_000b">Name Requirements and Indexes<a name="0202_000b"></h3><P>
+The functions exported by the video DLL must have the names shown in this article, in upper case.  Pascal is internally case insensitive, but all exported DLL function names are forced into upper case when the compiler generates the DLL.  The DLL function indexes are not important, as TDW locates the DLL functions by name rather than index.<P>
+The module name of the video DLL must be TDVIDEO.  Therefore, in Turbo Pascal for Windows, the filename of the DLL source module should be TDVIDEO.PAS, so that the compiler will make TDVIDEO the DLL's internal module name.  As mentioned earlier, the video DLL must be named TDVIDEO .DLL in order for TDW to find and load the file, but for distribution your video DLL should have a human-readable filename indicating what type of card or chipset the DLL supports.  TDW ships with ATI.DLL and TSENG.DLL; I called my driver FAHR1280.DLL.<P>
+<h3><a name="0202_000c">Debugging a Debugger Driver<a name="0202_000c"></h3><P>
+It doesn't make sense to sic the debugger on a DLL that the debugger is using, and you can't u e TDW to debug a test program of your video routines, because TDW doesn't support the video modes that your video routines require.  However, you can certainly write a small Windows program to load your prototype video DLL and call a sequence of the DLL functions with &quot;tight&quot; delay loops between the calls.  You don't want Windows to get control while you're staring at the text-mode screen, so just have the test program spin in a loop for a few seconds before moving on to the next video-DLL function call.<P>
+If your video DLL doesn't switch modes 100 percent correctly, it will probably corrupt the Windows graphics system beyond salvation or lock up the CPU.  Be prepared for frequent reboots and power-downs while experimenting with your video DLL.  You'll probably apologize to your monitor before it's all over, too.<P>
+It's fairly safe to use Windows' MessageBeep function to find out if a section of code is being executed.  You can also write to a log file without interfering with the video system. Be careful about writing anything out to the display, however.  When you're in text mode, your compiler's text output library routines should work, but don't be surprised if they don't.  In Turbo Pascal, Writeln works fine on the text-mode screen that the Fahrenheit DLL sets up, but I discovered that the screen-position index is reset to 0,0 each time the system reenters text mode.  I had my program Writelning text to the screen after each mode switch to verify that the text-mode memory was not being erased, but I found that a call to GotoXY was needed to keep the Writeln statements from overwriting each other.  Similar caveats may exist in other languages or standard output libraries.<P>
+<h3><a name="0202_000d">Sample Source Code<a name="0202_000d"></h3><P>
+The sample code (see <a href="#0202_0010">Listing One</A>, page 120) for this article is the complete TPW source code for a TDW video DLL to support the Orchid Fahrenheit 1280 video card.  The Pascal code contains blocks of inline assembly language where machine instructions or register access is needed or convenient.<P>
+I chose the Fahrenheit because TDW doesn't support the Fahrenheit's S3 graphics accelerator architecture, and it has a special dual text/graphics mode which reduces the amount of effort required to switch between graphics and text modes.  The lazy approach works quite well in the Fahrenheit's 640x 480x256 and 800x600x256 graphics modes.  The dual text/graphics mode of the card sets aside the top 64K of video memory for text mode and remaps all text-mode memory accesses into that high block.  As long as the graphics system doesn't write in that top area of video memory (a big assumption, as noted later), and you're careful not to clear the graphics screen or the text screen when switching modes, the dual mode is a quick and useful solution.  I did have to copy and save the VGA color palette.<P>
+The higher modes (1024 and 1280) of the Fahrenheit card use the entire 1 Mbyte of the card's video memory, so I don't expect the dual text/graphics mode feature to work in those modes without some memory preservation and swapping.  To support the higher modes, the DLL would probably have to revert to copying a portion of the graphics memory to a main-memory buffer.<P>
+Orchid warns that all the Fahrenheit Windows drivers may use the top 64K of video memory as a scratch pad or off-screen storage area.  The Windows drivers are not aware of the dual text/graphics mode, so the video DLL should take precautions and save the graphics image from the top memory area before each switch to text mode.  However, in the months since I created this video DLL, I haven't encountered a memory overwrite problem in the higher modes, so I haven't gone to the extra trouble of copying the image back and forth.<P>
+This Fahrenheit video DLL may work with other manufacturers' S3 86C911 accelerator-based video cards, but because this code looks for the Orchid signature in the VESA description field, its VideoInit will fail with an &quot;incompatible hardware&quot; return code.  If you disable the signature checking, you should be able to at least experiment with this code on your S3-based video card.<P>
+You are now armed with a functional specification of the Turbo Debugger for Windows 3.0 Video Compatibility Interface.  You also have source code for a Turbo Pascal for Windows DLL performing the low-level video manipulations required for that specification, supporting the fast and affordable new S3 graphics-accelerator architecture at the heart of the Orchid Fahrenheit 1280.  We took advantage of a fairly obscure dual-mode feature of the S3 chip to make the video DLL an almost trivial exercise.  Armed with this specification and sample code, and with some additional information about your particular video hardware, you can make TDW debug Windows applications on your video hardware running in your favorite graphics modes.<P>
+<h3><a name="0202_000e">Acknowledgments<a name="0202_000e"></h3><P>
+Thanks to Dave Wilhelm and Jeff Peters at Borland, and to Marc Warden at Orchid.<P>
+<h3><a name="0202_000f">References<a name="0202_000f"></h3><P>
+86C911 GUI Accelerator Technical Reference.  Santa Clara, CA: S3 Inc.<P>
+DOS Protected Mode Interface (DPMI) Specification 1.0. Intel Corp., 1991.<P>
+Ferraro, Richard F. Programmer's Guide to the EGA and VGA Cards, second edition.  Reading, MA: Addison-Wesley, 1990.<P>
+
+<PRE>
+
+
+_A VIDEO-COMPATIBILITY INTERFACE FOR TURBO DEBUGGER_
+by Danny Thorpe
+
+
+<a name="0202_0010">
+<a name="0202_0011"></pre><B>[LISTING ONE]</B><pre><a name="0202_0011">
+{------------------------------------------------------------
+
+  Windows video interface DLL for
+  Borland's Turbo Debugger for Windows 3.0
+
+  Orchid Fahrenheit 1280 graphics accellerator card driver version 1.0
+
+ ------------------------------------------------------------}
+
+{ Copyright (C) 1992 by Danny Thorpe }
+
+{$D TDW 3.0 Video DLL 1.0 for Orchid Fahrenheit 1280 }
+
+{$A+,B-,D-,F-,G+,L-,N-,R-,S+,V+,W-,X+}
+
+
+library fahr1280;
+{
+
+   This driver is for the Orchid Fahrenheit 1280 video card.  The modes supported
+   are 640x480x256 and 800x600x256.
+
+   Borland does not provide technical support on this file or the TDW video
+   DLL interface, and reserves the right to change the DLL requirements
+   in future versions of TDW.
+
+   The Fahrenheit's graphics coprocessor is an 86C911 by S3 Inc.  The S3 Technical
+   Reference was the source for all enhanced mode video information used by this
+   driver.  VESA bios calls are used to identify the Orchid card.
+
+-Danny Thorpe
+}
+
+uses Wintypes, Winprocs, strings;
+
+Type
+
+  PWordArray = ^WordArray;
+  WordArray = array [0..($FFF0 div sizeof(Word))] of Word;
+
+  VesaInfoBlock = record
+    Signature     : array [1..4] of char;   { not a PChar, = 'VESA'}
+    VersionMinor  : byte;
+    VersionMajor  : byte;
+    OEMString     : PChar;      { points into BIOS }
+    Capabilities  : longint;
+    VideoModes    : PWordArray; { points to string of supported modes, $FFFF terminated}
+    OrchidCardName: array [0..255-18] of char;  { a copy of OEMString }
+       { a copy of VideoModes array follows the OEMString null terminator}
+  end;
+
+  RealRegs = record   { for DPMI simulated real mode interrupts }
+    rDI,
+    rSI,
+    rBP,
+    Reserved,
+    rBX,
+    rDX,
+    rCX,
+    rAX:  Longint;
+    rFLAGS,
+    rES,
+    rDS,
+    rFS,
+    rGS,
+    rIP,
+    rCS,
+    rSP,
+    rSS:  Word;
+  end;
+
+
+const
+
+  { the Fahrenheit 1280 graphics modes }
+
+  m640x480x256   = $201;  { Works fine }
+  m800x600x16    = $202;  { not supported in this driver version}
+  m800x600x256   = $203;  { Works fine }
+  m1024x768x16   = $204;  { not supported in this driver version}
+  m1024x768x256  = $205;  { not supported in this driver version}
+  m1280x960x16   = $206;  { not supported in this driver version}
+  m1280x1024x16  = $208;  { not supported in this driver version}
+
+  HighestVGAMode = $13;
+
+  RegisterLock1  = $48;
+  RegisterLock2  = $A0;
+
+  VesaDontErase  = $8000;
+
+
+
+var   { global variables }
+
+  GraphicsMode: Word;
+  VGAPalette: array [0..255,0..2] of byte;
+  LockStates: array [0..2] of byte;
+  ColorScreen: Boolean;
+  VGA50LineMode: Boolean;
+
+{ Utility functions }
+
+procedure SavePalette; near;
+var i,j: byte;
+begin
+  Port[$3C7] := 0;
+  for j := 0 to 255 do
+    for i := 0 to 2 do
+      VGAPalette[j,i] := Port[$3C9];
+end;
+
+
+procedure RestorePalette; near;
+var i,j: byte;
+begin
+  Port[$3C8] := 0;
+  for j := 0 to 255 do
+    for i := 0 to 2 do
+      Port[$3C9] := VGAPalette[j,i];
+end;
+
+
+procedure LockEnhancedRegisters; near;
+ { Disable coprocessor commands and register access }
+begin
+  Port[$3d4] := $40;
+  Port[$3d5] := Port[$3d5] and not 1;
+  Port[$3d4] := $40;
+  Port[$3d4] := $38;
+  Port[$3d5] := $0; { lock 1 }
+  Port[$3d4] := $39;
+  Port[$3d5] := $0; { lock 2 }
+end;
+
+
+procedure UnlockEnhancedRegisters; near;
+ { Give ourselves access to the graphics coprocessor commands & registers }
+begin
+  Port[$3d4] := $38;
+  Port[$3d5] := $48; { Enhanced mode unlock 1 }
+  Port[$3d4] := $39;
+  Port[$3d5] := $a0; { Enhanced mode unlock 2 }
+  Port[$3d4] := $40;
+  Port[$3d5] := Port[$3d5] or 1; { Enable Enhanced commands & registers }
+end;
+
+
+procedure SaveLockStates;  near;
+begin
+  Port[$3d4] := $38;
+  LockStates[0] := Port[$3D5];  { Enhanced mode lock 1 = $48 if unlocked}
+  Port[$3d4] := $39;
+  LockStates[1] := Port[$3d5];  { Enhanced mode lock 2 = $A0 if unlocked }
+  Port[$3d4] := $40;
+  LockStates[2] := Port[$3d5] and 1; { Enable Enhanced commands & registers }
+end;
+
+
+procedure RestoreLockStates;  near;
+begin
+  UnlockEnhancedRegisters;
+  Port[$3d4] := $40;
+  Port[$3d5] := Port[$3d5] or LockStates[2];
+  Port[$3d4] := $38;
+  Port[$3d5] := LockStates[0];
+  Port[$3d4] := $39;
+  Port[$3d5] := LockStates[1];
+end;
+
+
+function VESAGetVideoMode: Word; near; assembler;
+asm
+  mov  ax, $4F03
+  int  $10
+  mov  ax,bx  { move video mode from bx to ax - our function result has to be in ax }
+end;
+
+
+function VESAGetInfo(var InfoBlock: VesaInfoBlock): Boolean; near;
+var Regs: RealRegs;
+    Twins: Longint;
+{ Use VESA bios calls to verify that this is an Orchid Fahrenheit 1280 card }
+{ Since we have to pass a pointer to a buffer to this VESA call in the es:di
+  registers, and BIOS requires real mode addresses, and real mode address
+  can't be loaded into es:di in protected mode, we have to use a
+  DPMI Simulate Real Mode Interrupt function.  }
+
+begin
+  Twins := GlobalDosAlloc(sizeof(InfoBlock));
+asm
+  mov  di, ss
+  mov  es, di
+  lea  di, Regs
+  push di
+  mov  cx, 21     { size of Regs }
+  xor  ax,ax
+  cld
+  rep  stosw      { zero out Regs data }
+  pop  di
+
+  mov  ax, $300    { DPMI Simulate Real Mode Interrupt function }
+  mov  word ptr Regs.rAX, $4F00        { vesa get info }
+  mov  bx, word ptr Twins[2]
+  mov  word ptr Regs.rES, bx     { info block (for bios) is at es:0000, real mode }
+  mov  cx, 0
+  mov  bx, $10
+  int  $31
+
+  jc   @@1          { jump if there was a DPMI error }
+  mov  ax, word ptr Regs.rAX
+  push ds
+  mov  ds, word ptr Twins[0]
+  xor  si, si                   { info block (for us) is at ds:si, protected mode }
+  les  di, InfoBlock
+  mov  cx, 128
+  rep  movsw        { copy the data from the local block to the parameter }
+  pop  ds
+
+  cmp  al, $4F      { Was vesa call accepted? }
+  jne  @@1          { If not, jump to error section }
+
+  or   ah,ah        { Did the function execute successfully? }
+  jnz  @@1          { If not, jump to error section }
+
+  mov  @Result, 1   { vesa info successfully retreived }
+  jmp  @@2
+
+@@1:
+  mov  @Result, 0   { fail the initiallization - incorrect video card }
+
+@@2:
+end;
+  GlobalDosFree(LoWord(Twins));
+end;
+
+
+{****************************************************************}
+function VideoInit: Word;  export;
+{
+   Called when TDW first loads up.  All dynamic allocation and chip and
+   video mode detection should be preformed here.
+   Any failure will cause TDW to unload TDVIDEO.DLL.
+
+   Return codes are:
+}
+
+const
+
+  Success = 0;  { success }
+  BadCard = 1;  { Incorrect video card was detected }
+  BadMode = 2;  { Unsupported video mode of correct card was detected }
+  NoMemory= 3;  { Could not allocate the memory needed from Windows }
+  NoNeed  = 4;  { Regular video mode detected (TDVIDEO.DLL not required) }
+  Error   = 5;  { Misc. error }
+
+var CardInfo: VESAInfoBlock;
+
+begin
+
+  { Verify that we're running an Orchid Fahrenheit 1280 card. }
+  if (not VESAGetInfo(CardInfo)) or
+     (stricomp(CardInfo.OrchidCardName,
+       'Orchid Technology Fahrenheit 1280') &lt;&gt; 0) then
+  begin
+    VideoInit := BadCard;
+    Exit;
+  end;
+
+  GraphicsMode := VESAGetVideoMode;
+  case GraphicsMode of
+    m640x480x256,
+    m800x600x256 : ;  { do nothing }
+  else
+    begin
+      if GraphicsMode &lt; HighestVGAMode then
+        VideoInit := NoNeed
+      else
+        VideoInit := BadMode;
+      Exit;
+    end;
+  end;
+
+  VGA50LineMode := False;   { 80x25 standard text mode}
+
+  SaveLockStates;
+
+  UnlockEnhancedRegisters;
+
+  { Put the Fahrenheit card into dual-page (graphics and text) mode }
+  asm
+    mov ax, 4fffh
+    mov bx, 2
+    int 10h
+  end;
+
+  ColorScreen := True;
+
+  VideoInit := Success;
+end;
+
+{****************************************************************}
+function VideoDone: Word;    export;
+{
+   Called when TDW exits back to Windows.  All memory allocated must be
+   freed by the end of this function (Don't rely on ExitProc).
+   1 means success, 0 means it failed.
+}
+{  All memory for this DLL is statically stored in the data segment. }
+begin
+  RestoreLockStates;   { Put the enhanced mode locks back the way we found them. }
+  VideoDone := 1;
+end;
+
+
+{ Magic functions to get the selectors of these areas of physical memory }
+procedure __B000; far; external 'KERNEL' index 181;
+procedure __B800; far; external 'KERNEL' index 182;
+
+{****************************************************************}
+function VideoGetTextSelector(Display: Integer): Word;    export;
+{
+   Called when TDW needs the selector (protected mode segment) value of
+   the text mode screen requested.  If display is 0, return the selector
+   for 0xB800 (color). If display is 1, return the selector for 0xB000 (mono).
+   This can be done with the Windows pre-defined selectors: _B800H and _B000H.
+}
+begin
+  ColorScreen := Display = 0;
+  if ColorScreen then
+    VideoGetTextSelector := Ofs(__B800)
+  else
+    VideoGetTextSelector := Ofs(__B000);
+end;
+
+{****************************************************************}
+procedure VideoSetCursor(X, Y: Word);   export;
+{
+   Called when TDW needs to set the cursor position on the text mode
+   screen.  Most VGA cards can use the code here (since it's
+   a non SuperVga register that controls the cursor position).  TDW will
+   call this function when it needs to make the cursor disappear (by
+   placing it at an off-screen position).
+}
+var P: word;
+begin
+  if ColorScreen then
+    P := $3D4
+  else
+    P := $3B4;
+
+  X := X + Y * 80;
+  Port[P]   := $E;    { cursor location high byte reg. }
+  PortW[P+1]:= Hi(X);
+  Port[P]   := $F;    { cursor location low byte reg.  }
+  PortW[P+1]:= Lo(X);
+end;
+
+{****************************************************************}
+procedure VideoSetSize(BigFlag: Word);   export;  assembler;
+{
+   Called when TDW wants to switch the resolution of the text mode
+   screen.  Bigflag will be 1 if high res, 0 if low res.
+}
+asm
+     lea  bx, BigFlag
+     mov  ax, ss:[bx]
+     or   ax, ax
+     jz   @@1
+                      { BigFlag = 1, so do 50 line text mode }
+     mov  byte ptr VGA50LineMode, 1
+     mov  ax, $1112   { load 8x8 font }
+     xor  bx, bx
+     int  $10
+     jmp  @@2
+@@1:                  { else BigFlag = 0, so do 25 line mode }
+     mov  byte ptr VGA50LineMode, 0
+     mov  ax, $1111   { load 8x14 font }
+     xor  bx, bx
+     int  $10
+     mov  ax, $83
+     int  $10
+@@2:
+end;
+
+{****************************************************************}
+procedure VideoDebuggerScreen;   export;
+{
+   Called when TDW wants to switch to the text mode screen.  This
+   function must save the appropriate memory locations, save the VGA
+   palette, and switch to text mode.
+}
+begin
+  if ColorScreen then  { We're assuming that a mono screen will be dual monitor }
+  begin
+    SavePalette;
+    asm
+      mov ax, $83      { select text mode $03, don't clear the screen ($80) }
+      int $10
+    end;
+    VideoSetSize(word(VGA50LineMode));
+  end;
+end;
+
+{****************************************************************}
+procedure VideoWindowsScreen;  export;
+{
+   Called when TDW wants to switch back to the Windows screen.  This
+   function must switch back to the original graphics mode, restore the
+   palette, and restore the SuperVGA graphics memory planes that were
+   blown away by text mode.
+}
+begin
+  if ColorScreen then
+  begin
+    asm
+      mov ax, $4f02
+      mov bx, word ptr GraphicsMode
+      or  bx, VesaDontErase    { don't erase the graphics or text screens }
+      int 10h
+    end;
+    RestorePalette;
+  end;
+end;
+
+{****************************************************************}
+function VideoBigSize: Word;   export; assembler;
+{
+   Called when TDW needs to determine if there is a higher resolution
+   text mode availible (usually 43 or 50 lines).  The maximum number of
+   lines that this you are able to support should be returned here.
+}
+asm
+  mov ax,50
+end;
+
+{****************************************************************}
+function VideoIsColor: Word;   export;  assembler;
+{
+   Returns 1 for color, and 0 for monochrome;
+}
+asm
+  xor ax, ax
+  mov al, byte ptr ColorScreen
+end;
+
+
+exports
+
+  VideoDone,
+  VideoInit,
+  VideoGetTextSelector,
+  VideoDebuggerScreen,
+  VideoWindowsScreen,
+  VideoSetCursor,
+  VideoSetSize,
+  VideoBigSize,
+  VideoIsColor;
+
+
+begin
+end.
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

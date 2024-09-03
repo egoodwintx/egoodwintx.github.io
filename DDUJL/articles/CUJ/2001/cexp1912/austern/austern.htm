@@ -1,0 +1,86 @@
+<HTML>   
+     <HEAD>
+<TITLE>December 2001 C++ Experts Forum/The Standard Librarian</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.12/tocdec.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">The Standard Librarian: A Debugging Allocator</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Matt Austern</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>Allocators in the Standard C++ library have a complicated and low-level interface <a href="#1">[1]</a>. Unlike <b>new</b> and <b>delete</b>, they decouple memory allocation from object creation. Unlike <b>malloc</b> and <b>free</b>, they require you to keep track of the data type for which you're allocating memory and the number of objects you're allocating.</p>
+<p>Ordinarily, this isn't a problem.  Allocators have a low-level interface because they're a low-level concept: they're normally buried inside of container classes, and they do not belong in normal user code. There's one time, however, when you may have to worry about allocators: when you're writing a new container class of your own.  Allocators are harder to use than <b>new</b> and <b>delete</b>, and, accordingly, they're more error-prone. If you do have to write code that uses allocators, how can you make sure your code is correct? Run-time testing can never prove the absence of errors but only their presence. Still, testing is important &#151; the sooner you find a bug, the easier it is to fix. </p>
+<p>All of the standard container classes take an allocator class as a template parameter; this parameter has a default so that, for example, <b>std::vector&lt;int&gt;</b> is an abbreviation for <b>std::vector&lt;int, std::allocator&lt;int&gt; &gt;</b>. If we wrote a new allocator class that performed extra checking to make sure it's being used consistently, then we could provide that class, instead of <b>std::allocator&lt;int&gt;</b>, as <b>vector</b>'s second template argument. Assuming there are no bugs, <b>vector</b> will behave just the same as before. (Except that the extra checks will make it slower, of course.)</p> 
+<p>This column presents such a debugging allocator class. It's useful in its own right, and writing it also turns out to be an interesting exercise in working with allocators.</p>
+
+<H3><FONT COLOR="#000080">The Tests</FONT></H3>
+
+<p>What kinds of errors would we like to check for? The most important are:</p>
+
+<UL><LI>The memory that we pass to <b>deallocate</b> was actually allocated by this allocator.</LI>
+<LI>When we deallocate a block, we're deallocating the same number of bytes as we allocated. (Unlike <b>malloc</b> and <b>free</b>, allocators don't keep track of that for themselves.)</LI>
+<LI>We're deallocating memory for the same type as we allocated it for. (Although allocators decouple memory allocation and object creation, memory must still be allocated for a particular data type.)</LI>
+<LI>When we work within a block of memory, we don't overstep the bounds of that block.</LI>
+<LI>We never attempt to construct two objects at the same location, and we never attempt to destroy an object twice.</LI>
+<LI>When we deallocate a block of memory, we make sure to destroy all objects in that block first.</LI>
+</UL>
+
+<p>As we shall see, our debugging allocator will not satisfy all of those goals. We'll be able to check for some of those errors, but not all.</p>
+<p>The basic idea behind the debugging allocator is simple <a href="#2">[2]</a>: whenever we allocate a block of memory, allocate a bit more than the user asked for and store some extra information in the first few bytes. The user never sees this debug area; we pass the user a pointer to the memory that follows it. When we're passed a pointer to a memory block that we've allocated, however, we can decrement the pointer, look in the debug area, and verify that the memory block is being used consistently.</p>
+<p>This design has two implications.  First, it's impossible to implement it quite portably. We have to preserve alignment: given an address that's properly aligned for the user's data, we want to reserve a few bytes and still have something that's properly aligned. How can we know how much to add? In principle, we can't; the language doesn't provide a mechanism for determining alignment requirements. (Perhaps this will be added to a future version of the Standard.) In practice, it's not a serious portability issue: aligning everything on double-word boundaries tends to be good enough on most existing platforms, and can easily be changed on those few platforms with more stringent requirements.</p>
+<p>A second implication is that, with this design, there are some errors we can easily check for and others that we can't. A user gets a memory block with <b>allocate</b> and passes it to <b>deallocate</b>, so this design makes it very easy to check that <b>allocate</b> and <b>deallocate</b> are being used consistently. Unfortunately, it's harder to verify that <b>construct</b> and <b>destroy</b> are being used consistently.</p>
+<p>The problem is that in general the argument that's passed to <b>construct</b> or <b>destroy</b> isn't a pointer that was returned from <b>allocate</b>.  If you write <b>a.construct(p, x)</b>, then <b>p</b> must point into a memory block that was allocated through <b>a</b> &#151; but that's <i>into</i>, not <i>to</i>.  Perhaps the user allocated enough memory for 1,000 elements, with <b>p1 = a.allocate(1000)</b>. In that case, we don't know whether the first argument to construct is <b>p1</b>, <b>p1+5</b>, or <b>p1+178</b>.  We can't find the debugging information we need, because we have no way of finding the beginning of the block that the user allocated.</p>
+<p>There are two possible solutions to this problem, but neither of them quite works. First, and most obvious, we could give up on the idea that all of the debugging information must go at the beginning of the memory that the user allocates. This doesn't quite work, though, because we'd have to store our information intermingled with the user's.  But this would break pointer arithmetic: the user would have no way to step from one element to the next without seeing our hidden debugging information. Alternatively, we could maintain an extra data structure off to the side: for example, we could maintain an <b>std::set</b> of active objects, adding an address to the <b>set</b> whenever the user creates an object with <b>construct</b>, and removing it whenever the user destroys an object with <b>destroy</b>.</p> 
+<p>That technique is simple and elegant, and the reason it doesn't work is rather subtle. The problem is that the user doesn't necessarily have to use the same allocator to create an object as to destroy it: the user need only use an <i>equal</i> allocator. Consider the following sequence of operations:</p>
+
+<UL><LI>The user is given an allocator, <b>a1</b>, and makes a copy of it, <b>a2</b>.</LI>
+<LI>The user creates a new object with <b>a1.construct(p, x)</b>.</LI>
+<LI>The user destroys the object with <b>a2.destroy(p)</b>.</LI>
+</UL>
+
+<p>This sequence is legal, but an allocator that maintained a list of active objects as a <b>set</b> would flag it as an error: we'd be adding the new object to <b>a1</b>'s list of active objects, and we wouldn't find it when we destroyed the object with <b>a2</b>.</p> 
+<p>Could we get around this problem by using a list that's shared between all copies of a given allocator?  Perhaps, but we'd start running into definitional problems. If we have:</p>
+
+<pre>
+my_allocator&lt;int&gt; a1;
+my_allocator&lt;double&gt; a2(a1);</pre>
+
+<p>then should <b>a1</b> and <b>a2</b> share the same list of active objects? (The answer might seem to be &quot;no,&quot; but then what about <b>my_allocator&lt;int&gt;(a2)</b>?) We also run into implementation problems: an object that's shared behind the scenes requires special care, especially in the presence of concurrency.</p>
+<p>Because of these problems, I have simply given up on the idea of nontrivial checks in <b>construct</b> and <b>destroy</b>. This version of a debugging allocator does some minimal checks of their arguments, but it doesn't try to make sure that <b>destroy</b>'s argument was previously <b>construct</b>ed or that an object is only destroyed once. </p>
+<p>The main purpose of this debugging allocator is making sure that <b>allocate</b> and <b>deallocate</b> are being used consistently. When we allocate memory, we reserve two words at the beginning of every memory block, and store the number of elements in that block, as well as a hash code that's derived from the type (from the type's name, in particular, as given by <b>typeid(T).name()</b>). Then we reserve another word at the end of the memory block and store another copy of the hash code as a sentinel. Then when we deallocate the block, we check that the number of elements we've stored is the same as the argument passed to <b>deallocate</b>, and that both copies of the hash code are correct. We call <b>assert</b> so that an inconsistency will cause the program to fail.</p>
+<p>This doesn't give us all of the checks that we hoped for at the beginning of this section, but it does allow us to make sure that memory passed to <b>deallocate</b> really was allocated by this allocator, that it was allocated for the same type as it's being deallocated for, and that argument counts are consistent.  It also gives us some limited protection against overruns: a user who makes an off-by-one error in either direction will overwrite the sentinel, and this error will be detected at deallocation time.</p>
+
+<H3><FONT COLOR="#000080">An Allocator Adaptor</FONT></H3>
+
+<p>So far I haven't shown any code, because I haven't yet said anything about the exact form of the debugging allocator. One simple option would be to build the debugging allocator on top of <b>malloc</b> or on top of <b>std::allocator</b>. In that case, we'd have a class with a single template parameter, the type of the object to be allocated.  That's not quite as general as we might want: users wouldn't be able to combine testing with a user-defined allocator.  For greater generality, it's better to write the debugging allocator as an allocator <i>adaptor</i>. (Another motive for writing it as an allocator adaptor, I admit, is pedagogical: that way we can explore general features of allocator adaptors.)</p>
+<p>Writing an allocator adaptor presents two new problems. The first is that we don't get to make as many assumptions about what we're dealing with as we may be used to. We can't necessarily assume that <b>Allocator::pointer</b> is of type <b>T*</b>, and we can't necessarily assume that we can put objects &#151; even objects of built-in types, like <b>char</b> and <b>int</b> &#151; in uninitialized memory. We have to use <b>construct</b> and <b>destroy</b> religiously. This is a nuisance, but it's just a matter of being careful.</p>
+<p>The second problem is a design issue: what should our debugging allocator's template parameters look like?  A first thought might be that we should just have a single template parameter, a template template parameter.  However, that's not general enough: a template template parameter is only good for a specific number of arguments, and allocators aren't so constrained. A template template parameter that sufficed for the default allocator, <b>std::allocator&lt;T&gt;</b>, wouldn't work for a user-defined allocator with extra arguments, like <b>my_allocator&lt;T, flags&gt;</b>. </p> 
+<p>What about a single ordinary template parameter, then? We might imagine writing:</p>
+
+<pre>
+template &lt;class Allocator&gt;
+class debug_allocator;</pre>
+
+<p>That comes closer. A user might write, for example, <b>debug_allocator&lt;std::allocator&lt;int&gt; &gt;</b>. Unfortunately, there's still a problem. An allocator's value type may be <b>void</b>, and sometimes (as I described in my earlier column) this is even useful and important. What happens if a user writes this?</p>
+
+<pre>
+typedef debug_allocator&lt;std::allocator&lt;int&gt; &gt; A;
+typedef typename A::template rebind&lt;void&gt;::other A2;</pre>
+
+<p>The problem is that <b>A2</b>'s value type is <b>void</b>, and there are some things in allocator classes that make no sense for <b>void</b>.  There's a reference <b>typedef</b>, for example, and <b>void&amp;</b> makes no sense; it will cause a compilation error.  The default allocator has a specialization, <b>std::allocator&lt;void&gt;</b>.  Somehow, we need a specialization too.</p>
+<p>We can't quite say that we want a specialized version of <b>debug_allocator&lt;Allocator&gt;</b> that we'll get whenever <b>Allocator</b>'s value type is <b>void</b>, but there's a trick that does the next best thing. We can give <b>debug_allocator</b> a second template parameter, let it default to <b>Allocator::value_type</b>, and then write a partial specialization that applies whenever the second template parameter is <b>void</b>. That second template parameter is purely an implementation detail: users will never write it explicitly, but will refer to this adaptor by writing (for example) <b>debug_allocator&lt;std::allocator&lt;int&gt; &gt;</b>.</p>
+<p>Once we have this trick, it's not hard to put all of the pieces together: the full debug allocator is shown in <a href="list1.htm">Listing 1</a>. You may find <b>debug_allocator</b> useful if you need to check memory usage in your container classes, but what's more important is that you can use it as a model. The implementation techniques used in <b>debug_allocator</b> are useful for allocator adaptors of your own.</p> 
+
+<H3><FONT COLOR="#000080">Notes</FONT></H3>
+
+<p><a name="1"></a>[1] Matt Austern. &quot;The Standard Librarian: What Are Allocators Good For?&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, December 2000, &lt;www.cuj.com/experts/1812/austern.htm&gt;.</p>
+
+<p><a name="2"></a>[2] This debugging allocator is based on the one in the SGI library, &lt;www.sgi.com/tech/stl&gt;. The original version was written by Hans-J. Boehm.</p>
+
+<p><i><B>Matt Austern</B> is the author of <I>Generic Programming and the STL</I> and the chair of the C++ standardization committee&#146;s library working group. He works at AT&amp;T Labs &#151; Research and can be contacted at <b>austern@research.att.com</b>.</i></p>
+
+</BLOCKQUOTE></BODY></HTML>

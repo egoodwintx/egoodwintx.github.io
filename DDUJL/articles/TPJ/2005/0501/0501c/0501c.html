@@ -1,0 +1,410 @@
+
+<html>
+<head>
+<title>January, 2005: Keeping Up  With the World</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Keeping Up  With the World</h1>
+<p><i>The Perl Journal</i> January, 2005</p>
+<h2></h2>
+
+
+<h3>By Simon Cozens</h3>
+
+
+<I>Simon is a freelance programmer and author, whose titles include Beginning Perl (Wrox Press, 2000) and Extending and Embedding Perl (Manning Publications, 2002). He's the creator of over 30 CPAN modules and a former Parrot pumpking. Simon can be reached at simon@ simon-cozens.org.</I>
+
+<hr>
+
+
+
+
+
+<p>I love the holiday period&#151;a chance to go back and see family, and to get away from it all in an isolated cottage in rural Wales. Of course, there's a downside to this: being in an isolated cottage in rural Wales. I still like to keep up with what's going on in the outside world, with the latest tech news and what people are saying on their blogs. Unfortunately, there's only dial-up available and that is time-metered, so I'm very much on a bandwidth budget.</p>
+
+<p>Normally, I'd use an RSS reader. We've met RSS before&#151;it's a way for sites to publish a machine-readable file of their latest news and items, so we can suck down these XML files and see if there's anything we haven't seen yet. Unfortunately, these XML files can get quite big, averaging around 10K, and if you're following a lot of them, that soon adds up. One possible solution is to run a console-based RSS reader on my server, and use a text-mode interface to that: This drastically cuts down the amount of data I need to download.</p>
+
+<p>One last stipulation&#151;when I get back from my holiday and back to bandwidth and my desktop, I don't want to lose track of what I've already read; I want to be able to carry on where I left off. At college, I use NetNewsWire, a Mac RSS client, so I want my text-based reader to read the NNW history format as well. Naturally, there aren't many of these around; several come close, but nothing was quite right. So I did the obvious thing: I wrote one. It's called "press," from "Perl RSS."</p>
+
+<p>We'll look at how I did it this month and next: This month, we'll concentrate on getting a basic RSS aggregator working, and next month, we'll see how to interface that to NetNewsWire.</p>
+<h3>Scanning CPAN</h3>
+
+<p>The first port of call for any application like this is CPAN. What modules can we find that will do the work for us? I already knew about <i>POE::Component::RSSAggregator</i>, which does most of the job: It polls news sites, downloads their RSS, and alerts the POE event loop if there are any new headlines. Next, we need a UI to display it all: Curses is the right idea, but it's a bit low level, so I decided to check out <i>Curses::UI</i>. We'll need to format the stories contained in the RSS files, which are usually in HTML, for display as plain text, so we pick up <i>HTML::FormatText</i> as well. Finally, for dealing with the Macintosh property list files used by NetNewsWire, we can grab the aptly named <i>Mac::PropertyList</i>.</p>
+
+<p>If it sounds like we've got most of the application done already, we have&#151;the finished product was just over 200 lines of code.</p>
+<h3>Hacking the UI</h3>
+
+<p>Next, I got myself familiar with <i>Curses::UI</i> by creating a mock-up of the application. <i>Curses::UI</i> allows you to create "widgets," such as windows, list boxes, text areas, and so on, and stick them all together in a nice object-oriented way. So for instance, I wanted the display to have three panels, just like NetNewsWire (and many other readers), one for the list of the feeds I'm following, one for the headlines in an individual feed, and one for the story behind the headline. <a name="rf1"></a><a href="0501cf1.html">Figure 1</a> is a picture of what we're aiming toward.</p>
+
+<p>I started by creating the three windows and adding them to the main <i>Curses::UI</i> object:</p>
+
+<blockquote>
+<pre>
+my $cui = new Curses::UI(-color_support =&gt; 1);
+my $win1 = $cui-&gt;add( "feedlist", "Window",
+    -titlereverse =&gt; 0, -htmltext =&gt; 1, 
+    -border =&gt; 1, -bfg=&gt;"blue",
+    -title =&gt; "Feed List", -width =&gt; 30);
+
+my $win2 = $cui-&gt;add( "headlist", "Window",
+    -titlereverse =&gt; 0, -htmltext =&gt; 1, 
+    -border =&gt; 1, -bfg=&gt;"blue",
+    -title =&gt; "Headline List", 
+    -x =&gt; ($win-&gt;width+1), -height =&gt; 10);
+
+my $win3 = $cui-&gt;add( "datawin", "Window",
+    -titlereverse =&gt; 0, -htmltext =&gt; 1, 
+    -border =&gt; 1, -bfg=&gt;"blue",
+    -x =&gt; ($win-&gt;width+1), 
+    -y =&gt; ($win2-&gt;height+1) );
+
+</pre>
+</blockquote>
+
+<p>Each call to <i>cui-&gt;add</i> is followed by a name for the widget so that we can get at it later, the name of the widget (here we're starting with Windows), and then some options&#151;we don't want the title to be reversed, we want to be able to use simple markup in titles, we want a border, and so on. We declare the sizes and positions of the latter two windows relative to the first, so that if we change the width of that, everything else will still be in the right place. Incidentally, the first line of options is always the same, so we factor that out to avoid repeating code:</p>
+
+<blockquote>
+<pre>
+@mywindow = ( "Window",
+    -titlereverse =&gt; 0, -htmltext =&gt; 1, 
+    -border =&gt; 1, -bfg=&gt;"blue");
+my $win1 = $cui-&gt;add( "feedlist", @mywindow, ...);
+my $win2 = $cui-&gt;add( "headlist", @mywindow, ...);
+
+</pre>
+</blockquote>
+
+<p>Now we can place some widgets inside the windows&#151;a "Listbox" widget in each of the feed and headline lists, and a "TextViewer" in the data window:</p>
+
+<blockquote>
+<pre>
+my $feedbox = $win1-&gt;add('feedlistbox', "Listbox",
+                         -vscrollbar =&gt; 1);
+my $headbox = $win2-&gt;add('headlistbox', "Listbox",
+                         -vscrollbar =&gt; 1);
+my $viewer  = $win3-&gt;add('data', "TextViewer");
+
+</pre>
+</blockquote>
+
+<p>And now we can tell the main Curses event loop to start:</p>
+
+<blockquote>
+<pre>
+$cui-&gt;mainloop;
+
+</pre>
+</blockquote>
+
+
+
+<p>When we run this, we get presented with a nice three-panel interface, two empty lists, and...no way to quit. Oops. We'd better add some simple navigation. First, we tell <i>Curses::UI</i> that the "^C" and "q" keys can be used to quit:</p>
+
+<blockquote>
+<pre>
+$cui-&gt;set_binding(sub { exit }, $_) for "\cC", "q";
+
+</pre>
+</blockquote>
+
+
+
+<p>Next, we'll tell each window that the tab key can be used to move to the next window, just as we'd expect. We do this by moving the focus to the next window in sequence:</p>
+
+<blockquote>
+<pre>
+$win1-&gt;set_binding(sub { $win2-&gt;focus }, "\cI");
+$win2-&gt;set_binding(sub { $win3-&gt;focus }, "\cI");
+$win3-&gt;set_binding(sub { $win1-&gt;focus }, "\cI");
+
+</pre>
+</blockquote>
+
+<p>Now our interface looks a bit better, and we can start thinking about how we're going to implement the logic.</p>
+<h3>What's POE?</h3>
+
+<p>This application is going to have multiple sources of input, and they could happen at any time: The user could hit a key on the keyboard and we'd have to update the screen, or an updated RSS feed could come in and we'd possibly have to deal with adding new headlines to the display. We also want to fire off HTTP requests occasionally to ask for new news. All of these things are called "events," and we're now entering the world of event-driven programming.</p>
+
+<p>In an ordinary, procedural program, we'd have to deal with the user's keystrokes, then send off the HTTP request and block there until we got a response, and the user couldn't use the application's UI until we cede control back to her and wait for another keystroke. This leads to a horrible user experience. In the event world, we have a main event loop that watches for things happening. We tell the event loop that we want to schedule web requests periodically. When something happens, such as a keystroke or a response from the HTTP request, the event loop calls a routine. In this sense, the event loop is a bit like an operating system&#151;it looks after scheduling events and dispatching them to the appropriate bit of code that's currently listening for them.</p>
+
+<p>POE is one such event loop, and an award-winning one at that. Part of the beauty of POE is that major chunks of event-generating and event-responding code are packaged up as "components," like our <i>POE::Component::RSSAggregator</i>. There are also POE components that act as HTTP servers, IRC clients, watch for changes to files, or even control MP3 players. POE can look fiendish if you've never seen it before, but we'll explain it as we go along.</p>
+<h3>Subclassing CPAN</h3>
+
+<p>While I'm a big fan of doing as much as possible with CPAN modules, I'm not going to pretend that CPAN modules are always a perfect fit for the job in hand. However, they're usually pretty good, and if they're not a perfect fit, you can usually get some use out of them by subclassing and bending them to your will.</p>
+
+<p>So with the current program, there are two slight mismatches that we need to fix. First, <i>POE::Component::RSSAggregator</i> uses <i>XML::RSS::Feed</i> objects, which are great, but unfortunately they assume that every time a new article appears, the old articles aren't new any more; this is perfectly good behavior if you're writing a news ticker where you only want to display each new item once. However, we're writing a news reader, and we want articles to stay new until the user has read them. So we get subclassing!</p>
+
+<p>Looking at<i> XML::RSS::Feed,</i> we find that every time an XML file is parsed, it calls<i> _mark_all_headlines_seen</i>, and this method puts the ID of the headline object in the <i>rss_headline_ids</i> hash. So we create a new class that doesn't <i>_mark_all_headlines_seen</i> automatically, but does allow us to specify manually when a headline has been read:</p>
+
+<blockquote>
+<pre>
+package XML::RSS::Feed::Manual;
+use base 'XML::RSS::Feed';
+sub _mark_all_headlines_seen {} 
+sub mark_read {
+    my ($self, $head) = @_;
+    $self-&gt;{rss_headline_ids}{$head-&gt;id} =1;
+}
+
+</pre>
+</blockquote>
+
+<p>The second mismatch is that we want to use POE as our event loop so that <i>POE::Component::RSSAggregator</i> can post events about new articles. Unfortunately, we're also using <i>Curses::UI</i>, which has its own event loop. There's a Curses loop for POE, <i>POE::Wheel::Curses</i>, but we still need to glue it all together. So we look at <i>Curses::UI</i>'s <i>mainloop</i> and see how it works:</p>
+
+<blockquote>
+<pre>
+sub mainloop ()
+{
+    my $this = shift;
+
+    # Draw the initial screen.
+    $this-&gt;focus(undef, 1); # 1 = forced focus
+    $this-&gt;draw;
+    doupdate();
+
+    # Infinite event loop.
+    for(;;)
+    {
+        $this-&gt;do_one_event
+    }
+}
+
+</pre>
+</blockquote>
+
+<p>We also find that <i>do_one_event</i> reads a key from the keyboard, unless <i>$this-&gt;{-feedkey}</i> is set to a pending keystroke. <i>POE::Wheel::Curses</i> also reads a key from the keyboard, so we can use that as our main loop, then have it feed the key that it has just read into <i>$cui-&gt;{-feedkey}</i> and call <i>do_one_event</i>: This will cause <i>Curses::UI</i> to dispatch the key to the appropriate widget and do the right thing. So we convert our dummy UI to use POE:</p>
+
+<blockquote>
+<pre>
+POE::Session-&gt;create(inline_states =&gt; {
+    _start =&gt; sub {
+        my ($heap) = $_[HEAP];
+        $heap-&gt;{console} = 
+            POE::Wheel::Curses-&gt;new(
+               InputEvent =&gt; "got_keystroke"
+            );
+        $cui-&gt;focus(undef, 1);
+        $cui-&gt;draw;
+        Curses::doupdate();
+    },
+    got_keystroke =&gt; sub {
+        $cui-&gt;{-feedkey} = $_[ARG0];
+        $cui-&gt;do_one_event;
+    }
+});
+POE::Kernel-&gt;run;
+
+</pre>
+</blockquote>
+
+<p>If POE is like an operating system, then <i>POE::Session</i> objects are its processes. An operating system with no processes is boring, so we create a new one. This session will respond to two events: the <i>_start</i> event is called when the session begins, and the <i>got_keystroke</i> will be called every time <i>POE::Wheel::Curses</i> sees a keystroke. Inside the <i>start</i> event, we set up <i>POE::Wheel::Curses</i>, and put its data on the "heap"&#151;this is just a storage area that the POE kernel sets up for us, and means that the Curses handler is going to stick around for the whole of the application. We also tell the Curses wheel what event to fire when a key is pressed, and then we copy in the initialization code from <i>Curses::UI</i>'s <i>mainloop</i>.</p>
+
+<p>When a key is pressed, we feed the key into the <i>Curses::UI</i> object and run one event. Once we're all set up, we tell the POE kernel to run, and now we can test that our application correctly dispatches keystrokes from POE to <i>Curses::UI</i>.</p>
+<h3>Adding the News</h3>
+
+<p>So far so good, but now we need to think about the RSS handling part. For this month, we'll assume that we have a static list of feeds, like so:</p>
+
+<blockquote>
+<pre>
+my %feeds = (
+    "http://planet.perl.org/rss10.xml" =&gt; 
+        "Planet Perl",
+    "http://slashdot.org/slashdot.rss" =&gt;
+        "Slashdot",
+"http://interglacial.com/~sburke/torgo_x_upo.rss"
+      =&gt; "Torgo-X zhoornal",
+    # ...
+);
+
+</pre>
+</blockquote>
+
+<p>Now we'll create our <i>XML::RSS::Feed::Manual</i> objects:</p>
+
+<blockquote>
+<pre>
+my @values;
+my %labels;
+while (my ($rss, $name) = each %feeds) {
+    my $feed = XML::RSS::Feed::Manual-&gt;new(
+        rss =&gt; $rss, name =&gt; $name
+    );
+    push @values, $feed;
+    $labels{$feed} = $name;
+}
+
+</pre>
+</blockquote>
+
+<p>We now have a list of feed objects and a hash that turns the feed object into a name. We can use these as the values and labels of our list box:</p>
+
+<blockquote>
+<pre>
+$feedbox-&gt;values(\@values);
+$feedbox-&gt;labels(\%labels);
+
+</pre>
+</blockquote>
+
+<p>This means that the feed list will be full of items labeled according to the name of the feed: We will see a list "Planet Perl," "Slashdot," and so on, as we might expect. However, when one of these items is selected, we can call a method on the list box and get back the underlying <i>XML::RSS::Feed::Manual</i> object for that item.</p>
+
+<p>For instance, as we select each feed in the feed list, we want the list of headlines to change. To do this, we add an <i>onselchange</i> handler to the feed list:</p>
+
+<blockquote>
+<pre>
+my $feedbox = $win-&gt;add('feedlistbox', 
+    "Listbox", -vscrollbar =&gt; 1, 
+    -onselchange =&gt; \&amp;select_feed );
+
+</pre>
+</blockquote>
+
+<p>Now as we cursor up and down in that box, <i>select_feed</i> is called:</p>
+
+<blockquote>
+<pre>
+sub select_feed {
+    my $feed = $feedbox-&gt;get_active_value;
+    my @headlines = $feed-&gt;headlines;
+    $headbox-&gt;values(\@headlines);
+    $headbox-&gt;labels({
+        map { $_ =&gt; $_-&gt;headline } @headlines
+    });
+    $headbox-&gt;layout_content-&gt;draw(1);
+}
+
+</pre>
+</blockquote>
+
+<p>As mentioned, we can ask the feed box for the currently selected feed object. As this changes, we ask the feed for its headline objects, which are in the <i>XML::RSS::Headline</i> class. In the same way as with the feed box, we fill the headline box with these objects, and then give each object a label that is the human-readable headline. Since we have changed the data in the headline box, we need to force it to redraw, which we do with an incantation stolen from the <i>Class::UI::Dialog::Filebrowser</i>.</p>
+
+<p>Next, as we select a headline, we want to display the story in the data window. So, in exactly the same way, we attach a handler to the headlines box:</p>
+
+<blockquote>
+<pre>
+my $headbox = $win2-&gt;add('headlistbox', "Listbox",
+    -vscrollbar =&gt; 1, 
+    -onselchange =&gt; \&amp;select_story );
+
+</pre>
+</blockquote>
+
+<p>And this does much the same thing, looking at the headline object this time instead of the feed object:</p>
+
+<blockquote>
+<pre>
+sub select_story {
+    my $head = shift-&gt;get_active_value;
+    if ($head) {
+        $viewer-&gt;text(
+            HTML::FormatText-&gt;format_string(
+                $head-&gt;description, 
+                lm=&gt;0, rm =&gt; $viewer-&gt;width -2
+            )
+        );
+        my $feed = $feedbox-&gt;get_active_value;
+        if (!$feed-&gt;seen_headline($head-&gt;id)) {
+           $feed-&gt;mark_seen($head);
+        }
+    } else { $viewer-&gt;text("Nothing selected"); }
+    $viewer-&gt;layout_content-&gt;draw(1);
+}
+
+</pre>
+</blockquote>
+
+<p>We take the description from the headline object and format that up as plain text, putting the result in the viewer. Now we need to tell the feed that this item has been read&#151;this currently doesn't make any difference, since we don't distinguish between read and unread items in the aggregator yet. But we will.</p>
+
+<p>We're very nearly there. The only thing we don't have is data. But once we plug in <i>POE::Component::RSSAggregator</i>, we'll get that automatically. So in our <i>session _start</i> event, we add the following code:</p>
+
+<blockquote>
+<pre>
+$heap-&gt;{rssagg} = 
+   POE::Component::RSSAggregator-&gt;new(
+      alias =&gt; "rssagg"
+   );
+$kernel-&gt;post('rssagg', add_feed =&gt; $_) 
+                           for @values;
+
+</pre>
+</blockquote>
+
+<p>This is all we need to do. Having told the aggregator about the feed objects that we want to watch, it will arrange with the POE scheduler to update them for us. When the program starts, the aggregator component will fire off a set of HTTP requests; when it sees a response to one of them, it will create the appropriate headline objects in the feed. The next time the user selects a new feed, the new headlines will already be there. Then the aggregator schedules another bunch of requests, 10 minutes later. We don't need to do any work.</p>
+<h3>Finishing Touches</h3>
+
+<p>The whole point of this exercise was for me to be able to quickly and easily check RSS news with a minimum of bandwidth. Unfortunately, at present, I have to check every single feed since there's no visual indication of which feeds have new items, or even which items are new and which have been seen before.</p>
+
+<p>Here's one subroutine that will help:</p>
+
+<blockquote>
+<pre>
+sub bolden_news {
+    my $labels = $feedbox-&gt;labels;
+    for my $elem (@values) {
+        if ($elem-&gt;late_breaking_news and $labels-&gt;{$elem} !~ /&lt;bold&gt;/) {
+            $labels-&gt;{$elem} = "&lt;bold&gt;".$labels-&gt;{$elem}."&lt;/bold&gt;"
+        } elsif (!$elem-&gt;late_breaking_news) {
+            $labels-&gt;{$elem} =~ s{&lt;/?bold&gt;}{}g;
+        }
+    }
+    $feedbox-&gt;labels($labels);
+    $feedbox-&gt;layout_content-&gt;draw(1);
+}
+
+</pre>
+</blockquote>
+
+<p>The key here is the <i>late_breaking_news</i> method on a feed object. It returns True if the feed contains any articles we haven't yet marked. We look at each of the feeds in the feed box; if there are some new articles, and the label doesn't have bold tags around it (this is the simple markup we were talking about when we created the windows), then we add some tags. If we've read everything in this feed, then we take the bold tags out again.</p>
+
+<p>We can do the same trick for headlines in the headlines list:</p>
+
+<blockquote>
+<pre>
+sub select_feed {
+    my $feed = $feedbox-&gt;get_active_value;
+    my @headlines = $feed-&gt;headlines;
+    $headbox-&gt;values(\@headlines);
+    $headbox-&gt;labels({ map {
+            my $head = $_-&gt;headline;
+            $_ =&gt; (!$feed-&gt;seen_headline($_-&gt;id)
+                    ? "&lt;bold&gt;$head&lt;/bold&gt;" : $head)
+        } $feed-&gt;headlines });
+
+    $headbox-&gt;layout_content-&gt;draw(1);
+}
+
+</pre>
+</blockquote>
+
+<p>If we haven't seen this headline before, we "bolden" it. Now we just need to arrange for <i>bolden_news</i> and <i>select_feed</i> to be called when the <i>POE::Component::RSSAggregator</i> sees new news:</p>
+
+<blockquote>
+<pre>
+my ($kernel, $heap, $session) = @_[KERNEL, HEAP, SESSION];
+...
+$heap-&gt;{rssagg} = POE::Component::RSSAggregator-&gt;new(
+    alias    =&gt; 'rssagg',
+    callback =&gt; $session-&gt;postback("handle_feed"),
+);
+
+sub handle_feed { bolden_news(); select_feed() }
+
+</pre>
+</blockquote>
+
+<p>When a new news item comes in, the aggregator asks the session to call the <i>handle_feed</i> subroutine; in this, <i>bolden_news</i> will highlight the feed that the new item is in, and <i>select_feed</i> will highlight the unread items.</p>
+
+<p>Now we have a useful news aggregator that will keep track of new news articles for us while requiring minimal bandwidth. Next month, we'll see how to pull the feeds out of the NetNewsWire preferences and how to read and store history so that the information about which articles we've read becomes persistent.</p>
+
+
+<p><b></b></p>
+<p><b>TPJ</b></p>
+
+
+
+
+</body>
+</html>

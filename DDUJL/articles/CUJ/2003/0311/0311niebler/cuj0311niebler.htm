@@ -1,0 +1,298 @@
+<html>
+<head>
+<title>FOR_EACH and LOCK</title>
+</head>
+
+<body>
+
+
+<h2>FOR_EACH and LOCK</h2>
+
+<h3>By Eric Niebler and Anson Tsao</h3>
+
+
+<p>C# introduced a couple of new constructs to make some common tasks easier. One is the <b>lock</b> keyword, which makes it trivial to synchronize thread access to an object. Another is the <b>foreach</b> keyword, which makes iterating over collections easy and intuitive. </p>
+<p>Since the introduction of <b>foreach</b> and <b>lock</b>, some C++ programmers have clamored for the addition of similar facilities to C++. A purist might say, "There are already more general facilities in the C++ language to enable these programming constructs." But these "general facilities" lack the ease-of-use of their C# counterparts. As we've discovered, C++ can have the equivalent of <b>lock</b> and <b>foreach</b> &#151; all it takes is a dose of templates, a pinch of obscure language features, and a dash of the preprocessor. Although this article focuses primarily on managed collections, the <b>FOR_EACH</b> code is applicable to both native C++ and Managed C++. The final version of <b>FOR_EACH</b> goes far beyond what C#'s <b>foreach</b> keyword can do &#151; it is an extensible iteration solution that seamlessly handles native arrays and even STL containers, in addition to a host of managed collection types.</p>
+
+
+
+<h3>C#'s <b>lock</b> Keyword</h3>
+
+
+<p>All C++ programmers know how to manage locks for thread synchronization. You use the C++ idiom of "resource acquisition is initialization," acquiring the lock in a constructor, and releasing it in a destructor. This guarantees that every lock is unlocked. Deterministic finalization is what makes it work so well in C++, but what about C#? Without deterministic finalization, C# needs another solution &#151; the <b>lock</b> keyword. You use <b>lock</b> to acquire a lock on an object and hold it for the duration of the following lexical scope (that is, block). It looks like this:</p>
+
+
+<pre>
+lock( this )
+
+
+{
+
+    // this is locked here
+
+}
+
+
+   // this is unlocked here
+</pre>
+
+<p>Some C++ programmers see this and think it's an ugly hack.  Others look at it and want it. If you are in the second camp, take heart. There is a simple way to implement C#'s locking semantics in Managed C++. This technique also serves as our first stop on the way to a more elusive goal &#151; the implementation of C#'s <b>foreach</b> keyword. </p>
+
+
+
+<h3>MC++ <b>LOCK</b> macro</h3>
+
+
+<p>It is a litle-known fact that, in C++, you can declare and initialize a variable in an <b>if</b> statement. According to Bjarne Stroustrup in<i> The Design and Evolution of C++ </i>(Addison-Wesley, 1994), this idea  was introduced to support <b>dynamic_cast</b>, and usually looks like this:</p>
+
+
+<pre>
+if(Foo *f=dynamic_cast&lt;Foo*&gt;(this))
+
+{
+
+    // dynamic_cast succeeded! f!=0
+
+}
+</pre>
+
+<p>The variable <b>f</b> is declared, initialized, and compared to NULL all in the condition of the <b>if</b> statement. What is of interest is that <b>f</b> is "injected" into the scope of the block following the<b> if</b>. You can use this to implement <b>lock</b> (and <b>foreach</b>) in C++. But first you need a helper class.</p>
+
+<p>Locking and unlocking are best done in constructors and destructors. The <b>gclock</b> class (<A HREF="0311nieblerl1.htm" target="_BLANK">Listing 1</A>) handles this chore. With this class, the <b>LOCK</b> macro is trivial:</p>
+
+<pre>
+#define LOCK(obj) \
+
+    if(gclock _lock_=(object))
+</pre>
+
+<p>First, you take an object and use it to initialize an instance of <b>gclock</b>. The <b>gclock</b> constructor uses <b>Monitor::Enter</b> to acquire the lock for the object. Then, <b>_lock_ </b>is evaluated in Boolean context. The purpose of the operator <b>bool</b> becomes clear &#151; all <b>gclock</b> objects evaluate to True in Boolean context, causing the <b>if</b> block to execute. After the block has finished executing, the <b>gclock</b> object goes out of scope, and the destructor releases the lock. The <b>LOCK</b> macro is used like this:</p>
+
+<pre>
+LOCK( this )
+
+{
+
+    // this is locked here
+
+}
+    // this is unlocked here
+</pre>
+
+<p>There is one problem with the <b>LOCK</b> macro as currently written. Consider the following code:</p>
+
+<pre>
+if( some_condition )
+
+   LOCK( this )
+
+      do_something();
+
+else
+
+      do_something_else();
+</pre>
+
+
+<p>After macro substitution, this becomes:</p>
+
+
+<pre>
+if( some_condition )
+
+   if( gclock _lock_=(this) )
+
+      do_something();
+
+else
+
+      do_something_else();
+</pre>
+<p>The <b>if</b> statement in the <b>LOCK</b> macro got greedy and gobbled up the trailing <b>else</b> clause. You can see that the <b>else</b> clause never executed &#151; probably not your intention. This "greedy <b>if</b>" problem raises its ugly head again in the implementation of <b>FOR_EACH</b>. For now, the problem is easily solved by changing the <b>LOCK</b> macro to:</p>
+
+
+<pre>
+#define LOCK(obj) \
+
+   if(gclock _lock_=(obj)) {} else
+</pre>
+<p>and changing <b>gclock::operator bool()</b> to return False instead of True.</p>
+
+
+<p>There is one detail in the <b>gclock</b> implementation that we have not discussed &#151; the use of the <b>gcroot&lt;&gt;</b> smart pointer. <b>gcroot&lt;&gt;</b> is a template provided with the .NET Framework that allows references to garbage-collected types to be embedded in unmanaged types (see "Using the C++ Standard Library with Managed Types," by Jonathan Cave, <i>CUJ</i>, November 2002).</p>
+
+
+
+<h3>C#'s <b>foreach</b> Keyword</h3>
+
+
+<p>Writing loops can be a pain. To make it easier, C++ takes the approach of using generic algorithms like <b>std::for_each</b>. C# went a different route &#151; utilizing the <b>foreach</b> keyword. With <b>foreach</b>, you can easily loop over elements in collections, characters in strings, or items in arrays. What's more, with <b>foreach</b> you can make  the code execute right where you need it. For instance:</p>
+
+
+<pre>
+foreach( Foo f in fooArray ) 
+
+   { /* do something with f */ }
+</pre>
+
+<p>Unlike STL containers, the collections in the .NET Framework are heterogeneous, storing all the elements polymorphically as <b>System::Object*</b>. As an added convenience, the C# <b>foreach</b> loop casts the collection elements to the desired type during enumeration.</p>
+
+
+
+<h3>C++ FOR_EACH Macro</h3>
+
+
+<p>Unlike C#'s <b>foreach</b> keyword, <b>std::for_each</b> requires you to define your "loop body" in a predicate that must be defined at namespace scope, far from where it will be used. That's inconvenient, but looping over .NET Framework collections in Managed C++ is even worse. C++ programmers must resort to explicitly using enumerators, and the following verbose code often results:</p>
+
+
+<pre>
+IEnumerator *pEnum = fooArray-&gt;GetEnumerator();
+
+while( pEnum-&gt;MoveNext() )
+
+{
+
+    Foo *f = __try_cast&lt;Foo*&gt;( 
+
+        pEnum-&gt;Current );
+
+    /* do something with f */
+
+}
+</pre>
+<p>When faced with the prospect of writing loops like this time and again, it's easy to see why some C++ programmers cast a jealous eye at C#'s <b>foreach</b> keyword. What you would like is some way in C++ to write code like this:</p>
+
+
+<pre>
+FOR_EACH( Foo *, f, fooArray ) 
+
+    { /* do something with f */ }
+</pre>
+<p>Can you apply the tricks you used to implement the <b>LOCK</b> macro to create a <b>FOR_EACH</b> macro?</p>
+
+
+
+
+<h3><b>FOR_EACH</b>, Take 1</h3>
+
+
+<p>There are two obstacles to turning the preceding while loop into a <b>FOR_EACH</b> macro. First, since the enumerator variable <b>pEnum</b> is outside of the <b>while</b> loop, it clashes with any other <b>FOR_EACH</b> loop in the same scope. Second, the loop body needs to act as a real block, so the <b>FOR_EACH</b> macro should not introduce an unmatched opening brace.</p>
+
+
+<p>The <b>LOCK</b> macro declared a variable in an <b>if</b> statement, injecting it into the following scope. The <b>FOR_EACH</b> macro can use the same trick. In <A HREF="0311nieblerl2.htm" target="_BLANK">Listing 2</A> (which is incomplete), you might wonder what belongs in "<b>/* magic happens here */</b>"? Whatever the magic is, it must:</p>
+
+
+<ul>
+  <li>Move to the next item in the collection.
+  <li>Evaluate to False if the sequence is exhausted.
+
+  <li>Evaluate to True otherwise, and assign the current element to the loop variable, casting it as appropriate.
+</ul>
+
+<p>You can accomplish this with the <b>move_next()</b> helper function in <A HREF="0311nieblerl3.htm" target="_BLANK">Listing 3</A>. <b>move_next()</b> is a template function. Notice how the compiler deduces the type of the loop variable and uses the type in the <b>__try_cast </b>statement. (<b>__try_cast</b> is the managed equivalent of <b>dynamic_cast</b>.)</p>
+
+<p>This leads to the first snag: What if the compiler deduces <b>T</b> to be a value type, such as <b>int</b>? In the .NET Framework, you must first "box" a value (convert it to <b>System::Object*</b>) before you can put it in a collection. To retrieve the value out of the collection, you must "unbox" it. The <b>move_next()</b> function does not account for that. With a bit of template metaprogramming, you can detect at compile time if <b>T</b> is a <b>value</b> type or a <b>GC</b> (garbage collected) type by checking if it is convertible to<b> System::Object*</b>. If it is a <b>GC</b> type, then a simple cast to <b>T</b> is correct. If <b>T</b> is a <b>value</b> type, however, it must be cast to a <b>T __box*</b>, then dereferenced. The <b>auto_unbox&lt;&gt;</b> template in <A HREF="0311nieblerl4.htm" target="_BLANK">Listing 4</A> embodies this logic. It is interesting that you can apply many of the advanced C++ template techniques to managed types. We are using our <b>auto_unbox&lt;&gt;</b> template in <b>move_next()</b> to do the appropriate cast from <b>System::Object*</b>.</p>
+
+<p>But even with this new-and-improved <b>move_next()</b>, the <b>FOR_EACH</b> macro still has a problem. If you look at the <b>FOR_EACH</b> implementation in <A HREF="0311nieblerl2.htm" target="_BLANK">Listing 2</A>, you see that it suffers from the same "greedy <b>if</b>" problem as our first <b>LOCK</b> macro. That is, it is possible for the <b>if</b> to gobble up a trailing <b>else</b> that doesn't rightfully belong to it. Back to the drawing board.</p>
+
+
+
+<h3><b>FOR_EACH</b>, Take 2</h3>
+
+
+<p>With the <b>LOCK</b> macro, the "greedy <b>if</b>" problem was easily solved by providing an <b>else</b> and making sure the <b>if</b> condition evaluates to False. <b>FOR_EACH</b> can use the same trick, but it needs the helper function <b>init_enum()</b>:</p>
+
+
+<pre>
+bool init_enum( 
+
+   IEnumerator *&amp; num,
+
+   IEnumerable * coll )
+
+{
+
+   num = coll-&gt;GetEnumerator();
+
+   return false;
+
+}
+
+#define FOR_EACH(type,var,coll)\
+
+if( IEnumerator *_num_=0 ) {}\
+
+else if( init_enum(_num_,coll) ) {}\
+
+else for( /* ... */ )
+</pre>
+
+Putting all the pieces together gives you a nice <b>FOR_EACH</b> macro that iterates over any collection that implements the <b>IEnumerable</b> interface. But C#'s <b>foreach</b> keyword lets you loop over arrays and strings as well. <p></p>
+
+
+
+<h3><b>FOR_EACH</b>, Take 3</h3>
+
+
+<p>The <b>FOR_EACH</b> macro works with .NET Framework collections, but it should also work with strings and arrays. Ideally, <b>FOR_EACH</b> should be extensible so that it can iterate over any collection, even an STL container. To solve this problem, the compiler must detect the type of collection being enumerated and select the proper implementation at compile time. This calls for more template metaprogramming.</p>
+
+
+<p>The first step is to detect the type of the collection. A set of overloaded functions solves this problem nicely:</p>
+
+<pre>
+typedef char (&amp;num_type)[1];
+
+typedef char (&amp;arr_type)[2];
+
+typedef char (&amp;str_type)[3];
+
+
+num_type select( IEnumerable* );
+
+arr_type select( System::Array* );
+
+str_type select( System::String* );
+</pre>
+
+<p>The compiler selects the overloaded function based on its argument. To find out which overloaded function the compiler selected, we use the "<b>sizeof</b>" trick. When applied to an expression, <b>sizeof</b> evaluates to the size in bytes of that expression. If the expression is a function call, <b>sizeof</b> evaluates to the size of the function's return value. This conveniently lets you map a collection type to an integer at compile time. To provide specialized behavior for each collection type, you write an <b>enumerator&lt;&gt;</b> template that accepts a <b>size_t</b> as a nontype template parameter. This template has specializations for <b>sizeof(num_type), sizeof(arr_type)</b>, and <b>sizeof(str_type)</b>. Each specialization has:</p>
+
+
+<ul>
+  <li><b>enum_type</b>, a nested <b>typedef</b> indicating the type of the enumerator variable. <b>enum_type</b> is: <b>IEnumerator*</b> for <b>num_type</b>; <b>int</b> for <b>arr_type</b> and <b>str_type</b> (for indexing into the array or string).
+  <li><b>init_enum()</b>, a static member function that initializes the enumeration variable and returns False.
+
+  <li><b>move_next()</b>, a static member function that: Moves to the next element in the sequence; returns False if the sequence is exhausted; or returns True otherwise, and assigns the current element to the loop variable.
+
+
+  <li>For the full implementation of the <b>enumerator&lt;&gt;</b> template, see the code accompanying this article at <a href="http://www.cuj.com/code/">http://www.cuj.com/code/</a>. With <b>enumerator&lt;&gt;</b>, you can finally implement a proper <b>FOR_EACH</b> macro; see <A HREF="0311nieblerl5.htm" target="_BLANK">Listing 5</A>.
+
+  <li>The <b>enumerator&lt;&gt;</b> template is an extensible mechanism for customizing <b>FOR_EACH</b> behavior for different types of collections. As you can see in the final <b>FOR_EACH</b> code, we've used this mechanism to extend <b>FOR_EACH</b> to iterate over STL containers as well as native arrays. 
+
+</ul>
+
+<h3>Additional Considerations</h3>
+
+
+<p>Now that you've gone through the details of implementing the C++ <b>FOR_EACH</b> loop, how does it compare with the C# compiler's implementation?</p>
+
+
+<p>We examined the intermediate language (IL) generated by our <b>FOR_EACH</b> loop with full optimizations enabled. We found that <b>FOR_EACH</b> generates nearly optimal IL that is virtually indistinguishable in performance from the C# compiler-generated version. </p>
+
+<p>Our implementation, however, is still missing one feature from the C# version. For enumerators that implement <b>IDisposable</b>, C# guarantees that <b>Dispose</b> is called after the enumeration is complete. <b>IDisposable</b> is the design pattern that mimics C++ deterministic finalization, guaranteeing that resources are released immediately instead of at the next garbage-collection cycle. The <b>FOR_EACH</b> macro does not call <b>Dispose()</b> on the enumerator. Is this a serious problem? The enumerators for Framework collections do not implement <b>IDisposable</b>, so they are not affected by this deficiency. A few enumerators such as <b>MessageQueueEnumerator</b> do implement <b>IDisposable</b>, so you should be careful when using <b>FOR_EACH</b> with these collections. With more work, it is possible to address even this deficiency in the implementation, but the solution incurs significant overhead that we didn't feel was justified. </p>
+
+<p>The final version of <b>FOR_EACH</b> has a few other optimizations. <b>ArrayList</b> enumeration uses an index instead of the enumerator for performance reasons. Also, evaluating <b>ArrayList</b>'s end-of-sequence condition involves a virtual call that is hoisted out of the loop.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>In this article, we've described how to match the functionality and ease-of-use of C#'s <b>lock</b> and <b>foreach</b> keywords in C++. The final version of <b>FOR_EACH</b> takes these ideas further by applying them to native C++ types and STL containers, and by providing a mechanism for extending <b>FOR_EACH</b> to work with other types of collections. </p>
+
+<hr><I>
+<b>Eric</b> is an independent consultant working with Boost Consulting and previously worked as a library developer on the Visual C++ team. <b>Anson</b> is a developer for Microsoft. They can be contacted at <a href="mailto:neric@qwest.net">neric@qwest.net</a> and <a href="mailto:ansont@microsoft.com">ansont@microsoft.com</a>, respectively.</I>
+
+<hr>
+
+</body>
+</html>

@@ -1,0 +1,956 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>JUN92: PORTING UNIX TO THE 386 MISSING PIECES II</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>PORTING UNIX TO THE 386 MISSING PIECES II<a name="0155_0002"></h1><P>
+<h2><a name="0155_0001"><a name="0155_0000">Completing the 386BSD kernel</h2><P>
+<h3>William Frederick Jolitz and Lynne Greer Jolitz</h3><P>
+<p><i><a name="0155_0000">Bill was the principal developer of 2.8 and 2.9BSD and was the chief architect of National Semiconductor's GENIX project, the first virtual-memory, micro-processor-based UNIX system.  Prior to establishing TeleMuse, a market research firm, Lynne was vice president of marketing at Symmetric Computer Systems.  They conduct seminars on BSD, ISDN, and TCP/IP. Send e-mail questions or comments to ljolitz@cardio.ucsf.edu. (c) 1992 TeleMuse.</i></p><hr><P>
+Last month, we began the final steps of a journey that will lead to a bootable running 386BSD kernel that provides a self-supporting development environment.  The source code presented over the last two installments--plus a small set of bug fixes and a recent copy of the NET/2 tape--will enable you to build an operational kernel.<P>
+This month, we'll implement a &quot;bare-bones&quot; execve() system call that allows 386BSD to provide basic operation; a block-I/O buffer cache used to reduce the cost of UNIX file operations, and ring buffers that reduce the cost of tty-character buffer management.<P>
+<h3><a name="0155_0003">Leveraging the POSIX Definition<a name="0155_0003"></h3><P>
+POSIX 1003.1 describes the semantics of file execution and the requirements of the implementation.  It defines, from the point of view of a C program's main() procedure, just what needs to be delivered to the new process image.  Aside from the arguments passed to the new process image, it also describes the structure of the environment that is passed and the treatment of other systems facilities (such as files, signals, and process credentials).  It also defines the possible error conditions that exec() should return if it cannot correctly complete the request.  All the various function calls of the exec() family are implemented in the NET/2 object library, and they all eventually translate down to an execve() system call that actually does the work.<P>
+<h3><a name="0155_0004">Choices of Implementation<a name="0155_0004"></h3><P>
+While POSIX says nothing about system-call semantics (because it's entirely an object-library based standard), both The UNIX System V Programmer's Reference Manual and the BSD Programmer's Manual fill in the minor details lacking in the standard.  In fact, we could even implement the execve() function from user code that manipulates the address space with special system calls.  During early discussions at Berkeley concerning the 4.2BSD design process, &quot;RISCizing&quot; the system calls was strongly considered, and the system call that topped the lists for this treatment was exec().  (It was to be built out of segment-creation calls, piece by piece.) Recent versions of Mach have implemented a program loader that works somewhat like this, in that the understanding of various executable formats can be exported to a user program loader.  In MINIX, the responsibility is sensibly split between user and kernel: The user exec() subroutine gathers a buffer of argument pointers, and the kernel copies the buffer into the new process and then fixes up the argument pointers by relocating them (now that the new location is known in the new process's image).  Unfortunately, we cannot implement these approaches because the Intel BCS (Binary Compatibility Standard) specifies that execve() is a system call, and a system call implements the full semantics of execve()'s operation.<P>
+The costs in execve() arise primarily from collecting all the argument (and environment) strings, saving them temporarily, and then depositing them in the new process.  The representation of argument strings is dense; for example, the strings are adjacent at the top of the new stack with their corresponding pointers.  Therefore, we generally use a two-pass algorithm that determines the size of the space to hold the strings and the number of strings that exist.  Thus, we can reserve space and determine the relocation of the strings and arguments in the new process's image--remember, we're packing things together at the top of the stack, working from the top down.  The principle reason for tightly packed arguments is so that a program knows that it can have (at most) ARG_MAX bytes of incoming arguments, and that those bytes can be saved away (by a bcopy, perhaps) to another region without chasing each of them down.<P>
+If we don't mind wasting some space, we can make the algorithm single pass, by assuming where the arguments and strings will go, copying them into position, and doing the relocation all at the same time.  We can't destroy the old process's stack (who knows, an argument might point at an invalid location, or worse yet, at the location we are copying to for the new image), so we need to save our results elsewhere.  By forcing this buffer to be aligned on an appropriate page boundary instead of copying it to the new address space, we can map the page accordingly and maintain our single-pass objective.<P>
+<h3><a name="0155_0005">execve()<a name="0155_0005"></h3><P>
+Our implementation (see <a href="#0155_0014">Listing One</A>, page 96) contains a bare-bones execve() system call that allows 386BSD to provide basic operation.  This minimal version is compact enough to discuss easily, yet complete enough to allow a system using it to rebuild the kernel.  In other words, this is not a toy implementation!<P>
+As a system call in the kernel, this procedure obeys certain conventions that all system-call code in our 386BSD kernel uses.  The arguments to all system-call code are identical in number and use.  The first parameter is always a pointer to the process structure of the process requesting the system call, and all process-relative facilities, resources, and state information are referenced solely through this pointer.  (See Figure 2 in our August 1991 386BSD article.)  The next argument is a pointer to the user's arguments for this system call.  Each system call itself has different numbers and types of arguments, so it is a pointer to a structure that is usually different per each system call.  The execve system call itself has three arguments: the filename of the file to be executed, a pointer to a vector of string arguments for the new process, and a pointer to a vector of string environment variables.  The last parameter of the execve() procedure is the return value pointer, which can be used to return a data value to the caller of the system call.  Independently, an error can be passed to the system-call management function sys-call(), which calls all system-call functions in the kernel by the execve() function returning a value.<P>
+This implementation can be broken down into five separate steps: file validation, executable format recognition and consistency checking, reading and processing argument strings, building a new process image, and preparing the new image for execution.<P>
+<h3><a name="0155_0006">File Validation<a name="0155_0006"></h3><P>
+We first check whether the file we've been asked to execute actually exists, and if so, the internal name by which to refer to it (the vnode).  We do this by employing the file-lookup function called namei().  This function has so many arguments that it actually requires a structure (nameidata) to detail all the related matters that will occur as a result of its use.  We instruct namei() to LOOKUP the filename and return a pointer to an internal file reference (a vnode or abstract file node).  We then LOCK it so that others don't alter it while we process our execve() system call, and then interpret any symbolic links we encounter as we incrementally evaluate the filename.  namei is also told that the filename to be requested is in the user process's address space, located in the address specified by the first argument of the execve() system call.  When namei() succeeds, we check whether the file is &quot;regular&quot; (that is, not a directory, socket, device, fifo, and so on), and whether it's an executable file about which we can obtain status information.  All these calls occur relative to our &quot;virtual,&quot; or abstract file-system level, and the calls hide access to the actual mechanisms that implement the file system's operations.  The main result of this step is a pointer to a vnode (ndp -&gt;ni_vp) that points to a qualified file.<P>
+<h3><a name="0155_0007">Executable Format Recognition and Consistency Checking<a name="0155_0007"></h3><P>
+Now that we have a file we can read, we need to divine its format and check this against what we can execute.<P>
+vn_rdwr() is a vast, kitchen-sink styled internal kernel procedure that implements the general scheme for reading a desired amount of data from a vnode.  It places this in our prototype header structure (hdr), so we can then dig through it to validate that it's a recognizable format with a sane request.  We don't want to execute if the file is too small or the parameters are not aligned with page boundaries.  We check sizes, first separately and then together, to avoid the chance that together they overflow our 4-gigabyte address space. The result is that we now have a vnode that contains an image we can load and execute.<P>
+<h3><a name="0155_0008">Reading and Processing Argument Strings<a name="0155_0008"></h3><P>
+We need to collect argument and environment strings prior to loading the new image.  In this implementation, we take advantage of the &quot;floating&quot; location of the user stack (no absolute reference has been assumed in 386BSD) and our 4-Gbyte process address space.  We create a &quot;new&quot; stack within the &quot;old&quot; image in its new process-image location, and then build it in place.  Thus, we consume 32 Mbytes of virtual address space, but only allocate three to ten pages of actual memory touched (&quot;sparse&quot; allocation).  Vector by vector, we obtain the address of argument strings and use copyinoutstr() to obtain a string from the user's address space that does not exceed the size of our temporary buffer.  (Unlike applications programming, kernel work is loaded with obscurely arranged procedures that service special-purpose needs ideally.)  We build a pointer to the string that corresponds to its location in the new process's image.  After doing this for all arguments, we repeat the procedure on the environment vector, thus reusing the code for a similar purpose.  Due to sparse allocation, three objects (argument vectors, strings, and stack) each take up at least a page.  (These could be condensed to a single page if speed considerations are subordinate to space considerations.)<P>
+<h3><a name="0155_0009">Building a New Process Image<a name="0155_0009"></h3><P>
+We can do no more at this point with the old image--we must destroy the old to build the new. We can no longer return to the image we were called from and are now committed.  We must ask the virtual memory system to erase the old process image and map the new executable file in its place, taking care to leave the new stack present.  Note that no I/O is yet done, and that the pages will be demand-loaded on access.  If, following the vm_mmap(), we referenced the bottom of the virtual address space where this file is mapped, a fault would be generated. The page in the file associated with the address would be read in and our reference would be satisfied.  MAP_COPY and VM_PROT_ALL specify that the pages may be referenced for all purposes (read, write, and execute), and that any changes will affect this process's copy only.  We want instructions to be protected from modification by the program, so vm_protect() allows us to restrict valid references to read and execute (not write) over the extent of the text (instruction) portion of the address space.  Next, we allocate any remaining uninitialized data address space with anonymous paged memory from the virtual memory system.  The virtual memory system has simply been instructed in building data structures that it can consult to decide how to handle faults in specific portions of the processor's address space.  No pages of memory have been allocated, nor have any parts of the processor's address-mapping hardware been touched in building the new process image, other than to invalidate the address range.<P>
+<h3><a name="0155_000a">Preparing the New Image for Execution<a name="0155_000a"></h3><P>
+Before we return from execve(), we must inform the system of the new image's characteristics, close off any files as needed, and reset caught signals.  We set the stack pointer and other registers (setregs for the PC), unlock and release the file so others can mess with it, and return to the new image we have just effectively loaded.  We have not done a shred of I/O to read in the instruction pages, so the first return to start the user process is guaranteed to generate a page fault.  The virtual memory system will then consult the information from the previous step to satisfy a &quot;page in&quot; request from our executable file.  This is how the cycle of life begins for our new incarnation of the process.<P>
+<h3><a name="0155_000b">What's Not Finished with execve?<a name="0155_000b"></h3><P>
+To be POSIX compliant, we should implement the famous setuid/setgid features of UNIX, by extracting information out of the file-attribute buffer and altering the process's credentials (for instance, user id and group id).  We've neglected any details concerning statistics updating/gathering and accounting.  Another intentional oversight was neglecting the interface to the user-process debugging mechanism.  Each of the items results in small additions to this implementation.  These are good exercises for the enthusiast but are outside the scope of this article.<P>
+Importantly, the 386BSD system will now operate, and allow us to recompile the kernel, even without these additional changes, but the fully fleshed-out execve() does allow programs facilities like su(1) to work.<P>
+Another useful functionality not discussed is the ability to execute more than one kind of file format.  We are unsure how far to extend 386BSD in this direction, as there are literally dozens of potential formats.  One possibility is to create a new format that just addresses the weaknesses we have seen.  This may be necessary for the multiprocessor, multithreaded version of 386BSD.<P>
+<h3><a name="0155_000c">Block I/O Cache<a name="0155_000c"></h3><P>
+Much of the file-system code and various other facilities of our BSD kernel use the ancient UNIX buffer-cache interface.  This buffer cache, splendidly and generously described in Maurice Bach's The Design of the UNIX Operating System, implements a file-system, block-oriented cache of I/O operations.  Since the original UNIX file system, block buffers have been used to reduce the cost of UNIX file operations, in which partial block reads and writes occur frequently.  By retaining a small cache of those frequently accessed buffers, the UNIX kernel could avoid unnecessary redundant I/O operations.  The mechanisms of delayed writes avoid writing a block until the buffer is reused: read-aheads ensure that the successive block will be available by &quot;prereading&quot; it.<P>
+The principle interfaces to the rest of the 386BSD kernel is through the procedures getblk(), bread(), breada(), bwrite(), bdwrite(), bawrite(), and brelse().<P>
+getblk() sifts through the buffer cache, looking for a matching buffer that it can make busy.  Failing that, it allocates a new buffer out of those currently not busy, makes it busy, and returns it to its caller.  The caller of getblk() can tell if the contents were obtained from the cache or if the block needs to be filled because it's not cached or valid.  If getblk() ever needs to pause to wait for something to become available, it needs to restart its algorithm on the off chance that it is working with stale pointers.  If getblk() attempts to contend for a free buffer, it needs to ensure unique access by issuing a splbio(), thus blocking out all asynchronous events that could intrude.  bread() uses getblk() to obtain the appropriate buffer.  If the contents of the buffer are not appropriate, it issues a logical read of the buffer, VOP_STRATEGY(), whereby the logical-to-physical mapping occurs and the I/O operation is passed to the driver.  A wait for the operation to complete (biowait()) is then entered.  With appropriate contents, the buffer is returned for unique access by caller.<P>
+breada() is like bread(), but it overlaps the possible first read operation with the second read operation, in an attempt to force the read-ahead block into the cache, in anticipation of it being read by the process &quot;soon.&quot;  If the read-ahead block is already in the cache, then the block is merely moved to the tail of the LRU chain so it won't be reused so soon. breada() is naive about cache flooding and relies on the wait for subsequent blocks being high because the blocks are not contiguous.  Thus, its concept of &quot;double buffering&quot; works best in a file system with rotational delays (unlike, for example, a log-based file system).<P>
+bwrite() accomplishes a synchronous write of a block obtained from one of the previously mentioned sources (or indirectly, such as through a delayed write).  The only magic here, other than being almost symmetrical with bread(), is that delayed writes need to inform the vnode layer that they are no longer delayed.  After the write completes, the block buffer is returned to the freelist, ready for others to use.<P>
+bdwrite() does not actually do a write, it just marks the block and tells the vnode layer of its special significance.  Tape drives can never have delayed (and possibly unordered) writes, so we enforce a synchronous write.<P>
+bawrite() is much like the synchronous case; however, it marks the block to be released when output is finished using the ASYNC flag on the block.  Note that the read-ahead block will also be released in the same manner when its read completes.<P>
+brelse() is how a block buffer is returned for use by the rest of the system.  To prevent congestion, other processes waiting for this or any other block are notified of the change in state.  The WANTED flags merely reduce the number of spurious wakeups that might otherwise be generated.  We then categorize the block and put it on the appropriate list for reuse.  (This is where buffer-cache policies are instituted.)  It then is marked no longer busy, and may be reallocated.<P>
+getblk() and others use incore() and getnewbuf() to do the dirty work of locating blocks in the cache and obtaining them.  Buffers are allocated space with malloc(), and if the size changes, allocbuf() adjusts the size accordingly.  The file systems themselves are responsible for upgrading the size of blocks that are cached, because new data might need to be read in. Note that as buffers gain and leave association with a given file (vnode pointer), they must inform the virtual file-system layer of the event.  Likewise, a block buffer must gain and lose association with a given freelist (search for a freeblock), and hashlist (so it can be located by search for contents).<P>
+biowait() is used to wait for a buffer to be finished with I/O, and biodone() signals the end of I/O to interested biowait() calls; see <a href="#0155_0016">Listing Two</A>, page 101. Both are used for dealing with the drivers.  biodone(), in particular, needs to specially handle cases for the virtual memory system (B_CALL) and asynchronous I/O (deallocation).<P>
+<h3><a name="0155_000d">4.4BSD Demands<a name="0155_000d"></h3><P>
+The current BSD kernel uses the block cache quite differently from older versions.  It is now a logical cache: Its contents are relative to a logical file rather than to a physical disk-sector address.  As a result, the virtual file-system layer must translate between the two on demand, and do the necessary I/O operation, VOP_STRATEGY()<P>
+Also, the vnode layer must track delayed writes with a list of dirty blocks per each vnode.  bgetvp(), brelvp(), and reassignbuf() track the assignment of blocks to clean and dirty block lists in each vnode.  This information is consulted with a file commit (fsync()).  File-system commit (sync()) operation is done by the file-system layers.<P>
+Because the file system may work with variable block sizes, the buffer contents and sizing are actually the provenance of the file-system code.  Surprisingly, the buffer cache has no knowledge of the scaling of the logical blocks it manages, and limited knowledge on the size of the cached block itself.  (Only the file system associated with the block knows how much is valid at any time.) This makes it particularly difficult to advance the state-of-the-art of a file-system page cache.<P>
+<h3><a name="0155_000e">4.4BSD Weaknesses<a name="0155_000e"></h3><P>
+As a result, there are many weaknesses in this design.  First, it creates a synchronous logjam on I/O, as blocks are sequenced out to the disk driver.  (Everything is done in small, synchronous transfers that don't allow the modern disk subsystems to maintain high data rates.)  The buffer cache is privately managed space, so it competes for resources with the virtual memory system, with which it's not on speaking terms.  Worse yet, both tend to cache the same data, so they are at odds with duplicated effort and state information.  Finally, the cache policies implied by the buffer cache usurp the kinds of policies a file system might wish to make.  An example of this is when an NFS file server wishes to offer &quot;leases&quot; on buffered contents of file-system information to reduce client-server cache coherence cost.<P>
+<h3><a name="0155_000f">Terminal Ring Buffers<a name="0155_000f"></h3><P>
+The final missing piece for an operable system is the code to manipulate the character buffers used by the tty driver, called &quot;clists.&quot; clists are just another privately managed buffer mechanism that relies on the reallocation of a pool of small (32-byte) blocks of character data that can be viewed logically as a FIFO queue of characters.  The tty driver uses these queues to implement a general-purpose terminal interface for consoles, serial ports, and network sessions.  clists are an elegant mechanism to allow numerous terminal sessions to share a region of buffer memory, and they were ideal for a timesharing system with small memory and a large number of competing sessions.  However, they are cumbersome to maintain and inconvenient for mass transfers (such as painting a bitmap screen).  Therefore, we have written code to implement ring buffers in their place.  These reduce the cost of character buffer management, especially in the mass transfer case.  Instead of making an analogue of the interface of clists, we modified the BSD tty driver and related code to take advantage of large, contiguous buffer regions of characters that this approach afforded.<P>
+<h3><a name="0155_0010">Character-by-Character Operations<a name="0155_0010"></h3><P>
+For the drivers themselves, written with character-by-character code, we kept the traditional getc/putc operations and their inverse operations ungetc/unputc; see <a href="#0155_0018"> Listing Three</A>, page 103.  These work by means of successor and predecessor macros (<a href="#0155_001a">Listing Four</A>, page 104) that topologically make a ring buffer's data region contiguous.  A side effect of this is that the operations and inverses are valid for any underlying method of storage.  So if, for example, we wanted to use another buffering mechanism (such as BSD mbufs), we could do so just by modifying the macros.<P>
+<h3><a name="0155_0011">Block Operations<a name="0155_0011"></h3><P>
+Block operations are afforded by the contiguous transfer-length macros that allow inline code to manipulate ring-buffer contents in contiguous sections.  This means that code to replace clist-to-block (and its inverse) must be generated on a case-by-case basis, but that code is exactly where the transfer rate bottleneck is anyway, so this is appropriate.<P>
+This scheme requires more space for each active terminal session, because the blocks don't share buffer space but still have private ring-buffer contents.  Also, at the moment, this code is faster than the buffering policies anticipate, so the higher layers of the tty driver suspend operation for too long, anticipating the usual transfer rate.  As such, much work needs to be done to tune the system for this mechanism.<P>
+<h3><a name="0155_0012">386BSD: Other Portions Beyond Basic Operation<a name="0155_0012"></h3><P>
+With the code presented in this article and a list of trivial bug fixes available from DDJ, the system becomes bootable (using the MS-DOS bootstrap) and can rebuild itself.  However, to be fully complete, two areas remain.  One is the &quot;raw&quot; I/O facility for mass-storage devices, that allows block transfer directly to a user process.  This is used in file-system integrity checks, and file-system dump and backup procedures.  In addition, no user-process debugging can be done, because the process-tracing facility is not yet present (although process core dumps are available).<P>
+<h3><a name="0155_0013">Lessons Learned<a name="0155_0013"></h3><P>
+We were loath to proceed in the manner outlined here because we ended up creating some backward-looking portions of code.  We worried about the waste of time and loss of focus such a diversion might cause.  However, in retrospect, it was the fastest way to clearly outline the problems to be considered while working on more grandiose or innovative schemes.  Our enforced realism exposed many weaknesses lying dormant and taken for granted.<P>
+William Saroyan once said that re-reading a good book was never a waste of time, because in every great work lay little things that had been unnoticed or forgotten.  It seems that the same holds true for systems programming and design.<P>
+
+<PRE>
+
+
+_PORTING UNIX TO THE 386: THE MISSING PIECES, PART II_
+by William Jolitz and Lynne Greer Jolitz
+
+<a name="0155_0014">
+<a name="0155_0015"></pre><B>[LISTING ONE]</B><pre><a name="0155_0015">
+
+/* Copyright (c) 1989, 1990, 1991, 1992 William F. Jolitz, TeleMuse
+ * All rights reserved.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *  This software is a component of &quot;386BSD&quot; developed by
+ *  William F. Jolitz, TeleMuse.
+ * 4. Neither the name of the developer nor the name &quot;386BSD&quot; may be used to
+ *    endorse or promote products derived from this software without specific
+ *    prior written permission.
+ * THIS SOFTWARE IS A COMPONENT OF 386BSD DEVELOPED BY WILLIAM F. JOLITZ
+ * AND IS INTENDED FOR RESEARCH AND EDUCATIONAL PURPOSES ONLY. THIS
+ * SOFTWARE SHOULD NOT BE CONSIDERED TO BE A COMMERCIAL PRODUCT.
+ * THE DEVELOPER URGES THAT USERS WHO REQUIRE A COMMERCIAL PRODUCT
+ * NOT MAKE USE OF THIS WORK. THIS SOFTWARE IS PROVIDED BY THE DEVELOPER
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE DEVELOPER BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
+ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * This procedure implements a minimal program execution facility for
+ * 386BSD. It interfaces to the BSD kernel as the execve system call.
+ * Significant limitations and lack of compatiblity with POSIX are
+ * present with this version, to make its basic operation more clear.
+ */
+
+#include &quot;param.h&quot;
+#include &quot;systm.h&quot;
+#include &quot;proc.h&quot;
+#include &quot;mount.h&quot;
+#include &quot;namei.h&quot;
+#include &quot;vnode.h&quot;
+#include &quot;file.h&quot;
+#include &quot;exec.h&quot;
+#include &quot;stat.h&quot;
+#include &quot;wait.h&quot;
+#include &quot;signalvar.h&quot;
+#include &quot;mman.h&quot;
+#include &quot;malloc.h&quot;
+
+#include &quot;vm/vm.h&quot;
+#include &quot;vm/vm_param.h&quot;
+#include &quot;vm/vm_map.h&quot;
+#include &quot;vm/vm_kern.h&quot;
+
+#include &quot;machine/reg.h&quot;
+extern int dostacklimits;
+
+/* execve() system call. */
+/* ARGSUSED */
+execve(p, uap, retval)
+    struct proc *p;
+    register struct args {
+        char    *fname;
+        char    **argp;
+        char    **envp;
+    } *uap;
+    int *retval;
+{
+    register struct nameidata *ndp;
+    struct nameidata nd;
+    struct exec hdr;
+    char **argbuf, **argbufp, *stringbuf, *stringbufp;
+    char **vectp, *ep;
+    int needsenv, limitonargs, stringlen, addr, size, len,
+        rv, amt, argc, tsize, dsize, bsize, cnt, foff;
+    struct vattr attr;
+    struct vmspace *vs;
+    caddr_t newframe;
+    /* Step 1. Lookup filename to see if we have something to execute. */
+    ndp = &amp;nd;
+    ndp-&gt;ni_nameiop = LOOKUP | LOCKLEAF | FOLLOW;
+    ndp-&gt;ni_segflg = UIO_USERSPACE;
+    ndp-&gt;ni_dirp = uap-&gt;fname;
+    /* is it there? */
+    if (rv = namei(ndp, p))
+        return (rv);
+    /* is it a regular file? */
+    if (ndp-&gt;ni_vp-&gt;v_type != VREG) {
+        vput(ndp-&gt;ni_vp);
+        return(ENOEXEC);
+    }
+    /* is it executable? */
+    rv = VOP_ACCESS(ndp-&gt;ni_vp, VEXEC, p-&gt;p_ucred, p);
+    if (rv)
+        goto exec_fail;
+    /* does it have any attributes? */
+    rv = VOP_GETATTR(ndp-&gt;ni_vp, &amp;attr, p-&gt;p_ucred, p);
+    if (rv)
+        goto exec_fail;
+    /* Step 2. Does file contain a format we can understand and execute */
+    rv = vn_rdwr(UIO_READ, ndp-&gt;ni_vp, (caddr_t)&amp;hdr, sizeof(hdr),
+        0, UIO_SYSSPACE, IO_NODELOCKED, p-&gt;p_ucred, &amp;amt, p);
+    /* big enough to hold a header? */
+    if (rv)
+        goto exec_fail;
+    /* ... that we recognize? */
+    rv = ENOEXEC;
+    if (hdr.a_magic != ZMAGIC)
+        goto exec_fail;
+    /* sanity check  &quot;ain't not such thing as a sanity clause&quot; -groucho */
+    if (hdr.a_text &gt; MAXTSIZ
+        || hdr.a_text % NBPG || hdr.a_text &gt; attr.va_size)
+        goto exec_fail;
+    if (hdr.a_data == 0 || hdr.a_data &gt; DFLDSIZ
+        || hdr.a_data &gt; attr.va_size
+        || hdr.a_data + hdr.a_text &gt; attr.va_size)
+        goto exec_fail;
+    if (hdr.a_bss &gt; MAXDSIZ)
+        goto exec_fail;
+    if (hdr.a_text + hdr.a_data + hdr.a_bss &gt; MAXTSIZ + MAXDSIZ)
+        goto exec_fail;
+    /* Step 3.  File and header are valid. Now, dig out the strings
+     * out of the old process image. */
+    /* We implement a single-pass algorithm that builds a new stack
+     * frame within the address space of the &quot;old&quot; process image,
+     * avoiding the second pass entirely. Thus, the new frame is
+     * in position to be run. This consumes much virtual address space,
+     * and two pages more of 'real' memory, such are the costs.
+     * [Also, note the cache wipe that's avoided!] */
+    /* create anonymous memory region for new stack */
+    vs = p-&gt;p_vmspace;
+    if ((unsigned)vs-&gt;vm_maxsaddr + MAXSSIZ &lt; USRSTACK)
+        newframe = (caddr_t) USRSTACK - MAXSSIZ;
+    else
+        vs-&gt;vm_maxsaddr = newframe = (caddr_t) USRSTACK - 2*MAXSSIZ;
+    /* don't do stack limit checking on traps temporarily XXX*/
+    dostacklimits = 0;
+    rv = vm_allocate(&amp;vs-&gt;vm_map, &amp;newframe, MAXSSIZ, FALSE);
+    if (rv) goto exec_fail;
+    /* allocate string buffer and arg buffer */
+    argbuf = (char **) (newframe + MAXSSIZ - 3*ARG_MAX);
+    stringbuf = stringbufp = ((char *)argbuf) + 2*ARG_MAX;
+    argbufp = argbuf;
+    /* first, do args */
+    vectp = uap-&gt;argp;
+    needsenv = 1;
+    limitonargs = ARG_MAX;
+    cnt = 0;
+do_env_as_well:
+    if(vectp == 0) goto dont_bother;
+    /* for each envp, copy in string */
+    do {
+        /* did we outgrow initial argbuf, if so, die */
+        if (argbufp == (char **)stringbuf) {
+            rv = E2BIG;
+            goto exec_dealloc;
+        }
+        /* get an string pointer */
+        ep = (char *)fuword(vectp++);
+        if (ep == (char *)-1) {
+            rv = EFAULT;
+            goto exec_dealloc;
+        }
+        /* if not a null pointer, copy string */
+        if (ep) {
+            if (rv = copyinoutstr(ep, stringbufp,
+                (u_int)limitonargs, (u_int *) &amp;stringlen)) {
+                if (rv == ENAMETOOLONG)
+                    rv = E2BIG;
+                goto exec_dealloc;
+            }
+            suword(argbufp++, (int)stringbufp);
+            cnt++;
+            stringbufp += stringlen;
+            limitonargs -= stringlen;
+        } else {
+            suword(argbufp++, 0);
+            break;
+        }
+    } while (limitonargs &gt; 0);
+dont_bother:
+    if (limitonargs &lt;= 0) {
+        rv = E2BIG;
+        goto exec_dealloc;
+    }
+    /* have we done the environment yet ? */
+    if (needsenv) {
+        /* remember the arg count for later */
+        argc = cnt;
+        vectp = uap-&gt;envp;
+        needsenv = 0;
+        goto do_env_as_well;
+    }
+    /* At this point, one could optionally implement a second pass to
+         * condense strings, arguement vectors, and stack to fit fewest pages.
+     * One might selectively do this when copying was cheaper
+     * than leaving allocated two more pages per process. */
+    /* stuff arg count on top of &quot;new&quot; stack */
+    argbuf[-1] = (char *)argc;
+    /* Step 4. Build the new processes image. At this point, we are
+         * committed -- destroy old executable! */
+    /* blow away all address space, except the stack */
+    rv = vm_deallocate(&amp;vs-&gt;vm_map, 0, USRSTACK - 2*MAXSSIZ, FALSE);
+    if (rv)
+        goto exec_abort;
+    /* destroy &quot;old&quot; stack */
+    if ((unsigned)newframe &lt; USRSTACK - MAXSSIZ) {
+        rv = vm_deallocate(&amp;vs-&gt;vm_map, USRSTACK - MAXSSIZ, MAXSSIZ,
+            FALSE);
+        if (rv)
+            goto exec_abort;
+    } else {
+        rv = vm_deallocate(&amp;vs-&gt;vm_map, USRSTACK - 2*MAXSSIZ, MAXSSIZ,
+            FALSE);
+        if (rv)
+            goto exec_abort;
+    }
+    /* build a new address space */
+    addr = 0;
+    /* screwball mode -- special case of 413 to save space for floppy */
+    if (hdr.a_text == 0) {
+        foff = tsize = 0;
+        hdr.a_data += hdr.a_text;
+    } else {
+        tsize = roundup(hdr.a_text, NBPG);
+        foff = NBPG;
+    }
+    /* treat text and data in terms of integral page size */
+    dsize = roundup(hdr.a_data, NBPG);
+    bsize = roundup(hdr.a_bss + dsize, NBPG);
+    bsize -= dsize;
+    /* map text &amp; data in file, as being &quot;paged in&quot; on demand */
+    rv = vm_mmap(&amp;vs-&gt;vm_map, &amp;addr, tsize+dsize, VM_PROT_ALL,
+        MAP_FILE|MAP_COPY|MAP_FIXED, (caddr_t)ndp-&gt;ni_vp, foff);
+    if (rv)
+        goto exec_abort;
+    /* mark pages r/w data, r/o text */
+    if (tsize) {
+        addr = 0;
+        rv = vm_protect(&amp;vs-&gt;vm_map, addr, tsize, FALSE,
+            VM_PROT_READ|VM_PROT_EXECUTE);
+        if (rv)
+            goto exec_abort;
+    }
+    /* create anonymous memory region for bss */
+    addr = dsize + tsize;
+    rv = vm_allocate(&amp;vs-&gt;vm_map, &amp;addr, bsize, FALSE);
+    if (rv)
+        goto exec_abort;
+    /* Step 5. Prepare process for execution. */
+    /* touchup process information -- vm system is unfinished! */
+    vs-&gt;vm_tsize = tsize/NBPG;      /* text size (pages) XXX */
+    vs-&gt;vm_dsize = (dsize+bsize)/NBPG;  /* data size (pages) XXX */
+    vs-&gt;vm_taddr = 0;       /* user virtual address of text XXX */
+    vs-&gt;vm_daddr = (caddr_t)tsize;  /* user virtual address of data XXX */
+    vs-&gt;vm_maxsaddr = newframe; /* user VA at max stack growth XXX */
+    vs-&gt;vm_ssize =  ((unsigned)vs-&gt;vm_maxsaddr + MAXSSIZ
+        - (unsigned)argbuf)/ NBPG + 1; /* stack size (pages) */
+    dostacklimits = 1;  /* allow stack limits to be enforced XXX */
+    /* close files on exec, fixup signals */
+    fdcloseexec(p);
+    execsigs(p);
+    /* setup initial register state */
+    p-&gt;p_regs[SP] = (unsigned) (argbuf - 1);
+    setregs(p, hdr.a_entry);
+    vput(ndp-&gt;ni_vp);
+    return (0);
+exec_dealloc:
+    /* remove interim &quot;new&quot; stack frame we were building */
+    vm_deallocate(&amp;vs-&gt;vm_map, newframe, MAXSSIZ, FALSE);
+exec_fail:
+    dostacklimits = 1;
+    vput(ndp-&gt;ni_vp);
+    return(rv);
+exec_abort:
+    /* sorry, no more process anymore. exit gracefully */
+    vm_deallocate(&amp;vs-&gt;vm_map, newframe, MAXSSIZ, FALSE);
+    vput(ndp-&gt;ni_vp);
+    exit(p, W_EXITCODE(0, SIGABRT));
+    /* NOTREACHED */
+    return(0);
+}
+
+
+
+
+<a name="0155_0016">
+<a name="0155_0017"></pre><B>[LISTING TWO]</B><pre><a name="0155_0017">
+
+/* Copyright (c) 1992 William Jolitz. All rights reserved.
+ * Written by William Jolitz 1/92
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *  This software is a component of &quot;386BSD&quot; developed by
+    William F. Jolitz, TeleMuse.
+ * 4. Neither the name of the developer nor the name &quot;386BSD&quot;
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ * THIS SOFTWARE IS A COMPONENT OF 386BSD DEVELOPED BY WILLIAM F. JOLITZ
+ * AND IS INTENDED FOR RESEARCH AND EDUCATIONAL PURPOSES ONLY. THIS SOFTWARE
+ * SHOULD NOT BE CONSIDERED TO BE A COMMERCIAL PRODUCT. THE DEVELOPER URGES
+ * THAT USERS WHO REQUIRE A COMMERCIAL PRODUCT NOT MAKE USE OF THIS WORK. THIS
+ * SOFTWARE IS PROVIDED BY THE DEVELOPER ``AS IS'' AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+ * EVENT SHALL THE DEVELOPER BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Block I/O Cache mechanism, ala malloc(). */
+#include &quot;param.h&quot;
+#include &quot;proc.h&quot;
+#include &quot;vnode.h&quot;
+#include &quot;buf.h&quot;
+#include &quot;specdev.h&quot;
+#include &quot;mount.h&quot;
+#include &quot;malloc.h&quot;
+#include &quot;resourcevar.h&quot;
+
+/* Initialize buffer headers and related structures.  */
+void bufinit()
+{
+    struct bufhd *bh;
+    struct buf *bp;
+
+    /* first, make a null hash table */
+    for(bh = bufhash; bh &lt; bufhash + BUFHSZ; bh++) {
+        bh-&gt;b_flags = 0;
+        bh-&gt;b_forw = (struct buf *)bh;
+        bh-&gt;b_back = (struct buf *)bh;
+    }
+    /* next, make a null set of free lists */
+    for(bp = bfreelist; bp &lt; bfreelist + BQUEUES; bp++) {
+        bp-&gt;b_flags = 0;
+        bp-&gt;av_forw = bp;
+        bp-&gt;av_back = bp;
+        bp-&gt;b_forw = bp;
+        bp-&gt;b_back = bp;
+    }
+    /* finally, initialize each buffer header and stick on empty q */
+    for(bp = buf; bp &lt; buf + nbuf ; bp++) {
+        bp-&gt;b_flags = B_HEAD | B_INVAL; /* we're just an empty header */
+        bp-&gt;b_dev = NODEV;
+        bp-&gt;b_vp = 0;
+        binstailfree(bp, bfreelist + BQ_EMPTY);
+        binshash(bp, bfreelist + BQ_EMPTY);
+    }
+}
+/* Find the block in the buffer pool. If buffer is not present, allocate a new
+ * buffer and load its contents according to the filesystem fill routine.  */
+bread(vp, blkno, size, cred, bpp)
+    struct vnode *vp;
+    daddr_t blkno;
+    int size;
+    struct ucred *cred;
+    struct buf **bpp;
+{
+    struct buf *bp;
+    int rv = 0;
+    bp = getblk (vp, blkno, size);
+    /* if not found in cache, do some I/O */
+    if ((bp-&gt;b_flags &amp; B_CACHE) == 0 || (bp-&gt;b_flags &amp; B_INVAL) != 0) {
+        bp-&gt;b_flags |= B_READ;
+        bp-&gt;b_flags &amp;= ~(B_DONE|B_ERROR|B_INVAL);
+        VOP_STRATEGY(bp);
+        rv = biowait (bp);
+    }
+    *bpp = bp;
+    return (rv);
+}
+/* Operates like bread, but also starts I/O on the specified read-ahead block.
+ * [See page 55 of Bach's Book] */
+breada(vp, blkno, size, rablkno, rabsize, cred, bpp)
+    struct vnode *vp;
+    daddr_t blkno; int size;
+    daddr_t rablkno; int rabsize;
+    struct ucred *cred;
+    struct buf **bpp;
+{
+    struct buf *bp, *rabp;
+    int rv = 0, needwait = 0;
+    bp = getblk (vp, blkno, size);
+    /* if not found in cache, do some I/O */
+    if ((bp-&gt;b_flags &amp; B_CACHE) == 0 || (bp-&gt;b_flags &amp; B_INVAL) != 0) {
+        bp-&gt;b_flags |= B_READ;
+        bp-&gt;b_flags &amp;= ~(B_DONE|B_ERROR|B_INVAL);
+        VOP_STRATEGY(bp);
+        needwait++;
+    }
+    rabp = getblk (vp, rablkno, rabsize);
+    /* if not found in cache, do some I/O (overlapped with first) */
+    if ((rabp-&gt;b_flags &amp; B_CACHE) == 0 || (rabp-&gt;b_flags &amp; B_INVAL) != 0) {
+        rabp-&gt;b_flags |= B_READ | B_ASYNC;
+        rabp-&gt;b_flags &amp;= ~(B_DONE|B_ERROR|B_INVAL);
+        VOP_STRATEGY(rabp);
+    } else
+        brelse(rabp);
+    /* wait for original I/O */
+    if (needwait)
+        rv = biowait (bp);
+    *bpp = bp;
+    return (rv);
+}
+/* Synchronous write. Release buffer on completion. */
+bwrite(bp)
+    register struct buf *bp;
+{
+    int rv;
+    if(bp-&gt;b_flags &amp; B_INVAL) {
+        brelse(bp);
+        return (0);
+    } else {
+        int wasdelayed;
+        wasdelayed = bp-&gt;b_flags &amp; B_DELWRI;
+        bp-&gt;b_flags &amp;= ~(B_READ|B_DONE|B_ERROR|B_ASYNC|B_DELWRI);
+        if(wasdelayed) reassignbuf(bp, bp-&gt;b_vp);
+        bp-&gt;b_flags |= B_DIRTY;
+        VOP_STRATEGY(bp);
+        rv = biowait(bp);
+        if (!rv)
+            bp-&gt;b_flags &amp;= ~B_DIRTY;
+        brelse(bp);
+        return (rv);
+    }
+}
+/* Delayed write. The buffer is marked dirty, but is not queued for I/O. This
+ * routine should be used when the buffer is expected to be modified again
+ * soon, typically a small write that partially fills a buffer. NB: magnetic
+ * tapes can't be delayed; must be written in order writes are requested. */
+void bdwrite(bp)
+    register struct buf *bp;
+{
+    if(bp-&gt;b_flags &amp; B_INVAL)
+        brelse(bp);
+    if(bp-&gt;b_flags &amp; B_TAPE) {
+        bwrite(bp);
+        return;
+    }
+    bp-&gt;b_flags &amp;= ~(B_READ|B_DONE);
+    bp-&gt;b_flags |= B_DIRTY|B_DELWRI;
+    reassignbuf(bp, bp-&gt;b_vp);
+    brelse(bp);
+    return;
+}
+/* Asynchronous write. Start I/O on a buffer, but do not wait for it to
+ * complete. The buffer is released when the I/O completes. */
+bawrite(bp)
+    register struct buf *bp;
+{
+    if(!(bp-&gt;b_flags &amp; B_BUSY))panic(&quot;bawrite: not busy&quot;);
+    if(bp-&gt;b_flags &amp; B_INVAL)
+        brelse(bp);
+    else {
+        int wasdelayed;
+        wasdelayed = bp-&gt;b_flags &amp; B_DELWRI;
+        bp-&gt;b_flags &amp;= ~(B_READ|B_DONE|B_ERROR|B_DELWRI);
+        if(wasdelayed) reassignbuf(bp, bp-&gt;b_vp);
+        bp-&gt;b_flags |= B_DIRTY | B_ASYNC;
+        VOP_STRATEGY(bp);
+    }
+}
+/* Release a buffer. Even if the buffer is dirty, no I/O is started. */
+brelse(bp)
+    register struct buf *bp;
+{
+    int x;
+    /* anyone need a &quot;free&quot; block? */
+    x=splbio();
+    if ((bfreelist + BQ_AGE)-&gt;b_flags &amp; B_WANTED) {
+        (bfreelist + BQ_AGE) -&gt;b_flags &amp;= ~B_WANTED;
+        wakeup(bfreelist);
+    }
+    /* anyone need this very block? */
+    if (bp-&gt;b_flags &amp; B_WANTED) {
+        bp-&gt;b_flags &amp;= ~B_WANTED;
+        wakeup(bp);
+    }
+    if (bp-&gt;b_flags &amp; (B_INVAL|B_ERROR)) {
+        bp-&gt;b_flags |= B_INVAL;
+        bp-&gt;b_flags &amp;= ~(B_DELWRI|B_CACHE);
+        if(bp-&gt;b_vp)
+            brelvp(bp);
+    }
+    /* enqueue */
+    /* buffers with junk contents */
+    if(bp-&gt;b_flags &amp; (B_ERROR|B_INVAL|B_NOCACHE))
+        binsheadfree(bp, bfreelist + BQ_AGE)
+    /* buffers with stale but valid contents */
+    else if(bp-&gt;b_flags &amp; B_AGE)
+        binstailfree(bp, bfreelist + BQ_AGE)
+    /* buffers with valid and quite potentially reuseable contents */
+    else
+        binstailfree(bp, bfreelist + BQ_LRU)
+    /* unlock */
+    bp-&gt;b_flags &amp;= ~B_BUSY;
+    splx(x);
+    return;
+}
+int freebufspace = 20*NBPG;
+int allocbufspace;
+/* Find a buffer which is available for use. If free memory for buffer space
+ * and an empty header from the empty list, use that. Otherwise, select
+ * something from a free list. Preference is to AGE list, then LRU list. */
+struct buf *
+getnewbuf(sz)
+{
+    struct buf *bp;
+    int x;
+    x = splbio();
+start:
+    /* can we constitute a new buffer? */
+    if (freebufspace &gt; sz
+      &amp;&amp; bfreelist[BQ_EMPTY].av_forw != (struct buf *)bfreelist+BQ_EMPTY) {
+      caddr_t addr;
+        if ((addr = malloc (sz, M_TEMP, M_NOWAIT)) == 0) goto tryfree;
+        freebufspace -= sz;
+        allocbufspace += sz;
+        bp = bfreelist[BQ_EMPTY].av_forw;
+        bp-&gt;b_flags = B_BUSY | B_INVAL;
+        bremfree(bp);
+        bp-&gt;b_un.b_addr = (caddr_t) addr;
+        goto fillin;
+    }
+tryfree:
+    if (bfreelist[BQ_AGE].av_forw != (struct buf *)bfreelist+BQ_AGE) {
+        bp = bfreelist[BQ_AGE].av_forw;
+        bremfree(bp);
+    } else if (bfreelist[BQ_LRU].av_forw != (struct buf *)bfreelist+BQ_LRU) {
+        bp = bfreelist[BQ_LRU].av_forw;
+        bremfree(bp);
+    } else  {
+        /* wait for a free buffer of any kind */
+        (bfreelist + BQ_AGE)-&gt;b_flags |= B_WANTED;
+        sleep(bfreelist, PRIBIO);
+        splx(x);
+        return (0);
+    }
+    /* if we are a delayed write, convert to an async write! */
+    if (bp-&gt;b_flags &amp; B_DELWRI) {
+        bp-&gt;b_flags |= B_BUSY;
+        bawrite (bp);
+        goto start;
+    }
+    if(bp-&gt;b_vp)
+        brelvp(bp);
+    /* we are not free, nor do we contain interesting data */
+    bp-&gt;b_flags = B_BUSY;
+fillin:
+    bremhash(bp);
+    splx(x);
+    bp-&gt;b_dev = NODEV;
+    bp-&gt;b_vp = NULL;
+    bp-&gt;b_blkno = bp-&gt;b_lblkno = 0;
+    bp-&gt;b_iodone = 0;
+    bp-&gt;b_error = 0;
+    bp-&gt;b_wcred = bp-&gt;b_rcred = NOCRED;
+    if (bp-&gt;b_bufsize != sz) allocbuf(bp, sz);
+    bp-&gt;b_bcount = bp-&gt;b_bufsize = sz;
+    bp-&gt;b_dirtyoff = bp-&gt;b_dirtyend = 0;
+    return (bp);
+}
+/* Check to see if a block is currently memory resident. */
+struct buf *incore(vp, blkno)
+    struct vnode *vp;
+    daddr_t blkno;
+{
+    struct buf *bh;
+    struct buf *bp;
+    bh = BUFHASH(vp, blkno);
+    /* Search hash chain */
+    bp = bh-&gt;b_forw;
+    while (bp != (struct buf *) bh) {
+        /* hit */
+        if (bp-&gt;b_lblkno == blkno &amp;&amp; bp-&gt;b_vp == vp
+            &amp;&amp; (bp-&gt;b_flags &amp; B_INVAL) == 0)
+            return (bp);
+        bp = bp-&gt;b_forw;
+    }
+    return(0);
+}
+/* Get a block of requested size that is associated with a given vnode and
+ * block offset. If it is found in block cache, mark it as found, make it busy
+ * and return it. Otherwise, return empty block of the correct size. It is up
+ * to caller to insure that the cached blocks be of the correct size. */
+struct buf *
+getblk(vp, blkno, size)
+    register struct vnode *vp;
+    daddr_t blkno;
+    int size;
+{
+    struct buf *bp, *bh;
+    int x;
+    for (;;) {
+        if (bp = incore(vp, blkno)) {
+            x = splbio();
+            if (bp-&gt;b_flags &amp; B_BUSY) {
+                bp-&gt;b_flags |= B_WANTED;
+                sleep (bp, PRIBIO);
+                continue;
+            }
+            bp-&gt;b_flags |= B_BUSY | B_CACHE;
+            bremfree(bp);
+            if (size &gt; bp-&gt;b_bufsize)
+                panic(&quot;now what do we do?&quot;);
+        } else {
+            if((bp = getnewbuf(size)) == 0) continue;
+            bp-&gt;b_blkno = bp-&gt;b_lblkno = blkno;
+            bgetvp(vp, bp);
+            x = splbio();
+            bh = BUFHASH(vp, blkno);
+            binshash(bp, bh);
+            bp-&gt;b_flags = B_BUSY;
+        }
+        splx(x);
+        return (bp);
+    }
+}
+/* Get an empty, disassociated buffer of given size. */
+struct buf *
+geteblk(size)
+    int size;
+{
+    struct buf *bp;
+    int x;
+    while ((bp = getnewbuf(size)) == 0)
+        ;
+    x = splbio();
+    binshash(bp, bfreelist + BQ_AGE);
+    splx(x);
+    return (bp);
+}
+/* Exchange a buffer's underlying buffer storage for one of different size,
+ * taking care to maintain contents appropriately. When buffer increases in
+ * size, caller is responsible for filling out additional contents. When buffer
+ * shrinks in size, data is lost, so caller must first return it to backing
+ * store before shrinking the buffer, as no implied I/O will be done.
+ * Expanded buffer is returned as value. */
+struct buf *
+allocbuf(bp, size)
+    register struct buf *bp;
+    int size;
+{
+    caddr_t newcontents;
+    /* get new memory buffer */
+    newcontents = (caddr_t) malloc (size, M_TEMP, M_WAITOK);
+    /* copy the old into the new, up to the maximum that will fit */
+    bcopy (bp-&gt;b_un.b_addr, newcontents, min(bp-&gt;b_bufsize, size));
+    /* return old contents to free heap */
+    free (bp-&gt;b_un.b_addr, M_TEMP);
+    /* adjust buffer cache's idea of memory allocated to buffer contents */
+    freebufspace -= size - bp-&gt;b_bufsize;
+    allocbufspace += size - bp-&gt;b_bufsize;
+    /* update buffer header */
+    bp-&gt;b_un.b_addr = newcontents;
+    bp-&gt;b_bcount = bp-&gt;b_bufsize = size;
+    return(bp);
+}
+/* Patiently await operations to complete on this buffer. When they do,
+ * extract error value and return it. Extract and return any errors associated
+ * with the I/O. If an invalid block, force it off the lookup hash chains. */
+biowait(bp)
+    register struct buf *bp;
+{
+    int x;
+    x = splbio();
+    while ((bp-&gt;b_flags &amp; B_DONE) == 0)
+        sleep((caddr_t)bp, PRIBIO);
+    if((bp-&gt;b_flags &amp; B_ERROR) || bp-&gt;b_error) {
+        if ((bp-&gt;b_flags &amp; B_INVAL) == 0) {
+            bp-&gt;b_flags |= B_INVAL;
+            bremhash(bp);
+            binshash(bp, bfreelist + BQ_AGE);
+        }
+        if (!bp-&gt;b_error)
+            bp-&gt;b_error = EIO;
+        else
+            bp-&gt;b_flags |= B_ERROR;
+        splx(x);
+        return (bp-&gt;b_error);
+    } else {
+        splx(x);
+        return (0);
+    }
+}
+/* Finish up operations on a buffer, calling an optional function (if
+ * requested), and releasing the buffer if marked asynchronous. Then mark this
+ * buffer done so that others biowait()'ing for it will notice when they are
+ * woken up from sleep(). */
+biodone(bp)
+    register struct buf *bp;
+{
+    int x;
+    x = splbio();
+    if (bp-&gt;b_flags &amp; B_CALL) (*bp-&gt;b_iodone)(bp);
+    bp-&gt;b_flags &amp;=  ~B_CALL;
+    if (bp-&gt;b_flags &amp; B_ASYNC) brelse(bp);
+    bp-&gt;b_flags &amp;=  ~B_ASYNC;
+    bp-&gt;b_flags |= B_DONE;
+    wakeup(bp);
+    splx(x);
+}
+
+
+
+
+<a name="0155_0018">
+<a name="0155_0019"></pre><B>[LISTING THREE]</B><pre><a name="0155_0019">
+
+/* Copyright (c) 1992 William F. Jolitz. All rights reserved.
+ * Written by William Jolitz 1/92
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met: 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *  This software is a component of &quot;386BSD&quot; developed by
+    William F. Jolitz, TeleMuse.
+ * 4. Neither the name of the developer nor the name &quot;386BSD&quot;
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ * THIS SOFTWARE IS A COMPONENT OF 386BSD DEVELOPED BY WILLIAM F. JOLITZ
+ * AND IS INTENDED FOR RESEARCH AND EDUCATIONAL PURPOSES ONLY. THIS SOFTWARE
+ * SHOULD NOT BE CONSIDERED TO BE A COMMERCIAL PRODUCT. THE DEVELOPER URGES
+ * THAT USERS WHO REQUIRE A COMMERCIAL PRODUCT NOT MAKE USE OF THIS WORK. THIS
+ * SOFTWARE IS PROVIDED BY THE DEVELOPER ``AS IS'' AND ANY EXPRESS OR IMPLIED
+ * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
+ * EVENT SHALL THE DEVELOPER BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ * Ring Buffer code for 386BSD. */
+#include &quot;param.h&quot;
+#include &quot;systm.h&quot;
+#include &quot;buf.h&quot;
+#include &quot;ioctl.h&quot;
+#include &quot;tty.h&quot;
+
+putc(c, rbp) struct ringb *rbp;
+{
+    char *nxtp;
+    /* ring buffer full? */
+    if ( (nxtp = RB_SUCC(rbp, rbp-&gt;rb_tl)) == rbp-&gt;rb_hd) return (-1);
+    /* stuff character */
+    *rbp-&gt;rb_tl = c;
+    rbp-&gt;rb_tl = nxtp;
+    return(0);
+}
+getc(rbp) struct ringb *rbp;
+{
+    u_char c;
+    /* ring buffer empty? */
+    if (rbp-&gt;rb_hd == rbp-&gt;rb_tl) return(-1);
+    /* fetch character, locate next character */
+    c = *(u_char *) rbp-&gt;rb_hd;
+    rbp-&gt;rb_hd = RB_SUCC(rbp, rbp-&gt;rb_hd);
+    return (c);
+}
+nextc(cpp, rbp) struct ringb *rbp; char **cpp; {
+    if (*cpp == rbp-&gt;rb_tl) return (0);
+    else {  char *cp;
+        cp = *cpp;
+        *cpp = RB_SUCC(rbp, cp);
+        return(*cp);
+    }
+}
+ungetc(c, rbp) struct ringb *rbp;
+{
+    char    *backp;
+    /* ring buffer full? */
+    if ( (backp = RB_PRED(rbp, rbp-&gt;rb_hd)) == rbp-&gt;rb_tl) return (-1);
+    rbp-&gt;rb_hd = backp;
+    /* stuff character */
+    *rbp-&gt;rb_hd = c;
+    return(0);
+}
+unputc(rbp) struct ringb *rbp;
+{
+    char    *backp;
+    int c;
+    /* ring buffer empty? */
+    if (rbp-&gt;rb_hd == rbp-&gt;rb_tl) return(-1);
+    /* backup buffer and dig out previous character */
+    backp = RB_PRED(rbp, rbp-&gt;rb_tl);
+    c = *(u_char *)backp;
+    rbp-&gt;rb_tl = backp;
+    return(c);
+}
+#define peekc(rbp)  (*(rbp)-&gt;rb_hd)
+initrb(rbp) struct ringb *rbp; {
+    rbp-&gt;rb_hd = rbp-&gt;rb_tl = rbp-&gt;rb_buf;
+}
+/* Example code for contiguous operations:
+    ...
+    nc = RB_CONTIGPUT(&amp;rb);
+    if (nc) {
+    if (nc &gt; 9) nc = 9;
+        bcopy(&quot;ABCDEFGHI&quot;, rb.rb_tl, nc);
+        rb.rb_tl += nc;
+        rb.rb_tl = RB_ROLLOVER(&amp;rb, rb.rb_tl);
+    }
+    ...
+    ...
+    nc = RB_CONTIGGET(&amp;rb);
+    if (nc) {
+        if (nc &gt; 79) nc = 79;
+        bcopy(rb.rb_hd, stringbuf, nc);
+        rb.rb_hd += nc;
+        rb.rb_hd = RB_ROLLOVER(&amp;rb, rb.rb_hd);
+        stringbuf[nc] = 0;
+        printf(&quot;%s|&quot;, stringbuf);
+    }
+    ...
+ */
+/* Concatinate ring buffers. */
+catb(from, to)
+    struct ringb *from, *to;
+{
+    char c;
+    while ((c = getc(from)) &gt;= 0)
+        putc(c, to);
+}
+
+
+
+
+<a name="0155_001a">
+<a name="0155_001b"></pre><B>[LISTING FOUR]</B><pre><a name="0155_001b">
+
+/* [Excerpted from tty.h, 386BSD Release 0.0 - wfj] */
+/* Ring buffers provide a contiguous, dense storage for character data used
+ * by the tty driver. */
+#define RBSZ 1024
+struct ringb {
+    char    *rb_hd;   /* head of buffer segment to be read */
+    char    *rb_tl;   /* tail of buffer segment to be written */
+    char    rb_buf[RBSZ];   /* segment contents */
+};
+#define RB_SUCC(rbp, p) \
+        ((p) &gt;= (rbp)-&gt;rb_buf + RBSZ - 1 ? (rbp)-&gt;rb_buf : (p) + 1)
+#define RB_ROLLOVER(rbp, p) \
+        ((p) &gt; (rbp)-&gt;rb_buf + RBSZ - 1 ? (rbp)-&gt;rb_buf : (p))
+#define RB_PRED(rbp, p) \
+        ((p) &lt;= (rbp)-&gt;rb_buf ? (rbp)-&gt;rb_buf + RBSZ - 1 : (p) - 1)
+#define RB_LEN(rp) \
+        ((rp)-&gt;rb_hd &lt;= (rp)-&gt;rb_tl ? (rp)-&gt;rb_tl - (rp)-&gt;rb_hd : \
+        RBSZ - ((rp)-&gt;rb_hd - (rp)-&gt;rb_tl))
+#define RB_CONTIGPUT(rp) \
+        (RB_PRED(rp, (rp)-&gt;rb_hd) &lt; (rp)-&gt;rb_tl ?  \
+            (rp)-&gt;rb_buf + RBSZ - (rp)-&gt;rb_tl : \
+            RB_PRED(rp, (rp)-&gt;rb_hd) - (rp)-&gt;rb_tl)
+#define RB_CONTIGGET(rp) \
+        ((rp)-&gt;rb_hd &lt;= (rp)-&gt;rb_tl ? (rp)-&gt;rb_tl - (rp)-&gt;rb_hd : \
+        (rp)-&gt;rb_buf + RBSZ - (rp)-&gt;rb_hd)
+</pre>
+
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

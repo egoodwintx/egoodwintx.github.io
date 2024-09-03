@@ -1,0 +1,186 @@
+<html>
+<head>
+<title>How Much Scalability Do You Have or Need?</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> September 2007</p>
+
+<h1>How Much Scalability Do You Have or Need?</h1>
+<h2>"Orders" of Throughput</h2>
+
+
+<h3>By Herb Sutter</h3>
+
+
+<I>Herb is a software architect at Microsoft and chair of the ISO C++ Standards committee. He can be contacted at www.gotw.ca.</I>
+
+<hr>
+
+
+
+
+<p>In your application, how many independent pieces of work are ready to run at any given time? Put another way, how many cores (or hardware threads, or nodes) can your code harness to get its answers faster? And when should the answers to these questions not be "as many as possible"?</p>
+
+<p>Table 1 summarizes three "orders" of throughput available in a given application or operation, using big-Oh notation to describe the amount of CPU-intensive work that will typically be ready to be actively executed at a given time. The rest of this article overviews these orders of scalability and summarizes when each one is appropriate. </p>
+
+<p> Last month [2], we looked at three "pillars" of concurrency: Pillar 1, isolation by structuring work asynchronously and communicating through messages; Pillar 2, scalable throughput by exploiting parallelism in algorithms and data structures; and Pillar 3, dealing with mutable shared state. This month's topic delves into throughput-oriented techniques using techniques in Pillar 1 and Pillar 2.</p>
+
+
+
+<div>
+<table cellpadding=3 cellspacing=3>
+	<tr>
+		<td><b>Order</b></td> <td><b>O(1): Single-Core</b></td> <td><b>O(K): Fixed</b></td> <td><b>O(N): Scalable</b></td>
+	</tr>
+	<tr>
+		<td><b>Tagline</b></td> <td>One thing at a time</td> <td>Explicit threading</td> <td>Re-enable the free lunch</td>
+	</tr>
+	<tr>
+		<td><b>Summary</b></td> <td>Sequential applications, and bottlenecked parallel  applications</td> <td>Explicitly express how much work can be done in parallel</td> <td>Express lots of  latent concurrency in a way that can be efficiently mapped to N cores</td>
+	</tr>
+	<tr>
+		<td><b>Examples</b></td> <td>Multithreaded code  convoyed on a global  lock or message queue,  occasional or intermittent  background work</td> <td>Pipelining, hardwired division of tasks, regular or continuous background computation</td> <td>Tree traversal, quicksort, compilation</td>
+	</tr>
+	<tr>
+		<td><b>Applicability</b></td> <td>Single-core hardware,  single-threaded OS, or nonCPU-bound app</td> <td>Hardware with fixed concurrency, or app whose CPU-bound parts have limited scalability</td> <td>Hardware with variable  (esp. growing) concurrency, and app with CPU-bound  parts that are scalably parallelizable</td>
+	</tr>
+	<tr>
+		<td><b>Examples</b></td> <td>Code targeting legacy  hardware, small embedded  systems, single-core game  consoles; simple text  processor</td> <td>Game targeting one multicore game console generation; code whose key operations are  order-sensitive (e.g., can  be pipelined but not fully  parallelized)</td> <td>Mainstream desktop or  server software with  CPU-bound features and targeting commodity hardware or future upgradeable game consoles</td>
+	</tr>
+	<tr>
+		<td><b>Pillar  (see Notes  [2]), and today's  mainstream tools</b></td> <td colspan="2">Pillar 1: Threads, message queues, futures </td>  <td>Pillar 2: Thread pools, futures, OpenMP</td>
+	</tr>
+</table>
+
+<div class="caption">
+Table 1: Orders of throughput.
+</div>
+</div>
+
+
+
+
+
+
+<h3>O(1): Sequential Code</h3>
+
+<p><i>O(1)</i> means that the program typically has one CPU-intensive piece of work available to be actively executed at any given time. It may occasionally perform multiple concurrent operations, such as occasional background work in addition to the main foreground work, but the extra work is not ongoing and/or doesn't keep more than a single core busy.</p>
+
+<p>This category includes not only all sequential code, but also every concurrent application with throughput that is as good as sequential because its threads execute serially, such as by being convoyed on a global lock or message queue. The free throughput lunch is over for both these kinds of <i>O(1)</i> code, but the fully serial option tends to have the additional liability of poorer responsiveness, while a concurrent application tends to be better structured to do background work asynchronously[1, 2]. </p>
+
+<p>For example, consider Microsoft Word: As I type this paragraph, WINWORD.EXE has between 8 and 11 active threads, but all CPU cores remain virtually idle. Each time Word regularly performs a background Save, one core's utilization increases to more than 50 percent for about two seconds before the system returns to idle. This version of Word is <i>O(1)</i> when used in this mode; I'm not likely to see improvement when running it on a system with a greater number of hardware cores, even though the application uses several threads internally.</p>
+
+<p>In all <i>O(1)</i> cases, if we want better throughput for CPU-bound operations, essentially, our only option is to try to optimize our code in traditional ways because adding more cores won't help.</p>
+
+
+
+
+
+
+
+
+
+<h3>O(K): Explicitly Threaded Code</h3>
+
+<p><i>O(K)</i> means that the system typically has some constant number of things it can do to keep a constant number of cores busy at any given time. That number is hardwired into the structure of the program and will be the same regardless of the amount of hardware concurrency available at execution time.</p>
+
+<p>For example, consider a first-person action game. To take some advantage of additional cores, let's say we divide the game's compute-bound work into three threads: Thread 1 does game physics, thread 2 does rendering, and thread 3 does nonplayer character AI. For simplicity, assume that all three threads are equally busy and interdependent. The game runs fine on a single-core machine; the operating system just interleaves the threads on the one core. When the user upgrades to a two-core machine, the game runs faster&#151;but not twice as fast, because if we schedule thread 1 on core 1, and thread 2 on core 2, we have to put thread 3 somewhere. If we put thread 3 on the same core as thread 1, then thread 2 (which depends on 1 and/or 3) will be idle half the time. But if we schedule thread 3 on both core 1 and core 2, we incur cache sloshing and other overhead every time we move it from one core to the other. So the game runs faster on a two-core system, just not twice as fast. When the user upgrades to a four-core machine, the game runs faster still&#151;but only three times as fast as on a single core, or maybe slightly better if spyware and other applications can be moved to the fourth core. When the user upgrades to an eight-core machine, nothing happens. When he upgrades to a 16-core machine, more nothing happens. The <i>O(3)</i> application is hardwired to prefer three cores regardless of the input or execution environment.</p>
+
+<p>A closely related technique is pipelining, which is useful when we have a collection of things to operate on, but we can't apply <i>O(N)</i> techniques to fully parallelize them because of ordering dependencies. For example, consider a communications subsystem that packets data to be sent over the network. The input to the subsystem is a stream of raw packets; before sending a given packet, it must first be decorated with header information, then compressed, and then encrypted. Those three operations can't easily be run in parallel for a given packet, in part because they must be applied in that order. A solution is to have three agents that communicate using message queues: The <i>Decorator</i> agent (typically a thread) decorates each raw packet and sends it to the <i>Compressor</i> agent; the <i>Compressor</i> accepts the decorated packet, compresses it, and sends it to the <i>Encryptor</i>; and the <i>Encryptor</i> encrypts it and sends it to the network. Like the game example, this subsystem also has <i>O(3)</i> parallelism if the pipeline stages are equally busy. We are using Pillar 1 techniques (isolated agents, messaging; see [2] for details) because it's a natural fit for expressing pipelines: The pipeline stages are relatively isolated, and using messaging lets us tolerate any difference in execution rates between the stages.</p>
+
+<p>Finally, consider Word again, but with a different usage scenario: Dictation. As I fire up speech recognition and dictate this paragraph, I see that generally two cores stay fairly busy as I'm speaking, while the rest of the system's cores remain idle. When used in dictation mode, this version of Word is an <i>O(2)</i> application that works fine on a single-core machine, better on a dual-core machine, but won't improve further in speed or accuracy in the presence of additional cores.</p>
+
+<p>An <i>O(K)</i> application is explicitly structured to prefer <i>K</i> cores for a given input workload. <i>O(K)</i> code can't scale to take advantage of environments with more than <i>K</i> cores, and it can penalize execution environments with fewer than <i>K</i> cores by interfering with load balancing and causing some of the cores to be only partly utilized.</p>
+
+
+
+
+
+
+
+<h3>Comparing O(1) and O(K)</h3>
+
+<p>Alert readers may already have noticed that in other computer science contexts we usually don't distinguish between <i>O(1)</i> and <i>O(K)</i> complexity because big-Oh notation typically ignores the constant factor; after all, <i>K</i>=1 is just a special case. That's exactly true, and similarly here <i>O(K)</i> is far closer to <i>O(1)</i> than it is to <i>O(N).</i> Both <i>O(1)</i> and <i>O(K)</i> hardwire concurrency into the explicit structure of the code, and neither is scalable to arbitrary numbers of cores. Even so, it's well worth distinguishing between <i>O(1)</i> and <i>O(K</i>).</p>
+
+<p><i>O(1)</i> is an important special case because it targets three significant situations:</p>
+
+<ul>
+  <li>Single-core hardware, including legacy hardware and some game consoles, such as Nintendo Wii.</li>
+  <li>Operating systems that don't support concurrency, including some that have no concept of a thread.</li>
+  <li>Applications that aren't CPU-bound, where their current feature set won't drive more than one core's worth of computation no matter how you slice them (a simple text processor, for instance).</li>
+</ul>
+
+<p>If you have no reason or capability to escape one of those constraints, it probably doesn't make sense to invest heavily in making your code <i>O(K)</i> or better because the extra concurrency will never be exercised on such systems. But don't forget that, even in the <i>O(1)</i> world, concurrency is a primary path to better responsiveness, and some basic techniques like using an event-driven program structure will work even in the most constrained case of running on an OS that has no support for actual threads. <i>O(K)</i> is appropriate especially for code that targets  domains with fixed concurrency:</p>
+
+<ul>
+    <li>Fixed hardware targets: A notable situation is when you're targeting one multicore game console generation. For example, when developing a game for XBox 360, it makes sense to write an <i>O(6)</i> application, because that generation of the console is fixed at six hardware threads (three cores with two hardware threads each); similarly, PlayStation 3 naturally lends itself to <i>O(8)</i> or <i>O(9)</i> applications because it is fixed at 1+8 cores (one general-purpose core, and eight special-purpose cores). These configurations will not change until each console's next major hardware generation.</li>
+  <li>Applications whose key operations cannot be fully parallelized: The earlier packet-sending example illustrates a case where a CPU-intensive operation has internal ordering dependencies; its parts are not sufficiently independent to let them be run fully in parallel. As we saw, pipelining is a classic approach to extract some parallelism out of an otherwise inherently serial operation; but basic pipelining is at best <i>O(K)</i>, for a pipeline with <i>K</i> stages of relatively equal cost. Although <i>O(K)</i> is not scalable, it can be deployed tactically to temporarily extend the free lunch.</li>
+</ul>
+
+<p>In <i>O(K)</i> in particular, there are some fixed costs of making the code concurrent that we will incur at runtime on even a single-core machine, including work to manage messages, perform context switches, and lock shared data. However, by applying concurrency, we can get some limited scalability, and often also better responsiveness.</p>
+
+<p>Note that <i>O(1)</i> and <i>O(K)</i> situations are mostly described by what you can't do. If you can target hardware that has variable parallelism (especially increasing parallelism), and your operating system supports concurrency, and you can find enough independence inside your application's CPU-intensive operations to make them scale, prefer aiming for <i>O(N</i>).</p>
+
+
+
+
+
+
+
+
+
+<h3>O(N): Scalable Throughput And the Free Lunch</h3>
+
+<p>The key to scalable throughput is to express lots of latent concurrency that isn't explicitly coded in the program and that scales to match its inputs (number of messages, size of data, and so on) and that can be efficiently mapped down at execution time to the variable number <i>N</i> cores available on a given machine.</p>
+
+<p>We find the scalable concurrency opportunities principally by exploiting natural parallelism:</p>
+
+<ul>
+    <li>Exploit parallelism in algorithm structures: For example, recursive sorting can exploit the natural parallelism in its divide-and-conquer structure.</li>
+  <li>Exploit parallelism in data structures: For example, tree traversal can often exploit the independence in each node's subtrees. Compilation can exploit independence at several levels in the structure of source code, from coarse-grained independence among source files to finer-grained independence among classes or methods within a file.</li>
+</ul>
+
+<p>This lets us decompose the application into a "sea of chores"&#151;expressing independent chunks of work that are big or small, blocking or nonblocking, structured subdivisions or independent; but we often want to look first for the CPU-bound work&#151;and rely on the runtime system to "rightsize" the application by assigning those chores efficiently to whatever hardware parallelism is available on a given user's system.</p>
+
+<p>OpenMP supports some constrained <i>O(N)</i> styles, but it is primarily intended for use with integer-indexed loops over arrays and doesn't work well with iteration-based containers in STL, .NET, or Java. Instead, as mentioned in last month's column [2], today, one common idiom for expressing such a sea of work items is to explicitly schedule chores for execution on a thread pool (for example, using Java <i>ThreadPoolExecutor</i> or .NET <i>BackgroundWorker</i>). Unfortunately, this incurs significant context-switch overhead and so you have to ensure that a work item will be worth shipping over to a worker thread. In the future, this constraint will be relaxed as languages and runtimes improve.</p>
+
+<p><i>O(N)</i> is the key to re-enabling the free lunch and keeping lots of cores busy, because it lets us express applications that can run on yesterday's single-core machine, run better on today's four-core machine, run better still on tomorrow's 64-core machine, and so on until we exhaust the inherent limit of CPU-boundedness in the application. For a thread pool-driven program, on a single-core machine the system can spin up a single worker thread that runs the program by serially pulling chore after chore from the sea and executing it; on an eight-core machine, it can spin up eight threads; and so on [4].</p>
+
+<p>As with <i>O(K)</i>, <i>O(N)</i> can have costs at runtime on even a single-core machine. In addition to the costs mentioned for <i>O(K)</i>, there can be extra work inherent in divide-and-conquer techniques (e.g., reductions such as piecing together a grand total from intermediate results), and the cost of locking shared data can now also increase. However, by applying concurrency, we can often get good scalability that far offsets the overhead.</p>
+
+<p>Using <i>O(N)</i> is highly desirable for software that expects to run on a variety of current and future hardware having variable amounts of hardware parallelism&#151;which happens to now be the target for all mainstream desktop and server software. If your application doesn't currently have key CPU-bound operations that are amenable to full <i>O(N)</i> parallelization, don't give up: Consider finding new desirable features that are amenable to <i>O(N)</i>, or at least more <i>O(K</i>), and you will still be able to deliver software that runs well on today's hardware, better on tomorrow's hardware, and better still on future systems.</p>
+<h3></h3>
+<h3>Notes</h3>
+
+<p>[1] I use "cores" as a simple shorthand measure of execution hardware parallelism. For applications running on one local machine the appropriate measure is usually "total hardware threads," meaning #sockets&times; #cores/socket&times;#threads/core; and for distributed applications the appropriate measure is usually "nodes."</p>
+
+<p>[2] H. Sutter. "The Pillars of Concurrency" (<i>DDJ</i>, 32(7), August 2007, http://ddj.com/dept/64bit/200001985).</p>
+
+<p>[3] H. Sutter. "The Free Lunch Is Over: A Fundamental Turn Toward Concurrency in Software" (<i>DDJ</i>, 30(3), March 2005, http://ddj.com/dept/webservices/184405990). </p>
+
+<p>[4] The details are more complex. For example, a pool should spin up extra worker threads to keep the system busy whenever one chore blocks to wait for some event and so temporarily idles its worker thread.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

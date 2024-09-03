@@ -1,0 +1,579 @@
+<HTML>
+<META NAME="year" CONTENT="1988">
+<HEAD>
+
+<TITLE>NOV88: MAPPING DOS MEMORY ALLOCATION</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>MAPPING DOS MEMORY ALLOCATION<a name="01fd_0003"><a name="01fd_0003"></h1><P>
+<h2><a name="01fd_0001"><a name="01fd_0000">Knowing how DOS manages your PC's memory saves you time and trouble</h2><P>
+<h3> by Robert J. Moore</h3><P>
+<p><i><a name="01fd_0002"><a name="01fd_0000">Robert J. Moore is a senior project engineer with Hughes Aircraft Radar Systems' F-14 Program in El Segundo, California. He can be reached at 2126 Prosser Ave., Los Angeles, CA 90025.</i></p><hr><P>
+The concept of a memory control block (MCB) was introduced in MS-DOS, Version 2.0, as the operating system's basic method of tracking memory allocation for application programs and installable device drivers. In this article, I'll discuss how DOS uses memory control blocks and will present a Turbo C program named MCB.C that prints out DOS' current state of memory allocation. First, it might be useful to review how the PC uses memory.<P>
+<a href="8811e.htm#01fd_0004">Figure 1</A>, next page, shows the major aspects of the PC memory map as documented by Microsoft and IBM. Addresses are shown in hexadecimal segment:offset form. Numeric addresses give absolute memory locations for those items that are always invariant in a PC running under MS-DOS, Versions 2.0, and later Symbolic addresses vary according to the version of DOS you are running and the number and types of applications presently in memory. More than one program will be in memory if one or more terminate-and-stay-resident (TSR) program has been installed.<P>
+<h4><a name="01fd_0004"><a name="01fd_0004"><B>Figure 1:</B> The PC memory map</h4><P>
+<pre>
+Address (Hex)                 Memory Usage
+
+0000:0000                Interupt vector table
+0040:0000                ROM BIOS data area
+0050:0000                DOS parameter area
+0070:0000                IBMBIO.COM / IO.SYS *
+mmmm:mmmm                BMDOS.COM / MSDOS.SYS *
+mmmm:mmmm                CONFIG.SYS - specified information
+                         (device drivers and internal buffers
+mmmm:mmmm                Resident COMMAND.COM
+mmmm:mmmm                Master environment
+mmmm:mmmm                Environment block #1
+mmmm:mmmm                Application program #1
+     .                        .      .                        .      .                        .
+mmmm.mmmm                Environment block #n
+mmmm:mmmm                Application #n
+xxxx:xxxx                Transient COMMAND.COM
+A000:0000                Video buffers and ROM
+FFFF:000F                Top of 8086 / 88 address space
+
+*    PC-DOS uses IBMBIO.COM and IBMDOS.COM:
+     MS-DOS uses IO.SYS and MSDOS.SYS instead
+
+</pre><P>
+<P>
+The program MCB.C in <a href="8811e.htm#01fd_0013">Listing One</A> computes and prints out specific addresses shown as mmmm: mmmm in <a href="8811e.htm#01fd_0004">Figure 1</A>, which includes most of the unknowns in the DOS memory map. The only address it cannot compute is the starting address of the transient portion of COMMAND. COM (denoted by address xxxx:xxxx). MCB.C also provides insight as to how the DOS memory management functions do their job and can show you exactly where ail your memory has gone the next time you run out of it on a machine overloaded with TSRs. Finally, MCB.C should give you ideas about how to reallocate memory appropriately should it become necessary. For now, I'll discuss DOS memory control blocks and describe where they fit it into all this.<P>
+<h3><a name="01fd_0005"> Memory Control Blocks<a name="01fd_0005"></h3><P>
+Microsoft and IBM document the fact that they use MCBs, but neither documents specific details of how they use them. The contents of an MCB, also known as an arena header, are illustrated in <a href="8811e.htm#01fd_0006">Figure 2</A>, page 57. An MCB contains three fields called the chain id, process ID (PID), and block size. Together these fields occupy the first 5 bytes of the MCB; the remaining 11 bytes are unused. An MCB always begins on a paragraph boundary and occupies exactly one paragraph (16 bytes) of memory. The chain id byte indicates whether this is the last MCB (value Z) or if another follows (value M). The memory block controlled by a given MCB always follows immediately, starting at the next paragraph, and has a size equal to the number of paragraphs specified in the block-size field of the MCB. I'll refer to these blocks of memory as memory blocks (MBs) to distinguish them from the MCBs. Subsequent MCB/MB pairs always start just after the previous pair. MCBs can be thought of as a forward-linked-list data structure, with the MBs they control neatly sandwiched in between. In normal operation, there are no gaps in this structure. If DOS detects any corruption in the MCB chain, it prints out an error message and halts the system. (I have had occasion to break the MCB chain deliberately during my investigations; DOS doesn't always notice.)<P>
+<h4><a name="01fd_0006"><a name="01fd_0006"><B>Figure 2:</B> MCB Fields</h4><P>
+<pre>
+     MCB
+     Start               Memory Control Blaock Fields
+     Address
+                    chain          PID       blk       unused
+     yyy0:000        id                       size
+
+     Offset------    0             1-2       3-4       5-15
+
+     where chain id = MCB chain-identification byte. Its value is
+                      Z for the last MCB in DOS MCB chain and M otherwise
+
+               PID  = Process ID, or the program segment prefix of the
+                      program that &quot;owns&quot; the MCB and the memory it
+                      controls.
+
+           blk size = Size of the contiguous block of memeory controlled
+                      by the MCB in units of paragraphs. It does not
+                      include the MCB itself.
+
+</pre><P>
+<P>
+The first MCB/MB pair allocated by DOS is always owned by IBMDOS.COM/MSDOS.SYS and is the fifth PC memory region, as shown in <a href="8811e.htm#01fd_0004">Figure 1</A>. The number of remaining MCBs depends upon whether or not any TSRs have been installed. Typically, any program (transient or TSR) in memory owns at least two MCBs--one for its copy of the environment and the other for its code and data. If the program has allocated additional space (for example as internal buffer space), it may own more MCBs. If a TSR has freed its environment block (as some do), it may own only one MCB.<P>
+<h3><a name="01fd_0007"> DOS Memory-Management Functions<a name="01fd_0007"></h3><P>
+Starting with Version 2.0, all versions of DOS contain functions to allocate memory (function 48H), free allocated memory (function 49H), and modify allocated memory (function 4AH). None of these functions deal directly with MCBs; instead they deal with the associated MBs. Changes caused by use of these functions, however, are reflected in the MCBs, as can be seen upon inspection (using my program) after use of any of these functions. In addition, DOS 3.x provides function 58H(get/change memory allocation strategy), which controls how memory is allocated: first fit (the default in DOS 3.x and that used in DOS 2.x); last fit; and best fit.<P>
+Note that DOS (actually COMMAND.COM) uses these functions to allocate two memory blocks automatically when it loads and runs a transient program (using the DOS EXEC function 4BH) and frees them upon termination. Any other memory allocated by an application using these functions must subsequently be freed or it will remain in memory. None of the memory allocated for a TSR is released automatically, of course.<P>
+A more detailed discussion of these memory-management functions would warrant a separate article. After using my program, all of them should make more sense (the official documentation for them is a little cryptic). Also, with the understanding of DOS memory allocation provided by my program and this article, DOS could be bypassed altogether for memory management, although that is not my intention.<P>
+<h3><a name="01fd_0008"> Locating MCBs in Memory<a name="01fd_0008"></h3><P>
+Two of a program's MCBs can be found easily: one MCB is one paragraph above its PSP; the other is one paragraph above the environment block. The segment address of the copy of the environment is contained in the word at offset 2CH in the PSP. (This is not true for the master copy of COMMAND.COM. Under DOS 2.0 - 3.2, the environment pointer for the master copy of COMMAND.COM has a dummy value of 0000. DOS 3.3 corrects this oversight.) This doesn't help you find the MCBs lower in memory, though, because the MCBs are linked only in the forward direction. The trick is to locate the first MCB in memory--once you have done that, it is a simple matter to visit them all.<P>
+So how do you find the first MCB? There is no documented way. Any number of brute-force methods have occurred to me, none of them very satisfactory. Fortunately, there is a better method that involves the undocumented DOS Invars function 52H When this function call is complete, ES:[BX-2] points to a word that contains the segment address of the first MCB. Because all MCBs start on a paragraph boundary, that's all you need to locate the first one.<P>
+<h3><a name="01fd_0009"> Obtaining Additional Information<a name="01fd_0009"></h3><P>
+Each MCB/MB pair is owned by a PID which is nothing more than the segment address of the PSP of the program that owns the memory. From the PSP address, you can derive other useful information. First, you can find the location of the program's copy of the environment, as mentioned earlier. Another (undocumented) piece of information you can discover is the PID of the parent process, which is located at the word PSP:16H In DOS 3.x only, you can also find the name of the owner program.<P>
+The PID owner name consists of the drive, path, and filename of the program associated with the PID. To find it, first locate the copy of the environment for any program other than the operating system files IBMDOS.COM and COMMAND.COM (these must be treated separately) using the word at PID:2CH. Each string in the environment is in ASCIIZ form (which ends in a NULL, the ASCII character with value 0). Search for the first double NULL (sometimes there is more than one).<P>
+If a word count of 0001 immediately follows the double NULL (indicating that only one more ASCIIZ string is left in the environment), then the owner of the program is given by the ASCIIZ string immediately following. If the end of the environment is reached and no such pattern is found, the owner is unknown. (This will always be the case for DOS 2.x.) Note that if a TSR has freed its environment block, the owner name thus found is likely to be inaccurate because the TSR no longer owns it and it may have been claimed by a different program (typically, the next TSR or transient program will claim it).<P>
+<h3><a name="01fd_000a"> The MCB program<a name="01fd_000a"></h3><P>
+The program MCB.C in <a href="8811e.htm#01fd_0013">Listing One</A> is heavily commented, so I'll make only a few general comments here.<P>
+I used the small-memory model of Turbo C, Version 1.5, to compile and link MCB.C into MCB.EXE. The complications of doing so are manifested in the explicit declarations of some far and huge pointers, as explained in the comments.<P>
+I used no Turbo C library calls specific to either Turbo C itself or to the IBM PC, so other C compilers should have no problem compiling the program, and it should run on any MS-DOS machine, even one not compatible with the IBM PC. (I ran it without any difficulty on a DEC Rainbow under MS-DOS 2.11.)<P>
+The program itself is a straightforward implementation using the material discussed earlier in this article. The first MCB in memory is located using DOS function 52H The program then visits each one and computes and prints out information on each MCB/MB. See the large comment block at the end of function prn_header in <a href="8811e.htm#01fd_0013">Listing One</A> for a detailed description of the fields printed for each MCB.<P>
+Examples 1-6, pages 57-63, contain the screen output of several illustrative examples. The conditions under which each was run are summarized in the captions. The effects of other DOS commands run are also shown when they are relevant to the discussion.<P>
+<a href="8811e.htm#01fd_000b">Example 1</A> illustrates the minimum number of MCB/MB pairs because no extra device drivers or TSRs have been installed. The curious free embedded MCB 03 seems to be a leftover from the DOS boot process--it seems strange that DOS should leave it there. Also note the use of memory by MCB.EXE and the final large free block. Many application programs claim all of the remaining memory for themselves when they run, and I was curious as to why MCB.EXE didn't. Because it was an .EXE file, it was possible that its .EXE header specified a smaller amount of memory. I checked the header and found it was set to claim as much free memory as was available. I finally traced the return of memory to DOS by examining the Turbo C start-up code that was executed prior to giving main() control. Sure enough, this code called DOS function 4AH. The parent address (022BH) of IBMDOS.COM in this example is also interesting.<P>
+<h4><a name="01fd_000b"><a name="01fd_000b"><B>Example 1:</B> System booted with no CONFIG.SYS and no AUTOEXEC.BAT. (I was in the directory C:\TURBOC\DEV where MCB.EXE resides on my sysytem, for this and all subsequent examples.)</h4><P>
+<pre>
+C &gt; MCB
+==========================================================================
+MCB   MCB    ID   PID      MB        PAR-      ENV       OWNER
+NO.   SEG.                SIZE        ID       BLK?
+==========================================================================
+01    0973    M    0008    8208      022B      N    IBMDOS.COM/MSDOS.SYS
+02    0B75    M    0B76    3376      0B76      N    COMMAND.COM COPY #1
+03    0C49    M    0000      48      F000      N    FREE MEMORY CONTROL BLOCK
+04    0C4D    M    0B76     160      0B76      Y    COMMAND.COM COPY #1
+05    0C58    M    0C5E      64      0B76      Y    C:\TURBO\DEV\MCB.EXE
+06    0C5D    M    0C5E   71232      0B76      N    C:\TURBO\DEV\MCB.EXE
+07    1DC2    Z    0000  530384      F000      N    FREE MEMORY CONTROL BLOCK
+============================================================================
+</pre><P>
+<P>
+In <a href="8811e.htm#01fd_000c">Example 2</A>, the size of the MB controlled by MCB 01 and owned by IBMDOS.COM shows an increase of 8,144 bytes. The extra space was allocated during the boot process in response to the statements in CONFIG.SYS. These statements caused extra storage to be allocated for the installation of the device driver ANSI.SYS as well as that needed to carry out the FILES=50 and BUFFERS=20 commands. This block grows much larger when VDISK.SYS is installed. Try it.<P>
+<h4><a name="01fd_000c"><a name="01fd_000c"><B>Example 2:</B> The PC rebooted with the CONFIG.SYS shown and no AUTOEXEC.BAT</h4><P>
+<pre>
+C&gt; TYPE \CONFIG.SYS
+device=c: \dos\ansi.
+files=50
+buffers=20
+lastdrive=z
+
+C &gt; MCB
+==========================================================================
+MCB   MCB    ID   PID      MB        PAR-      ENV       OWNER
+NO.   SEG.                SIZE        ID       BLK?
+==========================================================================
+01   0973    M  0008     16352       022B       N   IBMDOS.COM/MSDOS.SYS
+02   0D72    M  0D73      3376       0D73       N   COMMAND.COM COPY #1
+03   0E46    M  0000        48       F000       N   FREE MEMORY CONTROL BLOCK
+04   0E4A    M  0D73       160       0D73       Y   COMMAND.COM COPY #1
+05   0E55    M  0E5B        64       0D73       Y   C:\TURBOC\DEV\MCB_EXE
+06   0E5A    M  0E5B     71232       0D73       N   C:\TURBOC\DEV\MCB.EXE
+07   1FBF    Z  0000     22240       F000       N   FREE MEMORY CONTROL BLOCK
+</pre><P>
+<P>
+In <a href="8811e.htm#01fd_000d">Example 3</A>, the DOS 3.3 command FASTOPEN is seen to be a memory-resident program that owns two blocks of memory--one for a copy of the environment and one for the resident code itself, which is the typical case.<P>
+<h4><a name="01fd_000d"><a name="01fd_000d"><B>Example 3:</B> The system rebooted with the CONFIG.SYS file in Example 2 and an AUTOEXEC.BAT file with the contents shown</h4><P>
+<pre>
+C&gt;TYPE \AUTOEXEC.BAT
+path c:\dos;c:\util;c:\turboc;c:\util\norton;c:\masm;c:\pe
+prompt $p$g
+mgc
+astclock
+subst u: c:\util
+fastopen c:
+cls
+
+C &gt; MCB
+==========================================================================
+MCB   MCB    ID   PID      MB        PAR-      ENV       OWNER
+NO.   SEG.                SIZE        ID       BLK?
+==========================================================================
+01   0973  M  0008  16352   022B  N      IBMDOS.COM/MSDOS.SYS
+02   0D72  M  0D73   3376   0D73  N      COMMAND.COM COPY #1
+03   0E46  M  0000     48   F000  N      FREE MEMORY CONTROL BLOCK
+04   0E4A  M  0D73    160   0D73  Y      COMMAND.COM COPY #1
+05   0E55  M  0E5F    128   0D73  Y      C:\DOS\FASTOPEN.EXE
+06   0E5E  M  0E5F   2896   0D73  N      C:\DOS\FASTOPEN.EXE
+07   0F14  M  0F1E    128   0D73  Y      C:\TURBOC\DEV\MCB.EXE
+08   0F1D  M  0F1E  71232   0D73  N      C:\TURBOC\DEV\MCB.EXE
+09   2082  Z  0000 519120   F000  N      FREE MEMORY CONTROL BLOCK
+===========================================================================
+
+</pre><P>
+<P>
+<a href="8811e.htm#01fd_000e">Example 4</A> shows that the DOS GRAPHICS command is also a TSR and that it owns two more blocks of memory. Some TSR programs free their copy of the environment before executing the DOS TSR function. Such programs will not only have no environment block but also the owner of the remaining block holding the resident code may be incorrect because the owner string resides in the freed environment block. A TSR may have also allocated additional memory before exiting to DOS, in which case it would own additional memory blocks, which MCB.EXE would report.<P>
+<h4><a name="01fd_000e"><a name="01fd_000e"><B>Example 4:</B> Running the DOS command GRAPHICS</h4><P>
+<pre>
+C&gt; GRAPHICS
+
+C &gt; MCB
+==========================================================================
+MCB   MCB    ID   PID      MB        PAR-      ENV       OWNER
+NO.   SEG.                SIZE        ID       BLK?
+==========================================================================
+01   0973    M  0008    16352       022B       N  IBMDOS.COM/MSDOS.SYS
+02   0D72    M  0D73     3376       0D73       N  COMMAND.COM COPY #1
+03   0E46    M  0000       48       F000       N  FREE MEMORY CONTROL BLOCK
+04   0E4A    M  0D73      160       0D73       Y  COMMAND.COM COPY #1
+05   0E55    M  0E5F      128       0D73       Y  C:\DOS\FASTOPEN.EXE
+06   0E5E    M  0E5F     2896       0D73       N  C:\DOS\FASTOPEN.EXE
+07   0F14    M  0F1E      128       0D73       Y  C:\DOS\GRAPHICS.COM
+08   0F1D    M  0F1E     2144       0D73       N  C:\DOS\GRAPHICS.COM
+09   0FA4    M  0FAE      128       0D73       Y  C:\TURBOC\DEV\MCB.EXE
+10   0FAD    M  0FAE    71232       0D73       N  C:\TURBOC\DEV\MCB.EXE
+11   2112    Z  0000   516816       0F14       N  FREE MEMORY CONTROL BLOCK
+===========================================================================
+
+</pre><P>
+<P>
+In <a href="8811e.htm#01fd_000f">Example 5</A>, the secondary copy of COMMAND.COM owns three blocks of memory for some reason. I don't know why, but it's interesting.<P>
+<h4><a name="01fd_000f"><a name="01fd_000f"><B>Example 5:</B> Installing a secondary copy of the command processor COMMAND.COM</h4><P>
+<pre>
+C&gt; COMMAND
+
+The IBM Personal Computer DOS
+Version 3.30 (C) Copyright International Business Machine Corp 1981, 1987
+             (C) Copyright Microsoft Corp. 1981, 1986
+
+C &gt; MCB
+==========================================================================
+MCB   MCB    ID   PID      MB        PAR-      ENV       OWNER
+NO.   SEG.                SIZE        ID       BLK?
+==========================================================================
+01   0973    M  0008    16352       022B       N  IBMDOS.COM/MSDOS.SYS
+02   0D72    M  0D73     3376       0D73       N  COMMAND.COM COPY #1
+03   0E46    M  0000       48       F000       N  FREE MEMORY CONTROL BLOCK
+04   0E4A    M  0D73      160       0D73       Y  COMMAND.COM COPY #1
+05   0E55    M  0E5F      128       0D73       Y  C:\DOS\FASTOPEN.EXE
+06   0E5E    M  0E5F     2896       0D73       N  C:\DOS\FASTOPEN.EXE
+07   0F14    M  0F1E      128       0D73       Y  C:\DOS\GRAPHICS.COM
+08   0F1D    M  0F1E     2144       0D73       N  C:\DOS\GRAPHICS.COM
+09   0FA4    M  0FAD      112       0FAD       N  COMMAND.COM COPY #2
+10   0FAC    M  0FAD     3376       0FAD       N  COMMAND.COM COPY #2
+11   1080    M  0FAD      160       0FAD       Y  COMMAND.COM COPY #2
+12   108B    M  1095      128       0FAD       Y  C:\TURBOC\DEV\MCB.EXE
+13   1094    M  1095    71232       0FAD       N  C:\TURBOC\DEV\MCB.EXE
+14   2112    Z  0000   516816       0F14       N  FREE MEMORY CONTROL BLOCK
+===========================================================================
+
+</pre><P>
+<P>
+<a href="8811e.htm#01fd_0010">Example 6</A> shows that the space formerly occupied by the secondary COMMAND.COM has been freed upon execution of the EXITcommand. You can install more than one secondary COMMAND.COM if desired, and you can remove each one in reverse order with an EXITcommand.<P>
+<h4><a name="01fd_0010"><a name="01fd_0010"><B>Example 6:</B> The secondary COMMAND.COM remains in memory until a DOS EXIT command is issued</h4><P>
+<pre>
+C&gt; EXIT
+
+C &gt; MCB
+==========================================================================
+MCB   MCB    ID   PID      MB        PAR-      ENV       OWNER
+NO.   SEG.                SIZE        ID       BLK?
+==========================================================================
+01   0973    M  0008    16352       022B       N  IBMDOS.COM/MSDOS.SYS
+02   0D72    M  0D73     3376       0D73       N  COMMAND.COM COPY #1
+03   0E46    M  0000       48       0F14       N  FREE MEMORY CONTROL BLOCK
+04   0E4A    M  0D73      160       0D73       Y  COMMAND.COM COPY #1
+05   0E55    M  0E5F      128       0D73       Y  C:\DOS\FASTOPEN.EXE
+06   0E5E    M  0E5F     2896       0D73       N  C:\DOS\FASTOPEN.EXE
+07   0F14    M  0F1E      128       0D73       Y  C:\DOS\GRAPHICS.COM
+08   0F1D    M  0F1E     2144       0D73       N  C:\DOS\GRAPHICS.COM
+09   0FA4    M  0FAE      128       0D73       Y  C:\TURBOC\DEV\MCB.EXE
+10   0FAD    M  0FAE    71232       0D73       N  C:\TURBOC\DEV\MCB.EXE
+11   2112    Z  0000   516816       0F14       N  FREE MEMORY CONTROL BLOCK
+===========================================================================
+</pre><P>
+<P>
+In <a href="8811e.htm#01fd_0011">Example 7</A>, CHKDSK reports 588,064 bytes free, whereas in Example 6 MCB shows 516,816 bytes free in the MB controlled by MCB 11. Let's reconcile the differences. The free memory reported by CHKDSK is equal to 516,816 (MCB 11) plus 16 plus 71,232 (MCB 10).<P>
+<h4><a name="01fd_0011"><a name="01fd_0011"><B>Example 7:</B> Running the DOS command CHKDSK to see how much free memory it reports and see how it compares to that reported by MCB.C</h4><P>
+<pre>
+C&gt;CHKDSK
+
+21309440 bytes total disk space
+53248 bytes in 2 hidden files
+59392 bytes in 28 directories
+9635840 bytes in 580 user files
+11560960 bytes available on disk
+
+652288 bytes total memory
+588064 bytes free
+
+</pre><P>
+<P>
+This makes sense. When CHKDSK runs, it has memory allocated to it (in fact all the remaining memory). When it reports the amount of free memory, it subtracts the memory needed to run itself but does not discount that needed for its copy of the environment, apparently reasoning that any program run will need to have such an environment block allocated. The extra 16 bytes in the equation above are needed to account for the paragraph of memory needed for the last MCB (11 here) itself. Also note that CHKDSK does not include the memory in any free memory embedded in the body of the allocation chain (such as MCB 03), even though such memory is available for use under the right conditions.<P>
+You'll also notice that the PC on which I ran this program seems to have only 652,288 bytes of total memory, which is 3,072 bytes less than the full 640K (655,360 bytes) of memory that is actually installed. This is an example of memory being hidden from DOS. My computer was an IBM PC XT equipped with a Paradise graphics card (which provides for monochrome text and CGA graphics on an IBM monochrome monitor). This video card also needs a memory-resident program (called MGC.COM, see the contents of the AUTOEXEC.BAT file in Example 3) installed in order for it to function. So why doesn't MGC.COM show up in one of the MBs?<P>
+It occupies the top 3,072 bytes of memory. After installing itself it modifies DOS' record of memory stored in word 40H:13H and does a warm reboot, which reinitializes the computer without doing a memory check. The reason for this procedure is that MGC.COM must be in memory even when DOS is not being used (for example, for some games that need to be booted from a floppy). The MCB/MB scheme is used only by DOS and wouldn't be sufficient in such cases.<P>
+<h3><a name="01fd_0012">Conclusion<a name="01fd_0012"></h3><P>
+The possible uses for this program are many. You could, for example, examine the effect of all of the DOS memory-allocation functions detail. You could possibly devise a scheme to remove any TSR from memory, not necessarily in reverse of the order installed, without creating a hole in memory. With the location of the master environment known, those who need to change the environment frequently (for example the DOS path) and find the use of SET tedious, could write a full-screen version of the DOS SET command. No doubt you will think of other uses.<P>
+
+
+MAPPING DOS MEMORY ALLOCATION_
+by
+Robert J. Moore
+
+<a name="01fd_0013"><a name="01fd_0013">
+<a name="01fd_0014"></pre><B>[LISTING ONE]</B><pre><a name="01fd_0014">
+
+/*
+  ====================  MCB.C  =======================================
+    This program chains through all the DOS memory control
+    blocks and computes and prints out information related to
+    each one.
+    R.J. Moore (C) 06 June 1988 Version 1.2. May be used freely
+    for non-commercial purposes only.
+    Compiled under Turbo C, Version 1.5, using the small memory
+    model, which itated the explicit declaration of some huge and
+    far pointers.  Tested on IBM PC, IBM XT, IBM AT, TP/286 AT
+    clone, under PC-DOS 2.1, 3.1, 3.2, and 3.3.  Also run under
+    MS-DOS 2.11 on a DEC Rainbow.  PC-DOS 3.3 required some
+    adjustments as discussed in later comments.
+    ==================================================================
+*/
+
+#include &lt;stdio.h&gt;
+#include &lt;dos.h&gt;
+
+/*-------Global declarations----------------------------------------*/
+struct MCB             /*template for a one paragraph MS-DOS MCB    */
+{
+     char chain;       /* 'Z' for last MCB, 'M' for all others      */
+     unsigned  pid;    /* PSP segment for process owning the MCB    */
+     unsigned  psize;  /* Paragraphs of memory in the MB following  */
+     char unused [11]; /* Last 11 bytes of MCB (currently unused)   */
+};
+
+typedef struct MCB huge *PTRMCB;    /*PTRMCB is a type declared
+                                      to be a huge pointer to MCB   */
+
+/*-------Function prototypes----------------------------------------*/
+void main (void);
+void far *ffmcb (void);   /* Returns far pointer to first MCB.      */
+void prn_header (void);   /* Prints output table header.            */
+void prn_mcb (PTRMCB pm); /* Prints out MCB and related information.*/
+                          /* Prints out owner name string for pid.  */
+void prn_pid_own (unsigned pid,unsigned parent);
+
+/*------main()------------------------------------------------------*/
+/* Executive to control finding a pointer to each MCB and directing
+   the printing out of information for each until the end of the
+   MCB chain is reached.                                            */
+
+void main()
+{
+  PTRMCB ptrmcb;             /* ptrmcb is a huge pointer to an MCB  */
+
+   /* Get pointer to first MCB. Note that ffmcb() returns a far
+      pointer, which is then cast to a huge pointer. A far pointer
+      is good enough to find the first MCB since a far pointer can
+      start at any memory location.  However, the use of this pointer
+      in ptrmcb must be huge because MCBs range over more than 64K,
+      which is all that a far pointer can handle since the segment
+      portion of a far pointer never changes. I, of course, found
+      this out the hard way.  Such special declarations can be
+      avoided if this program is compiled under the huge memory
+      model, but I think the method I used is more instructive.     */
+
+  ptrmcb = (PTRMCB) ffmcb(); /* Get far pointer to first MCB and
+                                cast to huge pointer via (PTRMCB).  */
+  prn_header ();             /* Print out table header to stdout.   */
+  prn_mcb(ptrmcb);           /* Print out information for first MCB.*/
+
+    /* Print out MCB information for each of the remaining MCBs    */
+  do
+  {
+    ptrmcb += ptrmcb-&gt;psize + 1;   /* Get pointer to next MCB       */
+
+    /* Each unit increment of ptrmcb corresponds to one paragraph;
+       adding ptrmcb-&gt;psize thus increments through entire allocated
+       memory block following the MCB. Since this doesn't include
+       space occupied by the MCB itself, must increment through one
+       more paragraph (+ 1) to point to the next MCB.               */
+
+    prn_mcb(ptrmcb);               /* Print out information for MCB */
+  } while (ptrmcb-&gt;chain == 'M');  /* as long as not at end of chain*/
+                                   /*Print out final decoration.    */
+  printf (&quot;========================================================&quot;);
+  puts   (&quot;===========&quot;);
+}
+
+/*------ffmcb()-----------------------------------------------------*/
+/* Returns a far pointer to the first MCB in memory.  Explict
+   declaration of far needed since small model was used to compile,
+   as noted in a comment in main.                                   */
+
+void far *ffmcb(void)
+{
+  union REGS regs;        /* REGS and SREGS defined in dos.h.       */
+  struct SREGS sregs;
+  unsigned far *segmptr;  /*  Far pointer to segment address of MCB.*/
+  regs.h.ah=0x52;         /*  Undocumented MS-DOS function 52H.     */
+  intdosx(&amp;regs, &amp;regs, &amp;sregs);  /* ES:BX-2 points to segment
+                                     address of first MCB on return
+                                     and is copied to segmptr below.*/
+  segmptr=MK_FP(sregs.es,regs.x.bx-2);
+  return MK_FP(*segmptr,0);       /* Return pointer to MCB itself.  */
+}                                 /* Segment pointed to by *segmptr.*/
+                                  /* Offset is zero (on paragraph). */
+
+/*-----------prn_header()-------------------------------------------*/
+/* Prints out header for the output variables describing the
+   information for each MCB which will be subsequently printed
+   out by the function prn_mcb().
+*/
+void prn_header (void)
+{
+  printf (&quot;===================================================&quot;);
+  puts   (&quot;================&quot;);
+  puts   (&quot;MCB MCB  ID PID      MB PAR- ENV  OWNER&quot;);
+  puts   (&quot;NO. SEG            SIZE ENT  BLK?&quot;);
+  printf (&quot;===================================================&quot;);
+  puts   (&quot;================&quot;);
+
+/*    MCB NO. = ordinal number of MCB being processed (1,2,...).
+      MCB SEG = segment address (hex) of memory control block.
+      ID      = chain id, 'Z' if last MCB, 'M' otherwise.
+      PID     = process id, the PSP segment address (hex) of owner of
+                the MCB. (PSP always starts on paragraph boundary.)
+      MB SIZE = size of the allocated memory block controlled by
+                the MCB (the MB immediately follows its associated
+                MCB at the next paragraph in memory (decimal bytes).
+      PARENT  = segment address (hex) of parent process's PID.
+      ENV BLK?= 'Y' if the MCB controls an environment block,
+                'N' otherwise.
+      OWNER   = string that prints out program associated with
+                the PID.
+*/
+}
+
+/*------prn_mcb()---------------------------------------------------*/
+/* Prints out the information associated with the MCB pointer passed
+   to it in its argument list
+*/
+
+void prn_mcb (PTRMCB pm)
+{
+  static cnt = 0;          /* Count of number of times parent has
+                              been equal to the pid.                */
+  static mcbnum = 1;       /* Ordinal # of MCB being printed out.   */
+  unsigned parid;          /* Parent id (segment address of parent
+                               process).                            */
+  unsigned mcbseg;         /* Segment address of MCB (offset is
+                               always zero since paragraph aligned).*/
+  char envf;               /*Set to 'Y'/'N' if MB is/is not an
+                               environment block.                   */
+  unsigned envseg;         /*Segment address of pid's environment
+                               block.                               */
+
+   /* Get parent id located at pid:16H                              */
+  parid = * (unsigned far *) MK_FP (pm-&gt;pid,0x16);
+
+  mcbseg = FP_SEG (pm);    /* Segment address of the MCB            */
+
+  envseg = * (unsigned far *) MK_FP(pm-&gt;pid,0x2C);  /* segment      */
+                           /* Address of pid's environment          */
+                           /* located at pid:2CH.                   */
+
+    /* If the MCB segment value plus one equals the environment
+       segment address, then the MCB controls the environment
+       block (set envf = 'Y'); otherwise set envf = 'N'             */
+
+  envf = mcbseg+1 ==  envseg ? 'Y' : 'N';
+
+    /* Count the number of times parent and pid have been equal
+       (when this is true, memory blocks are owned by COMMAND.COM   */
+
+  if (parid == pm-&gt;pid) cnt++;
+
+    /* The above determination of whether an MB is an environment
+       block isn't complete for DOS versions 2.0 thru 3.2.  The
+       above logic will not identify the master environment block
+       owned by the master copy of COMMAND.COM since the value at
+       pid:2CH contains zero, not the segment address of the master
+       environment.  The logic below uses the fact that the master
+       environment follows the master COMMAND.COM in memory. (The
+       environment copies for other programs are in memory BEFORE
+       the pid they are associated with.) Starting with DOS 3.3
+       pid:2CH always points to the environment, even for the
+       master COMMAND.COM, so the following is not needed (but it
+       doesn't do any harm).                                         */
+
+  if (!envseg &amp;&amp; cnt == 2) envf = 'Y';
+
+    /* Print out MCB information except for owner name in the
+       following call to printf().                                  */
+
+  printf(&quot;%2.2u%06.4X%2.1c%06.4X%7lu%5.4X %-5.1c&quot;,
+   mcbnum++,mcbseg,pm-&gt;chain,pm-&gt;pid,(long) pm-&gt;psize*16,parid,envf);
+
+/* Call prn_pid_own() to find and print out owner string            */
+
+  prn_pid_own(pm-&gt;pid,parid);
+}
+
+/*------prn_pid_own()-----------------------------------------------*/
+/* Prints out owner name string associated with the pid, which is an
+   input parameter.  Also needs the parent address as an input to
+   identify cases where COMMAND.COM is the owner (true when
+   pid=parent). This function also uses the fact that the following
+   pid values are special:
+
+   pid = 0 means that MCB is a free block of memory
+   pid = 8 means that the MCB is owned by IBMDOS.COM/MSDOS.SYS
+   pid = parent means that the MCB is owned by COMMAND.COM (the only
+         program that is its own parent.)
+
+   In these cases I assign appropriate owner string names instead of
+   getting them from the environment since they are not available
+   there.  Owner names consisting of a string with the drive, path,
+   and file name of the program that owns the memory are only
+   available in DOS 3.x. Note that DOS 3.3 does not provide an owner
+   string for the master copy of COMMAND.COM for some reason.  This
+   is of no consequence in the method used here.
+*/
+
+void prn_pid_own (unsigned pid,unsigned parent)
+{
+  unsigned far *envsegptr;  /* Pointer to seg address of environment*/
+  char far *envptr;         /* Pointer to pid's environment         */
+  unsigned far *envsizeptr; /* Pointer to envsize word below        */
+  unsigned envsize;         /* Size of pid's environment            */
+
+  /* Ordinal # of copy of COMMAND.COM in memory (ccnum=1 for master
+     copy, 2 for first secondary copy (if any), etc.                */
+
+  static unsigned char ccnum = 0;
+
+  /* Pid value saved from previous call to this function.
+  Initialized to an impossible value (no PSP could start at FFFF:0) */
+
+  static prev_pid = 0xFFFF;
+
+  switch (pid)
+  {
+       /* Assign owner names for two special cases                  */
+     case 0 : puts (&quot;FREE MEMORY CONTROL BLOCK&quot;);return;
+     case 8 : puts (&quot;IBMDOS.COM/MSDOS.SYS&quot;);return;
+  }
+
+  /* pid:2CH contains ptr to segment address of pid's environment   */
+  envsegptr = (unsigned far *) MK_FP (pid,0x2C);
+
+  /* Get pointer to the environment block itself                    */
+  envptr = (char far *) MK_FP (*envsegptr,0);
+
+  /* Define a pointer that contains the size of the environment
+     block. Must point back one paragraph (where the environment's
+     MCB resides) plus three bytes forward (where the MCB block
+     size field is).                                                */
+  envsizeptr = (unsigned  far *) MK_FP(*envsegptr-1,0x3);
+
+  /* Get the size of the environment using the above pointer in
+     units of bytes (1 paragraph = 16 decimal bytes).               */
+  envsize = *envsizeptr*16;
+
+    /* If next stmt is satisfied, owner is a copy of COMMAND.COM    */
+
+  if (pid == parent)
+  {
+    /* If previous pid is different from current pid, have found a
+       new secondary copy of COMMAND - ccnum keeps track records the
+       copy number.                                                 */
+
+    if (prev_pid != pid) ccnum++;
+    printf (&quot;COMMAND.COM COPY #%-2u\n&quot;,ccnum);
+
+    prev_pid = pid;        /* Save current pid - will be previous   */
+    return;                /*  in the next call to this function    */
+  }
+
+  /* Loop at most until the end of the environment                  */
+
+  while (envsize)
+  {
+      /* Decrement counter (envsize) indicating # of bytes left in
+         environment and advance pointer thru environment block until
+         either end of environment or a NULL is located
+      */
+    while (--envsize &amp;&amp; *envptr++);
+
+      /* The next stmt will be true if another NULL immediately
+         follows the first one located and a word count of 0001 then
+         follows that.                                              */
+
+    if (!*envptr &amp;&amp; *(unsigned far *) (envptr+1) == 0x1)
+    {
+       envptr +=3;           /* Correct pattern found (00 00 01 00) */
+       break;                /* so point envptr to owner string     */
+    }
+  }
+
+  if (envsize)
+  {
+     /* If an owner string was found before the end of the
+         environment so print out the owner name.  Note that can't
+         use puts() or printf() to print out the results since I
+         used the small memory model.
+      */
+    while(*envptr) putchar(*envptr++);
+    putchar('\n');
+  }
+  else
+     /* If reached the end of the environment without finding
+        an owner string (should only occur for DOS 2.x)             */
+    puts (&quot;UNKNOWN OWNER&quot;);
+}
+
+
+
+<P>
+<P>
+</pre></BODY></HTML>

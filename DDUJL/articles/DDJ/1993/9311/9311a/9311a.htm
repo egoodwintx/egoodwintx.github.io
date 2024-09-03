@@ -1,0 +1,438 @@
+<HTML>
+<META NAME="year" CONTENT="1993">
+<HEAD>
+<TITLE>NOV93: Performance Tuning: Slugging It Out!</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Performance Tuning: Slugging It Out!<a name="02f9_0003"></h1><P>
+<h2><a name="02f9_0001"><a name="02f9_0000">Watching the call stack is the key to deslugging</h2><P>
+<h3>Michael R. Dunlavey</h3><P>
+<p><i><a name="02f9_0002"><a name="02f9_0000">Michael, who's president of Performance Software Associates, is the author of YAPA, a shareware tool performance tuning. He can be reached at 276 Harris Ave., Needham, MA 02192.</i></p><hr><P>
+When you think &quot;performance tuning,&quot; what comes to mind? Handcoding in assembly language? Profilers? Fancy data structures? I do a lot of coding for DOS, UNIX, and VMS applications and I use a way of speeding up programs that's so simple it's addictive. I can't remember exactly when I first learned it. It might have been in the late '70s, testing comm drivers for Raytheon by single stepping with panel buttons.<P>
+Sometimes I'd get tired of single stepping, so I would alternately hit the RUN and HALT buttons. In between, the old mini would whiz off half a million instructions and land someplace random. Out of curiosity, I'd check it against the listing to see what it was doing. Oddly, much of the time it was doing something correct, but totally unexpected. Sure you can attack performance problems with faster algorithms, DMA, or faster processors, but simply stopping at random times and examining the state of the software reveals that nine out of ten times these approaches bark up the wrong tree. Usually, what makes the software slow is something impossible to guess, but trivial to fix.<P>
+For example, on one occasion (on a 68000 UNIX box), there was a loop over an array of structures, something like <a href="#02f9_000d">Example 1(a)</A>. It seemed to be taking too long, but there was nothing obvious slowing it down. We ran it under the profiler and, except for a hot spot in the math library, saw nothing odd. Finally we ran it under <I>adb</I> and hit Control-C. There was the program counter, dawdling along in the math library routine for multiplying 32-bit numbers, even though no multiplication was called for in the source code. Typing out the call stack cleared up the mystery. Variable <I>i</I> was declared <I>int</I>, making it 32 bits (in that compiler). To get the address of <I>a[i],</I> it had to multiply <I>i</I> times the size of the structure. The 68000 has a 16-bit multiply instruction, but not 32. Therefore, the compiler generated a subroutine call. The fix was trivial--just declare <I>i</I> as <I>short</I>--and the loop tripled in speed.<P>
+In another case, an embedded program was taking far too long to print floating-point numbers on a color graphic display. Putting the program on an in-circuit emulator and halting it turned up the problem--it was in the middle of the floating-point library. Tracing return pointers back to the application showed that it was printing numbers, digit-by-digit, as in <a href="#02f9_000d">Example 1(b)</A>. We'd had to write our own <I>printf</I> (the code was actually in Pascal). The code was perfectly correct, but it was doing floating divide, float-to-fix, fix-to-float, multiply, and floating subtract <I>on every single digit</I>. The repair was easy; we just converted the number into fixed point and then dealt with it in that form.<P>
+I've come to call these things &quot;slugs&quot; because they're not really bugs--the code isn't wrong, per se, it's just slower than necessary. The process of finding slugs is called &quot;deslugging,&quot; and it is much easier than debugging. To find bugs, you have to trace the program and catch it going wrong. To find slugs, you simply interrupt it and take a look.<P>
+To illustrate this process, I'll describe a program that simulates a Computer Integrated Manufacturing (CIM) application. At 700+ lines, it's a large for a sample program (that's why its available electronically, see &quot;Availability,&quot; page 3), but still small for a CIM application. The most interesting slugs appear when a program is large enough to need a few layers of subroutines. First I'll describe the design of the program, then I'll discuss how it was deslugged in stages. Finally I'll show how it was redesigned to be not only much faster, but much smaller and clearer as well.<P>
+<h3><a name="02f9_0004">The Problem<a name="02f9_0004"></h3><P>
+In CIM cell-control applications, there are usually four principal functions:<P>
+<UL>
+<li>Schedule Execution (ISCH in the program), which takes requests for individual manufacturing JOBs. A job consists of a sequence of OPERATIONs. It fits these into a schedule, allocates resources for them, and dispatches them for processing. When all operations of a job are done, it sends completion information back to the requestor.</li>
+<li>Task Coordination (ITC in the program), which takes requests for operations on jobs and controls their execution. An operation consists of a series of TASKs, such as: command material handling (IMH) to start moving the part to the machining center; command device control (IDEV) to start downloading the tool path file; wait for both tasks to complete; validate the bar code on the part; instruct the machining center to begin cutting; wait for it to finish; upload status information; and command material handling to move the part to storage.</li>
+<li>Device Control (IDEV), which takes requests for machine-related functions such as tool path download, cycle start and stop, and status monitoring, and talks to the actual machine to get it done. In our simulation, this is just a no-op.</li>
+<li>Material Handling (IMH), which takes care of moving parts from here to there. It &quot;talks&quot; to the actual controllers. In the simulation, this is a no-op.</li>
+</UL>
+The standard way to design such a system is with a message-flow diagram. It would contain four big message handlers (see <a href="199302fb.htm">Figure 1</A>), each taking in requests and issuing  acknowledgments when those requests are satisfied. Each function in turn sends requests to the handler below it and receives acknowledgments. Each function handler has state information in the form of outstanding requests and their completion status. It uses this to decide what to do next whenever something happens. It is all very event-driven. The main entry point is a message dispatch loop, as in Microsoft Windows. The loop takes each queued message and passes it to the proper handler. That handler will most likely put more messages in the queue.<P>
+In addition to the major functions, some utilities are needed, and the &quot;cluster&quot; paradigm (related to OOP) is a state-of-the-art way to design these. They are:<P>
+<UL>
+<li>List cluster (ILST), which includes primitives for creating linked lists, deleting them, appending to them, iterating over them, and so on.</li>
+<li>Transaction cluster (ITRN), a queuing messages. There are primitives for creating, deleting, sending, receiving, and so on.</li>
+</UL>
+<h3><a name="02f9_0005">First Deslugging Pass<a name="02f9_0005"></h3><P>
+The simulation program runs 100 simulated jobs, each with ten (plus or minus five) operations, and each operation has five device tasks and five material-handling tasks. The message <I>Ack Job nn</I> is printed as each job completes. All in all, this is about 1000 operations and 10,000 tasks.<P>
+The program takes 48 seconds to complete (see <a href="199302fc.htm">Figure 2</A>). Granted it's doing a lot of stuff, but think about the timing. If it does 10,000 tasks (each of which is a no-op) in 50 seconds, it's doing about 200 per second. That is about one every 5 milliseconds, or around 5000 instructions per task, assuming a 1-MIP machine. What is it about a no-op task that takes 5000 instructions to perform?<P>
+Turning to Microsoft's CodeView debugger, you can compile the program using the Zi flag, and enter <I>CV /I MAIN</I> to execute it. Let it run, then halt it (with Ctrl-C or Ctrl-Alt-SysReq), after which you can display the call stack and make a note of the results.<P>
+If you do this several times, you'll discover that the program is spending around 60 percent of its time in the ILST cluster in functions ILST_NTH, ILST_NEXT, and ILST_LENGTH. You could optimize the daylights out of these routines, scuttle the ILST cluster altogether (go around to all 50 or so places it's used and replace it with something else), or rewrite the transaction cluster because it is based on the ILST cluster. However, the call stack tell you that most of the time is being spent in the ILST routines that are being called from ITC_PROCESS. If you examine the specific lines they're being called from, you can see one of those slugs; <a href="#02f9_000e">Example 2(a)</A>. The operation variable <I>current_task</I> is the index of the next task to perform. This test is being performed solely to determine if the operation is complete, which 90 percent of the time it isn't. Above this line is another slug; see <a href="#02f9_000e">Example 2(b)</A>. The cluster operation ILST_NEXT is being called to iterate over the list of operation requests. This is an <I>n</I>-squared operation since ILST_NEXT searches from the beginning of the list.<P>
+A few lines further, the call stacks point to the slug in <a href="#02f9_000e">Example 2(c)</A> which is extracting a pointer to the current task from the task list. These slugs are all due to the stilted way the list cluster is designed and used.<P>
+You might also be tempted to think this is a lesson in how not to use list clusters. Wrong! It's a lesson in how to find the slugs that are really there, not the ones you imagine. The slugs in other software will be different, but the process of finding them is the same.<P>
+The fix is easy. First of all, get rid of the ILST_NEXT in the iteration. Just step a pointer along in the normal way. Second, rather than keeping a numeric index of the next task in the list, keep a pointer to it. This eliminates the need to call the ILST_NTH and ILST_LENGTH primitives. (When it runs off the end and becomes NULL, there are no more tasks.)<P>
+The result is that execution time drops to about 20 seconds (speedup factor: 2.4) without hand-optimizing anything!<P>
+<h3><a name="02f9_0006">Second Deslugging Pass<a name="02f9_0006"></h3><P>
+On the second pass, again run the program again under the debugger, randomly halting it a few times. This time new slugs appear--ones that were there before, but were masked by the big slugs. Again, time is being spent in the ILST cluster--in the ILST_APPEND primitive (it runs down the list, tacking new items on the end).<P>
+Some of the calls occur when the task list of an operation is being created. The tasks are appended to the list one at a time in <a href="#02f9_000f">Example 3(a)</A>, an n-squared operation because ILST_APPEND runs the length of the list.<P>
+Another significant source of calls to ILST_APPEND is <a href="#02f9_000f">Example 3(b)</A> in ITRN_PUT in the transaction cluster. We're finally seeing time spent in transactions!<P>
+The fix I made was twofold. To eliminate the time spent appending tasks when building a task list, I put them in a temporary array and then built the list all at once. I added a routine <I>ilst_make</I> to the ILST cluster that would take an array of pointers and make an equivalent list.<P>
+In the transaction cluster, I changed it to use a circular array for the queue, rather than a list.<P>
+The result? Execution time dropped to 17 seconds (speedup factor: 2.8). (I'm getting greedy; I was hoping for more.)<P>
+<h3><a name="02f9_0007">Third Pass<a name="02f9_0007"></h3><P>
+The slugs are getting smaller now, but there are more of them. I find time being spent on list operations at the operation/job level and in transaction dispatching. I make the following changes:<P>
+<UL>
+<li>In ITRN, I change the cluster to use pointers into the queue rather than indexes.</li>
+<li>In ITC, I change pointers <I>l</I> and <I>ptop</I> to be register variables.</li>
+<li>In ISCH, I get rid of using the ILST cluster on the operation lists, just as I did earlier on the task lists in ITC.</li>
+<li>In ITC, time is being spent in the loop in <a href="#02f9_0010">Example 4(a)</A>.</li>
+</UL>
+It is a linear search of the operation list whenever a task completion is received from IDEV. I replaced it with <a href="#02f9_0010">Example 4(b)</A>. This seemed to compile into a faster loop. I did the same thing for the same loop on receipt of a material-handling acknowledgment.<P>
+In <I>main</I>, transaction dispatching is handled by doing a linear table search. When the transaction code is found in the table, it knows what routine to send the transaction to. I replaced that loop by unrolling it and hard coding the search. This is based on the idea that it is pointless to put things in run-time tables if they never change at run time. Results? 13 seconds (speedup factor: 3.7).<P>
+Fixes are becoming less easy to find. The call stack tells me what it's doing, but I've already done what I could to speed it up. It is easy to see that it is spending much of its time dispatching transactions, and finding relevant operations when acknowledgments are received.<P>
+<h3><a name="02f9_0008">The Redesign<a name="02f9_0008"></h3><P>
+At this point, you need to ask the question: Are all those transactions and id searches really necessary? The original problem description doesn't say you need handlers, message queues, and so on. It only tells you to do a number of JOBs in parallel, that each job consists of a series of OPERATIONs, and that each operation consists of a series of TASKs. All we really have to do is transform the problem description into a running program. One way to do this is to use a special-purpose language.<P>
+To do this, I created a &quot;little language&quot; (using C macros) that supports a very simple form of non-preemptive parallel processing (because the problem statement calls for it). The result is <a href="#02f9_0011">Listing One</A> (page 90). <a href="#02f9_000b">Table 1</A> provides a brief description of the language's primitives. In this language a process consists of an application data record, plus a pointer to a procedure, and a simple integer state variable. Processes can be used to simulate application entities such as jobs, records, and tasks.<P>
+When a new job process is begun, its record is allocated and initialized. Then it is resumed. Resuming consists of calling the record's control procedure. The control procedure does whatever it needs to do and returns, but first it sets the state variable. The next time it is resumed, it dispatches on the state variable and does whatever comes next, and so on. In short, it's a finite-state machine.<P>
+What does this buy us? By modelling jobs as processes, operations as subprocesses of jobs, and tasks as subprocesses of operations, we eliminate all queued transactions except those that are forced on us by the nature of the problem, namely external-device and material-handling delays.<P>
+So where does this leave us? The application is now given in <a href="#02f9_0011">Listing One</A>. It's one-fourth the size of the first version, even including the definitions of the process macros. It now gets the job done in 10 seconds (speedup factor: 4.8)<P>
+<h3><a name="02f9_0009">Further Deslugging Passes<a name="02f9_0009"></h3><P>
+Being ever greedy, I deslugged it again. Now it had hot spots in the <I>enque</I> and <I>deque</I> routines. I just replaced these with in-line macros, and the time went down to seven seconds (speedup factor: 6.9).<P>
+At the fifth pass, deslugging it showed that most of the time was being spent in printing out the hundred <I>Ack Job nn</I> messages. Commenting out the <I>printf</I> got the time down to four seconds (speedup factor: 12).<P>
+At the sixth pass, I increased the number of jobs to 1000, to make it run long enough to observe. I saw that it was spending a large percentage of time in <I>_malloc()</I> and <I>_free</I> as objects were being created and destroyed. So, I recycled used objects in special stacks. Also, in each process, I made the self pointer <I>p</I> a register variable. Resulting time was 26 seconds, or 2.6 seconds for 100 jobs (speedup factor: 18.5).<P>
+<h3><a name="02f9_000a">Final Rewrite<a name="02f9_000a"></h3><P>
+Still not satisfied, I deslugged it again. Now, the bulk of the time went into the CALL and RETURN statements. Since operations and tasks are serialized within each job, there is no need to make them separate processes, so I recoded again, eliminating the CALL statements (see <a href="#02f9_0013">Listing Two</A>, page 91). The result? Eleven seconds, or 1.1 seconds per 100 jobs (see <a href="199302fd.htm">Figure 3</A>). Not bad, when you consider that the original program took 48 seconds. That's a speedup factor of 43.6.<P>
+Conclusion<P>
+Performance tuning is like wringing water from a towel. You can always get more if you keep working at it and remember that diagnosis is important, guesswork doesn't work, and software redesign not only improves performance but maintainability too.<P>
+<h4><a name="02f9_000b">Table 1:<a name="02f9_000b">Language primitives</h4><P>
+<pre>
+PROLOGUE(<I>type,f</I>)     <I>type</I> is the <I>typedef</I>ed name of the application record, 
+                      and <I>f</I> the control procedure.
+DISPATCH<I>n</I>            <I>n</I> is the number of states in the process.
+BREAK(<I>n</I>)             <I>n</I> is a unique state number.
+CALL(<I>n,expr</I>)         <I>n</I> is a unique state number, and <I>expr</I> creates another process.
+RETURN(<I>v</I>)            Effects a lightweight-process return, 
+                      resuming the calling process and passing it the value <I>v</I>.</pre>
+All About Profilers<P>
+<h3>Mike Armistead</h3><P>
+<p><i>Mike works at Pure Software and can be contacted at marmi@pure.com.</i></p><hr><P>
+The key to improving a program's performance is understanding its run-time behavior--and profilers are the tools that lead you to this understanding. Jon Bentley describes profilers as the programmer's equivalent of a stethoscope, a necessary and simple tool that &quot;looks inside&quot; a program. A general definition of the term &quot;profiler&quot; is any tool that captures execution-timing data about a program and reports the profile of that run. Various tools use different technologies and techniques to collect and present that data. The accuracy, ease of output interpretation, ease of implementation/deployment, and overhead are among the critical factors that determine a profiler's usefulness.<P>
+<a href="199302fe.htm">Figure 4</A> illustrates the three generations of profiler technology. The first generation is characterized by a &quot;roll your own profiler&quot; approach. Programmers relied on embedded <I>print</I> statements that output simple &quot;time of day&quot; statistics obtained from the system clock to understand execution whereabouts and estimated timing. This technique works for small, self-contained programs, but is cumbersome to implement and sparse on insightful data. Program overhead is also high due to calls made to access the system clock. This leads to skewed results that often misrepresents actual execution.<P>
+Second-generation profilers tools are similar, but packaged into self-contained, more manageable tools. The UNIX prof and gprof utilities are included here. Second-generation profilers are closely tied to compilers that insert special instructions into the source. These instructions typically call a monitoring routine to record execution times for instrumented functions. The information obtained is usually based on sampling the stack according to a set interval of time, typically in the 10 microsecond range. Profilers based on this approach don't require an extreme amount of effort to setup or deploy, although they do require separate compilation. The UNIX utility gprof requires a -pg flag to instrument the program. A separate command analyzes the results from a test run, writing them to a file. Borland's Turbo Profiler only requires that you compile the source for debugging. (Turbo Profiler is also source-based, although it offers both sampling and instruction-counting modes. In many ways, it straddles the gap between second- and third-generation technology.)<P>
+This generation of tools typically collects function call relationships and timing data for the sections that have been instrumented. Because they're source-based, only routines where the source is available are visible. However, without visibility into libraries and operating system calls made on your program's behalf, strategies to limit or circumvent time sinks are difficult to design, implement, and realize. A source-only view further hampers a profiler's accuracy by incorrectly allocating time to the proper functions. Gprof's call graph, for instance, only covers those portions of code that compiled for gprof. Thus calls into vendor and third-party libraries aren't reflected in the call graph. Gprof's mcount data records pairs of function-called-function data. Consequently, if the gprofed code calls a library function that can't be instrumented (because source isn't available), which in turn calls gprofed code, the call graph can't be connected and the information can't be correctly propagated up the call chain.<P>
+<I>Sampling</I> is a technique used by most profilers of this generation. While sampling isn't inherently faulty, it's limited by the profiler timer's accuracy, and factors such as the length of your profiling run. It's hard to interpret sampling-based results because functions often execute in less time than the &quot;tick&quot; rate of the timer. Today's CPUs can execute over 250,000 instructions between interrupts. Turning up the clock speed isn't an answer to the accuracy problem, either. The faster the clock speed, the more calls added to the program, thereby skewing results. The best way to limit this statistical error is to lengthen the time runs. This may or may not be practical for large applications--and certainly not welcome by individual programmers. Overhead in terms of code size and execution speed is quite low. Sampling doesn't add significant penalties to either of these factors. Additionally, because the profiling only covers the run-time space for user code, there's less overhead than if the entire application was comprehensively covered.<P>
+Third-generation technology manipulates executables to record actual instruction execution. Since these tools rewrite the executable, they can capture data over the entire program space, including library function calls. They don't usually require a separate compile. These tools (which include Pure Software's Quantify and, up to a point, Borland's Turbo Profiler) analyze functions in terms of their basic code blocks. (A basic block is a linear sequence of machine instructions terminating in either a branch instruction or the beginning of another basic block.) They identify the basic blocks of each function, then use information about the machine's hardware to compute the expected number of instruction cycles each basic block would consume. Additionally, these tools can insert code around trap instructions that switch the processor from user state to kernel state, enabling system calls to be recorded.<P>
+Third-generation (or object-based) tools provide greater accuracy because they count actual instructions executed for the entire application--including libraries for which you don't have the source--and are able to record the time it takes system calls to process a request on your program's behalf. Additionally, this overall view leads to correct propagation up the call chain. Typically, object-based tools only require a relink of the object files.<P>
+Basic block instruction counting can incur noticeable overhead. Since instructions are being inserted directly into object code, code size can double. In addition, execution of the instrumented version can slow down. Instruction counts must be resolved with the hardware implementation to remove the instruction overhead from the data. For additional discussion of profiler &quot;gotchas,&quot; see &quot;Profiling for Performance&quot; by Joseph Newcomer (<I>DDJ</I>, January 1993).<P>
+Data presentation is a distinct, yet unseparable attribute of any profiler. Users must be able to focus on improving performance, not on how to find and interpret data. As a result, profilers that attempt to filter out &quot;noise&quot; and present multiple, complimentary views for all run-time behavior save users time and effort.<P>
+<a href="199302ff.htm">Figure 4</A>: The evolution of profiler technology<P>
+<a href="#02f9_000c">Table 2</A> summarizes key attributes of each generation. Don't think that the third-generation is the last word for profilers. Next-generation profilers will likely provide data on every aspect of run time--from algorithms to memory access--and give users even more control to filter data, all in complete, easy-to-use packages.<P>
+<h4><a name="02f9_000c">Table 2:<a name="02f9_000c">Profiler attributes</h4><P>
+<pre>                             
+                             Print           Source  Object
+                             statements      based   based
+Accuracy                     Y               -       Y
+Easy to interpret data       Y               N       Y
+Ease to setup/deploy         N               Y       Y
+Overhead                     High            Low     Medium-high</pre><P>
+<h4><a name="02f9_000d">Example 1: (a) A loop over an array of structures; (b) correct, yet inefficient, code.<a name="02f9_000d"></h4><P>
+<pre>(a)
+    struct { ...
+    } a[...];
+    int i;
+    while ( ... ){
+    ... a[i] ...
+    }
+(b)
+    float num, newnum;
+    char digit;
+    while (...){
+      newnum = (int)(num / 10);
+      digit = num - newnum * 10 + '0';
+      num = newnum;
+      ... store digit for output ...
+    }</pre><P>
+<h4> <a href="19930300.htm">Figure 1</A>: Design of a CIM simulation program, a &quot;typical&quot; program to be deslugged.  Schedule Execution receives manufacturing Job Requests and carries them out by issuing Operation Requests to Task Coordination, which requests device and material-handling tasks.  The simulation of 100 jobs originally took 48 seconds.  It was reduced to 1.1 seconds in a series of eight revisions.</h4><P>
+<h4> <a href="19930301.htm">Figure 2</A>: Revision history of program.  The original program is deslugged three times, bringing its time down to 13 seconds.  Then it is redesigned, reducing its time to 10 seconds, and its code by a factor of 4.  Three more sessions bring it down to 2.6 seconds.  A final rewrite brings it down to 1.1 seconds.</h4><P>
+<h4><a name="02f9_000e">Example 2: (a) The slug here is the operation variable current_task; (b) in this slug, the cluster operation ILST_NEXT is being called to iterate over the list of operation requests; (c) this slug extracts a pointer to the current task from the task list.<a name="02f9_000e"></h4><P>
+<pre>(a)
+/* IF ALL TASKS DONE, SEND ITC_ACKOP AND DELETE OP */
+if (ptop-&gt;current_task &gt;= ILST_LENGTH(ptop-&gt;tasklist)){
+(b)
+/* FOR EACH OPERATION REQUEST */
+for (   ptop = ILST_FIRST(oplist);
+    ptop != NULL;
+    ptop = ILST_NEXT(oplist,ptop)
+        ){
+(c)
+ptask = ILST_NTH(ptop-&gt;tasklist,ptop-&gt;current_task);</pre><P>
+<h4><a name="02f9_000f">Example 3: (a) Tasks that are appended to the list one at a time; (b) another significant source of calls in the transaction cluster<a name="02f9_000f"></h4><P>
+<pre>(a)
+ILST_APPEND(ptop-&gt;tasklist,ptask);
+(b)
+    ILST_APPEND(trnque,ptrn);</pre><P>
+<h4><a name="02f9_0010">Example 4: (a) Time being spent in the loop; (b) replacement code that compiles into a faster loop.<a name="02f9_0010"></h4><P>
+<pre>(a)
+   for (l=oplist; l; l=l-&gt;next){
+        ptop = l-&gt;thing;
+        if (ptop-&gt;id==ptn-&gt;tskid) break;
+        }
+    if (ptop==NULL){
+        /* ERROR: INVALID OPERATION ID */
+        }
+(b)
+    for (l=oplist
+        ; l &amp;&amp; ((operation_t*)l-&gt;thing)-&gt;id != ptn-&gt;tskid
+        ; l=l-&gt;next){
+        }
+    if (l==NULL){
+        /* ERROR: INVALID OPERATION ID */
+        }
+    ptop = l-&gt;thing;</pre><P>
+<h4> <a href="19930302.htm">Figure 3</A>: Out of 48 seconds, 46.9 were eliminated.  In this particular program, much of it was due to needless general-purpose cluster usage and a programming style that arises from data-flow design and event-driven processing.  Other software will be slow for different reasons.</h4><P>
+
+<PRE>
+
+
+_PERFORMANCE TUNING: SLUGGING IT OUT!_
+by Michael R. Dunlavey
+
+<a name="02f9_0011"><a name="02f9_0012"><B>[LISTING ONE]</B>
+
+
+/* FAST.H  DEFINITION OF DISPATCHn MACROS ------------------ */
+
+#define DISPATCH0
+
+#define DISPATCH1 \
+    if (p-&gt;state==1) goto L1;\
+    DISPATCH0
+#define DISPATCH2 \
+    if (p-&gt;state==2) goto L2;\
+    DISPATCH1
+#define DISPATCH3 \
+    if (p-&gt;state==3) goto L3;\
+    DISPATCH2
+#define DISPATCH4 \
+    if (p-&gt;state==4) goto L4;\
+    DISPATCH3
+
+/* FAST.C  REDESIGNED IMPLEMENTATION ----------------------- */
+
+#include &lt;stdio.h&gt;
+#include &quot;fast.h&quot;
+
+/* MACRO TO GEN STANDARD STATE MACHINE VARS */
+#define STDVARS int (*func)(); int state; struct machine_struct *caller
+/* &quot;ROOT CLASS&quot; OF STATE MACHINE */
+typedef struct machine_struct {
+    STDVARS;
+    } machine_t;
+/* MACRO TO GEN SETUP CODE FOR A CLASS OF MACHINE */
+#define PROLOGUE(typ,f)\
+    typ *p = (typ*)malloc(sizeof(*p));\
+    extern int f();\
+    p-&gt;caller = caller;\
+    p-&gt;func = f;\
+    p-&gt;state = 0;\
+    (*p-&gt;func)(p);
+/* BREAK STATEMENT */
+#define BREAK(n,lab) p-&gt;state=(n); enque(p); return; lab:
+/* CALL STATEMENT */
+#define CALL(n,lab,expr) p-&gt;state=(n); (expr); return; lab:
+machine_t * ptemp=NULL;
+int retn_val=0;
+/* RETURN STATEMENT */
+#define RETURN(v)\
+    ptemp=p-&gt;caller;\
+    retn_val=(v);\
+    free(p);\
+    if (ptemp){(*ptemp-&gt;func)(ptemp);};
+/* THE GLOBAL WAIT QUEUE */
+int enq=0, deq=0, ninq=0;
+machine_t *queue[256];
+enque(p) machine_t *p;{
+    queue[enq++] = p;
+    if (enq&gt;=256) enq=0;
+    ninq++;
+    }
+machine_t * deque(){
+    machine_t *p = NULL;
+    if (ninq){
+        p = queue[deq++];
+        if (deq&gt;=256) deq=0;
+        ninq--;
+        }
+    return(p);
+    }
+/* -------- APPLICATION CODE -------------- */
+int jobs_started=0;
+int jobs_completed=0;
+
+#define NBOPS (rand()%5 + 10)
+#define NTASK 10
+#define NJOBS 100
+/* MAIN() */
+main(){
+    machine_t *p;
+    /* REPEAT UNTIL ALL JOBS ARE COMPLETE */
+    while(jobs_completed &lt; NJOBS){
+        /* RUN WHATEVER CAN BE RUN */
+        if (ninq){
+            p = deque();
+            (*p-&gt;func)(p);
+            }
+        /* IF &lt; 100 JOBS STARTED AND &lt; 10 JOBS IN PROCESS */
+        if (jobs_started&lt;NJOBS &amp;&amp; jobs_started-jobs_completed &lt; 10){
+            /* START ANOTHER JOB */
+            job(NULL);
+            }
+        }
+    }
+/* JOB_T: A SUBCLASS OF STATE MACHINE */
+typedef struct {
+    STDVARS;
+    int jobid;
+    int i;
+    int nbops;
+    } job_t;
+/* JOB(): CREATE AND START A JOB */
+job(caller) machine_t *caller;{
+    PROLOGUE(job_t,job_func);
+    }
+/* JOB_FUNC(): CONTROL PROCEDURE FOR A JOB */
+job_func(p) job_t *p;{
+    DISPATCH1;
+    p-&gt;jobid = jobs_started++;
+    p-&gt;nbops = NBOPS;
+    /* FOR EACH OPERATION */
+    for (p-&gt;i=0; p-&gt;i &lt; p-&gt;nbops; p-&gt;i++){
+        /* PERFORM THE OPERATION */
+        CALL(1,L1,opn(p));
+        }
+    jobs_completed++;
+    printf(&quot;Ack Job %d\n&quot;,p-&gt;jobid);
+    RETURN(1);
+    }
+/* OPN_T: OPERATION STATE MACHINE */
+typedef struct {
+    STDVARS;
+    int taskid;
+    int ntask;
+    } opn_t;
+opn(caller) machine_t *caller;{
+    PROLOGUE(opn_t,opn_func);
+    }
+opn_func(p) opn_t *p;{
+    DISPATCH2;
+    p-&gt;ntask = NTASK;
+    /* FOR EACH OPERATION */
+    for (p-&gt;taskid=0; p-&gt;taskid &lt; p-&gt;ntask; p-&gt;taskid++){
+        /* PERFORM DEVICE CONTROL TASK */
+        CALL(1,L1,dev_ctl(p));
+        /* PERFORM MATERIAL HANDLING TASK */
+        CALL(2,L2,mh_ctl(p));
+        }
+    RETURN(1);
+    }
+/* DEV_CTL_T: DEVICE CONTROL TASK STATE MACHINE */
+typedef struct {
+    STDVARS;
+    } dev_ctl_t;
+dev_ctl(caller) machine_t *caller;{
+    PROLOGUE(dev_ctl_t,dev_ctl_func);
+    }
+dev_ctl_func(p) dev_ctl_t *p;{
+    DISPATCH1;
+    /* IT'S A NO-OP.  DELAY A LITTLE AND RETURN */
+    BREAK(1,L1);
+    RETURN(1);
+    }
+/* MH_CTL_T: MATERIAL HANDLING TASK STATE MACHINE */
+typedef struct {
+    STDVARS;
+    } mh_ctl_t;
+mh_ctl(caller) machine_t *caller;{
+    PROLOGUE(mh_ctl_t,mh_ctl_func);
+    }
+mh_ctl_func(p) mh_ctl_t *p;{
+    DISPATCH1;
+    /* IT'S A NO-OP.  DELAY A LITTLE AND RETURN */
+    BREAK(1,L1);
+    RETURN(1);
+    }
+
+
+<a name="02f9_0013"><a name="02f9_0014"></pre><B>[LISTING TWO]</B><pre><a name="02f9_0014">
+
+/* fast.c */
+
+#include &lt;stdio.h&gt;
+#include &quot;fast.h&quot;
+
+#pragma check_stack(off)
+#define STDVARS int state; int (*func)(); struct machine_struct *caller
+
+typedef struct machine_struct {
+    STDVARS;
+    } machine_t;
+/* STACK STRUCTURES FOR CACHEING USED STATE MACHINES */
+struct mstk_struct {
+    int n;
+    struct machine_struct *stk[64];
+    };
+#define M_ALLOC(mstk,size,p) {\
+    if (mstk.n &lt;= 0) p = (struct machine_struct*)malloc(size);\
+    else p = mstk.stk[--mstk.n];\
+    }
+#define M_FREE(mstk,p) {\
+    if (mstk.n &gt;= 64) free(p);\
+    else mstk.stk[mstk.n++] = p;\
+    }
+#define PROLOGUE(typ,f,stk)\
+    register typ *p;\
+    extern int f();\
+    M_ALLOC(stk,sizeof(*p),p);\
+    p-&gt;caller = caller;\
+    p-&gt;func = f;\
+    p-&gt;state = 0;\
+    (*p-&gt;func)(p);
+#define BREAK(n,lab) p-&gt;state=(n); ENQUE(p); return; lab:
+#define CALL(n,lab,expr) p-&gt;state=(n); (expr); return; lab:
+
+machine_t * ptemp=NULL;
+int retn_val=0;
+#define RETURN(v,stk)\
+    ptemp=p-&gt;caller;\
+    retn_val=(v);\
+    M_FREE(stk,p);\
+    if (ptemp){(*ptemp-&gt;func)(ptemp);};
+
+unsigned int ninq=0;
+machine_t *queue[256];
+machine_t **enq = queue, **deq = queue;
+
+#define ENQUE(p) {*enq++ = p; if (enq&gt;=(queue+256)) enq=queue; ninq++;}
+#define DEQUE(p) {p = *deq++; if (deq&gt;=(queue+256)) deq=queue; ninq--;}
+
+int jobs_started=0;
+int jobs_completed=0;
+#define NBOPS (rand()%5 + 10)
+#define NTASK 10
+int njobs = 1000;
+main(){
+    register machine_t *p;
+    /* REPEAT UNTIL ALL JOBS ARE COMPLETE */
+    while(jobs_completed &lt; njobs){
+        /* RUN WHATEVER CAN BE RUN */
+        if (ninq){
+            DEQUE(p);
+            (*p-&gt;func)(p);
+            }
+        /* IF &lt; 100 JOBS STARTED AND &lt; 10 JOBS IN PROCESS */
+        if (jobs_started&lt;njobs &amp;&amp; jobs_started-jobs_completed &lt; 10){
+            /* START ANOTHER JOB */
+            job(NULL);
+            }
+        }
+    }
+/* JOB_T: SUBCLASS OF MACHINE */
+struct mstk_struct jobstk;
+typedef struct {
+    STDVARS;
+    int jobid;
+    int i;
+    int nbops;
+    int taskid, ntask;
+    } job_t;
+job(caller) machine_t *caller;{
+    PROLOGUE(job_t,job_func,jobstk);
+    }
+job_func(p) register job_t *p;{
+    DISPATCH2;
+    p-&gt;jobid = jobs_started++;
+    p-&gt;nbops = NBOPS;
+    /* FOR EACH OPERATION */
+    for (p-&gt;i=0; p-&gt;i &lt; p-&gt;nbops; p-&gt;i++){
+        p-&gt;ntask = NTASK;
+        /* FOR EACH TASK */
+        for (p-&gt;taskid=0; p-&gt;taskid &lt; p-&gt;ntask; p-&gt;taskid++){
+            /* DO DEVICE CONTROL */
+            BREAK(1,L1);
+            /* DO MATERIAL HANDLING */
+            BREAK(2,L2);
+            }
+        }
+    jobs_completed++;
+    RETURN(1,jobstk);
+    }
+
+
+
+
+
+</pre><HR><P>Copyright &copy; 1993, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

@@ -1,0 +1,157 @@
+<html>
+<head>
+<title>Apr02: Implementing the JMS Publish/Subscribe API</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Implementing the JMS Publish/Subscribe API</h1>
+<p><i>Dr. Dobb's Journal</i> April 2002</p>
+<h2>Point-to-point or publish/subscribe &#151; take your pick</h2>
+
+<h3>By Philip Rousselle</h3>
+
+<I>
+Philip develops network management software for Advent Networks in Austin, Texas. He can be reached at <a href="mailto:prousselle@hotmail.com">prousselle@hotmail.com</a>.</I>
+
+<hr>
+
+<p>For many distributed applications, it is more convenient for components to communicate using asynchronous message passing than to use RPC semantics, which are the basis for CORBA- and DCE-based middleware. To this end, Sun's Java Message Service (JMS) API (<a href="http://java.sun.com/products/jms">http://java.sun.com/products/jms</a>) provides a powerful message-passing API. Many commercial JMS implementations are available.</p>
+<p>JMS supports two complementary messaging models: point-to-point and publish/subscribe. With the point-to-point model, the middleware provides message-passing queues. Message producers place messages on queues and message consumers retrieve them. In most situations, each message placed on a queue is retrieved by a single consumer. The publish/subscribe model, on the other hand, replaces the notion of a point-to-point queue with a publish/subscribe topic. Messages published to a topic are typically delivered to multiple subscribers. Point-to-point semantics are useful in situations where the task that will process a message may not be online when it is produced, or where load balancing can be achieved by having the least busy message consumer process the next available message. Publish/subscribe communications are most useful when multiple processes need to receive the same piece of information. The chatroom application described in "Publish, Subscribe, &amp; the JMS API," by Philip Rousselle and Daniel Greff (<i>DDJ</i>, July 2000) is a good example of this. Any situation where information such as stock quotes, sports scores, or news events need to be transmitted to a large number of interested parties lends itself to use of publish/subscribe middleware. In my work in network management systems, I've found that communicating alarms to multiple components of a management system using publish/subscribe middleware eases programming and improves performance. </p>
+<DDJADVERTISEMENT INLINE>
+
+<p>In spite of the utility of publish/subscribe communications, most JMS implementations are designed to optimize point-to-point performance. In these systems, publish/subscribe functionality is implemented with an additional layer of software (a publish/subscribe message broker) that utilizes underlying message queues. This approach does not exploit some optimizations possible in a publish/subscribe environment. However, an open-source implementation of the JMS API called "Presumo" (<a href="http://www.presumo.com/">http://www.presumo.com/</a>), designed by Daniel Greff, provides the highest possible performance and scalability for publish/subscribe communications. In this article, I describe some of the characteristics of publish/ subscribe-oriented distributed applications and discuss how the design of Presumo JMS capitalizes on them.</p>
+
+
+
+<h3>JMS Publish/Subscribe Applications</h3>
+
+
+<p>Components of a JMS publish/subscribe application communicate with each other through a transparent middleware topology; see <A NAME="rf1"><A HREF="0204bf1.htm">Figure 1</A>. That is, each client registers its intent to publish or subscribe on a particular topic with its JMS server. Multiple servers may be interconnected for scalability (<A NAME="rf2"><A HREF="0204bf2.htm">Figure 2</A>). The applications attached to the servers are not aware of the server topology. Each client simply sends messages to, or receives messages from, the server it is attached to. Of course, the key to the scalability and performance of the middleware lies in intelligently routing messages through the server topology. <A NAME="rf2"><A HREF="0204bf2.htm">Figure 2</A> shows a topology of seven servers and five active clients using two topics. The only two subscribers to Topic A are attached to servers 2 and 5. Because these two servers are adjacent, only two of the seven servers in the topology need to be involved in the routing of messages on Topic A. </p>
+
+
+<p>The goal of optimizing the performance of publish/subscribe middleware generally boils down to preventing a message from flowing from one server to another, unless the transmission is necessary to get the message to an interested consumer. If the only information the middleware had to go on were the topics that clients are publishing on or subscribed to, the processing would be straightforward. However, the JMS API also allows subscribers to specify other criteria, beyond a message's topic, that must be satisfied before the message is delivered. This second criterion is a content filter. A message is only delivered to a subscriber if it is published on the subscriber's topic and the message's contents satisfy the subscriber's filter. Managing message filtering is the key to the JMS publish/subscribe middleware's performance.</p>
+
+
+
+<h3>JMS Content-Based Filtering</h3>
+
+
+<p>A JMS message consists of a header containing properties (name/value pairs, some defined by the JMS standard and others defined by the application) and a payload. The payload is never examined by the middleware. Each subscriber, using a syntax similar to a SQL <i>where</i> clause, specifies a content filter string. When a message is published on the subscriber's topic, and the message's header properties causes the message's filter to evaluate to True, the message is delivered. For example, in the chatroom application presented in my previous article, each chatroom (sports, politics, and so on) was implemented as a JMS topic. A typical subscriber might have a filter string like:</p>
+
+
+<pre><p>
+((targetUser = 'all') OR (targetUser = 'phil'))<br>
+AND ((sender NOT IN ('dan', 'harry')<br>
+
+</pre>
+
+<p>This filter instructs the middleware to deliver only private messages directed to this user (<i>phil</i>) or messages directed to the entire chatroom except when the messages originate from the "ignored" users <i>dan</i> or <i>harry</i>. The JMS filtering capability lets you delegate some of the application logic to the middleware. It also gives the middleware additional information it can use to improve routing performance.</p>
+
+
+
+<h3>Optimizing Content-Based Filtering</h3>
+
+
+<p>The simplest way to perform content-based filtering in a JMS publish/subscribe implementation is to deliver each message to all JVMs subscribed to the message's topic. Then, JMS software running in the client's JVM can evaluate the local subscriber's filter and discard the message if the filter is not satisfied. While easy to implement, this approach is inefficient in many common situations. Consider the chatroom filtering scheme previously mentioned. In <A NAME="rf2"><A HREF="0204bf2.htm">Figure 2</A>, if Clients 2, 4, and 5 have joined a chatroom (represented by Topic B), but Clients 4 and 5 are ignoring Client 2, then messages published by Client 2 consume network and processing resources on five servers and two clients before they are discarded. Further, if private messages are sent between Clients 4 and 5, all these messages will travel through the server topology to Client 2 before being dropped. In applications where a significant number of messages are eliminated by content-based filtering, this technique of "filtering at the subscriber" tends to be inefficient.</p>
+
+
+<p>The approach taken in the Presumo JMS implementation is to push all the filters associated with a topic to the servers nearest the publishers on that topic. Filters are applied as soon as messages enter the topology. Each message flows between servers or from servers to clients only if the transmission is necessary to get the message to a subscriber who will actually consume it. Messages are never needlessly routed through the topology and delivered to subscribed JVMs, only to be passed through a subscriber's filter and discarded.</p>
+
+
+
+<h3>Intelligent Filtering on the Server </h3>
+
+
+<p>To illustrate how content-based publish/subscribe filtering is implemented in Presumo, consider the topology in <A NAME="rf2"><A HREF="0204bf2.htm">Figure 2</A>. If you assume the clients are participating in the chatroom application, and that no users are ignoring each other, then Client 4 would be using this filter:</p>
+
+
+<pre><p>
+(targetUser = 'all') OR (targetUser = '4')</p>
+
+</pre><p>Client 5 would use the similar filter:</p>
+
+
+<pre><p>
+(targetUser = 'all') OR (targetUser = '5')</p>
+
+</pre>
+
+<p>Both these filters would be pushed by Server 7 to Server 4 because Server 4 has a client publishing on Topic B. The mechanism for pushing filters (which is not the focus of this article) utilizes the underlying publish/subscribe infrastructure. Whenever a subscriber registers with a server, the server publishes a message containing the new filter to all servers hosting publishers on that Topic. So, in our example, if we imagine that Client 5 was the most recent addition to the topology, then when Client 5 registered its subscription, Server 7 would have published the new filter on a topic, only used for communication among servers, to which Server 4 was subscribed.</p>
+
+<p>Once the filters for Clients 4 and 5 were received by Server 4, Server 4 would build a new filter for Topic B by inserting an OR operation between all the filters it had received. Specifically, Server 4 would build this composite filter:</p>
+
+<pre><p>
+((targetUser = 'all') OR (targetUser = '4')) OR<br>
+((targetUser = 'all') OR (targetUser = '5'))<br>
+
+</pre><p>This filter would be applied to all messages published by Client 2. Any message that did not satisfy this filter would not flow from Server 4 to Server 2.</p>
+
+
+
+
+<h3>Optimizing Filter Evaluation</h3>
+
+
+<p>Clearly, the naive approach of pushing multiple filters towards publishers and concatenating them with OR will cause a variety of performance problems unless the number of filters is very small. The focus of the Presumo JMS design is to efficiently manage large filters and optimize their evaluation. The result is a recursive decent JMS filter parser implemented using JavaCC. </p>
+
+
+<p>Processing of JMS filters entails two largely independent tasks. The first is parsing the filter <i>String</i> supplied by the client into a set of Java objects that implement the desired operations. The second task is using the resulting control and data structures to determine how messages should be routed.</p>
+
+<p>Assume that in <A NAME="rf2"><A HREF="0204bf2.htm">Figure 2</A>, Client 2 joined the application first, then Client 4 and finally Client 5. When Client 4 joins, its filter will be pushed by Server 7 to Server 4. Again, Client 4's filter is:</p>
+
+<pre><p>
+(targetUser = 'all') OR (targetUser = '4')</p>
+
+</pre>
+
+<p>When Server 2 receives this filter, the JavaCC-based recursive decent parser processes it from the bottom up, one clause at a time. That is, it begins by processing <i>targetUser='all' </i>and builds the expression subtree in <A NAME="rf3"><A HREF="0204bf3.htm">Figure 3</A>. Before the parser adds any element to the expression tree it calls a static method to determine if the element already exists. When the parser encounters <i>targetUser='4',</i> it will detect that there is already a node in the expression tree for the variable <i>targetUser</i> and reuse this node. The result is the expression tree diagramed in <A NAME="rf4"><A HREF="0204bf4.htm">Figure 4</A>.</p>
+
+<p>When Client 5 joins the application, Server 4 replaces Client 4's filter with a composite filter that represents both Client 4's and Client 5's filters. Again, this composite filter is: </p>
+
+<pre><p>
+((targetUser = 'all') OR (targetUser = '4')) OR<br>
+((targetUser = 'all') OR (targetUser = '5'))<br>
+
+</pre>
+
+<p>In this composite filter, the variable <i>targetUser</i> appears four times and the expression <i>targetUser='all' </i>appears twice. The filter parser on Server 2 will find these characteristics of the expression and build the optimized expression tree given in <A NAME="rf5"><A HREF="0204bf5.htm">Figure 5</A>. In JMS applications, many of the clients running a particular application may use filters with common elements. Detecting these commonalties can reduce the complexity of compound filters.</p>
+
+<p>Once the compound filter is parsed by Server 4 into the expression tree of <A NAME="rf5"><A HREF="0204bf5.htm">Figure 5</A>, evaluating the expression for messages published by Client 2 is very efficient. The variable <i>targetUser</i> is retrieved from the message only once. If either subtree of an OR node evaluates True, the other subtree is not evaluated. In the case where <i>targetUser </i>is<i> 'all',</i> the evaluation logic will detect that this satisfies all the ORs between the comparison and the root of the expression tree. Evaluation of the entire expression tree will complete (in this case) after a single comparison and two logic operations.</p>
+
+<p>In addition to evaluating each filter efficiently, Presumo also uses logic to speed evaluations when multiple filters must be applied to a single message. For instance, in <A NAME="rf2"><A HREF="0204bf2.htm">Figure 2</A>, Server 7 might have to be concerned with these three filters for Topic B:</p>
+
+<pre><p>
+(targetUser = 'all') OR (targetUser = '2')<br>
+(targetUser = 'all') OR (targetUser = '4')<br>
+(targetUser = 'all') OR (targetUser = '5')</p>
+
+</pre>
+
+<p>When a message is published by Client 4, the first filter must be applied to see if the message needs to be forwarded to Server 4 and the third filter must be evaluated to determine if the message should be delivered to Client 5. In short, Server 7 has to use different filters for messages on Topic B depending on where the messages originate. Rather than building three independent expression trees, Server 7 builds a single multirooted expression tree (<A NAME="rf6"><A HREF="0204bf6.htm">Figure 6</A>). When Client 4 publishes a message with <i>targetUser</i> set to <i>'all',</i> Server 7 first evaluates the expression subtree corresponding to the left most root OR node in <A NAME="rf6"><A HREF="0204bf6.htm">Figure 6</A>. This will result in the <i>TargetUser='all'</i> comparison being performed, the subtree evaluating to True and the message being forwarded to Server 4. Then the subtree rooted in the right most root OR node must be evaluated to determine whether the message should flow to Client 5. When this evaluation is performed, results of comparisons and logic operations performed for the earlier evaluation are reused. Specifically, the subtree corresponding to <i>TargetUser='all' </i>still holds its "true" result from the earlier evaluation. The comparison will not be performed again. Because of this, the subtree corresponding to Client 5's filter will be evaluated (in this case) without performing any additional comparisons. In fact, no matter how many filters contain the clause <i>TargetUser= 'all',</i> the comparison will never be performed more than once on the same message.</p>
+
+
+
+<h3>Implementing the Point-to-Point API</h3>
+
+
+<p>The JMS API includes both publish/subscribe and point-to-point (message queue) semantics. Most JMS implementations, other than Presumo, are based on underlying queuing systems (such as IBM's MQSeries). In these systems, publish/subscribe functionality is implemented using an additional software layer that transports messages from publishers to subscribers using message queues. Because the Presumo JMS implementation is designed around a publish/subscribe routing approach, point-to-point semantics must be implemented with queue objects that actually use publish/subscribe topics (transparently) to move messages between clients putting messages on a queue and clients taking messages off a queue. </p>
+
+
+<p>The details of how publish/subscribe topics are used by queuing wrapper classes to synthesize point-to-point functionality in the Presumo JMS implementation is beyond the scope of the present discussion. Details can be found in documents on the Presumo web site. However, it is important to note that, just as point-to-point-oriented JMS implementations can support the publish/subscribe API by reusing their queue-oriented transport code, it is similarly possible to support point-to-point semantics without redesigning the transport infrastructure of a publish/subscribe JMS implementation.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>The JMS API supports both point-to-point and publish/subscribe semantics without favoring either. However, these two approaches to message passing middleware have different characteristics and require different transport layer implementations to maximize performance. Up until now, most JMS implementations have been implemented with software that optimizes point-to-point communication. These systems do not exploit many of the techniques that are possible to optimize publish/subscribe performance (like pushing subscriber filters toward publishers). </p>
+
+
+<p>The Presumo JMS implementation is among the first that seek to optimize publish/subscribe performance and scalability. Since most message passing applications lend themselves to either point-to-point or publish/subscribe solutions, application developers can choose the JMS implementation with the greatest affinity to the programming style they employ. Now that Presumo JMS offers a high-performance publish/subscribe implementation, programmers may be more comfortable designing publish/subscribe applications, and other JMS providers may consider implementing their own publish/subscribe optimizations.</p>
+
+
+<p><b>DDJ</b></p>
+</body>
+</html>

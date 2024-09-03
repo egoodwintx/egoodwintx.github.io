@@ -1,0 +1,149 @@
+
+<html>
+<head>
+<title>November, 2005: Linux Kernel Debugging</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Linux Kernel Debugging</h1>
+<p><i>Dr. Dobb's Journal</i> November, 2005</p>
+<h2>Using KDB in your next driver development project</h2>
+
+
+<h3>By Dean A. Gereaux</h3>
+
+
+<I>Dean is a consultant engineer and principal of Golden Bits Software. He can be contacted at deang@goldenbits.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Developing Linux kernel-level software can be a difficult task. Your code has to work well within the kernel (can't hog resources or hold spin locks for long periods of time), be multithreaded, and run smoothly on several Linux distributions. Depending on the product and driver, 40-50 percent of your development time will be spent testing your driver on different Linux distributions, with different system loads, and under a range of error conditions such as hardware failures or out-of-memory cases. No matter how the hardware fails or if the operating system is out of resources, your driver should never cause a panic. The bottom line is "test test test" and "debug debug debug." It isn't glamorous, but this is how solid products are created. </p>
+
+<p>Unfortunately, there isn't a lot of kernel-level debugging support in Linux. The only available stock tool (one that is always available) is the good old debug <i>printk()</i>. (Remember debugging your first program, "Hello World," with <i>printf()</i>? Ugh!) Print statements alone are completely inadequate when debugging any kernel code of moderate complexity. Fortunately for kernel developers, there is the Kernel Debugger (KDB). Although not part of the official kernel release from kernel.org, KDB has been around for a while and become the de facto kernel debugger of choice.</p>
+
+<p>In this article, I explain how to debug drivers with KDB, add hooks into KDB from your drivers, and create KDB modules. I also include several KDB tips and a sample driver (available electronically; see "Resource Center, page 4).</p>
+<h3>KDB Overview</h3>
+
+<p>KDB is an assembly-level debugger. To use it, you should be familiar with assembly to write and debug kernel code. It's handy if you can decode a stack trace and the assembly instructions that worked on the stack. There is also a good source-level kernel debugger called "kgdb" that supports the 2.4 and 2.6 kernels (see http://sourceforge.net/projects/kgdb/) and is worth investigating. If possible, you might want to set up two development systems or two different bootable kernels&#151;one with KDB and the other with kgdb. KDB provides a command-line interface from which you can run various debug commands to dump memory, view registers, look at stack traces, and more. Typing the <i>help</i> command or "?" at the KDB prompt displays all of the commands. The nice thing about KDB is that it's "lightweight," meaning it does not interfere or change the normal flow and timing of the kernel code during runtime. Unlike a source-level debugger, you do not have to compile your driver with debug information. Sometimes this extra debug information does change the timing of your driver, and this subtle difference can mask a bug.</p>
+
+<p>KDB is invoked when a breakpoint is hit, the system panics, or by the break key. The main entry point for KDB is <i>kdb()</i> in kdb/kdbmain.c; when invoked, KDB disables interrupts for the local processor, and stops the other processors and disables their interrupts. All interrupts are disabled (with the exception of nonmaskable interrupts) when KDB is invoked. If your hardware generates an interrupt request while you are in KDB, the request is ignored until you leave KDB.</p>
+<h3>Setup</h3>
+
+<p>You often hear that KDB is the Linux kernel's "built-in" debugger. In this case, "built-in" doesn't necessarily mean what you usually think. In fact, look hard when you download the kernel source (http:// www.kernel.org/). You won't find any KDB source, so you'll have to apply a KDB patch to your kernel. Kernel patches for KDB are available from ftp://oss .sgi.com/projects/kdb/download/, the latest being Version 4.4. But beware of these patches because they are usually written for a generic kernel from kernel.org and not for a specific distribution. As a result, sometimes these patches do not work for a specific distribution such as Red Hat or  Mandrake, and it's usually the distribution you need to test against! You might have to tweak the patch itself or hopefully the distribution contains a version of KDB that compiles and runs. For this article, I used the Mandrake 10.0 distribution, which does come with KDB already bundled with the kernel source. After the KDB patch has been applied, you need to turn on debugging via the kernel configuration menu and rebuild the kernel. The configuration menu selection is under "Kernel Hacking/Built-in Kernel Debugger" support. Two other menu selections of note are "KDB Modules" and "KDB Off by Default." </p>
+
+<p>KDB modules let you extend the functionality of KDB itself, a powerful feature. KDB Off by Default controls whether KDB is enabled at boot time or manually enabled by the user at a later time (off by default). If KDB is disabled and the kernel panics, KDB is not invoked. To enable KDB after boot, use the command <i>"echo "1" &gt; /proc/sys/kernel/kdb"</i>; to disable, use <i>"echo "0" &gt; /proc/sys/kernel/kdb"</i>. You can run KDB from the console or via a serial cable. Using a serial connection is preferable because if the kernel panics while the console is running X-Windows (rendering your keyboard useless), you can still use KDB via the serial cable. Terminal programs, such as Minicom, provide a history of commands and KDB output to which you can refer while debugging. To set up a serial connection, you need to configure the kernel to boot using the serial port as a console and a NULL modem cable. The details are documented in linux/Documentation/serialconsole.txt. Even if you are not using KDB, it's handy to have a serial console to save any kernel messages while debugging. For example, if an overnight test is running and in the morning the system is hung, hopefully there will be some useful debug information on the serial console.</p>
+
+<p>You can also configure KDB to your personal preferences by using the kdb_cmds text file. This file can contain environment variables such as number of lines to display and KDB commands such as breakpoints. However, since this file is compiled into KDB itself, you must recompile KDB whenever you make any changes. </p>
+<h3>Common Commands</h3>
+
+<p>When you drop into KDB, the KDB prompt displays on the console terminal (or minicom if connected via serial line). From the KDB command prompt, you can start entering debugging commands. Type the "?" for a listing of commands. <a name="rf1"></a><a href="0511gf1.html">Figure 1</a> is  sample output of the KDB <i>help</i> command. Some useful debugging commands are:</p>
+
+
+
+<ul>
+  <li><i>id.</i> Disassembles instructions at a specific address. You can use the instruction pointer address to find the name of a function. Here's where you need to understand some assembly code. When the kernel panics, the instruction pointer (IP) at the time of the panic is saved. From this IP, you can use the <i>id</i> command to disassemble the code. <a name="rf2"></a><a href="0511gf2.html">Figure 2</a> is sample output from the <i>id</i> command. From this assembly, you can then figure out where in the source code the panic occurred. To help determine the exact location of the panic, compile your source code into just the assembly part by using the "<i>-S</i>" option with GCC. The result is assembly intermixed with source-code line numbers.</li>
+  <li><i>ss</i>. Single steps an instruction.</li>
+  <li><i>bp.</i> Sets a breakpoint.</li>
+  <li><i>mm.</i> Looks at memory. You can also modify memory contents.</li>
+  <li><i>dmesg</i>. Prints messages in the kernel message buffer. This lets you view the most recent system messages before KDB was invoked.</li>
+</ul>
+<h3>KDB Modules, Extending KDB,  &amp; Custom KDB Commands</h3>
+
+<p>A powerful KDB feature is the ability to extend KDB's functionality by adding your own debugging module, referred to as a "KDB module." This lets you add debugging commands&#151;specific to your driver&#151;directly into KDB itself. A KDB module is a kernel module, similar to a device driver, that registers itself with KDB when it is loaded. Like drivers, KDB modules contain <i>module_init()</i> and <i>module_exit()</i> functions and are loaded into the kernel using the <i>insmod</i> command.</p>
+
+<p>When the module is loaded, the function <i>kdb_register()</i> is called for each command you wish to register with KDB. In the sample KDB module that I provide (available electronically), the function <i>tank_kdbm_init()</i> in the source file tank_kdbm.c contains the code that registers a debug command with KDB. The prototype of the <i>kdb_register()</i> function is:</p>
+
+<blockquote>
+kdb_register(char *cmd, kdb_func_t func,<br>
+   char *usage,char *help, short minlen);<br>
+
+</blockquote>
+
+<p>where <i>cmd</i> is a pointer to the command string (this is the actual command used at the KDB prompt); <i>func</i> is a pointer to the function KDB calls when this command is entered; <i>usage</i> describes how this command is issued and lists any arguments for this command; <i>help</i> is the help text; and <i>minlen</i> is the minimum length of the command and also lets you abbreviate commands.</p>
+
+<p>Note the <i>func</i> argument. This is a pointer to a function that is called when the command, pointed to by the <i>*cmd</i> argument, is executed from the KDB prompt. This function is where you actually implement (via code) your debugging command. If you look at the KDB source file, kdbmain.c, you notice that all of the debugging commands are registered with the function <i>kdb_register()</i>. Also, there is a <i>kdb_unregister()</i> function that must be called when your module or driver unloads. If you don't unregister your debug command, KDB has no knowledge that the command and function for that command is no longer loaded. When the command is executed from the KDB prompt, the old function pointer is called (which by now points to some random memory) and Boom!&#151;panic. How do you create your own KDB module? Registering the KDB command is straightforward&#151;simply call the <i>kdb_register()</i>. But what about the function KDB calls? </p>
+
+<p>Whenever you add a KDB command, you also have to supply a corresponding function for this command. The function prototype is:</p>
+
+<blockquote>
+static int<br>
+  debug_func(int argc, const char **argv,<br>
+  const char **envp, struct pt_regs *regs)<br>
+
+</blockquote>
+
+<p>where <i>argc</i> is the number of arguments passed to the debug command; <i>**argv</i> is the pointer to the array of arguments (identical to how arguments are passed to a <i>main()</i> function); <i>**envp</i> is a pointer to the array of environment variables; and <i>*regs</i> is a pointer to the registers (can be NULL).</p>
+
+<p>This debug function is called by KDB directly and is executed while KDB has control of the system. As such, when writing your debug function, keep in mind the execution context of your debug function: The system is halted, interrupts are disabled, the kernel panics, memory might be corrupted, and who knows what else.</p>
+
+<p>Because of this context, you probably will be limited in the amount and type of things you can do within your debug function. You can call other kernel functions and subsystems (such as the network stack), but because the kernel is probably in an unstable state (which is why you are in the debugger), these calls may not be successful and will further destabilize the kernel. It is best to keep your debug function simple; limit the work to the specific debug command. Usually you will want to dump some data structures or set/reset some values within your driver. After these warnings and suggestions, remember that it is your code and project, so if you need to perform any complex debugging work (such as sending debug output over a network connection), then go for it. </p>
+
+<p>KDB provides a set of functions you should use whenever possible, which are exported from kdbmain.c. Some of the commonly used KDB functions are <i>kdb_printf()</i>, <i>kdb_getarea_size()</i>, <i>kdb_putarea_size()</i>, and <i>kdb_getenv()</i>. For more details, check the KDB code itself.</p>
+
+<p>It is often necessary to pass arguments with your debug command, such as the number of lines to display. In the sample KDB module, the number of lines to display is passed as an argument for both the <i>tankdata</i> and <i>tankthrd</i> debug commands. Arguments are passed using the <i>argc</i> and <i>**argv</i> parameters, just like a <i>main()</i> function. The number of arguments is contained in <i>argc</i>, and a pointer for each argument is contained in the char array pointed to by <i>**argv</i>. </p>
+
+<p>In addition to creating a standalone KDB module that you can load (via <i>insmod</i>) to debug your driver, you can also register KDB commands using the <i>kdb_register()</i> function directly from your driver. A separate module isn't necessary. The kernel build define, CONFIG_KDB, lets you conditionally define KDB functions (using <i>kdb_register()</i>, <i>kdb_unregister()</i>, and so on). In the sample code, the driver contains two KDB debug functions, <i>kdb_TankDataArray</i> and <i>kdb_ TankThrdState</i>. Both of these functions are exported from the driver and called directly by <i>dump_tankdata()</i> and <i>tank_threadstate()</i> in the sample KDB module tank_kdbm.ko. This illustrates how you can hook into KDB from a module or directly from your driver. The debug functions themselves, <i>kdb_TankDataArray</i> and <i>kdb_TankThrdState</i> (both located in the driver), dump the tank data array and thread state.</p>
+<h3>Debugging Tips and Tricks with KDB</h3>
+
+<p>Because KDB is an assembly debugger, it is difficult to figure out what's on the stack or in memory. However, if you create a global variable in your driver, then you can refer to this global by its symbolic name when using the KDM display memory command (<i>mm</i>).</p>
+
+<p>For example, declare this in your driver:</p>
+
+<blockquote>
+ulong g_currentstate;<br>
+
+</blockquote>
+
+<p>Update this variable in your driver as necessary (per your logic flow). When KDB is invoked, you can easily display or modify the contents using the command, <i>mm g_currentstate</i>. </p>
+
+<p>Another technique is to create a circular buffer containing debug statements and save the pointer to the buffer in a global variable along with the current index (last entry made in buffer). When the kernel panics or another error condition occurs, you can use KDB to dump the contents of the buffer by using the global pointer. This gives you a snapshot of activity and any recent errors that your driver has logged. This is really an old technique, but one that is helpful and usually implemented in most driver or embedded projects.</p>
+
+<p>If your driver uses any tables or key data structures such as a structure containing device information, then you can create a KDB command to display the contents of the tables or any data structure in a nice, readable format. This is where a custom KDB command is ideal, because you can extend KDB to display or modify driver-specific information.</p>
+
+<p>How often have you seen the comment, "This cannot happen" in a source file? Nope, no way should the code be executing here. Right? I'm guilty of writing this comment and have been proven wrong when, yes, the code actually does execute these particular lines of code. In situations such as this, you can invoke KDB directly from your driver by simply using the macro, <i>KDB_ENTER()</i> (defined in include/asm/kdb.h). This freezes the execution of your driver and enables you to debug your code and hopefully answer the question: Why is the code executing in the wrong place?</p>
+
+<p>The sample driver contains an example of invoking KDB directly by using the sample user application. The user application uses the <i>IOCTL_FORCE_KDB ioctl()</i> call. Invoking KDB directly is great when your code detects a corrupted link list, invalid state, or an unknown input. You can freeze the driver state when the error occurred. This is especially helpful if you are running an overnight test and this error condition occurs during the night. In the morning, you can examine the state of your driver. </p>
+
+<p>Because you have access to the kernel source, you can directly modify the kernel panic function to display debug information specific to your driver. To do this, create a function pointer as a global variable within the kernel itself. When your driver loads, set this pointer to a function within your driver; when the system panics, check if the function pointer is NULL. If not, then call the function (which is in your driver) using the function pointer directly from the panic code. When your driver unloads, set the global function pointer to NULL. Unless you are building your driver directly into the kernel, you need to create a global variable because your exported debug function is not known to the kernel at boot time. The kernel panic function is called <i>panic()</i> and is in the kernel source file, kernel/panic.c. This is handy when the system panics because you can display debug information for your driver. While this technique is not KDB specific, it is good to know.</p>
+<h3>KDB Sample Driver</h3>
+
+<p>The sample driver I include with this article is a <i>char</i> driver that monitors the air pressure of a scuba tank during testing. Because of the high pressure used, scuba tanks have to be hydrostatically tested every five years. This test consists of filling the tank with water, submerging the filled tank within a larger test tank also filled with water, and then pressurizing the water within the tank. As the water within the scuba tank is pressurized, the tank itself expands; the amount of tank expansion is measured and must fall within a specific range. This procedure tests the strength of the tank itself. (An interesting web page that describes this procedure in more detail can be found at http://www.deep-six.com/page37.htm.)</p>
+
+<p>The sample driver monitors the pressure within the tank and the amount of expansion the tank experiences during the testing cycle. A real-world monitoring system would use some type of external hardware (like a PCI card or USB device) connected to the specialized test system to provide the real numbers; for our purposes, the sample driver generates sample data internally. There are two data types: tank pressure and tank expansion. The sample driver maintains a circular queue of tank pressure and expansion using an array of structures of <i>tank_test_data_t</i> (defined in tank_ioctl.h). When the driver loads, the function <i>InitMonitor()</i> initializes this queue; the pointer to the queue buffer is saved in the driver structure <i>tank_mon_device_t</i>. A kernel thread, <i>TestDataThread</i>, is used to simulate a real device that would measure tank pressure and expansion. The sample application, tankapp, uses a set of <i>ioctl</i> commands to start, stop, and reset the thread. The sample application is also used to read the actual tank data and invoke KDB directly.</p>
+<h3>KDB Debug</h3>
+
+<p>Given this sample driver, how can you use KDB to help debug? The sample code presents two KDB commands&#151;one displays the thread state and the other dumps the contents of the circular buffer. In this sample, the circular queue contains tank pressure and stretch, but queues are common structures used by device drivers. Disk I/O, events, network packets, cell packets, and pending actions are examples of things that get queued by different drivers. In addition to KDB commands, the driver invokes KDB directly when the user application calls the <i>IOCTL_FORCE_KDB ioctl</i> command (by running the command <i>tankapp-k</i>).</p>
+
+<p>The KDB module source code is located in tank_kdbm.c and registers the KDB commands <i>tankdata</i> and <i>tankthrd</i> when loaded. The sample driver registers the KDBM commands, <i>tkdata_drv</i> and <i>tkthrd_drv</i>, when it loads. The KDB module and driver both ultimately call the driver functions <i>kdb_TankDataArray</i> and <i>kdb_TankThrdState</i> implemented in the driver. The KDB <i>help</i> command displays the commands registered by the driver and standalone KDB module.</p>
+
+<p>To run the debug commands from the KDB prompt, enter these commands:</p>
+
+<blockquote>
+tkdata_drv 10 <br>
+tankthrd <br>
+
+</blockquote>
+
+<p>The first command displays 10 lines of tank test data, while the second displays thread state. <a name="rf3"></a><a href="0511gf3.html">Figure 3</a> is sample output from the KDB commands.</p>
+<h3>Conclusion</h3>
+
+<p>KDB is a powerful tool and you should use it whenever you are developing a driver of any complexity. After reading this article and studying the sample driver, you should be able to incorporate KDB into your next driver. </p>
+
+
+
+
+
+
+<p><b>DDJ</b></p>
+
+
+
+
+</body>
+</html>

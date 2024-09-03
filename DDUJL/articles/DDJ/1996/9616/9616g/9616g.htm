@@ -1,0 +1,735 @@
+<HTML>
+<META NAME="year" CONTENT="1996">
+<HEAD>
+<!-- This document was built using HyperWriter Professional by NTERGAID Inc. -->
+<TITLE>Visual Tools 96:  Ramblings In Real Time</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<P>
+
+<h1>Sorted Spans in Action</h1><P>
+
+<P>
+
+<h3>Michael Abrash</h3><P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+<i>Michael is the author of Zen of Graphics Programming, Second Edition, and Zen of Code Optimization. He
+is currently pushing the envelope of real-time 3-D on Quake at id Software. He can be contacted at
+mikeab@idsoftware.com.</i></p><hr><P>
+
+<P>
+
+Last time, we dove headlong into the intricacies of hidden surface removal (HSR) by way of z-sorted
+(actually, 1/z-sorted) spans. At the end, I noted that we were currently using 1/z-sorted spans in
+<I>Quake</I>, but it was unclear whether we'd switch back to BSP order. Well, it's clear now: We're back
+to sorting spans by BSP order.<P>
+
+In Robert A. Heinlein's wonderful story "The Man Who Sold the Moon," the chief engineer of the Moon rocket
+project tries to figure out how to get a payload of three astronauts to the Moon and back. He starts out with
+a four-stage rocket design, but finds that it won't do the job, so he adds a fifth stage. The fifth stage helps,
+but not quite enough, "Because," he explains, "I've had to add in too much dead weight, that's why." (The
+dead weight is the control and safety equipment that goes with the fifth stage.) He then tries adding yet
+another stage, only to find that the sixth stage actually results in a net slowdown. In the end, he has to give
+up on the three-person design and build a one-person spacecraft instead.<P>
+
+1/z-sorted spans in <I>Quake</I> turned out pretty much the same way. Before explaining why, though, I'd
+first like to note that this column is very technical and builds heavily on previously covered material;
+reading the last column is strongly recommended, and reading the six columns before that (which cover BSP
+trees, 3-D clipping, and 3-D math) might be a good idea as well. I regret that I can't make this column stand
+completely on its own, but the truth is that commercial-quality 3-D graphics programming requires more
+knowledge and code than did the 2-D graphics I've written about in years past. And make no mistake about
+it, this is commercial-quality stuff; in fact, the code in this column uses the same sorting technique as the
+test version of <I>Quake</I>, qtest1.zip, that we recently placed on the Internet. These columns are
+reports from the leading edge, and I trust that you'll be patient if careful rereading and some catch-up
+reading of prior columns are required to absorb everything. Besides, the ultimate reference for any design
+is working code, which you'll find in part in <a href="9616g.htm#029e_0141">Listing One </A>and in its
+entirety in ftp.idsoftware.com/mikeab/ddjzsort.zip.<P>
+
+<h3><I>Quake</I> and Sorted Spans</h3><P>
+
+As you'll recall from last time, <I>Quake</I> uses sorted spans to get zero overdraw while rendering the
+world, thereby both improving overall performance and leveling frame rates by speeding up scenes that
+would otherwise experience heavy overdraw. Our original design used spans sorted by BSP order; because
+we traverse the world BSP tree from front to back relative to the viewpoint, the order in which BSP nodes
+are visited is a guaranteed front-to-back sorting order. We simply gave each node an increasing BSP
+sequence number as it was visited, set each polygon's sort key to the BSP sequence number of the node
+(BSP splitting plane) it lay on, and used those sort keys when generating spans.<P>
+
+In a change from earlier designs, polygons now are stored on nodes, rather than leaves, which are the
+convex subspaces carved out by the BSP tree. Visits to potentially visible leaves are used only to mark that
+the polygons that touch those leaves are visible and need to be drawn, and each marked polygon is then
+drawn after everything in front of its node has been drawn. This results in less BSP splitting of polygons,
+which is A Good Thing, as explained later.<P>
+
+This worked flawlessly for the world, but had a couple of downsides. First, it didn't address the issue of
+sorting small, moving BSP models such as doors: Those models could be clipped into the world BSP tree's
+leaves and assigned sort keys corresponding to the leaves into which they fell, but that left the question of
+how to sort multiple BSP models in the same world leaf against each other. Second, strict BSP order
+requires that polygons be split so that every polygon falls entirely within a single leaf. This can be
+stretched by putting polygons on nodes, allowing for larger polygons on average, but even then, polygons
+still need to be split so that every polygon falls within the bounding volume for the node on which it lies. The
+end result, in either case, is more and smaller polygons than if BSP order weren't used--and that, in turn,
+means lower performance, because more polygons must be clipped, transformed, and projected, more
+sorting must be done, and more spans must be drawn.<P>
+
+We figured that if only we could avoid those BSP splits, <I>Quake</I> would get a lot faster. Accordingly,
+we switched from sorting on BSP order to sorting on 1/z, and left our polygons unsplit. Things did get
+faster at first, but not as much as we had expected, for two reasons.<P>
+
+First, as the world BSP tree is descended, we clip each node's bounding box in turn to see if it's inside or
+outside each plane of the view frustum. The clipping results can be remembered, and they often allow the
+avoidance of some or all clipping for the node's polygons. For example, all polygons in a node that has a
+trivially accepted bounding box are likewise guaranteed to be unclipped and in the frustum, since they all lie
+within the node's volume and need no further clipping. This efficient clipping mechanism vanished as soon as
+we stepped out of BSP order, because a polygon was no longer necessarily confined to its node's volume.<P>
+
+Second, sorting on 1/z isn't as cheap as sorting on BSP order, because floating-point calculations and
+comparisons are involved, rather than integer compares. So <I>Quake</I> got faster, but, like Heinlein's
+fifth rocket stage, there was clear evidence of diminishing returns.<P>
+
+That wasn't the bad part; after all, even a small speed increase is a good thing. The real problem was that
+our initial 1/z sorting proved to be unreliable. We first ran into problems when two forward-facing
+polygons started at a common edge, because it was hard to tell which one was really in front (as I'll soon
+discuss), and we had to do additional floating-point calculations to resolve these cases. This fixed the
+problems for a while, but then odd cases started popping up where just the right combination of polygon
+alignments caused new sorting errors. We tinkered with those too, adding more code and incurring
+additional slowdowns in the process. Finally, we had everything working smoothly again, although by this
+point <I>Quake</I> was back to pretty much the same speed it had been with BSP sorting.<P>
+
+And then yet another crop of sorting errors popped up.<P>
+
+We could have fixed those errors too; we'll take a quick look at how to deal with such cases shortly.
+However, like the sixth rocket stage, the fixes would have made <I>Quake</I> slower than it had been with
+BSP sorting, so we gave up and went back to BSP order. Now the code is simpler, and sorting works
+reliably. It's too bad our experiment didn't work out, but it wasn't wasted time because we learned quite a
+bit. In particular, we learned that the information provided by a simple, reliable world-ordering mechanism
+such as a BSP tree can do more good than is immediately apparent, in terms of both performance and solid
+code.<P>
+
+Nonetheless, sorting on 1/z can be a valuable tool, used in the right context; drawing a <I>Quake</I> world
+just doesn't happen to be such a case. In fact, sorting on 1/z is how we're now handling the sorting of
+multiple BSP models that lie within the same world leaf in <I>Quak</I><I>e</I>; here we don't have the
+option of using BSP order (because we're drawing multiple independent trees), so we've set restrictions on
+the BSP models to avoid running into the types of 1/z sorting errors we encountered drawing the
+<I>Quake</I> world. There is another application in which sorting on 1/z is quite useful--one where objects
+move freely through space. As is so often the case in 3-D, there is no one "right" technique, but rather a
+great many different techniques, each handy in the right situation. Often, a combination of techniques is
+beneficial.<P>
+
+For the remainder of this column, I'm going to look at the three main types of 1/z span sorting, then discuss
+a sample 3-D app built around 1/z span sorting.<P>
+
+<h3>Types of 1/z Span Sorting</h3><P>
+
+With 1/z span sorting, all the polygons in a scene are treated as sets of screenspace pixel spans, and 1/z
+(where z is the distance from the viewpoint in viewspace, as measured along the viewplane normal) is used
+to sort the spans so that the nearest span overlapping each pixel is drawn. As discussed in my previous
+column, in the sample program, we'll actually do all our sorting with polygon edges, which represent spans
+in an implicit form.<P>
+
+There are three types of 1/z span sorting, each requiring a different implementation. In order of increasing
+speed and decreasing complexity, they are as follows: intersecting, abutting, and independent. (These are
+names of my own devising; I haven't come across any standard nomenclature.)<P>
+
+<h3>Intersecting-Span Sorting</h3><P>
+
+Intersecting-span sorting occurs when polygons can interpenetrate. Thus, two spans may cross such that
+part of each span is visible. In this case, the spans have to be split and drawn appropriately, as in <a href="1997029f.htm">Figure 1</A>.<P>
+
+Intersecting is the slowest and most complicated type of span sorting, because it is necessary to compare
+1/z values at two points in order to detect interpenetration, and additional work must be done to split the
+spans as necessary. Thus, although intersecting-span sorting certainly works, it's not the first choice for
+performance.<P>
+
+<h3>Abutting-Span Sorting</h3><P>
+
+Abutting-span sorting occurs when polygons that are not part of a continuous surface can butt up against
+each other, but don't interpenetrate, as in <a href="199702a0.htm">Figure 2</A>. This is the sorting
+used in <I>Quake</I>, where objects like doors often abut walls and floors, and it turns out to be more
+complicated than you might think. The problem is that when an abutting polygon starts on a given scan line,
+as with polygon B in <a href="199702a1.htm">Figure 2</A>, it starts at exactly the same 1/z value as
+the polygon it abuts, in this case, polygon A, so additional sorting is needed. Of course, the two-point
+sorting used for intersecting polygons would work, but we'd like to find something faster.<P>
+
+As it turns out, the additional sorting for abutting polygons is actually quite simple; whichever polygon has
+a greater 1/z gradient with respect to screen x (that is, whichever polygon is heading fastest toward the
+viewer along the scan line) is the front one. The hard part is identifying when ties--that is, abutting
+polygons--occur; due to floating-point imprecision, as well as fixed-point, edge-stepping imprecision that
+can move an edge slightly on the screen, calculations of 1/z from the combination of screen coordinates and
+1/z gradients (as discussed last time) can be slightly off, so most tie cases will show up as near matches,
+not exact matches. This imprecision makes it necessary to perform two comparisons, one with an adjust-up
+by a small epsilon and one with an adjust-down, creating a range in which near-matches are considered
+matches. Fine-tuning this epsilon to catch all ties without falsely reporting close-but-not-abutting edges as
+ties proved to be troublesome in <I>Quake</I>, and the epsilon calculations and extra comparisons slowed
+things down.<P>
+
+Abutting 1/z span sorting could have been made reliable enough for production use in <I>Quake</I>, except
+that we share edges between adjacent polygons, so that the world is a large polygon mesh. When a polygon
+ends and is followed by an adjacent polygon that shares the edge that just ended, we simply assume that the
+adjacent polygon sorts relative to other active polygons in the same place as the one that ended (because
+the mesh is continuous and there's no interpenetration), rather than doing a 1/z sort from scratch. This
+speeds things up by saving a lot of sorting, but it means that if there is a sorting error, a whole string of
+adjacent polygons can be sorting incorrectly, pulled in by the one missorted polygon. Missorting is a very
+real hazard when a polygon is nearly perpendicular to the screen, so that the 1/z calculations push the
+limits of numeric precision, especially in single-precision floating point.<P>
+
+Many caching schemes are possible with abutting-span sorting, because any given pair of polygons, being
+noninterpenetrating, will sort in the same order throughout a scene. However, in <I>Quake</I> at least, the
+benefits of caching sort results were outweighed by the additional overhead of maintaining the caching
+information, and every caching variant we tried actually slowed <I>Quake</I> down.<P>
+
+<h3>Independent-Span Sorting</h3><P>
+
+Finally, we come to independent-span sorting, the simplest and fastest of the three and the type used in <a href="9616g.htm#029e_0144">Listing One</A>. Here, polygons never intersect or touch any other
+polygons except adjacent polygons with which they form a continuous mesh. This means that when a polygon
+starts on a scan line, a single 1/z comparison between that polygon and the polygons it overlaps on the
+screen is guaranteed to produce correct sorting, with no extra calculations or tricky cases to worry
+about.<P>
+
+Independent-span sorting is ideal for scenes with lots of moving objects that never actually touch each
+other, such as a space battle. Next, we'll look at an implementation of independent 1/z span sorting.<P>
+
+<h3>1/z Span Sorting in Action</h3><P>
+
+<a href="9616g.htm#029e_0144">Listing One</A> is a portion of a program that demonstrates
+independent 1/z span sorting. This program is based on the sample 3-D clipping program from my
+March/April column; however, the earlier program did HSR by simply z-sorting whole objects and drawing
+them back to front, while <a href="9616g.htm#029e_0144">Listing One </A>draws all polygons by
+way of a 1/z-sorted edge list. Consequently, where the earlier program worked only if object centers
+correctly described sorting order, <a href="9616g.htm#029e_0144">Listing One</A> works
+properly for all combinations of nonintersecting and nonabutting polygons. In particular, <a href="9616g.htm#029e_0144">Listing One</A> correctly handles concave polyhedra; a new L-shaped
+object (the data for which is not included in<a href="9616g.htm#029e_0144"> Listing One</A>) has
+been added to the sample program to illustrate this capability. The ability to handle complex shapes
+makes<a href="9616g.htm#029e_0144"> Listing One</A> vastly more useful for real-world
+applications than the earlier 3-D clipping demo.<P>
+
+By the same token, <a href="9616g.htm#029e_0144">Listing One</A> is quite a bit more complicated
+than the earlier code. The earlier code's HSR consisted of a z-sort of objects, followed by the drawing of
+the objects in back-to-front order, one polygon at a time. Apart from the simple object sorter, all that was
+needed was backface culling and a polygon rasterizer.<P>
+
+<a href="9616g.htm#029e_0142">Listing One</A> replaces this simple pipeline with a three-stage HSR
+process. After backface culling, the edges of each of the polygons in the scene are added to the global-edge
+list, by way of <I>AddPolygonEdges()</I>. After all edges have been added, the edges are turned into spans
+by <I>ScanEdges()</I>, with each pixel on the screen being covered by one, and only one, span (that is,
+there's no overdraw). Once all the spans have been generated, they're drawn by <I>DrawSpans()</I>, and
+rasterization is complete.<P>
+
+There's nothing tricky about <I>AddPolygonEdges()</I>. <I>DrawSpans()</I>, as implemented in <a href="9616g.htm#029e_0143">Listing One</A>, is straightforward as well. In an implementation that
+supported texture mapping, however, all the spans wouldn't be put on one global span list and drawn at
+once, as is done in <a href="9616g.htm#029e_0144">Listing One,</A> because that would result in
+drawing spans from all the surfaces in no particular order. (A surface is a drawing object that's originally
+described by a polygon, but in <I>ScanEdges()</I> there is no polygon in the classic sense of a set of
+vertices bounding an area, rather, just a set of edges and a surface that describes how to draw the spans
+outlined by those edges.) That would mean constantly skipping from one texture to another, which in turn,
+would hurt processor cache coherency a great deal, and would also cause considerable overhead in setting
+up gradient and perspective calculations each time a surface was drawn. In <I>Quake</I>, we have a linked
+list of spans hanging off each surface, and we draw all the spans for one surface before moving on to the
+next surface.<P>
+
+The core of <a href="9616g.htm#029e_0145">Listing One</A>, and the most complex aspect of
+1/z-sorted spans, is <I>ScanEdges()</I>, where the global edge list is converted into a set of spans
+describing the nearest surface at each pixel. This process is actually pretty simple, though, if you think of
+it as follows.<P>
+
+For each scan line, there is a set of active edges, or edges that intersect the scan line. A good part of
+<I>ScanEdges()</I> is dedicated to adding any edges that first appear on the current scan line (scan lines
+are processed from the top scan line on the screen to the bottom), removing edges that reach their bottom
+on the current scan line, and x-sorting the active edges so that the active edges for the next scan can be
+processed from left to right. This per-scan-line maintenance is basically just linked-list insertion, deletion,
+and sorting.<P>
+
+The heart of the action is the loop in <I>ScanEdges()</I> that processes the edges on the current scan line
+from left to right, generating spans as needed. The best way to think of this loop is as a surface-event
+processor, where each edge is an event with an associated surface. Each leading edge is an event marking
+the start of its surface on that scan line; if the surface is nearer than the current nearest surface, then a
+span ends for the nearest surface, and a span starts for the new surface. Each trailing edge is an event
+marking the end of its surface; if its surface is currently nearest, then a span ends for that surface, and a
+span starts for the next-nearest surface (the surface with the next-largest 1/z at the coordinate where
+the edge intersects the scan line). One handy aspect of this event-oriented processing is that leading and
+trailing edges need not be explicitly paired, because they are implicitly paired by pointing to the same
+surface. This saves memory and time that would otherwise be needed to track edge pairs.<P>
+
+One more element is required in order for <I>ScanEdges()</I> to work efficiently. Each time a leading or
+trailing edge occurs, it must be determined whether its surface is nearest (at a larger 1/z value than any
+currently active surface). In addition, for leading edges, the current topmost surface must be known. For
+trailing edges, it may be necessary to know the current next-to-topmost surface. The easiest way to
+accomplish this is with a surface stack; that is, a linked list of all currently active surfaces, starting with
+the nearest surface and progressing toward the farthest surface, which is always the background surface.
+(The operation of this sort of edge-event-based stack was described and illustrated in the May/June
+column.) Each leading edge causes its surface to be 1/z-sorted into the surface stack, with a span emitted
+if necessary. Each trailing edge causes its surface to be removed from the surface stack, again with a span
+emitted if necessary. As you can see from<a href="9616g.htm#029e_0146"> Listing One</A>, it takes a
+fair bit of code to implement this, but all that's really going on is a surface stack driven by edge events.<P>
+
+<h3>Implementation Notes</h3><P>
+
+Finally, a few notes on<a href="9616g.htm#029e_0144"> Listing One</A>. First, you'll notice that
+although we clip all polygons to the view frustum in worldspace, we nonetheless later clamp them to valid
+screen coordinates before adding them to the edge list. This catches any cases where arithmetic
+imprecision results in clipped polygon vertices that are a bit outside the frustum. I've only found such
+imprecision to be significant at very small z distances, so clamping would probably be unnecessary if there
+were a near clip plane. It might not even be needed in <a href="9616g.htm#029e_0144">Listing
+One,</A> because of the slight nudge inward that we give the frustum planes (as described in the
+March/April column). However, my experience has consistently been that relying on worldspace or
+viewspace clipping to produce valid screen coordinates 100 percent of the time leads to sporadic and
+hard-to-debug errors.<P>
+
+There is no separate clear of the background in <a href="9616g.htm#029e_0144">Listing One</A>.
+Instead, a special background surface at an effectively infinite distance is added, so whenever no polygons
+are active the background color is drawn. If desired, it's a simple matter to flag the background surface and
+draw the background specially. For example, the background could be drawn as a star field or a cloudy
+sky.<P>
+
+The edge-processing code in <a href="9616g.htm#029e_0144">Listing One</A> is fully capable of
+handling concave polygons as easily as convex polygons, and can handle an arbitrary number of vertices per
+polygon, as well. One change is needed for the latter case: Storage for the maximum number of vertices per
+polygon must be allocated in the polygon structures. In a fully polished implementation, vertices would be
+linked together or pointed to and would be allocated dynamically from a vertex pool so each polygon
+wouldn't have to contain enough space for the maximum possible number of vertices.<P>
+
+Each surface has a field named <I>state</I>, which is incremented when a leading edge for that surface is
+encountered, and decremented when a trailing edge is reached. A surface is activated by a leading edge only
+if <I>state</I> increments to 1, and is deactivated by a trailing edge only if <I>state</I> decrements to 0.
+This is another guard against arithmetic problems, in this case, quantization during the conversion of
+vertex coordinates from floating point to fixed point. Due to this conversion, it is possible, although rare,
+for a polygon that is viewed nearly edge-on to have a trailing edge that occurs slightly before the
+corresponding leading edge, and the span-generation code will behave badly if it tries to emit a span for a
+surface that hasn't started yet. It would help performance if this sort of fix-up could be eliminated by
+careful arithmetic, but I haven't yet found a way to do so for 1/z-sorted spans.<P>
+
+Lastly,<a href="9616g.htm#029e_0147"> Listing One</A> uses the gradients for 1/z with respect to
+changes in screen x and y to calculate 1/z for active surfaces each time a leading edge needs to be sorted
+into the surface stack. The natural origin for gradient calculations is the center of the screen, which is
+(x,y) coordinate (0,0) in viewspace. However, when the gradients are calculated in
+<I>AddPolygonEdges()</I>, the origin value is calculated at the upper left corner of the screen. This is done
+so that screen x and y coordinates can be used directly to calculate 1/z, with no need to adjust the
+coordinates to be relative to the center of the screen. Also, the screen gradients grow more extreme as a
+polygon is viewed closer to edge-on. To keep the gradient calculations from becoming meaningless or
+generating errors, a small epsilon is applied to backface culling, so polygons that are very nearly edge-on
+are culled. This calculation would be more accurate if it were based directly on the viewing angle, rather
+than on the dot product of a viewing ray to the polygon with the polygon normal, but that would require a
+square root. In my experience, the epsilon used in <a href="9616g.htm#029e_0148">Listing One</A>
+works fine.<P>
+
+<h3>Bretton Wade's BSP Web Page has Moved</h3><P>
+
+A while back, I mentioned that Bretton Wade was constructing a promising Web site on BSPs. He has moved
+that site, which has grown to contain a lot of useful information, to http://www.qualia .com/bspfaq/.
+Alternatively, you can e-mail bspfaq@qualia.com with a subject line of "help".<P>
+
+<P>
+
+<P>
+
+<B>Figure 1:</B> Intersecting-span sorting. Polygons A and B are viewed from above.<P>
+
+<P>
+
+<P>
+
+<B>Figure 2:</B> Abutting-span sorting. Polygons A and B are viewed from above.<P>
+
+<P>
+
+<P>
+
+<P>
+
+<a name="029e_0147"><a name="029e_0146"><a name="029e_0144"><a name="029e_0143"><a name="029e_0142"><a name="029e_0141"><a name="029e_0145"><a name="029e_0148"><H4>Listing  One</H4>
+<pre>
+// Part of Win32 program to demonstrate z-sorted spans. Whitespace removed for
+// space. Full source code available at ftp.idsoftware.com/mikeab/ddjzsort.zip.
+#define MAX_SPANS           10000
+#define MAX_SURFS           1000
+#define MAX_EDGES           5000
+typedef struct surf_s {
+    struct surf_s   *pnext, *pprev;
+    int             color, visxstart, state;
+    double          zinv00, zinvstepx, zinvstepy;
+} surf_t;
+typedef struct edge_s {
+    int             x, xstep, leading;
+    surf_t          *psurf;
+    struct edge_s   *pnext, *pprev, *pnextremove;
+} edge_t;
+// Span, edge, and surface lists
+span_t  spans[MAX_SPANS];
+edge_t  edges[MAX_EDGES];
+surf_t  surfs[MAX_SURFS];
+// Bucket list of new edges to add on each scan line
+edge_t  newedges[MAX_SCREEN_HEIGHT];
+// Bucket list of edges to remove on each scan line
+edge_t  *removeedges[MAX_SCREEN_HEIGHT];
+// Head and tail for the active edge list
+edge_t  edgehead, edgetail;
+// Edge used as sentinel of new edge lists
+edge_t  maxedge = {0x7FFFFFFF};
+// Head/tail/sentinel/background surface of active surface stack
+surf_t  surfstack;
+// pointers to next available surface and edge
+surf_t  *pavailsurf;
+edge_t  *pavailedge;
+
+// Returns true if polygon faces the viewpoint, assuming a clockwise
+// winding of vertices as seen from the front.
+int PolyFacesViewer(polygon_t *ppoly, plane_t *pplane)
+{
+    int     i;
+    point_t viewvec;
+
+    for (i=0 ; i&lt;3 ; i++)
+        viewvec.v[i] = ppoly-&gt;verts[0].v[i] - currentpos.v[i];
+    // Use an epsilon here so we don't get polygons tilted so
+    // sharply that the gradients are unusable or invalid
+    if (DotProduct (&amp;viewvec, &amp;pplane-&gt;normal) &lt; -0.01)
+        return 1;
+    return 0;
+}
+// Add the polygon's edges to the global edge table.
+void AddPolygonEdges (plane_t *plane, polygon2D_t *screenpoly)
+{
+    double  distinv, deltax, deltay, slope;
+    int     i, nextvert, numverts, temp, topy, bottomy, height;
+    edge_t  *pedge;
+
+    numverts = screenpoly-&gt;numverts;
+    // Clamp the polygon's vertices just in case some very near
+    // points have wandered out of range due to floating-point imprecision
+    for (i=0 ; i&lt;numverts ; i++) {
+        if (screenpoly-&gt;verts[i].x &lt; -0.5)
+            screenpoly-&gt;verts[i].x = -0.5;
+        if (screenpoly-&gt;verts[i].x &gt; ((double)DIBWidth - 0.5))
+            screenpoly-&gt;verts[i].x = (double)DIBWidth - 0.5;
+        if (screenpoly-&gt;verts[i].y &lt; -0.5)
+            screenpoly-&gt;verts[i].y = -0.5;
+        if (screenpoly-&gt;verts[i].y &gt; ((double)DIBHeight - 0.5))
+            screenpoly-&gt;verts[i].y = (double)DIBHeight - 0.5;
+    }
+    // Add each edge in turn
+    for (i=0 ; i&lt;numverts ; i++) {
+        nextvert = i + 1;
+        if (nextvert &gt;= numverts)
+            nextvert = 0;
+        topy = (int)ceil(screenpoly-&gt;verts[i].y);
+        bottomy = (int)ceil(screenpoly-&gt;verts[nextvert].y);
+        height = bottomy - topy;
+        if (height == 0)
+            continue;       // doesn't cross any scan lines
+        if (height &lt; 0) {
+            // Leading edge
+            temp = topy;
+            topy = bottomy;
+            bottomy = temp;
+            pavailedge-&gt;leading = 1;
+            deltax = screenpoly-&gt;verts[i].x -
+                     screenpoly-&gt;verts[nextvert].x;
+            deltay = screenpoly-&gt;verts[i].y -
+                     screenpoly-&gt;verts[nextvert].y;
+            slope = deltax / deltay;
+            // Edge coordinates are in 16.16 fixed point
+            pavailedge-&gt;xstep = (int)(slope * (float)0x10000);
+            pavailedge-&gt;x = (int)((screenpoly-&gt;verts[nextvert].x +
+                ((float)topy - screenpoly-&gt;verts[nextvert].y) *
+                slope) * (float)0x10000);
+        } else {
+            // Trailing edge
+            pavailedge-&gt;leading = 0;
+            deltax = screenpoly-&gt;verts[nextvert].x -
+                     screenpoly-&gt;verts[i].x;
+            deltay = screenpoly-&gt;verts[nextvert].y -
+                     screenpoly-&gt;verts[i].y;
+            slope = deltax / deltay;
+            // Edge coordinates are in 16.16 fixed point
+            pavailedge-&gt;xstep = (int)(slope * (float)0x10000);
+            pavailedge-&gt;x = (int)((screenpoly-&gt;verts[i].x +
+                ((float)topy - screenpoly-&gt;verts[i].y) * slope) *
+                (float)0x10000);
+        }
+        // Put the edge on the list to be added on top scan
+        pedge = &amp;newedges[topy];
+        while (pedge-&gt;pnext-&gt;x &lt; pavailedge-&gt;x)
+            pedge = pedge-&gt;pnext;
+        pavailedge-&gt;pnext = pedge-&gt;pnext;
+        pedge-&gt;pnext = pavailedge;
+        // Put the edge on the list to be removed after final scan
+        pavailedge-&gt;pnextremove = removeedges[bottomy - 1];
+        removeedges[bottomy - 1] = pavailedge;
+        // Associate the edge with the surface we'll create for this polygon
+        pavailedge-&gt;psurf = pavailsurf;
+        // Make sure we don't overflow the edge array
+        if (pavailedge &lt; &amp;edges[MAX_EDGES])
+            pavailedge++;
+    }
+    // Create the surface, so we'll know how to sort and draw from the edges
+    pavailsurf-&gt;state = 0;
+    pavailsurf-&gt;color = currentcolor;
+    // Set up the 1/z gradients from the polygon, calculating the base value at
+    // screen coordinate 0,0 so we can use screen coordinates directly when 
+    // calculating 1/z from the gradients
+    distinv = 1.0 / plane-&gt;distance;
+    pavailsurf-&gt;zinvstepx = plane-&gt;normal.v[0] * distinv *
+            maxscreenscaleinv * (fieldofview / 2.0);
+    pavailsurf-&gt;zinvstepy = -plane-&gt;normal.v[1] * distinv *
+            maxscreenscaleinv * (fieldofview / 2.0);
+    pavailsurf-&gt;zinv00 = plane-&gt;normal.v[2] * distinv -
+            xcenter * pavailsurf-&gt;zinvstepx -
+            ycenter * pavailsurf-&gt;zinvstepy;
+    // Make sure we don't overflow the surface array
+    if (pavailsurf &lt; &amp;surfs[MAX_SURFS])
+        pavailsurf++;
+}
+// Scan all the edges in the global edge table into spans.
+void ScanEdges (void)
+{
+    int     x, y;
+    double  fx, fy, zinv, zinv2;
+    edge_t  *pedge, *pedge2, *ptemp;
+    span_t  *pspan;
+    surf_t  *psurf, *psurf2;
+
+    pspan = spans;
+    // Set up the active edge list as initially empty, containing
+    // only the sentinels (which are also the background fill). Most
+    // of these fields could be set up just once at start-up
+    edgehead.pnext = &amp;edgetail;
+    edgehead.pprev = NULL;
+    edgehead.x = -0xFFFF;           // left edge of screen
+    edgehead.leading = 1;
+    edgehead.psurf = &amp;surfstack;
+    edgetail.pnext = NULL;          // mark edge of list
+    edgetail.pprev = &amp;edgehead;
+    edgetail.x = DIBWidth &lt;&lt; 16;    // right edge of screen
+    edgetail.leading = 0;
+    edgetail.psurf = &amp;surfstack;
+    // Background surface is the entire stack initially, and is infinitely far
+    // away, so everything sorts in front of it. Could be set once at start-up
+    surfstack.pnext = surfstack.pprev = &amp;surfstack;
+    surfstack.color = 0;
+    surfstack.zinv00 = -999999.0;
+    surfstack.zinvstepx = surfstack.zinvstepy = 0.0;
+    for (y=0 ; y&lt;DIBHeight ; y++) {
+        fy = (double)y;
+        // Sort in any edges that start on this scan
+        pedge = newedges[y].pnext;
+        pedge2 = &amp;edgehead;
+        while (pedge != &amp;maxedge) {
+            while (pedge-&gt;x &gt; pedge2-&gt;pnext-&gt;x)
+                pedge2 = pedge2-&gt;pnext;
+            ptemp = pedge-&gt;pnext;
+            pedge-&gt;pnext = pedge2-&gt;pnext;
+            pedge-&gt;pprev = pedge2;
+            pedge2-&gt;pnext-&gt;pprev = pedge;
+            pedge2-&gt;pnext = pedge;
+            pedge2 = pedge;
+            pedge = ptemp;
+        }
+        // Scan out the active edges into spans. Start out with left background
+        // edge already inserted, and surface stack containing only background
+        surfstack.state = 1;
+        surfstack.visxstart = 0;
+        for (pedge=edgehead.pnext ; pedge ; pedge=pedge-&gt;pnext) {
+            psurf = pedge-&gt;psurf;
+            if (pedge-&gt;leading) {
+                // It's a leading edge. Figure out where it is relative to the
+                // current surfaces and insert in the surface stack; it it's on
+                // top, emit the span for the current top.
+                // First, make sure the edges don't cross
+                if (++psurf-&gt;state == 1) {
+                    fx = (double)pedge-&gt;x * (1.0 / (double)0x10000);
+                    // Calculate the surface's 1/z value at this pixel
+                    zinv = psurf-&gt;zinv00 + psurf-&gt;zinvstepx * fx +
+                            psurf-&gt;zinvstepy * fy;
+                    // See if that makes it a new top surface
+                    psurf2 = surfstack.pnext;
+                    zinv2 = psurf2-&gt;zinv00 + psurf2-&gt;zinvstepx * fx +
+                            psurf2-&gt;zinvstepy * fy;
+                    if (zinv &gt;= zinv2) {
+                        // It's a new top surface
+                        // emit the span for the current top
+                        x = (pedge-&gt;x + 0xFFFF) &gt;&gt; 16;
+                        pspan-&gt;count = x - psurf2-&gt;visxstart;
+                        if (pspan-&gt;count &gt; 0) {
+                            pspan-&gt;y = y;
+                            pspan-&gt;x = psurf2-&gt;visxstart;
+                            pspan-&gt;color = psurf2-&gt;color;
+                            // Make sure we don't overflow
+                            // the span array
+                            if (pspan &lt; &amp;spans[MAX_SPANS])
+                                pspan++;
+                        }
+                        psurf-&gt;visxstart = x;
+                        // Add the edge to the stack
+                        psurf-&gt;pnext = psurf2;
+                        psurf2-&gt;pprev = psurf;
+                        surfstack.pnext = psurf;
+                        psurf-&gt;pprev = &amp;surfstack;
+                    } else {
+                        // Not a new top; sort into surface stack. Guaranteed
+                        // to terminate due to sentinel background surface
+                        do {
+                            psurf2 = psurf2-&gt;pnext;
+                            zinv2 = psurf2-&gt;zinv00 +
+                                    psurf2-&gt;zinvstepx * fx +
+                                    psurf2-&gt;zinvstepy * fy;
+                        } while (zinv &lt; zinv2);
+                        // Insert the surface into the stack
+                        psurf-&gt;pnext = psurf2;
+                        psurf-&gt;pprev = psurf2-&gt;pprev;
+                        psurf2-&gt;pprev-&gt;pnext = psurf;
+                        psurf2-&gt;pprev = psurf;
+                    }
+                }
+            } else {
+                // It's a trailing edge; if this was the top surface, emit the
+                // span and remove it. First, make sure the edges didn't cross
+                if (--psurf-&gt;state == 0) {
+                    if (surfstack.pnext == psurf) {
+                        // It's on top, emit the span
+                        x = ((pedge-&gt;x + 0xFFFF) &gt;&gt; 16);
+                        pspan-&gt;count = x - psurf-&gt;visxstart;
+                        if (pspan-&gt;count &gt; 0) {
+                            pspan-&gt;y = y;
+                            pspan-&gt;x = psurf-&gt;visxstart;
+                            pspan-&gt;color = psurf-&gt;color;
+                            // Make sure we don't overflow
+                            // the span array
+                            if (pspan &lt; &amp;spans[MAX_SPANS])
+                                pspan++;
+                        }
+                        psurf-&gt;pnext-&gt;visxstart = x;
+                    }
+                    // Remove the surface from the stack
+                    psurf-&gt;pnext-&gt;pprev = psurf-&gt;pprev;
+                    psurf-&gt;pprev-&gt;pnext = psurf-&gt;pnext;
+                }
+            }
+        }
+        // Remove edges that are done
+        pedge = removeedges[y];
+        while (pedge) {
+            pedge-&gt;pprev-&gt;pnext = pedge-&gt;pnext;
+            pedge-&gt;pnext-&gt;pprev = pedge-&gt;pprev;
+            pedge = pedge-&gt;pnextremove;
+        }
+        // Step the remaining edges one scan line, and re-sort
+        for (pedge=edgehead.pnext ; pedge != &amp;edgetail ; ) {
+            ptemp = pedge-&gt;pnext;
+            // Step the edge
+            pedge-&gt;x += pedge-&gt;xstep;
+            // Move the edge back to the proper sorted location,
+            // if necessary
+            while (pedge-&gt;x &lt; pedge-&gt;pprev-&gt;x) {
+                pedge2 = pedge-&gt;pprev;
+                pedge2-&gt;pnext = pedge-&gt;pnext;
+                pedge-&gt;pnext-&gt;pprev = pedge2;
+                pedge2-&gt;pprev-&gt;pnext = pedge;
+                pedge-&gt;pprev = pedge2-&gt;pprev;
+                pedge-&gt;pnext = pedge2;
+                pedge2-&gt;pprev = pedge;
+            }
+            pedge = ptemp;
+        }
+    }
+    pspan-&gt;x = -1;  // mark the end of the list
+}
+// Draw all the spans that were scanned out.
+void DrawSpans (void)
+{
+    span_t  *pspan;
+    for (pspan=spans ; pspan-&gt;x != -1 ; pspan++)
+        memset (pDIB + (DIBPitch * pspan-&gt;y) + pspan-&gt;x,
+                pspan-&gt;color,
+                pspan-&gt;count);
+}
+// Clear the lists of edges to add and remove on each scan line.
+void ClearEdgeLists(void)
+{
+    int i;
+    for (i=0 ; i&lt;DIBHeight ; i++) {
+        newedges[i].pnext = &amp;maxedge;
+        removeedges[i] = NULL;
+    }
+}
+// Render the current state of the world to the screen.
+void UpdateWorld()
+{
+    HPALETTE        holdpal;
+    HDC             hdcScreen, hdcDIBSection;
+    HBITMAP         holdbitmap;
+    polygon2D_t     screenpoly;
+    polygon_t       *ppoly, tpoly0, tpoly1, tpoly2;
+    convexobject_t  *pobject;
+    int             i, j, k;
+    plane_t         plane;
+    point_t         tnormal;
+
+    UpdateViewPos();
+    SetUpFrustum();
+    ClearEdgeLists();
+    pavailsurf = surfs;
+    pavailedge = edges;
+    // Draw all visible faces in all objects
+    pobject = objecthead.pnext;
+    while (pobject != &amp;objecthead) {
+        ppoly = pobject-&gt;ppoly;
+        for (i=0 ; i&lt;pobject-&gt;numpolys ; i++) {
+            // Move the polygon relative to the object center
+            tpoly0.numverts = ppoly[i].numverts;
+            for (j=0 ; j&lt;tpoly0.numverts ; j++) {
+                for (k=0 ; k&lt;3 ; k++)
+                    tpoly0.verts[j].v[k] = ppoly[i].verts[j].v[k] +
+                            pobject-&gt;center.v[k];
+            }
+            if (PolyFacesViewer(&amp;tpoly0, &amp;ppoly[i].plane)) {
+                if (ClipToFrustum(&amp;tpoly0, &amp;tpoly1)) {
+                    currentcolor = ppoly[i].color;
+                    TransformPolygon (&amp;tpoly1, &amp;tpoly2);
+                    ProjectPolygon (&amp;tpoly2, &amp;screenpoly);
+                    // Move the polygon's plane into viewspace
+                    // First move it into worldspace (object relative)
+                    tnormal = ppoly[i].plane.normal;
+                    plane.distance = ppoly[i].plane.distance +
+                        DotProduct (&amp;pobject-&gt;center, &amp;tnormal);
+                    // Now transform it into viewspace
+                    // Determine the distance from the viewpont
+                    plane.distance -=
+                          DotProduct (&amp;currentpos, &amp;tnormal);
+                    // Rotate the normal into view orientation
+                    plane.normal.v[0] =
+                            DotProduct (&amp;tnormal, &amp;vright);
+                    plane.normal.v[1] =
+                            DotProduct (&amp;tnormal, &amp;vup);
+                    plane.normal.v[2] =
+                            DotProduct (&amp;tnormal, &amp;vpn);
+                    AddPolygonEdges (&amp;plane, &amp;screenpoly);
+                }
+            }
+        }
+        pobject = pobject-&gt;pnext;
+    }
+    ScanEdges ();
+    DrawSpans ();
+    // We've drawn the frame; copy it to the screen
+    hdcScreen = GetDC(hwndOutput);
+    holdpal = SelectPalette(hdcScreen, hpalDIB, FALSE);
+    RealizePalette(hdcScreen);
+    hdcDIBSection = CreateCompatibleDC(hdcScreen);
+    holdbitmap = SelectObject(hdcDIBSection, hDIBSection);
+    BitBlt(hdcScreen, 0, 0, DIBWidth, DIBHeight, hdcDIBSection,
+           0, 0, SRCCOPY);
+    SelectPalette(hdcScreen, holdpal, FALSE);
+    ReleaseDC(hwndOutput, hdcScreen);
+    SelectObject(hdcDIBSection, holdbitmap);
+    DeleteDC(hdcDIBSection);
+}
+
+</pre>
+
+</BODY></HTML>

@@ -1,0 +1,144 @@
+<HTML>   
+     <HEAD>
+<TITLE>July 2001 C++ Experts Forum/Object Interconnections</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.07/tocjul.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Object Interconnections: CORBA and XML, Part 2  &#151; XML as CORBA Data</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Douglas C. Schmidt and Steve Vinoski</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>In our previous column <a href="#1">[1]</a>, we discussed the relationship between CORBA and XML. We noted that the hype surrounding XML often conceals its real utility, which ultimately boils down to providing for structured  &#151; yet flexible  &#151; description and definition of data. XML's capabilities therefore mesh well with those of CORBA, which primarily focuses on system functionality rather than system data.</p>
+<p>We then explored the CORBA versioning problem, using an example bug tracking system to show how modifying IDL-defined data types to match system evolution could cause the system to break. Anytime we changed our data types using a type-safe approach, we needed to recompile and redeploy all our client and server applications. If we instead used a non-type-safe approach, our code became unwieldy to develop and maintain. We then briefly explained how using XML instead to define the data allowed our type definitions to evolve as needed without requiring us to recompile and redeploy all client and server applications based on that data.</p> 
+<p>In this column, we explore more of the relationship between CORBA and XML. Since our previous column advocated the passing of XML-defined data between client and server, we first discuss various alternatives for doing this. We then conclude the column with a brief discussion of SOAP and Web Services and how they relate to CORBA.</p> 
+
+<H3><FONT COLOR="#000080">XML as Strings</FONT></H3>
+
+<p>Because XML is textual, passing it around a CORBA system as a <b>string</b> is the most obvious way to handle it. Using the bug tracking system definitions from our previous column, for example, we could modify the <b>BugTracker</b> interface slightly to support XML-based strings for the <b>Bug</b> type definition:</p>
+
+<pre>interface BugTracker {   
+   exception NoSuchBug { long bugnum; };
+   typedef string Bug; // assume XML string contents
+   Bug get_details(in long bugnum) raises(NoSuchBug);
+   // ...
+};</pre>
+
+<p>There are multiple problems, however, with this approach:</p>
+
+<UL><LI>There is no way to guarantee that every implementation of the <b>BugTracker</b> interface will return an XML string describing the details of the desired bug. Because the <b>get_details</b> operation is defined to return a <b>string</b>, the ORB's marshaling subsystem will guarantee that a valid string is returned, or it will throw a <b>CORBA::MARSHAL</b> exception. But the ORB can do nothing more than that  &#151; it's not allowed to examine the contents of the <b>string</b> on behalf of the application to guarantee the <b>string</b> contents are valid XML.</LI>
+<LI>The <b>string</b> return type cannot handle character sets other than the CORBA standard ISO Latin-1, which will not work for some <b>BugTracker</b> implementations. It's not unusual to expect that under some circumstances, a bug might contain internationalized text  &#151; for example, a bug report could contain localized error messages as part of its detailed description. </LI>
+<LI>This approach can be inefficient. For example, the target might implement the <b>get_details</b> operation by creating an in-memory DOM (Document Object Model) tree <a href="#2">[2]</a>, populating it with data for the requested bug, converting the DOM tree into an XML string, and returning it. Then, to examine or display the bug data, the invoking client might convert the XML string back into a DOM tree. This means that the application is essentially taking on the burden of performing its own marshaling and demarshaling above the ORB level. In other words, it's letting the ORB handle the marshaling steps required to send data over the network, but it's treating the IDL <b>string</b> data that's exchanged at the ORB level as another marshaled form  &#151; specifically, a stringified DOM tree  &#151; representing its own application-specific data.</LI> 
+</UL>
+
+<p>Naturally, the severity of these problems depends entirely on the nature of the application. After all, there are CORBA applications already in production today that pass XML data between client and target in the form of IDL <b>strings</b>, and they work just fine. But not all applications fit this description. In particular, the severity of the third problem for a given application depends on the lengths of the XML strings the application deals with, and on the efficiency of the DOM implementation that the application employs.</p> 
+<p>As always, there are alternative approaches that applications can use to avoid these problems. For example, one obvious way to avoid the character set internationalization problem described above is to use <b>wstring</b> rather than <b>string</b>, which allows your XML documents to contain characters from character sets other than just ISO Latin-1. There are drawbacks to even this simple fix, however. For one thing, not all ORBs support the <b>wchar</b> or <b>wstring</b> types yet. Even for those ORBs that do support <b>wstring</b>, the needless complexity of the code-set negotiation aspects of GIOP might mean that your ORB's handling of wide characters is neither robust nor efficient, and thus not production-ready. Moreover, if for some reason your application requires the use of ORBs from two or more suppliers, the same code-set negotiation complexities may cause interoperability problems between the different ORBs. (In an ideal world, ORB suppliers would deliver functional and conforming implementations fully supporting <b>wchar</b> and <b>wstring</b>, but in practice this is not always the case.)</p> 
+
+<H3><FONT COLOR="#000080">Alternative Representations?</FONT></H3>
+
+<p>Given that passing XML data around your CORBA systems in string format seems to be fragile, we need to find still another format for representing XML data in a system. Reverting to <b>struct</b>s to represent our bug data is one approach, but given that we started out with <b>struct</b>s in our previous column and abandoned them in favor of XML due to versioning issues, it doesn't make much sense to go back there. The IDL <b>valuetype</b> suffers from the same versioning issues as <b>struct</b>s.</p>
+<p>Let's reexamine an example of our XML-based <b>bug</b> definition from our previous column:</p> 
+
+<pre>
+&lt;bug&gt;   
+   &lt;bugnum&gt;49938&lt;/bugnum&gt;   
+   &lt;synopsis&gt;DynStruct broken&lt;/synopsis&gt;   
+   &lt;owner&gt;vinoski&lt;/owner&gt;   
+   &lt;reported_by&gt;schmidt&lt;/reported_by&gt;   
+&lt;/bug&gt;
+</pre>
+
+<p>In XML terms, we have a <b>bug</b> element with four child elements named <b>bugnum</b>, <b>synopsis</b>, <b>owner</b>, and <b>reported_by</b>. Because XML fundamentally provides a way to represent structured information, this <b>bug</b> definition, as well as any XML document, can be naturally thought of as a hierarchy of nodes. All documents contain a &quot;root node&quot; that contains all other nodes in the document as child nodes. Other nodes might themselves have child nodes too. In our example, the root node has one child node named <b>bug</b>, which in turn has four child nodes as listed above. When handling such an XML hierarchy programmatically  &#151; using DOM for example  &#151; your program manipulates such a tree structure. For example, a pure XML-oriented program might first parse an XML file to create an in-memory tree representing the XML data, then manipulate either the nodes in the tree or the contents of the nodes (or both), and then finally write the tree back out to another file.</p> 
+<p>An alternative to a <b>string</b> XML representation in a CORBA application, therefore, might be as an XML data tree. One way to represent a tree structure in IDL is to use <b>struct</b>s and <b>sequence</b>s. For example, you could define a tree node in IDL like this:</p>
+
+<pre>
+   struct XMLElement;   
+   typedef sequence&lt;XMLElement&gt; XMLElementSeq;   
+
+   struct XMLAttr {   
+      wstring name;   
+      wstring value;   
+   };   
+   typedef sequence&lt;XMLAttr&gt; XMLAttrSeq;   
+
+   struct XMLElement {   
+      wstring name;   
+      wstring value;   
+      XMLAttrSeq attributes;   
+      XMLElementSeq children;   
+      // ...   
+   };   
+</pre>
+
+
+<p>Like a <b>string</b>, this tree structure can be passed from one CORBA application to another. It differs from the <b>string</b> approach, however, in that it avoids the need for the application to convert its XML data to and from a <b>string</b> representation when sending it to another process. Instead, it allows the application to send and receive its XML data directly as a tree structure, avoiding XML string parsing and its associated overhead.</p> 
+<p>Note that <b>XMLElement</b> contains a <b>sequence</b> of itself to simulate a tree structure. This type of definition normally requires the use of an anonymous type for the <b>sequence</b> member, but because anonymous types are problematic <a href="#3">[3]</a>, we've used a new IDL feature for avoiding anonymous types: the forward <b>struct</b> declaration. By forward declaring the <b>XMLElement</b> type, we can then correctly declare a <b>sequence</b> of its type, which we can then use inside the <b>XMLElement</b> type definition. Your ORB may not yet support this, but if your ORB supplier keeps up to date with respect to CORBA versions, you should have support for it soon. The old way of declaring a recursive <b>struct</b> type using an anonymous <b>sequence</b> will also still work, but it has been deprecated as of CORBA 2.4 <a href="#4">[4]</a>.</p> 
+<p>While this approach to modeling an XML tree in IDL will indeed work within an application, it's somewhat cumbersome and error-prone. In particular, the <b>XMLElement</b> type is a plain old data structure, and we know from years of OO programming that exposing fields in data structures is asking for trouble. Moreover, <b>sequences</b> have a minimal interface in the OMG C++ Mapping, making it hard when you want to add or remove children from the middle of the <b>sequence</b>.</p> 
+<p>In April 2001, the OMG formally adopted a new specification that solves these issues for us. The specification is called &quot;XMLDOM: DOM/Value Mapping Specification&quot; <a href="#5">[5]</a>. The DOM/Value mapping, like the original DOM, specifies an API that allows your application to build and traverse XML parse trees in memory. Unlike the original DOM specification, though, the DOM/Value mapping uses IDL <b>valuetypes</b> to represent the nodes in the XML tree. This approach has certain advantages, which we describe below.</p> 
+
+<H3><FONT COLOR="#000080">DOM/Value Mapping</FONT></H3>
+
+<p>If you look closely at the <b>XMLElement</b> type defined above, you'll see that it differs significantly from our previous approaches to defining data in IDL. Specifically, it avoids defining the data directly as we did with our <b>Bug</b> <b>struct</b> in our previous column, like this:</p>
+
+<pre>
+struct Bug {   
+   long bugnum;   
+   string synopsis;   
+   string owner;   
+};</pre>
+
+<p>Instead, the <b>XMLElement</b> type defines the characteristics of an XML element independent of the data it might hold. This is an important distinction because it allows <b>XMLElement</b> and its associated types to represent any XML data hierarchy, regardless of the shape of the hierarchy or the data it contains.</p>    
+<p>This approach to representing an XML tree in IDL is a key aspect of the OMG DOM/Value mapping. The specification contains definitions for node types that can compose an XML tree, but these node types are specified using IDL <b>valuetypes</b>, rather than IDL <b>interfaces</b> as in the original DOM specification. Because <b>valuetypes</b> support operations, it means that nodes can supply operations for their own manipulation, rather than directly exposing their data members to the whole application. More importantly, because <b>valuetypes</b> are transmissible, unlike <b>interfaces</b> (remember, CORBA objects are themselves not transmissible, only their object references are), it means that applications can send and receive XML data directly as a tree structure rather than having to convert to and from a stringified format. For applications that manipulate a lot of XML data, this feature can help greatly with performance by avoiding the inefficiencies associated with stringified format conversions. Note that this feature differs from that of the original DOM, where trees are represented as hierarchies of CORBA objects, meaning that references into a tree may be passed from one process to another, but not the tree itself. (Keep in mind that DOM was defined before <b>valuetypes</b> or <b>local interfaces</b> were added to IDL).</p> 
+<p>The DOM/Value mapping supports two different usage scenarios for XML documents:</p>
+
+<UL><LI>The <i>dynamic information scenario</i> is where the meaning of the elements in the document is not defined. In other words, the application has only the contents of the XML document available to it via the DOM/Value mapping. The DOM/Value mapping represents the contents of the XML document as an in-memory tree. An application can access or modify the document contents by performing operations on the general <b>valuetypes</b> composing the tree.</LI>
+<LI>The <i>static information scenario</i> builds on the dynamic information scenario by including statically known information about the elements making up the XML document. This information is represented in DTDs (Document Type Definitions), which are essentially type definitions for XML elements (in many ways, a DTD is to an XML document what a C++ class is to a class instance). Rather than using general <b>valuetypes</b> to represent the XML data, specific <b>valuetypes</b> based on the DTD are code-generated, allowing the data to be represented using DTD-specific <b>valuetypes</b>. These specific <b>valuetypes</b> are derived from the general <b>valuetypes</b> used for the dynamic information scenario, meaning that the general view of the tree is always available to the application. This can be important if your application sends a <b>valuetype</b> tree to another application that does not contain definitions for some or all of the DTD-specific <b>valuetypes</b>. Unfortunately, this is achieved by using <b>truncatable</b> inheritance between <b>valuetypes</b> in the DOM/Value specification, but not all ORBs support <b>truncatable</b>, even if they support <b>valuetypes</b>. (The <b>truncatable</b> IDL keyword specifies that a <b>valuetype</b> can safely be truncated to a base <b>valuetype</b> in the marshaling process without loss of information for the application.)</LI>
+</UL>
+
+<p>We don't know of any implementations of the DOM/Value mapping currently available today, but if you're interested in using this capability to deal with XML data in your CORBA applications, you should ask your ORB supplier about their plans for supporting this specification.</p> 
+
+<H3><FONT COLOR="#000080">But What about SOAP?</FONT></H3>
+
+<p>All this talk about XML and CORBA naturally leads to the question of how SOAP  &#151; the Simple Object Access Protocol <a href="#6">[6]</a>  &#151; fits in with CORBA. SOAP is an XML-based protocol intended to exchange information between senders and receivers, usually over HTTP, in decentralized distributed environments. Its protocol consists of three parts:</p> 
+
+<OL>
+<LI>An envelope that describes the contents of a message and how to process it,</LI>
+<LI>A set of encoding rules for expressing instances of application-defined datatypes, and</LI>
+<LI>A convention for representing remote procedure calls and responses.</LI>
+</OL>
+
+<p>Our discussion of the relationship between XML and CORBA has thus far focused on how CORBA applications can make use of XML. We've explored alternatives for sending and receiving XML messages in CORBA, but we haven't focused at all on how IIOP represents such messages. Like IIOP, SOAP is a protocol for conveying messages between applications. Unlike IIOP, which represents message data in binary format, SOAP represents its message content using XML.</p> 
+<p>Using XML at the application level is not made any easier or more difficult using either SOAP or IIOP. This is because one of the central ideas of CORBA is to hide the complexity and detail associated with underlying communication transports and protocols used to convey messages between applications. In other words, the use of XML as a <i>transfer syntax</i> for SOAP is completely orthogonal to whether an application uses it for its own data.</p> 
+<p>Nevertheless, the relationship between SOAP and CORBA is definitely worth exploring. Today SOAP is equated with Web Services, which is being widely hyped as the next Silver Bullet that will magically solve all of your computing problems (though not necessarily all of your venture capital acquisition problems if you work for a dot com...). In our next column, we'll explore how CORBA, SOAP, and Web Services all relate to one another.</p> 
+
+<H3><FONT COLOR="#000080">Concluding Remarks</FONT></H3>
+
+<p>In this column, we explored alternatives for representing and manipulating XML data in CORBA applications. Although a typical approach used by some CORBA applications today is to represent XML data as IDL <b>strings</b>, this comes at a price:</p>
+
+<OL>
+<LI>It's inefficient because it requires transformation to or from <b>string</b> form whenever an application wants to send or receive XML data from another CORBA application.</LI>
+<LI>It's error-prone because it relies heavily on programming conventions</LI>
+</OL>
+
+<p>In April 2001, the OMG published the DOM/Value Mapping Specification, which allows applications to represent and manipulate XML data as <b>valuetype</b> trees. These standard <b>valuetypes</b> are based on the original DOM specification, which used IDL <b>interfaces</b> to represent XML tree nodes. Like <b>interfaces</b>, <b>valuetypes</b> support attributes and operations, meaning that XML data can be encapsulated per standard OO best practices. Unlike <b>interfaces</b>, however, <b>valuetypes</b> are transmissible, allowing entire XML data trees to be sent and received by CORBA applications. Programmatic access and transmissibility make the DOM/Value mapping a superior alternative to <b>string</b>-based systems or homegrown mappings based on <b>struct</b>s.</p>
+<p>In our next column, we'll finish our exploration of CORBA and XML by delving into SOAP and Web Services.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1] D.C. Schmidt and S. Vinoski. &quot;CORBA and XML, Part 1: Versioning,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, May 2001, <b>www.cuj.com/experts/1905/vinoski.htm</b>.</p>
+<p><a name="2"></a>[2] Document Object Model (DOM) Level 2 Core Specification. W3C Recommendation. World Wide Web Consortium, <b>http://www.w3.org/TR/DOM-Level-2-Core/</b>, November 13, 2000.</p>
+<p><a name="3"></a>[3] Michi Henning and Steve Vinoski. <i>Advanced CORBA Programming with C++</i> (Addison Wesley, 1999).</p>
+<p><a name="4"></a>[4] Object Management Group. CORBA 2.4.2 Specification. <b>http://www.omg.org/cgi-bin/doc?formal/01-02-33</b>, 2001.</p>
+<p><a name="5"></a>[5] Object Management Group. XMLDOM: DOM/Value Mapping Specification. <b>http://www.omg.org/cgi-bin/doc?ptc/2001-04-04</b>, 2001.</p>
+<p><a name="6"></a>[6] Simple Object Access Protocol (SOAP) 1.1. W3C Note. World Wide Web Consortium, <b>http://www.w3.org/TR/SOAP/</b>, May 8, 2000.</p>
+
+<p><i><B>Steve Vinoski</B> is chief architect and vice president of Platform Technologies for IONA Technologies and is also an IONA Fellow. A frequent speaker at technical conferences, he has been giving CORBA tutorials around the globe since 1993. Steve helped put together several important OMG specifications, including CORBA 1.2, 2.0, 2.2, and 2.3; the OMG IDL C++ Language Mapping; the ORB Portability Specification; and the Objects By Value Specification. In 1996, he was a charter member of the OMG Architecture Board. He is currently the chair of the OMG IDL C++ Mapping Revision Task Force. He and Michi Henning are the authors of </i>Advanced CORBA Programming with C++<i>, published in January 1999 by Addison Wesley Longman.</i></p>
+<p><i><B>Doug Schmidt</B> is an associate professor member at the University of California, Irvine. His research focuses on patterns, optimization principles, and empirical analyses of object-oriented techniques that facilitate the development of high-performance, real-time distributed object computing middleware on parallel processing platforms running over high-speed networks and embedded system interconnects.  He is the lead author of the book <i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects</i>, published in 2000 by Wiley and Sons.  He can be contacted at <b>schmidt@uci.edu</b>.</i></p>
+
+</BLOCKQUOTE></BODY></HTML>

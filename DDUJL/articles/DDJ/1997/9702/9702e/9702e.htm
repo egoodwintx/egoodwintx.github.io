@@ -1,0 +1,337 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal February 1997: Examining the Windows NTFilesystem</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Examining the Windows NTFilesystem</h1>
+
+<p><i>Dr. Dobb's Journal</i> February 1997
+</p>
+<h2>A layered organization with filesystem and hardware-device drivers</h2>
+
+<h3>By Mark Russinovich and Bryce Cogswell</h3>
+
+<I>Mark is a consulting associate for Open Systems Resources and can be contacted at mark@meatball.osr.com. Bryce is a researcher at the University of Oregon and can be contacted at cogswell@ cs.uoregon.edu.</I>
+
+<hr>
+
+<p>The Windows NT filesystem is based on the same principles of layering as the Windows 95 filesystem (see our article, "Examining the Windows 95 Layered File System," <i>DDJ</i>, December 1995), but its device-driver model makes its implementation significantly different. In Windows 95, for instance, the filesystem consists of 32 distinct layers, each responsible for specific tasks, such as resolving path names and converting from logical to physical offsets. Device drivers, upon loading, indicate to the I/O manager the devices for which they wish to be on the I/O request path for and which layers on the paths they will occupy. In Windows NT, on the other hand, all I/O is device-object oriented and the layering protocol is built by the drivers themselves. Drivers create device objects and link them into chains associated with each physical or network drive. When a request passes down a chain, drivers associated with the device object receiving the request are notified via their associated handler procedures.</p>
+
+<p>In this article, we'll open up the inner workings of the NT filesystem by describing how a filesystem request originates in a user's program and ends up as a disk access. In addition, we'll present an application called "Filemon" that monitors and displays all filesystem activity -- paging, opening/closing files, reads/writes, directory searches, and the like. (This mirrors the filesystem API-monitoring capability of the Windows 95 VxD-level call, <i>IFSMgr_InstallFileSystemApiHook</i>.) filesystem API monitoring is useful for a variety of purposes, including profiling, virus detection, and security enhancement. </p>
+
+<h3>The Windows NT Filesystem</h3>
+
+<p>Any discussion of the NT filesystem requires an introduction to the NT device-driver model. The Windows NT I/O system is based on the concept of object-oriented, packet-driven I/O. This means that I/O requests (IRPs) are created as discrete packets of information and that their destinations are always some type of device object. Device objects are created by device drivers to represent physical, logical, or virtual devices. A device object's driver is responsible for processing IRPs that are targeted at its device object. The I/O system serves as the glue that connects device objects and drivers. Besides providing infrastructure support routines, the I/O system works behind the scenes to route IRPs to target drivers and propagate return values back to the request-initiating driver.</p>
+
+<p>Because the NT I/O model does not make assumptions about how responsibilities will be divided among device drivers, it provides the drivers with the ability to locate objects by name. It also allows device objects to be attached to each other. This enables one to act as a filter for another, processing and taking decisions on IRPs before it sends them on to their destination. To make a device object visible to user-level applications, the driver exports a name to the \DosDevices namespace inside the kernel. (Objects in the kernel namespace can be examined using the WinObj utility provided with the NT 4.0 SDK.) Applications can reference names exported there and have their requests directed to the associated drivers.</p>
+
+<p>The layering supported by NT's driver model introduces three types of drivers, defined by how they interact with other drivers:</p>
+
+<ul>
+<li>Highest-level drivers create device objects with exported user-space names and receive requests generated directly by user-level applications.  <li>Lowest-level drivers receive requests only from other device drivers and act as the interface to the lowest level of abstraction a device supports -- usually hardware such as a hard disk.
+  <li>Intermediate-level drivers act as coordinators between a higher-level driver's requests and lower-level drivers: routing requests, providing transparent error retry, or simply acting as filters. 
+</ul>
+
+<p>The generality of NT's approach to device drivers means that a common infrastructure is used to support all types of devices -- physical (keyboards, sound cards) and logical (disk partitions). It also means that the I/O system knows little about the filesystem, since this abstraction is provided by the drivers themselves. Consequently, it is difficult to describe the NT filesystem as having an absolute organization; its architecture is not defined by the NT I/O system. However, there is a de facto standard for the general structure. The support provided by the I/O system, as well as the existing base of Microsoft filesystem and hardware drivers, make it much easier to follow design guidelines that are in use than to implement a new architecture.</p>
+
+<p>As <a name="rf1"><a href="9702ef1.htm">Figure 1</A> illustrates, filesystems currently found on NT generally have only two layers. The first layer consists of filesystem drivers, which define the layout of data in the filesystem; these communicate with the second layer, which consists of the lowest-level hardware drivers -- those that read and write information directly on the underlying storage medium. Additional layers can be present, though: Some hardware devices have drivers divided into sublayers where higher levels deal with classes of devices and lower levels address specific types. Furthermore, intermediate-level drivers are often inserted between a filesystem and the lower-level drivers to provide additional functionality such as disk mirroring.</p>
+
+<p><a href="9702ef1.htm">Figure 1</A> doesn't show how the I/O supervisor's glue connects the drivers, via device objects, nor does it show the kinds of information sent in a request and how that information is packaged. These details are shown in <a name="rf2"><a href="9702ef2.htm">Figure 2</A>, which follows a request through several layers from a Win32 program down to a hard disk and back.</p>
+
+<h3>File and Device Objects</h3>
+
+<p>File objects represent files in the same way device objects represent devices. All NT filesystem requests must have a file object as their reference; see <a name="rl1"><a href="9702e.htm#l1">Listing One</A> The first task of the I/O supervisor is to take the user's request; if the request does not reference a previously opened handle, the supervisor creates a file object. A handle to the object is returned to the application, and further operations on the same file can be initiated by referencing the handle. Calls that create a file object, such as the <i>CreateFile</i> call, must supply enough information so that the filesystem knows precisely which file is being opened. This information is either a full path name (C:\foo\bar.txt), or an implied current directory (C:\foo) and a relative path name (bar.txt).</p>
+
+<p>The I/O supervisor determines the request's target logical drive (in this case, C:\) by extracting it from the full path name. It then determines the physical partition on which the drive resides. This is done by looking up the drive letter in \DosDevices, the kernel's internal exported-name directory. Logical drives are normally represented in this internal table with symbolic links to another name that identifies the device object representing the drive. A reference to this device object is stored in the file object so that future requests can skip this look-up step.</p>
+
+<p>For example, a system where C:\ is the first partition on the first hard disk might have an entry "\DosDevices\C:\" that is pointing to a symbolic link with the value "\device\harddisk0\partition1." Once it has found the device object for the drive, it determines which filesystem device object is associated with it by looking at the partition's volume parameter block -- a data structure in the device object that links a partition to a filesystem.</p>
+
+<p>With the filesystem device object in hand, the I/O supervisor creates an IRP for the request. An IRP is simply a data structure (see <a name="rl2"><a href="9702e.htm#l2">Listing Two</A>) that carries information about a specific filesystem request. This includes the request type (open, read, write, query, and so on) and associated file object (the handle of the file to be operated upon), as well as storage for intermediate driver-specific information, buffer pointers, and status flags. The I/O supervisor is responsible for sending the newly created IRP to the top-level device driver on the chain associated with the target drive, typically the filesystem driver.</p>
+
+<h3>Drivers</h3>
+
+<p>Each driver in the chain has multiple dispatch entry points, dedicated to processing specific types of filesystem requests. The set of entry points is defined by the <i>MajorFunction</i> table in the driver object. The I/O supervisor invokes the driver via the <i>IoCallDriver</i> call, passing the target device and IRP as arguments, and indexing into the driver's table of registered request-type handlers. There it finds the procedure in the device driver that processes the particular request type.</p>
+
+<p>At this point, the filesystem driver takes over. Its actions depend largely on the type of filesystem it serves and the type of request it has been sent. For accesses to files on a local FAT, HPFS, or NTFS drive, the filesystem driver is FASTFAT, HPFS, or NTFS, respectively. For accesses to a CD-ROM, the driver is usually CDFS, while for network drives, the driver is usually NWRDR, the network redirector filesystem. Looking again at <a href="9702ef2.htm">Figure 2</A> (where the access is to a FAT partition), we can see that FASTFAT determines which logical sectors on the drive must be accessed to complete the request. It then creates one or more new IRPs that it sends to the device object representing the partition, in this case the one named "\device\harddisk0\partition1." The I/O supervisor routes the IRPs to the correct handler procedure in the device driver that owns the partition's device object. The example path ends up in the ATDISK device driver, which is the standard IDE-type hard-disk driver. ATDISK interacts with the hard disk, and upon completion of the disk action, sends a message back to FASTFAT, indicating that it has finished servicing the request, passing a status value back in the IRP. The return route continues back up the driver chain, and, as indicated by the red lines in <a href="9702ef2.htm">Figure 2</A>, does not go through the device-object path.</p>
+
+<p>The path and procedure followed by a CD-ROM, floppy, or other local request is similar to <a href="9702ef2.htm">Figure 2</A>. If the target drive is a network drive, however, the filesystem driver does not perform the task of translating the request to logical sector accesses. Instead it serves merely as a proxy for a filesystem driver, such as FASTFAT or NTFS, residing on the remote node. It forwards the request to the remote node using a device driver for the network card on the local machine and then presents the results to the user application when they are received from the network.</p>
+
+<h3>Variations</h3>
+
+<p>The process whereby the I/O supervisor creates an IRP to send to filesystem drivers allows for great flexibility in the way a driver can respond to a request. It can reply immediately with a negative result (for example, if it determines the file or file handle does not exist); it can take the IRP and pass it to low-level drivers; or it can create several new IRPs to send to lower drivers.</p>
+
+<p>The NT I/O model makes special allowance for the performance demands of filesystem drivers in an optimization that can sometimes be used to avoid the creation of an IRP. This backdoor to the filesystem is known as the "fast I/O path." A filesystem device driver can specify in its driver-object data structure a table of routines that can be called directly to handle simple requests. The I/O supervisor uses one of these short-cuts when it is likely that a filesystem access will be served from the disk cache. If the filesystem driver cannot satisfy the request without calling lower-level drivers, it fails the fast I/O call and the I/O supervisor proceeds with normal IRP creation. This fast path saves the memory allocation and setup required to perform an IRP-based request.</p>
+
+<h3>The Filemon Application</h3>
+
+<p>To demonstrate this device-driver and device-object model, we have implemented an application called "Filemon" that layers above filesystem drivers by creating hook-device objects and attaching them to logical-drive device objects. Filemon's device driver sees every request directed to any of the system's logical drives.</p>
+
+<p>The Filemon application, which runs under NT 3.51 and 4.0, consists of two separate components -- a Win32 GUI called "filemon.exe" (see <a name="rf3"><a href="9702ef3.htm">Figure 3</A>), and an NT device driver called "filemon.sys." Filemon.sys is a dynamically loaded device driver; no installation procedure is necessary since filemon.exe loads it. During initialization, Filemon determines the types of logical drives present and lets users select the set of drives to be monitored, including hard disks, CD-ROMs, floppies, network drives, and RAM drives.</p>
+
+<p>During execution, Filemon dumps information about all requests directed at the set of monitored drives. This information includes number of requests, request type, path name of the associated file, result status, and any request-specific information such as file offsets and lengths. </p>
+
+<h3>Information-Handling Issues<b></h3>
+
+<p></b>A frequently seen request type is IRP_ MJ_CLEANUP, and its purpose is a little less obvious than most of the requests. Each file object has both an open count and a reference count associated with it. The open count is the number of open user-level handles that currently refer to the object. The reference count indicates the number of references, made by open handles as well as by other objects in the kernel, to a file object. The open count is always less than or equal to the reference count. When the open count drops to zero, the I/O supervisor sends the filesystem a cleanup request telling it that any outstanding IRPs it may have for the file object need not be completed since no user is waiting for a result. When the reference count drops to zero, the file object can be closed, and the filesystem will receive an IRP_MJ_CLOSE request.</p>
+
+<p>On an unrelated note, Filemon's device driver dynamically allocates storage in which to save filesystem request records. Although rare, it is possible for a system to generate requests fast enough that buffering all requests for the GUI would require too much memory. If that happens, some records may be dropped intentionally, reflected as a gap in the sequence of records displayed by the GUI.</p>
+
+<p>There are two situations where the pathname displayed is a drive letter followed by the text "DIRECT I/O." One is when the disk cache is flushing data that has no associated name. For example, in the FAT filesystem, the file-allocation table itself has no name. However, it is still desirable to cache file-allocation tables for quick access. The FASTFAT driver therefore has to cache the data as a direct I/O file object. Later, when the cache wants to flush out to disk, FASTFAT will receive a request with byte offsets relative to the start of a logical drive as a reference, rather than relative to the start of a file.</p>
+
+<p>Direct I/O is also used by administrative software such as FORMAT or CHKDSK. These utilities write directly to disk sectors, bypassing the structure imposed by filesystem drivers. If you format a floppy disk while running Filemon, for instance, you will see FORMAT accessing the floppy disk via direct I/O.</p>
+
+<p>An interesting result of the asynchronous behavior of many filesystem requests is the possibility of outstanding IRPs at GUI shutdown. When this is the case, Filemon's device driver cannot unload, because when an outstanding IRP completes, the I/O supervisor will attempt to call the I/O completion routine that Filemon has registered, regardless of whether it is in memory. (You can imagine the outcome if the device driver has been unloaded.) Under these circumstances, the GUI exits, but the driver remains memory resident to handle these last IRP completions. If another instance of the GUI is started, it connects with the already loaded driver image; at exits of these subsequent GUI instances, a check is made again to see if the driver can unload cleanly.</p>
+
+<h3>How Filemon Works</h3>
+
+<p>When the GUI starts, it initiates a load of the Filemon device driver (see the INSTDRV example in the NT DDK under SRC\GENERAL\INSTDRV for an example of dynamically loading a device driver). During initialization, the device driver creates a device object with the kernel object name "\DosDevices\FILEMON," so that the GUI can communicate with it via <i>CreateFile</i> and <i>DeviceIoControl</i> calls. The GUI then requests the driver to hook the set of drives desired by the user.</p>
+
+<p>To hook a drive, the device driver must first determine the device object that represents it. It uses the same technique that the kernel uses to determine the logical-drive device object referenced by an access to a previously opened file object (see <a name="rl3"><a href="9702e.htm#l3">Listing Three</A>). The device driver calls the kernel's internal open-file call, <i>ZwCreateFile</i>, on the root directory of the target drive (C:\, for example). This returns the necessary file-object handle. Next, it maps the handle to an actual file-object pointer, using <i>ObReferenceObjectByHandle</i>. Finally, the device object associated with the file object is retrieved with <i>IoGetRelatedDeviceObject</i>.</p>
+
+<p>Once a logical drive's device object has been located, the driver creates a hook-device object and attaches it to the drive's object via <i>IoAttachDeviceByPointer</i>. Thereafter, the hook object receives all requests directed to the logical drive's top-level driver. Except for dealing with the fast I/O path, the rest of the device driver's chores are straightforward. It simply registers handler routines for requests directed to filesystem drivers and pulls information about requests out of the IRPs it sees on their way to the filesystem. An I/O completion routine is registered for each request so that the driver can see the associated return status.</p>
+
+<p>Handling the fast I/O path is tricky because it is not documented in the NT DDK. A filter driver such as Filemon cannot ignore this control path because the I/O supervisor assumes that filesystem drivers have at least <i>some</i> fast I/O calls implemented; ignoring them leads to a quick system crash. Fortunately, the fast I/O call prototypes and table definition are included in the DDK's main include file, NTDDK.H, so adding fast I/O routines to a filter driver is straightforward -- once the problem is understood.</p>
+
+<p>Filemon copies ASCII text describing each request to a buffer that it transfers to the GUI periodically. Although only the most significant aspects of each transaction are recorded, the application is easily extended to display any data contained in the IRP. Unfortunately, much of the information packaged with requests is not documented. For many purposes, including enhanced security, profiling, and virus detection, the data collected by Filemon is sufficient. However, until Microsoft produces its much-awaited filesystem documentation, you must be prepared to put on your spelunking gear and get dirty with a kernel-mode debugger if you want a more detailed understanding.</p>
+
+<p><b>DDJ</b></p>
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>typedef struct _FILE_OBJECT {    CSHORT          Type;
+    CSHORT          Size;
+    PDEVICE_OBJECT  DeviceObject;
+    PVPB            Vpb;
+    PVOID           FsContext;
+    PVOID           FsContext2;
+    PSECTION_OBJECT_POINTERS SectionObjectPointer;
+    PVOID           PrivateCacheMap;
+    NTSTATUS        FinalStatus;
+    struct _FILE_OBJECT *RelatedFileObject;
+    BOOLEAN         LockOperation;
+    BOOLEAN         DeletePending;
+    BOOLEAN         ReadAccess;
+    BOOLEAN         WriteAccess;
+    BOOLEAN         DeleteAccess;
+    BOOLEAN         SharedRead;
+    BOOLEAN         SharedWrite;
+    BOOLEAN         SharedDelete;
+    ULONG           Flags;
+    UNICODE_STRING  FileName;
+    LARGE_INTEGER   CurrentByteOffset;
+    ULONG           Waiters;
+    ULONG           Busy;
+    PVOID           LastLock;
+    KEVENT          Lock;
+    KEVENT          Event;
+    PIO_COMPLETION_CONTEXT CompletionContext;
+} FILE_OBJECT;
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>typedef struct _IRP {    CSHORT          Type;
+    USHORT          Size;
+    // Define the common fields used to control the IRP.
+    // Define a pointer to the Memory Descriptor List (MDL) for this I/O
+    // request.  This field is only used if the I/O is "direct I/O".
+    PMDL            MdlAddress;
+    // Flags word - used to remember various flags.
+    ULONG           Flags;
+    // The following union is used for one of three purposes:
+    //  1. An associated IRP. Field is a pointer to a master IRP.
+    //  2. The master IRP. Field is the count of the number of IRPs which must
+    //      complete (associated IRPs) before the master can complete.
+    //  3. This operation is being buffered and the field is the address of
+    //      the system space buffer.
+    union {
+        struct _IRP     *MasterIrp;
+        LONG            IrpCount;
+        PVOID           SystemBuffer;
+    } AssociatedIrp;
+<p></p>
+    // Thread list entry - allows queueing the IRP to the thread pending I/O     // request packet list.
+    LIST_ENTRY          ThreadListEntry;
+    // I/O status - final status of operation.
+    IO_STATUS_BLOCK     IoStatus;
+// Requestor mode - mode of the original requestor of this operation.
+    KPROCESSOR_MODE RequestorMode;
+    // Pending returned - TRUE if pending was initially returned as the
+    // status for this packet.
+    BOOLEAN            PendingReturned;
+    // Stack state information.
+    CHAR               StackCount;
+    CHAR               CurrentLocation;
+    // Cancel - packet has been canceled.
+    BOOLEAN            Cancel;
+    // Cancel Irql - Irql at which the cancel spinlock was acquired.
+    KIRQL              CancelIrql;
+    // ApcEnvironment - Used to save the APC environment at the time that the
+    // packet was initialized.
+    CCHAR              ApcEnvironment;
+    // Zoned - packet was allocated from a zone.
+    BOOLEAN            Zoned;
+    // User parameters.
+    PIO_STATUS_BLOCK UserIosb;
+    PKEVENT            UserEvent;
+    union {
+        struct {
+            PIO_APC_ROUTINE UserApcRoutine;
+            PVOID       UserApcContext;
+        } AsynchronousParameters;
+        LARGE_INTEGER   AllocationSize;
+    } Overlay;
+    // CancelRoutine - Used to contain the address of a cancel routine supplied
+    // by a device driver when the IRP is in a cancelable state.
+    PDRIVER_CANCEL      CancelRoutine;
+    // Note that the UserBuffer parameter is outside of the stack so that I/O
+    // completion can copy data back into the user's address space without
+    // having to know exactly which service was being invoked.  The length
+    // of the copy is stored in the second half of the I/O status block. If
+    // the UserBuffer field is NULL, then no copy is performed.
+    PVOID           UserBuffer;
+    // Kernel structures
+    // The following section contains kernel structures which the IRP needs
+    // in order to place various work information in kernel controller system
+    // queues.  Because the size and alignment cannot be controlled, they are
+    // placed here at the end so they just hang off and do not affect the
+<p></p>
+    // alignment of other fields in the IRP.
+    union {
+        struct {
+            // DeviceQueueEntry - The device queue entry field is used to queue
+            // the IRP to the device driver device queue.
+            KDEVICE_QUEUE_ENTRY DeviceQueueEntry;
+            // Thread - pointer to caller's Thread Control Block.
+            PETHREAD            Thread;
+            // Auxillary buffer - pointer to any auxillary buffer that is             // required to pass information to a driver that is not contained
+            // in a normal buffer.
+            PCHAR           AuxiliaryBuffer;
+            // List entry - queues packet to completion queue, among others.
+            LIST_ENTRY      ListEntry;
+            // Current stack location - contains a pointer to the current
+            // IO_STACK_LOCATION structure in the IRP stack.  This field
+            // should never be directly accessed by drivers.  They should
+            // use the standard functions.
+            struct _IO_STACK_LOCATION *CurrentStackLocation;
+            // Original file object - pointer to the original file object
+            // that was used to open the file.  This field is owned by the
+            // I/O system and should not be used by any other drivers.
+            PFILE_OBJECT        OriginalFileObject;
+        } Overlay;
+        // APC - This APC control block is used for the special kernel APC as
+        // well as for the caller's APC, if one was specified in the original
+        // argument list.  If so, then the APC is reused for the normal APC for
+        // whatever mode the caller was in and the "special" routine that is
+        // invoked before the APC gets control simply deallocates the IRP.
+        KAPC        Apc;
+        // CompletionKey - This is the key that is used to distinguish
+        // individual I/O operations initiated on a single file handle.
+        //
+        ULONG       CompletionKey;
+    } Tail;
+} IRP, *PIRP;
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three</H4>
+
+<pre>BOOLEAN HookDrive( IN char Drive, IN PDRIVER_OBJECT DriverObject ){
+   IO_STATUS_BLOCK      ioStatus;
+   HANDLE               ntFileHandle;   
+   OBJECT_ATTRIBUTES    objectAttributes;
+   PDEVICE_OBJECT       fileSysDevice;
+   PDEVICE_OBJECT       hookDevice;
+   UNICODE_STRING       fileNameUnicodeString;
+   WCHAR                filename[] = L"\\DosDevices\\A:\\";
+   NTSTATUS             ntStatus;
+   ULONG                i;
+   PFILE_OBJECT         fileObject;
+   PHOOK_EXTENSION      hookExtension;
+<p></p>
+    if ( Drive &gt;= 'a' &amp;&amp; Drive &lt;= 'z' ) Drive -= 'a';
+    else                Drive -= 'A';
+    if ( (unsigned char)Drive &gt;= 26 )
+    return FALSE;
+<p></p>
+    if ( LDriveDevices[Drive] == NULL )  {
+<p></p>
+    // point to the current logical drive
+    filename[12] = 'A'+Drive;
+    // have to figure out what device to hook - first open the root directory
+    RtlInitUnicodeString( &amp;fileNameUnicodeString, filename );
+    InitializeObjectAttributes( &amp;objectAttributes, &amp;fileNameUnicodeString, 
+            OBJ_CASE_INSENSITIVE, NULL, NULL );
+    ntStatus = ZwCreateFile( &amp;ntFileHandle, SYNCHRONIZE|FILE_READ_ACCESS, 
+           &amp;objectAttributes, &amp;ioStatus, NULL, 0, 
+           FILE_SHARE_READ|FILE_SHARE_WRITE, FILE_OPEN, 
+           FILE_SYNCHRONOUS_IO_NONALERT|
+           FILE_OPEN_FOR_BACKUP_INTENT|FILE_DIRECTORY_FILE, NULL, 0 );
+    if( !NT_SUCCESS( ntStatus ) ) return FALSE;
+    // got the file handle, so now look-up the file-object
+    ntStatus = ObReferenceObjectByHandle( ntFileHandle, FILE_READ_DATA, 
+                        NULL, KernelMode,&amp;fileObject, NULL );
+    if( !NT_SUCCESS( ntStatus ))    return FALSE;
+    // now, find out what device is associated with the object
+    fileSysDevice = IoGetRelatedDeviceObject( fileObject );
+    if ( ! fileSysDevice ) {
+        ZwClose( ntFileHandle );
+        return FALSE;
+    }
+    // make sure we haven't already attached to this device 
+    // (which can happen for directory mounted drives for networks)
+    for( i = 0; i &lt; 26; i++ ) {
+        if( LDriveDevices[i] == fileSysDevice ) {
+            // yep, already watching it so add it to a group
+            ObDereferenceObject( fileObject );
+            ZwClose( ntFileHandle );
+            LDriveMap[ Drive ]     = LDriveMap[i];
+            LDriveDevices[ Drive ] = fileSysDevice;
+            return TRUE;
+        }
+    }
+    // create a device to attach to the chain
+    ntStatus = IoCreateDevice( DriverObject, sizeof(HOOK_EXTENSION), NULL,
+               fileSysDevice-&gt;DeviceType, 0, FALSE, &amp;hookDevice );
+    // did we create a device successfully?
+    if ( !NT_SUCCESS(ntStatus) ) return FALSE;
+    // clear our init flag as per NT DDK KB article on creating 
+    // device objects from a dispatch routine
+    hookDevice-&gt;Flagsn &amp;= ~DO_DEVICE_INITIALIZING;
+    // set-up the device extensions
+    hookExtension = hookDevice-&gt;DeviceExtension;
+    hookExtension-&gt;LogicalDrive = 'A'+Drive;
+    hookExtension-&gt;FileSystem   = fileSysDevice;
+    // now, attach ourselves to the device
+    ntStatus = IoAttachDeviceByPointer( hookDevice, fileSysDevice );
+    if ( !NT_SUCCESS(ntStatus) )  {
+        // if we couldn't attach
+        ObDereferenceObject( fileObject );
+        ZwClose( ntFileHandle );
+        return FALSE;
+    } else {
+        // assign this drive a drive group if it doesn't have one
+        if( !LDriveMap[ Drive ] ) LDriveMap[ Drive ] = ++LDriveGroup;
+    }
+    // close the file and update our list
+    ObDereferenceObject( fileObject );
+    ZwClose( ntFileHandle );
+    LDriveDevices[Drive] = hookDevice;
+    }
+    return TRUE;
+}
+</pre>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

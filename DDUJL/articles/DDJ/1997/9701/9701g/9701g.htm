@@ -1,0 +1,323 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal January 1997: Embedded Systems</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Simulation and Device-Driver Development</h1>
+
+<p><i>Dr. Dobb's Journal</i> January 1997
+</p>
+<h2>Taking the pain out of driver development</h2>
+
+<h3>By Eddy Quicksall and Ken Gibson </h3>
+
+<I>Eddy and Ken write device drivers at Adaptec's Boulder Technology Center. They can be reached at eddy_quicksall@corp .adaptec.com and ken_gibson@corp .adaptec.com.</I>
+
+<hr>
+
+<p>When writing device drivers for new hardware designs, you typically have to write and debug the driver concurrently with hardware development, then ship the driver almost immediately after hardware is available. This is difficult because of restricted visibility to drivers running under an operating system and the use of debuggers with limited capabilities. Also, it is difficult to create the variety of stimuli required to test unusual code paths within the driver, such as error handling and command-abort procedures. </p>
+
+<p>One solution to these problems is to write an application-level simulator that, to your device driver, looks just like the operating-system environment it will run in. The simulator causes the routines in your driver to execute in the same ways that they will execute in the real operating system. You can use a fully functional application-level debugger, have complete control over the stimulus provided to the driver to test unusual conditions, and debug in this environment before any hardware is available.</p>
+
+<p>This is possible because a device driver is simply a program that has a few specific entry points, and makes calls to only a predefined set of operating-system-supplied service routines. In addition, the hardware devices being controlled are usually accessed through macros or functions that read and write the control and status registers. The driver writes bit patterns to control registers, which causes the device to set bits in a status register and optionally generate interrupts that, to the driver, look like a call to its interrupt-handler routine. So, the simulator provides these input and output routines that return the correct bit patterns in status registers, and call the driver's interrupt handler at the correct time. The simulator also provides versions of the system-service routines that return realistic return values, and finally, it uses a main processing loop that issues I/O requests to the driver to simulate run-time operation.</p>
+
+<p>To demonstrate this, we present a simulation environment in this article that allows the sample Adaptec AHA-1540 SCSI miniport driver provided with the Windows NT DDK to be built as a Visual C Console application and run under the Visual C debugger. A SCSI miniport is a specific type of Windows 95/NT device driver designed to control SCSI host adapters, such as the AHA-1540. The simulator contains three main parts:</p>
+
+<ul>
+<li>A set of routines that simulate loading and initializing a miniport driver under Windows.  <li>A main work loop that simulates issuing I/O requests and interrupt notifications to the driver once Windows is up and running.
+  <li>Two routines that simulate the AHA-1540 hardware.
+</ul>
+
+<p></p>
+
+<p>The complete source for the simulator, the full Visual C project (including supporting .h files from the Windows 95/NT DDK), and the sample SCSI-miniport driver from the Windows NT DDK are available electronically; see "Availability," page 3.</p>
+
+<h3>Hardware Simulation</h3>
+
+<p>The AHA-1540 presents five registers to the processor's I/O space. In a Windows SCSI miniport driver, I/O-mapped registers are accessed using the <i>ScsiPortReadPortUchar</i> and <i>ScsiPortWritePortUchar</i> functions; see <a name="rl1"><a href="9701g.htm#l1">Listing One</A> Each takes an I/O address parameter, and the <i>WritePortUchar</i> version takes a data byte to write, while the <i>ReadPortUchar</i> version returns the data byte that was read. We simulate the AHA-1540 by using static variables to remember the contents of the readable registers and by providing functions with these names that return the same values as reads and writes to the real hardware.</p>
+
+<p>The two write-only registers in the AHA-1540 are the Control and the Command /Data Out registers; the three read-only registers are the Status, Data, and Interrupt registers. The write-only Control register contains bits to initiate hard and soft resets, and an interrupt-reset bit. If the interrupt-reset bit is set on a write to the Control register, <i>ScsiPortWritePortUchar</i> clears any interrupt-status bits that may be set in the <i>statusReg</i> variable so that a subsequent call to <i>ScsiPortReadPortUchar</i> will return the correct Status register contents. If the driver sets one of the hard or soft reset bits in the Control register, <i>ScsiPortWritePortUchar</i> first resets the <i>statusReg</i>, <i>dataReg</i>, and <i>interruptReg</i> variables to their initial value, then sets one of the pending bits in the <i>interruptReg</i>. <i>interruptReg</i> is checked by the simulator's main processing loop, which calls the driver's interrupt-handler function when an interrupt is pending.</p>
+
+<p><i>ScsiPortWritePortUchar</i> must also simulate more complicated AHA-1540 commands such as mailbox initialization and SCSI command execution. To issue SCSI commands to the AHA-1540, the driver builds a SCSI Command Control Block (CCB), places the address of the CCB in a Mailbox Out array, and writes the AC_START_SCSI_COMMAND opcode to the AHA-1540's Command register. Each mailbox entry contains a 1-byte command and a 3-byte CCB address. Mailbox entries are organized into an array of Mailbox Out entries for delivering CCBs to the AHA-1540 followed by an equal-size array of Mailbox In entries for delivering completed commands back to the driver. When the driver initializes, it allocates the Mailbox In and Out arrays and tells the AHA-1540 where it is located by writing the AC_MAILBOX_INITIALIZATION opcode to the Command/ Data Out register, followed by the number of mailboxes in each array, followed by the 3-byte base address of the mailbox array. </p>
+
+<p>When <i>ScsiPortWritePortUchar</i> detects the Mailbox Initialize opcode, it sets the <i>inInitMbox</i> flag to True and the <i>dataCount</i> variable to four to remember that the next four bytes written to the Data Out register will be the mailbox array size and base address. <i>ScsiPortWritePortUchar</i> saves the array size in its <i>mBoxCount</i> variable and collects the three bytes of base address into its <i>pMailboxOut</i> pointer and calculates the offset to <i>pMailboxIn</i>. <i>ScsiPortWritePortUchar</i> can then respond to Start SCSI Command opcodes. It retrieves the CCB pointer out of the Mailbox Out, updates the status field in the CCB, places the CCB pointer in the Mailbox In array  and sets the interrupt pending bit in <i>interruptReg</i> to post a completion interrupt back to the driver.</p>
+
+<p><i>ScsiPortReadPortUchar</i> is the complementary function that simulates reads of the AHA-1540's read-only registers. When the driver reads the Status and Interrupt registers, <i>ScsiPortReadPortUchar</i> just returns the contents of the <i>statusReg</i> or <i>interruptReg</i> variable. The Data In register is more complicated to simulate because it may return strings of information through multiple reads. For example, the Adapter Inquiry command causes the AHA-1540 to return four bytes of configuration information. The simulator uses static arrays that contain the sequences of bytes returned by such commands. When <i>ScsiPortWritePortUchar</i> detects an Adapter Inquiry, it points <i>dataRegPtr</i> to the beginning of the <i>adapterInquiryData</i> array and sets <i>dataCount</i> to four. Then, each time <i>ScsiPortReadPortUchar</i> is called, it returns the byte referenced by <i>dataRegPtr</i>, then increments <i>dataRegPtr</i> and decrements <i>dataCount</i>.</p>
+
+<h3>Driver Initialization</h3>
+
+<p>The next major portion of the simulator is the code to simulate loading and initializing the driver under Windows. All device drivers must have an exported, global function that the operating system can call to load and initialize the driver, and the first step in the simulator's main routine is to call this entry point. For a miniport driver, this is called <i>DriverEntry</i> and is contained in aha154x.c in the sample driver provided in the NT DDK. A miniport driver's <i>DriverEntry</i> must allocate and initialize a data structure of type HW_INITIALIZATION_DATA as defined in srb.h, which is provided by the Windows DDK. This structure contains pointers to the rest of the driver's entry points, fields to specify types of memory required, as well as various configuration parameters. The driver passes the structure HW_INITIALIZATION_DATA to Windows through a callback to a function called <i>ScsiPortInitialize</i>. This begins a sequence of calls back and forth between Windows and the driver, during which they cooperate to locate and initialize all AHA-1540 adapters in the system.</p>
+
+<p>Our simulator's <i>ScsiPortInitialize</i> function duplicates this calling sequence from the point of view of the driver being tested. It first looks at the HW_INITIALIZATION_DATA to verify that the driver provided function pointers for required entry points. It then allocates blocks of memory for the driver based on values specified in the HW_INITIALIZATION_ DATA. <i>ScsiPortInitialize</i> allocates an extension that will be provided along with each SCSI Request Block (SRB): a Logical Unit extension for use by the driver to store information about each device connected to the SCSI bus, and a HW device extension to store variables for each AHA-1540 adapter in the system. We simulate only one adapter with one SCSI device attached and only need to allocate one of each extension. Next, since the HW_INITIALIZATION_DATA is provided by the driver as a stack variable, the simulator makes a static copy for later reference.</p>
+
+<p>The next step in <i>ScsiPortInitialize</i> is to allocate a PORT_CONFIGURATION_ INFO structure that is also defined in srb.h and initialize it with configuration information, such as the type of system bus, the interrupt type, and assorted SCSI configuration information. One of the fields in this structure is a pointer to an ACCESS_RANGE structure that contains a base address and length for a block of I/O registers. <i>ScsiPortInitialize</i> allocates an ACCESS_ RANGE structure for the driver so that it can report the location of the AHA-1540 registers when it finds one. <i>ScsiPortInitialize</i> then calls back into the driver's <i>HwFindAdapter</i> entry point, which looks for its register signature at all the possible base I/O addresses where an AHA-1540 may reside. In the simulator, this causes calls to <i>ScsiPortReadPortUchar</i> as previously described, which will return the power-on initialization values for AHA-1540 registers.</p>
+
+<p>When the driver finds an AHA-1540 in <i>HwFindAdapter</i>, it fills in the base address and length in the ACCESS_RANGE structure referenced by HW_INITIALIZATION_DATA and then returns to <i>ScsiPortInitialize</i> with a return value indicating that an adapter was found. <i>ScsiPortInitialize</i> then passes the structure into the driver's <i>HwInitialize</i> routine. The miniport driver's <i>HwInitialize</i> routine performs all the steps required to prepare it for run-time operation. This involves many calls into <i>ScsiPortWritePortUchar</i> and <i>ScsiPortReadPortUchar</i> to reset the AHA-1540, obtain hardware configuration information, set operational parameters, and initialize the mailboxes.</p>
+
+<p>Once the AHA-1540 is initialized, <i>HwInitialize</i> returns to <i>ScsiPortInitialize,</i> which returns back up the call chain through <i>DriverEntry</i> and then back to Windows in the real environment or, in our simulation environment, back to the main routine. The driver is now loaded and initialized and the main routine can now start issuing SCSI commands. </p>
+
+<h3>System Services</h3>
+
+<p>One set of services used by drivers are routines to allocate physical memory and to convert between physical and virtual addresses. In our simulator, these routines are simple because the driver and the simulator being tested execute in the same application memory space. <i>ScsiPortGetPhysicalAddress</i>, <i>ScsiPortGetVirtualAddress</i>, and <i>ScsiPortConvertUlongToPhysicalAddress</i> are the address-conversion routines for Windows miniport drivers. The simulator treats all addresses as pointers in C, and no conversion is required. Similarly, <i>ScsiPortGetUncachedExtension,</i> which allocates page-locked physical memory in a Windows miniport driver, simply <i>malloc</i>s the requested amount of memory and returns a pointer to it. In some NT systems, even I/O space can be mapped through virtual memory so Windows provides the <i>ScsiPortGetDeviceBase</i> to perform the conversion; but again, in simulation, no conversion is required.</p>
+
+<p>Other system services include the <i>ScsiPortStallExecution</i> service, which normally delays for some number of microseconds; however, since real-time has no meaning in simulation, it simply returns. <i>ScsiPortMoveMemory</i> is a service for quickly copying memory, and <i>ScsiDebugPrint</i> prints to a debug port in the driver. In our simulator, this calls <i>printf</i> if you define DBG in the Visual C project settings. <i>ScsiPortLogError</i> sends an entry to the error log on NT. When debugging in the simulator, this can log events to a file or print a message to the screen.</p>
+
+<h3>Main Routine</h3>
+
+<p>Once the driver is initialized, you can simulate issuing SCSI I/Os. When Windows wants to issue a command to a SCSI device, it builds a SCSI Request Block (SRB) structure as defined in srb.h and passes it to the miniport driver through a call to its <i>HwStartIo</i> function. Our simulator allocates several SRBs and uses an array of pointers to the SRBs, called the <i>pSrbWorkList,</i> that can be quickly reordered in an editor to modify the workload provided to the driver. The main processing loop steps through the <i>pSrbWorkList</i> issuing each SRB to the driver. As each SRB is issued, the simulator increments its <i>testsToGo</i> variable to record how many SRBs are outstanding. After each SRB is issued, the miniport driver calls back to Window's <i>ScsiPortNotification</i> function to indicate that it is ready to process another SRB. The simulator keeps a Boolean <i>nextSrbOk</i> flag that it sets False after issuing an SRB. When the driver calls the simulator's <i>ScsiPortNotification</i> function, it resets <i>nextSrbOk</i> to True.</p>
+
+<p>After each SRB is issued, the main loop checks <i>interruptReg</i> to see if an interrupt should be posted back to the driver. If an interrupt is supposed to be posted, the main loop calls the driver's interrupt entry point. The miniport driver's interrupt handler detects a completed SCSI command in its mailbox and calls back into <i>ScsiPortNotification</i> with a notification type of <i>RequestComplete</i>. Our simulated <i>ScsiPortNotification</i> decrements <i>testsToGo</i> to indicate that an SRB has completed.</p>
+
+<p>To exercise handling one I/O at a time, <i>ScsiPortWritePortUchar</i> immediately returns each CCB back to the driver and sets the pending bit in <i>interruptReg</i> as soon as it receives a command. To test more-complicated overlapped I/O, the simulator can queue up some number of CCBs before returning them and setting the interrupt-pending bit. To handle a case such as this, the main routine continues to loop, calling the driver's interrupt entry after issuing the entire <i>pSrbWorkList</i> until <i>testsToGo</i> equals zero.</p>
+
+<p>This kind of flexibility lets you force interrupts at known, inopportune times and create conditions in the driver that would be difficult to reproduce when running under the real operating system. Also, since the simulator is synchronized by the main loop, it is easy to repeat the conditions that exercise bugs in driver code multiple times until all the bugs are fixed.</p>
+
+<p><b>DDJ</b></p>
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>//       ScsiPortWritePortUchar and ScsiPortReadPortUchar// These functions are used by the driver to read and write to I/O mapped 
+// registers. Routines are used to simulate the Adaptec 1540. Writing a 
+// control register initiates some action in the hardware. Reading returns 
+// appropriate status bits.
+//
+VOID ScsiPortWritePortUchar( IN PUCHAR Port, IN UCHAR Value)
+{
+    switch( (UINT)Port )  {
+        case CTRL_STAT_REG:
+            if( Value &amp; IOP_INTERRUPT_RESET ) {
+                // Clear any pending interrupt
+                interruptReg = 0;
+            }
+            if( Value &amp; IOP_HARD_RESET ) {
+                statusReg = (IOP_SCSI_HBA_IDLE
+                             +IOP_MAILBOX_INIT_REQUIRED);
+            }
+            break;
+        case CMD_DATA_REG:
+            if( statusReg &amp; IOP_COMMAND_DATA_OUT_FULL ) {
+                // Already have a command, ignore like 1540 does
+                break;
+            }
+            else  {
+                if( inInitMbox ) {
+                    switch( dataCount-- ) {
+                        case 4:
+                            // First byte tells number of mailboxes
+                            mBoxCount = Value;
+                            break;
+                        case 3:
+                            //Third byte of the mailbox address
+                            *(ULONG *)&amp;pMailboxOut |= (Value &lt;&lt; 16);
+                            break;
+                        case 2:
+                            *(ULONG *)&amp;pMailboxOut |= (Value &lt;&lt; 8);
+                            break;
+                        case 1:
+                            *(ULONG *)&amp;pMailboxOut |= Value;
+                            pMailboxIn = (MBI*)(pMailboxOut
+                                                + mBoxCount);
+                            interruptReg |= IOP_COMMAND_COMPLETE
+                                          | IOP_ANY_INTERRUPT;
+                            inInitMbox = FALSE;
+                            break;
+                        default:
+                            break;
+                    }
+                } else if (readSetupData) {
+                    // Setup to return the number of bytes requested
+                    // by the driver.
+                    readSetupData = FALSE;
+                    dataCount = Value;
+                    intOnDataComplete = TRUE;
+                    dataRegPtr = adapterSetupData;
+                    statusReg |= IOP_DATA_IN_PORT_FULL;
+                    adapterSetupData[4] = mBoxCount;
+                    adapterSetupData[5] = (UCHAR)(((ULONG)pMailboxOut
+                                          &gt;&gt; 16) &amp; 0xFF);
+                    adapterSetupData[6] = (UCHAR)(((ULONG)pMailboxOut
+                                          &gt;&gt;  8) &amp; 0xFF);
+                    adapterSetupData[7] = (UCHAR)(((ULONG)pMailboxOut) &amp; 0xFF);
+                }
+                else if ( dataCount &gt; 0 ) {
+                    // Just Throw away initialization bytes
+                    if (--dataCount==0) {
+                        interruptReg |= IOP_COMMAND_COMPLETE
+                                      | IOP_ANY_INTERRUPT;
+                    }
+                } else {
+                  statusReg &amp;= ~IOP_INVALID_COMMAND;
+                  switch( Value ) {
+                    case AC_ADAPTER_INQUIRY:
+                        // Set up to return 4 bytes of Adapter Data
+                        // through the Command/Data register
+                        dataRegPtr = adapterInquiryData;
+                        dataCount = 4;
+                        intOnDataComplete = TRUE;
+                        statusReg |= IOP_DATA_IN_PORT_FULL;
+                        break;
+                    case AC_RET_CONFIGURATION_DATA:
+                        // Set up to return 3 bytes of Config Data
+                        // through the Command/Data register
+                        dataRegPtr = adapterConfigData;
+                        dataCount = 3; // 3 bytes of config data
+                        intOnDataComplete = TRUE;
+                        statusReg |= IOP_DATA_IN_PORT_FULL;
+                        break;
+                    case AC_RETURN_SETUP_DATA:
+                        readSetupData = TRUE;
+                        break;
+                    case AC_SET_HA_OPTION:
+                        dataCount = 2;
+                        intOnDataComplete = TRUE;
+                        break;
+                    case AC_SET_MAILBOX_INTERFACE:
+                        dataCount = 2;
+                        intOnDataComplete = TRUE;
+                        break;
+                    case AC_GET_BIOS_INFO:
+                        // 1540 returns 2 bytes of BIOS info
+                        dataRegPtr = adapterBiosData;
+                        dataCount = 2;
+                        intOnDataComplete = TRUE;
+                        statusReg |= IOP_DATA_IN_PORT_FULL;
+                        break;
+                    case AC_MAILBOX_INITIALIZATION:
+                        // Driver provides number of mailboxes and
+                        // the 3-byte physical address
+                        inInitMbox = TRUE;
+                        dataCount = 4;
+                        statusReg &amp;= ~IOP_DATA_IN_PORT_FULL;
+                        break;
+                    case AC_SET_TRANSFER_SPEED:
+                    case AC_SET_BUS_ON_TIME:
+                    case AC_SET_BUS_OFF_TIME:
+                        // Driver is going to give 1540 one byte of
+                        // SCSI initialization parameters.
+                        dataCount = 1;
+                        break;
+                    case AC_SET_SELECTION_TIMEOUT:
+                        // Driver will give 4 bytes of SCSI bus
+                        // initialization parameters
+                        dataCount = 4;
+                        break;
+                    case AC_START_SCSI_COMMAND:
+                        // Simulate executing a SCSI Command
+                        {
+                            int i, j;
+                            CCB *pCmdBlock;
+                            MBO *pMbo;  // Mailbox Out
+                            MBI *pMbi;  // Mailbox In
+<p></p>
+                            // Find the new SCSI Command in the Mailbox
+                            pMbo = pMailboxOut;
+                            for( i=0; i&lt;mBoxCount; ++i, ++pMbo ) {
+                                if( pMbo-&gt;Command == MBO_START ) {
+                                    pCmdBlock = (CCB*)
+                                        (pMbo-&gt;Address.Lsb +
+                                         (pMbo-&gt;Address.Mid&lt;&lt;8) +
+                                         (pMbo-&gt;Address.Msb&lt;&lt;16));
+                                    // For now just report good status
+                                    // and return to the driver
+                                    pCmdBlock-&gt;HostStatus =CCB_COMPLETE;
+                                    pCmdBlock-&gt;TargetStatus = 0;
+                                    pCmdBlock-&gt;DataLength.Lsb
+                                        = pCmdBlock-&gt;DataLength.Mid
+                                        = pCmdBlock-&gt;DataLength.Msb=0;
+                                    pMbo-&gt;Command = MBO_FREE;
+<p></p>
+                                    // Post the mailbox back to the driver
+                                    pMbi = pMailboxIn + mbiIndex;
+                                    for( j=0; j&lt;mBoxCount; ++j ) {
+                                        if( pMbi-&gt;Status == MBI_FREE )
+                                        {
+                                            pMbi-&gt;Status =MBI_SUCCESS;
+                                            pMbi-&gt;Address.Lsb
+                                                = (UCHAR)((ULONG)
+                                                pCmdBlock &amp; 0xFF);
+                                            pMbi-&gt;Address.Mid
+                                                = (UCHAR)((ULONG)
+                                                pCmdBlock&gt;&gt;8 &amp; 0xFF);
+                                            pMbi-&gt;Address.Msb
+                                                = (UCHAR)((ULONG)
+                                                pCmdBlock&gt;&gt;16 &amp; 0xFF);
+                                            mbiIndex
+                                             = (mbiIndex+1)%mBoxCount;
+                                            interruptReg
+                                                  = IOP_MBI_FULL
+                                                  | IOP_ANY_INTERRUPT;
+                                            break;
+                                        }
+                                        mbiIndex = (mbiIndex+1)%mBoxCount;
+                                        pMbi = pMailboxIn + mbiIndex;
+                                    }
+                                }
+                            }
+                        }
+                        break;
+                    default:
+                        // This is an invalid command
+                        interruptReg |= IOP_COMMAND_COMPLETE
+                                      | IOP_ANY_INTERRUPT;
+                        statusReg |= IOP_INVALID_COMMAND;
+                        break;
+                  } // end switch
+                } // end else
+            }
+            break;
+        default:
+            break;      // Interrupt register not written
+    }
+}
+UCHAR ScsiPortReadPortUchar( IN PUCHAR Port)
+{
+    UCHAR   retVal;
+    // Just return the current contents of the appropriate register
+    switch( (UINT)Port ) {
+        case CTRL_STAT_REG:
+            return statusReg;
+        case INT_REG:
+            return interruptReg;
+        case CMD_DATA_REG:
+            if( dataCount &gt; 0 ) {
+                retVal = *(dataRegPtr++);
+                if( --dataCount == 0 ) {
+                    // No more data, clear DATA IN PORT FULL
+                    statusReg &amp;= ~IOP_DATA_IN_PORT_FULL;
+                    if( intOnDataComplete )  {
+                        // Command is complete, post an interrupt
+                        interruptReg |= IOP_COMMAND_COMPLETE
+                                      | IOP_ANY_INTERRUPT;
+                    }
+                } else {
+                    // Immediately indicate next byte is ready
+                    statusReg |= IOP_DATA_IN_PORT_FULL;
+                }
+            } else {
+                retVal = dataReg;
+            }
+            return retVal;
+        default:
+            // Driver is accessing some register that is not part of
+            // the adapter.  May want to flag an error since this
+            // could be a bug in the driver.  We will just return -1
+             return 0xFF;
+    }
+}
+// Read a memory location (the BIOS for our driver)
+UCHAR ScsiPortReadRegisterUchar( IN PUCHAR Register )
+{
+    return 0;   // Give 0 since there is no BIOS in simulation
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

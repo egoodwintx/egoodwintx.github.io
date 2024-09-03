@@ -1,0 +1,96 @@
+<HTML>   
+     <HEAD>
+<TITLE>January 2002 C++ Experts Forum/The (B)Leading Edge</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../20.01/tocjan.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">The (B)Leading Edge: XDR_Stream Class, Part IV</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Jack W. Reeves</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Backtracking</FONT></H3>
+
+<p>This column is going to be short and to the point, I hope. First I have to address an error that reader Patrick Rabau spotted. In the <b>FactoryCollection</b> class that I described, there is a function <b>find</b> that takes a reference to a <b>type_info</b> object, such as returned by the <b>typeid</b> operator, and returns a string that represents a user-defined name for the type. Naturally, this is implemented internally with a standard library <b>map</b>. Since <b>type_info</b> objects cannot be copied directly, the <b>map</b> holds pointers to <b>type_info</b> objects as its key. Unfortunately, when I presented the code, I declared the <b>map</b> as follows:</p>
+
+<pre>
+std::map&lt;std::type_info*, string&gt;  TypeNameMap;
+</pre>
+
+<p>This uses the default comparison function of <b>std::less&lt;std::type_info*&gt;.</b> This in turn means that to function correctly, there can be only one instance of a <b>type_info</b> object for a given type. As Rabau pointed out, the Standard does not guarantee this. The resulting code has undefined behavior. This is another example of something that probably works on most platforms, but will sooner or later fail. </p>
+<p>The correct declaration for the <b>map</b> provides a custom comparison operator that uses the <b>type_info</b> class' <b>before</b> member function to provide the ordering. It should look like this:</p> 
+
+<pre>
+struct TypeInfoComp : std::binary_function&lt;std::type_info*,
+  std::type_info*, bool&gt; {
+  bool operator()(const std::type_info* lhs,
+    const std::type_info* rhs) const
+  { return lhs-&gt;before(*rhs); }
+};
+
+typedef std::map&lt;std::type_info*, 
+  std::string, TypeInfoComp&gt;  TypeNameMap;
+</pre>
+
+<p>With this change, the <b>map</b>'s <b>find</b> function will now base its equivalence test on the comparison provided by the <b>type_info</b> class itself, and not on the equivalence of two pointers. </p>
+<p>Rabau also pointed out an error in the EBCDIC to ASCII translation in one of <b>XDR_Stream</b>'s output functions. The correct code is now in the downloadable listing.</p>
+
+<H3><FONT COLOR="#000080">Error Handling</FONT></H3>
+
+<p>Now back to <b>XDR_Stream</b>. I mentioned at the end of the last column that I felt that <b>XDR_Stream</b> was not quite ready for production use. The reason is that its error handling was unacceptable. This was because an <b>XDR_Streambuf</b> is just a synonym for the specialization of a <b>std::basic_streambuf&lt;XDR_Char&gt;.</b> You may recall that it was the possibility of creating this specialization by creating an <b>XDR_Char</b> type that sparked the entire idea of the <b>XDR_Stream</b> class. Unfortunately, this specialization has a problem. The virtual functions of <b>basic_streambuf</b> that are expected to be overridden by a derived class to actually fetch characters from an underlying source, or put characters to an underlying sink, all return an <b>int_type</b>: more specifically, they return a <b>XDR_Char_Traits::int_type</b>. They are expected to return an <b>eof()</b> whenever an error is encountered reading the stream. Otherwise, the <b>int_type</b> is expected to contain the last read <b>char_type</b> value.</p>
+<p>In order for this to work, an <b>int_type</b> has to be a type or a class that can represent all of the values of the corresponding character type, plus an <b>eof</b> value. The Standard notes that &quot;If <b>eof()</b> can be held in <b>char_type</b> then some iostreams operations may give surprising results.&quot; As <b>XDR_Char_Traits</b> is currently defined, an <b>int_type</b> is just a <b>long</b>, almost the same as <b>char_type</b> itself. Furthermore, the currently defined value for <b>eof()</b> is <b>-1</b>. This means that anytime an <b>XDR_Char</b> is read with the value of <b>-1</b>, then it would appear that an error has been encountered on the stream. Since a value of <b>-1</b> is a perfectly reasonable value for an <b>XDR_Char</b> that holds an integer value, this is not acceptable. </p>
+<p>In order to get the <b>XDR_Char</b> type to work correctly, I had to change the <b>XDR_Char_Traits</b> type so that its <b>int_type</b> correctly meets the requirements of the Standard. To do this, I changed <b>int_type</b> to be:</p>
+
+<pre>
+typedef std::pair&lt;char_type, bool&gt; int_type;
+</pre>
+
+<p>The Boolean flag indicates whether the value is <b>eof</b> or not. I changed the <b>XDR_Char_Traits</b> function <b>to_int_type(c)</b> to return <b>make_pair(c, false)</b>. The function <b>to_char_type(x)</b> returns <b>x.first</b>. The function <b>eof()</b> now returns <b>make_pair(-1, true)</b>.</p>
+<p>With these changes, it is possible to develop derived versions of <b>XDR_Streambuf</b> that can correctly differentiate between a returned <b>int_type</b> that contains a <b>-1</b> value, and an error condition. </p> 
+<p>This was only half the battle, however. The Standard allows that a derived <b>streambuf</b> can throw an exception. The Standard requires that, if an exception occurs, the appropriate error bit (<b>failbit</b> or <b>badbit</b>) be set in the stream's state. Then, if the stream's exception mask for that bit is set, the exception should be propagated. This gets a little tricky. The first requirement obviously means that any exception thrown by a lower-level <b>streambuf</b> operation has to be caught. When the stream's state is set, however, if the stream's exception mask for that bit is set, then the <b>basic_ios</b> class will throw a <b>basic_ios::failure</b> exception. In order to propagate the original exception, the <b>basic_ios::failure</b> exception has to be caught and then the original exception rethrown. </p> 
+<p>On the other hand, if the stream's exception mask is not set, then the original exception is not rethrown. </p>
+<p>All of these are requirements for the regular IOStream classes, but I figured that an <b>XDR_Stream</b> should follow the same pattern. This means that all formatting functions that directly call <b>XDR_Streambuf</b> functions have to be prepared for those lower-level functions to throw exceptions. </p>
+<p>The code for the <b>oXDR_Stream::put(char_type)</b> function that will handle the above circumstances is shown below.</p>
+
+<pre>
+oXDR_Stream&amp; 
+oXDR_Stream::put(char_type c)
+{
+  try {
+    int_type x = rdbuf()-&gt;sputc(c);
+    if (x == traits_type::eof()) setstate(badbit);
+  } catch (...) {
+    if (not good()) throw;
+    bool rethrow = false;
+    try {
+        setstate(badbit);
+    } catch (...) {
+        rethrow = true;
+    }
+    if (rethrow) throw;
+  }
+  return *this;
+}</pre>
+
+<p>In the first <b>catch(...)</b> clause, the current state of the stream is first checked. If it is not <b>good(),</b> then that means the exception was thrown (probably) by the <b>basic_ios</b> class when <b>setstate(failbit)</b> was called. That exception is just rethrown. If the stream is still marked as <b>good()</b>, then the exception was thrown by a lower-level routine. In this case, the operation calls <b>setstate(badbit)</b> inside a <b>try/catch</b> block. If the <b>basic_ios</b> class throws an exception at this point, it must be caught and just treated as a signal that the original exception is to be rethrown. If no exception results when <b>setstate(badbit)</b> is called, then that means the exception mask is clear, so the original exception is not rethrown. This code is the way it is because I could not see any way to set the stream state without causing an exception to be thrown if the stream's exception mask was also set. Perhaps an alternative approach would be to save the exception mask before the call to <b>setstate(badbit)</b>, restore it afterward, and then check it to see if the original exception should be rethrown. Since exceptions are presumably rare events, even for IOStreams, I do not really object to the nested try blocks.</p> 
+<p>You will note that this function sets <b>failbit</b> if an <b>eof()</b> is encountered, but sets <b>badbit</b> if a lower-level exception occurs. This reflects my feeling that exceptions represent unrecoverable failures, and so they leave the stream in a bad state. In my example <b>XIOStream</b> class that is included in the downloadable code, the stream buffer returns an ordinary <b>eof()</b> if the underlying buffer is empty when an attempt is made to read an <b>XDR_Char</b>. On the other hand, if the underlying buffer can only return a portion of an <b>XDR_Char</b>, I consider this an exceptional condition and throw a <b>basic_ios::failure</b> exception.</p> 
+<p>With these modifications added to all necessary formatting functions, I finally believe that <b>XDR_Stream</b> is ready for real world use.</p>
+<p>At this point, it seems appropriate to look back at where we have been, and why I wanted to get here in the first place. My original intent in describing <b>XDR_Stream</b> in such detail was to show a good example of the extensibility of the Standard IOStreams library. I think I have demonstrated that. Yes, there is a lot of code here. Yes, it was not trivial to come up with some of it. On the other hand, it would have been considerably more work to come up with all the functionality inherent in the <b>basic_streambuf</b> and <b>basic_ios</b> templates. </p> 
+<p>Along the way, a number of subtle, but important points have been raised. The need to create a custom <b>cytpe&lt;XDR_Char&gt;</b> facet and install it in the global locale just so the <b>basic_ios::init</b> function would work correctly completely caught me by surprise. Getting the actual type for <b>XDR_Char</b> correct so that it meets the Standard requirement for a POD type and, at the same time, works around some bugs in different library implementations also took a couple of tries to get right. Finally, getting the error handling correct required some careful review of the requirements for <b>char_traits</b>, as well as for the functionality expected of IOStreams in general.</p> 
+<p>Obviously, I could have just shown the finished code and not described my thinking and the changes I discovered that I had to make as I went along. I felt it was worthwhile to walk through the whole process is some detail for several reasons. First, I wanted to give a solid real-world example of how the design of a class library proceeds. I really see too much software that has very little reusable middle-layer abstractions in it.</p>  
+<p>Second, I wanted to point out some of the things that can go wrong and that designers should be aware of. Undefined behavior resulting from not completely adhering to the requirements of the Standard is something you must constantly be aware of. Sometimes libraries can be buggy. And finally, in spite of best efforts, you can sometimes just plain overlook something, but this no different than any other aspect of software development. Therefore, I hope that instead of scaring you off, I have maybe gone a little ways toward convincing you that deriving your own IOStream is not a totally impossible task that must be left to a few dedicated programmers that do nothing else.</p> 
+<p>And that is my real point. Reuse comes in many forms. Sometimes you can reuse something as-is. Other times you have to do some tailoring. Maybe that means creating a derived class. Sometimes it means taking an existing framework and creating a new piece of your own that fits into the framework. There are a lot of advantages for doing so, even if the process is more work than just creating a derived class. The C++ Standard has a lot of extensibility of this type. It occurs in the STL, and it occurs in the IOStreams library. You just have to be willing to take advantage of it.</p> 
+<p>In the next installment, I hope to show a true real-world use for a very special type of <b>XDR_Stream</b>.</p>
+
+<p><i><B>Jack W. Reeves</b> is an engineer and consultant specializing in object-oriented software design and implementation. His background includes Space Shuttle simulators, military CCCI systems, medical imaging systems, financial data systems, and numerous middleware and low-level libraries. He currently is living and working in Europe and can be contacted via <B>jack_reeves@bleading-edge.com</B>.</i></p>
+
+<h4><a href="../../../source/2002/jan02/reeves.zip"></a></h4>
+
+</BLOCKQUOTE>
+</body>
+
+</html>
+

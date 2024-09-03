@@ -1,0 +1,477 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+  <title>Signals, Sockets, and Pipes - The Perl Journal, Spring 1997</title>
+  <meta name="generator" content=
+  "HTML Tidy for Linux/x86 (vers 12 April 2005), see www.w3.org">
+  <meta name="vscategory" content="Perl">
+  <meta name="vsisbn" content="">
+  <meta name="vstitle" content="Signals, Sockets, and Pipes">
+  <meta name="vsauthor" content="Steve Lidie">
+  <meta name="searchdescription" content=
+  "I'm relatively new to the Unix world; it wasn't until 1991 that our monolithic mainframe was replaced by several large Unix servers. When meeting these new beasts, I was surprised to find that the things known as 'filesystems' had a maximum size of two gigabytes - I was used to 64 bit words and maximum filesystem sizes measured in terabytes. These days two gigs can be gobbled up quite easily; for instance, a high quality color scan of a photograph might produce a 42 megabyte file. A finite element analysis might require several hundred megabytes of scratch space and an hour of digital video hogs 20 gigabytes of disk. Wow.">
+  <meta name="vsimprint" content="The Perl Journal">
+  <meta name="vspublisher" content="Earthweb">
+  <meta name="vspubdate" content="Spring 1997">
+  <!-- always update the article title and issue -->
+
+</head>
+
+<body bgcolor="#FFFFFF">
+  <font face="verdana" size="1">Issue 5, Spring 1997</font>
+
+  <h2 align="center">Signals, Sockets, and Pipes</h2>
+
+  <h4><i>Steve Lidie</i></h4>
+  <!-- packages described, if necessary -->
+  I'm relatively new to the Unix world; it wasn't until 1991 that
+  our monolithic mainframe was replaced by several large Unix
+  servers. When meeting these new beasts, I was surprised to find
+  that the things known as "filesystems" had a maximum size of two
+  gigabytes - I was used to 64 bit words and maximum filesystem
+  sizes measured in terabytes. These days two gigs can be gobbled
+  up quite easily; for instance, a high quality color scan of a
+  photograph might produce a 42 megabyte file. A finite element
+  analysis might require several hundred megabytes of scratch space
+  and an hour of digital video hogs 20 gigabytes of disk. Wow.
+
+  <p>In short order I grew tired of manually monitoring these
+  newfangled workstations and their filesystems, so I threw
+  together a Perl TCP/IP client-server to do the dirty work. Once a
+  minute the client connected to a server (often called a
+  <i>daemon</i>) running on a monitored machine, and the server
+  executed a Unix <i>df</i> command and returned the output. The
+  client took this data, reformatted it, and wrote it to a log file
+  which could be dynamically viewed with <tt>tail -f</tt>. This
+  scheme sufficed for several years since it provided ample
+  lead-time to take corrective action before a filesystem became
+  critically low on space.</p>
+
+  <p>When Tk for Perl arrived I immediately dreamt of colored bars
+  on a X display that expanded and contracted as disk usage varied
+  over time. Blending Tk with the original code resulted in a
+  package collectively known as <i>monds</i>, short for "monitor
+  disk space." The issues involved have more to do with signals,
+  sockets, and pipes than regular Perl/Tk, so my column will be a
+  little different this time. Anyway, here's what <i>monds</i>
+  looks like:</p>
+
+  <div align="center">
+    <img src="images/lidie-fig1.gif" width="372" height="150"
+    border="0" alt="">
+  </div>
+
+  <p>The conversion was slightly painful because, as we saw in
+  <a href="../vol1_3/tpj0103-0006.html">TPJ #3</a>, mixing socket
+  events with Perl/Tk X events can make the application hang.
+  That's why the simple-minded client was completely redesigned to
+  separate the Tk code from the network code. The solution: spawn a
+  child process to perform the client socket duties, and use a pipe
+  to pass information between the client and the Tk parent. The Tk
+  code never blocks when reading the pipe because it uses Perl's
+  <tt>select()</tt> function to ensure that df data is
+  available.</p>
+
+  <p>The Tk parent and child client employ a simple communications
+  protocol that describes how the processes exchange information.
+  This means that the monds system requires bi-directional pipes.
+  One direction is used when the parent speaks to a child; the
+  other is used when the child speaks to its parent.</p>
+
+  <p>When the child client is activated it immediately requests df
+  data from its associated server, writes the filesystem data to
+  its output pipe, and then waits for an ACK (acknowledge) by
+  attempting to read from its input pipe. Meanwhile, the Tk parent
+  periodically polls its input pipes (there's one for each
+  monitored machine), reads the filesystem data, and acknowledges a
+  child's response by sending a newline. When the child receives
+  that ACK, the cycle repeats. This simple scheme synchronizes the
+  entire application while still allowing X events to flow.</p>
+
+  <div align="center">
+    <img src="images/disk_space.gif" width="170" height="217" alt=
+    "monitor disk space">
+  </div>
+
+  <p>The <i>monds</i> protocol also provides for rudimentary error
+  reporting. If there are network problems, or a child client
+  cannot connect to its server, the child sends one of several
+  canned messages to the parent, who then posts the alert message
+  on the X display.</p>
+
+  <h3>The Monitor Disk Space TCP Daemon</h3>The simplest part of
+  <i>monds</i> is the remote server. No doubt many of you have
+  already written your own client-server pairs, based on examples
+  from Perl books, but this server is even more concise because
+  <i>inetd</i>, the Unix Internet daemon, does all the work.* Here
+  is a good example of my inherent laziness:
+  <pre>
+&#13;#!/usr/bin/perl -w 
+&#13;# 
+&#13;# monitor_disk_space_daemon - transmit 'df' 
+&#13;# output to the asynchronous TCP/IP task 
+&#13;# spun-off by monitor_disk_space.
+&#13;
+&#13;print '/bin/df 2&gt;&amp;1'; 
+&#13;print "END_OF_DF\n";
+&#13;
+</pre><br>
+
+  <p>A single backticked <i>df</i> written to STDOUT, followed by a
+  marker line, and that's it - <i>inetd</i> automatically connects
+  Perl's filehandles to the network sockets! Filesystem data is now
+  outward bound for the client who initiated this connection.</p>
+
+  <h3>The Monitor Disk Space TCP Client</h3>
+
+  <p>Although <i>monds</i> comes with its own client, Unix already
+  provides us with an alternative: <i>telnet</i>. All we need to do
+  is specify the <i>monds</i> TCP port number on the command line.
+  Typing this:</p>
+  <pre>
+&#13;%      telnet Turkey.CC.Lehigh.EDU 10346
+&#13;
+</pre>
+
+  <p>produces output similar to this:</p>
+  <pre>
+&#13;Trying... 
+&#13;Connected to turkey.CC.Lehigh.EDU.     
+&#13;Escape character is '^]'. 
+&#13;Filesystem Total KB     free %used iused %iused Mounted on 
+&#13;       /dev/hd4      12288     8052 34%     785  25%  / 
+&#13;       /dev/hd9var   12288     7620 37%     144   3%  /var     
+&#13;/dev/hd2     303104     1612 99%   18496  24%  /usr    
+&#13;/dev/hd3      12288     1336 89%     412  10%  /tmp    
+&#13;/dev/lv00     20180     2808 86%    1718  27%  /vice/cache     
+&#13;AFS        72000000 72000000  0%       0   0%  /afs    
+&#13;END_OF_DF
+&#13;
+</pre>
+
+  <p>That df output comes from a SYSV-like Unix machine. Here's
+  output from a BSD-like server:</p>
+  <pre>
+&#13;Trying... 
+&#13;Connected to turkey.CC.Lehigh.EDU. 
+&#13;Escape character is '^]'. 
+&#13;Filesystem  1024-blocks  Used  Available  Capacity  Mounted on         
+&#13;/dev/hda4     247871  171858  63212     90%   / 
+&#13;       /dev/hda1     523968  389952  134016    74%   /dosc 
+&#13;       /dev/hda2     189300  112014  77256     94%   /dosd     
+&#13;END_OF_DF
+&#13;
+</pre>
+
+  <p>The representations differ, but monds normalizes them into a
+  common format as the data arrives.</p>
+
+  <p>The <i>monds</i> client is similar to the <i>telnet</i> client
+  in that it expects an IP address and port number and writes the
+  incoming <i>df</i> data to STDOUT, but there the similarity ends.
+  Instead of exiting, the client then issues a read on STDIN,
+  waiting for the go-ahead to re-connect to the server for its next
+  <i>df</i> sample. Just like <i>telnet</i>, the <i>monds</i>
+  client can be run interactively; later we'll see how the Perl/Tk
+  parent creates the bi-directional pipes and attaches them to the
+  client.</p>
+
+  <p>Here is the entire client, compact enough that we can see at a
+  glance how it implements its half of the <i>monds</i>
+  protocol.</p>
+  <pre>
+&#13;#!/usr/bin/perl -w 
+&#13;# 
+&#13;# monitor_disk_space_client - request 'df' data from
+&#13;# monitor_disk_space_daemon and feed to 
+&#13;# monitor_disk_space.
+&#13;
+&#13;require 5.002; 
+&#13;use English; 
+&#13;use IO; 
+&#13;use strict;
+&#13;
+&#13;do {print "Usage: monds_client host port\n"; exit} 
+&#13;  if scalar @ARGV != 2; 
+&#13;
+&#13;STDOUT-&gt;autoflush(1); # always flush output buffer
+&#13;
+&#13;sub timeout {
+&#13;    $SIG{ALRM} = \&amp;timeout; 
+&#13;    print "Socket Timeout\n";
+&#13;}
+&#13;
+&#13;# Read socket data into a list until END_OF_DF detected; only
+&#13;# then output to our parent's pipe. This ensures that the
+&#13;# parent never blocks reading input data, since select()
+&#13;# won't know we have data for our parent until we actually do.
+&#13;# Cycle after we receive the ACK from monds.
+&#13;
+&#13;while (1) { 
+&#13;  my $sock = IO::Socket::INET-&gt;new(PeerAddr =&gt; $ARGV[0],
+&#13;                                   Proto    =&gt; 'tcp',
+&#13;                             PeerPort =&gt; "monds($ARGV[1])");
+&#13;   if ($sock) { 
+&#13;               my(@sd) = (); 
+&#13;        # prevent infamous "Alarm clock" problem 
+&#13;               $SIG{ALRM} = \&amp;timeout; 
+&#13;               alarm 60;       
+&#13;        while(&lt;$sock&gt;) {         
+&#13;            push @sd, $ARG; 
+&#13;            last if /^END_OF_DF$/;     
+&#13;        }      
+&#13;        alarm 0; 
+&#13;               print ((/^END_OF_DF$/ and $#sd &gt; 0) ? @sd 
+&#13;          : "Daemon Failure\n"); 
+&#13;    } else { 
+&#13;               print "Cannot Connect\n"; 
+&#13;    } 
+&#13;    $_ = &lt;STDIN&gt;;                # wait for go-ahead from monitor_disk_space 
+&#13;}
+&#13;
+</pre><br>
+
+  <p>At the top of the loop IO::Socket::INET-&gt;new() attempts to
+  connect to the client's peer daemon using the IP address and port
+  number specified on the command line. Assuming the connect
+  succeeds and the <tt>END_OF_DF</tt> marker is detected, the data
+  is printed. It might go to a pipe connected to the Perl/Tk
+  parent, or simply STDOUT if the client is executed
+  interactively.</p>
+
+  <p>The client also reports error conditions like "Cannot
+  Connect", "Socket Timeout" or "Daemon Failure". In particular,
+  it's free to use Unix signals like SIGALRM to timeout socket
+  reads; if the Perl/Tk parent were to attempt this, it would
+  surely crash the application.</p>
+
+  <h3>Connecting the TCP Client to the Perl/Tk Parent</h3>
+
+  <p>The next hurdle is to propagate the filesystem data to the
+  Perl/Tk program <i>monds</i>; the basic mechanism is taken
+  directly from O'Reilly's <i>Programming Perl</i> and relies on
+  <tt>pipe()</tt>, <tt>fork()</tt>, and <tt>exec()</tt> system
+  calls. <i>monds</i> uses the global hash <tt>%CHILD</tt> to
+  manage its multiple client connections and bi-directional pipes.
+  Each <tt>%CHILD</tt> key is the hostname of a monitored machine,
+  and the key's value is a reference to another hash with three
+  keys, so <tt>%CHILD</tt> is a hash of a hash with three elements.
+  Thus for a machine named 'dandy' we have this structure:</p>
+  <pre>
+{'dandy'}-&gt;{pid} child process ID (for KILLing)
+{'dandy'}-&gt;{pr}  filehandle of parent read pipe
+{'dandy'}-&gt;{pw}  filehandle of parent write pipe
+</pre>
+
+  <p>With all that in mind (put on your thinking caps please),
+  here's the code that fires off the clients:</p>
+  <pre>
+$READ_BITS = '';                     # "bitlist" of parent filehandles
+my($fh) = ('fh0000');   # indirect filehandle names
+my($cr, $cw);                   # child read and write filehandles
+foreach (@{$OPT{hosts}}) {
+	$cr = $fh++;
+	$CHILD{$ARG}-&gt;{pw} = $fh++;
+	pipe($cr, $CHILD{$ARG}-&gt;{pw}) or abort 'cr/pw pipe';
+	$CHILD{$ARG}-&gt;{pr} = $fh++;
+	$cw = $fh++;
+	pipe($CHILD{$ARG}-&gt;{pr}, $cw) or abort 'pr/cw pipe';
+	if ($CHILD{$ARG}-&gt;{pid} = fork) { # parent
+	       close $cr;
+	       close $cw;
+	       $CHILD{$ARG}-&gt;{pw}-&gt;autoflush(1);
+	       vec($READ_BITS, fileno($CHILD{$ARG}-&gt;{pr}), 1) = 1;
+	} elsif (defined($CHILD{$ARG}-&gt;{pid})) { # child
+	       close $CHILD{$ARG}-&gt;{pr};
+	       close $CHILD{$ARG}-&gt;{pw};
+	       open(STDIN,  "&lt;&amp;$cr") or abort 'STDIN open';
+	       open(STDOUT, "&gt;&amp;$cw") or abort 'STDOUT open';
+	       open(STDERR, "&gt;&amp;$cw") or abort 'STDERR open';
+	       STDOUT-&gt;autoflush(1);
+	       STDERR-&gt;autoflush(1);
+	       exec("$LIBDIR/monds_client",$ARG,$PORT)
+	               or abort 'exec';
+	} else {
+	       abort 'fork';
+	} # if fork
+} # for each monitored machine
+&#13;
+</pre>
+
+  <p>First, the global <tt>$READ_BITS</tt> is cleared. This
+  variable represents a bit list of the Unix file descriptors (not
+  filehandles) available for reading. You'll learn more about
+  <tt>$READ_BITS</tt> as we proceed.</p>
+
+  <p>Then the variable <tt>$fh</tt> is initialized with an
+  <i>indirect file handle</i> template; that is, the value of
+  <tt>$fh</tt> is the <i>name</i> of the file handle in question,
+  rather than a plain Perl filehandle bareword like STDOUT. We do
+  this for simplicity, so filehandles can be generated dynamically
+  without regard to the number of clients.( Within reason, of
+  course. The code depends upon Perl's ability to increment a
+  string, and as long as we don&rsquo;t try to create more
+  filehandles than more than your supports, space-time behaves
+  normally.)</p>
+
+  <p>For each host, inbound and outbound pipes are created, a
+  requirement for the two-way protocol. The <tt>fork()</tt> call
+  creates a clone subprocess of the Perl/Tk parent, and the flow of
+  the code splits, like a fork in a road, depending upon whether
+  the parent or child is executing it. If <tt>fork()</tt> succeeds
+  it returns the Unix process ID of the child to the Perl/Tk
+  parent, and zero to the child. Later we'll see why it's important
+  for the parent to record the PID of all its children.</p>
+
+  <p>The parent cares nothing about the child's filehandles so it
+  immediately closes them. Then it unbuffers its write filehandle,
+  builds up the <tt>select()</tt> bit list, and goes about its
+  way.</p>
+
+  <p>To understand exactly what vec() is doing, examine this
+  statement (executed within the Perl debugger):</p>
+  <pre>
+DB&lt;1&gt; @f = (fileno STDIN, fileno STDOUT, fileno STDERR))
+DB&lt;2&gt; print "@f"
+0 1 2
+</pre>
+
+  <p>We see that <tt>fileno()</tt> maps a Perl filehandle to a
+  small integer - the Unix file descriptor of the filehandle. Each
+  file descriptor represents an index in the select() bit list. So
+  each assignment to vec(<tt>$READ_BITS, ...</tt>) flips on a
+  particular bit, building it up so that eventually there is one
+  bit set for every parent read pipe.</p>
+
+  <p>Like its Perl/Tk parent, the child closes filehandles it
+  doesn't need. It then prepares to invoke the TCP client in the
+  standard Unix way: by connecting its read and write pipe
+  filehandles to STDIN, STDOUT and STDERR, and calling
+  <tt>exec()</tt> (with three arguments: the client's path name, an
+  IP address, and port number) to overlay the client upon
+  itself.</p>
+
+  <h3>The Perl/Tk Parent's Secondary Main Loop</h3>
+
+  <p>Once all the clients are running, <i>monds</i> enters its main
+  loop, which coexists with, but is independent of, the ubiquitous
+  Perl/Tk <tt>MainLoop()</tt>.</p>
+  <pre>
+<tt>
+$MW-&gt;repeat($poll_interval, \&amp;poll_clients);
+</tt>
+</pre>
+
+  <p>Subroutine <tt>poll_clients()</tt> is nominally called every
+  minute, at which time it collects and processes all available df
+  data, and then sends acknowledgements as required.</p>
+  <pre>
+&#13;sub poll_clients {
+&#13;  my($rbits, $nfound); 
+&#13;  $nfound = select($rbits = $READ_BITS,undef,undef,undef); 
+&#13;  return if $nfound == 0;
+&#13;  my(@go_ahead) = ();            # ACK hosts for another 'df' 
+&#13;  my(@host_list) = @{$OPT{hosts}};
+&#13;  PROCESS_ALL_HOSTS: while ($nfound &gt; 0) {  
+&#13;      my $them = shift(@host_list);    
+&#13;      if (vec($rbits, fileno($CHILD{$them}-&gt;{pr}),1) == 0){ 
+&#13;          # if no incoming data from this client
+&#13;                 next PROCESS_ALL_HOSTS; 
+&#13;      } 
+&#13;      $nfound--;       
+&#13;      push @go_ahead, $them;    # give a "go-ahead" signal
+&#13;      # parent's (monds') read filehandle
+&#13;      my $fh = $CHILD{$them}-&gt;{pr}; 
+&#13;
+&#13;    PROCESS_HOST_FILESYSTEMS:  while (&amp;lgt;$fh&gt;) {   
+&#13;         last PROCESS_HOST_FILESYSTEMS if /^END_OF_DF$/;
+&#13;         # Process file system data here ...
+&#13;       }
+&#13;  } # whilend PROCESS_ALL_HOSTS
+&#13;  foreach (@go_ahead) {        
+&#13;      print {$CHILD{$ARG}-&gt;{pw}} "\n";     
+&#13;  }     
+&#13;  display_poll_results;
+&#13;} 
+&#13;
+</pre>
+
+  <p>Here's our friend <tt>$READ_BITS</tt> again, that bit list of
+  all possible input file descriptors. We copy it into
+  <tt>$rbits</tt>. <tt>select()</tt> then checks the specified file
+  descriptors, and for file descriptors with no input data, it
+  clears the corresponding bits in <tt>$rbits</tt>. When
+  <tt>select()</tt> returns, <tt>$rbits</tt> now has bits set only
+  for those file descriptors have input data, and $nfound tells us
+  how many there are.</p>
+
+  <p>Using <tt>vec()</tt>, the data collection loop finds a viable
+  client, pushes its name on the acknowledgement list, and proceeds
+  to read and process the client's df data. Once all the df data
+  has been read, each client is given its ACK, the poll results are
+  displayed, and the cycle repeats.</p>
+
+  <h3>Further Considerations</h3>
+
+  <p><b>Termination.</b> Unix etiquette dictates that the Perl/Tk
+  parent properly terminate its children, so this code is bound to
+  the application's Quit button:</p>
+  <pre>
+&#13;foreach (@{$OPT{hosts}}) { 
+&#13;       kill 'SIGTERM', $CHILD{$ARG}-&gt;{pid} 
+&#13;      if defined $CHILD{$ARG}-&gt;{pid}; 
+&#13;}
+&#13;
+</pre>
+
+  <p><b>Efficiency.</b> As usual, the marginal utility of an
+  optimiziation isn't always worth the time and effort needed to
+  create, implement, and test the change. However, the <i>monds</i>
+  daemon is loaded, compiled, and executed 1440 times per day, and
+  so it's worth looking at. One possibility is to translate the
+  Perl code to C, resulting in a compact, lightweight process that
+  would load very fast. Another approach is to do away with
+  <i>inetd</i> altogether and write a true <i>monds</i> daemon that
+  loads once and accepts and handles network connections itself.
+  Then again, perhaps 1440 loads per day is mere noise, so the
+  choice is up to you.</p>
+
+  <p><b>Intelligence.</b> The current <i>monds</i> warning scheme
+  is overly simplistic because it only notices a filesystem when
+  its usage exceeds 90%. Suppose you have an empty two gigabyte
+  filesystem, and a process, for whatever reason, starts writing a
+  file upon it at 200,000 bytes per second. Assuming no disk
+  limits, that filesystem becomes completely filled in 2e9/2e5
+  seconds, or about 2.78 hours, and <i>monds</i> will post its
+  first alert with 16 minutes left. But if your filesystem had only
+  200 megabytes. That same process will fill the filesystem an
+  order of magnitude faster, in around 16 minutes, and monds would
+  only yelp with less than two minutes to go! So although the rate
+  of filling is identical in each case, the percentage of disk
+  usage is radically different, and that's what you care about.
+  This is an interesting idea to throw into the heuristic stew -
+  scale the threshold criteria so that every filesystem, regardless
+  of size, is provided an identical "reaction time period."</p>
+
+  <p><b>Action.</b> But wait, there's more! Since monds has a
+  modicum of intelligence, why not let the program load-level a
+  machine's filesystems? By that I mean actually move directories
+  from a file system low on space to one with excess space. If
+  monds was supplied with a list of filesystems among which it was
+  permitted to distribute directories, we can imagine a Perl/Tk
+  window like this:</p>
+
+  <p align="center"><a href="images/lidie-fig2.gif"><img src=
+  "images/lidie-fig2_sm.gif" align="center" alt="" border="0"
+  width="250" height="278"></a></p>
+
+  <p>We can take this idea even further and envision load-leveling
+  AFS volumes across the Internet, but now we need to deal with
+  multiple mount points possibly spread across multiple AFS severs,
+  a topic, as they say, beyond the scope of this column. 'Nuff
+  said.</p>
+
+  <p>_ _END_ _ <!-- end of article -->
+   <!-- end of file --></p>
+</body>
+</html>

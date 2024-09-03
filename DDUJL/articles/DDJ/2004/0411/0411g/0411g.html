@@ -1,0 +1,288 @@
+
+<html>
+<head>
+<title>November, 2004: Practical  Secure Port Knocking</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Practical  Secure Port Knocking</h1>
+<p><i>Dr. Dobb's Journal</i> November, 2004</p>
+<h2>"Who's there?"</h2>
+
+
+<h3>By John Graham-Cumming </h3>
+
+
+<I>John is vice president of engineering at Electric Cloud, which focuses on reducing software build times. He can be contacted at jgc@electric-cloud.com.</I>
+
+<hr>
+
+
+
+
+Last year, Martin Krzywinski described a technique for stealthily communicating with a computer (see "Port Knocking: Network Authentication Across Closed Ports," <i>Sys Admin</i> magazine, June 2003). The idea was that open ports on a machine invite attack. If you leave a machine on the Internet with an SSH daemon running on port 22, it's a simple matter for attackers to use port scanners like nmap (http://www.insecure .org/nmap/) to discover that the port is open and then try to attack it.
+
+<p>Krzywinski suggested that sensitive ports should be left closed until opened using a secret knock. The knock consists of sending TCP SYN packets (the first packet sent when opening a TCP connection) to a sequence of closed ports on the target machine. Firewall software records in a log file the failed connection attempts and software watching the firewall log checks for a specific sequence of ports and enables/disables a service. For example, with the correct knock, an SSH daemon could start waiting for connections, or the firewall could be reconfigured to allow connections from the host that knocked.</p>
+
+<p>Since a knock is just a sequence of attempted TCP connections, programs such as telnet can be used to manually generate it. For example, to knock on ports 42, 196, and 69 of 192.168.0.3, do: </p>
+
+<blockquote>
+telnet 192.168.0.3 42<br>
+telnet 192.168.0.3 196<br>
+telnet 192.168.0.3 69<br>
+
+</blockquote>
+
+<p>Imagine that Linux host 192.168.0.3 is running an SSH daemon on port 22, but the iptables firewall (http://www.netfilter .org/) has been set to drop and log every incoming TCP packet, thus making access to the SSH daemon impossible:</p>
+
+<blockquote>
+iptables -N LOGNDROP<br>
+iptables -A INPUT -p tcp -j LOGNDROP<br>
+iptables -A LOGNDROP -j LOG --log-level warn \<br>
+                   --log-prefix='FIREWALL:'<br>
+iptables -A LOGNDROP -j DROP<br>
+
+</blockquote>
+
+<p>This tells <i>iptables</i> to create a new chain called <i>LOGNDROP</i>, then pass all incoming TCP packets to the chain where they are first logged (most likely to /var/log/messages) with the prefix <i>FIREWALL: </i>(for easy grepping), then dropped.</p>
+
+<p>The use of the action <i>DROP</i> means that TCP packets are not acknowledged in any way. The packet is simply discarded. The host machine will not even generate an ICMP "port unreachable" packet and the host appears to be switched off, but the connection attempt has been logged. To outsiders, the system appears to be inoperative, but the log file tells a different story.</p>
+
+<p>An application watching /var/log/messages sees entries such as those in <a name="re1"></a><a href="0411ge1.html">Example 1</a> if a knock is made against ports 42, 196, and 69 from host 192.168.0.5. The same application could process the ports knocked to decide to add or remove entries in iptables, thereby opening or closing ports. For example, the correct knock on 42, 196, 69 could result in the firewall opening port 22 just for host 192.168.0.5 for SSH access with the iptables command:</p>
+
+<blockquote>
+iptables -I INPUT -p tcp -s 192.168.0.5 --<br>
+                           dport 22 -j ACCEPT<br>
+
+</blockquote>
+
+<p>Port knocking has three fundamental ideas behind it:</p>
+
+<ul>
+    <li>Default to Closed. It's better to leave sensitive services firewalled until they are needed so that scanning the machine with nmap doesn't reveal any ports to attack.</li>
+  <li>Share a Secret. How ports get opened should rely on a secret (for example, a password in the form of a specific sequence of ports).</li>
+  <li>Vow of Silence. The port knocking application does not respond to any packets. It listens but divulges no information about its operation, or even existence, so that it too is undetectable with nmap.</li>
+</ul>
+
+
+
+<p>A slightly more controversial tenet of port knocking is that the knock should be hard to intercept. Some people accuse port knocking of relying on "security through obscurity": that is, both the sequence of ports to knock is secret and it's not possible to determine the sequence.</p>
+
+<p>Obviously the simplistic port knocking system just outlined has vulnerabilities and it is possible to detect the knocks using a packet sniffer. Eavesdroppers can easily detect the knock sequence using, for example, tcpdump (http://www.tcpdump.org/) with an appropriate filter: </p>
+
+<blockquote>
+tcpdump -t -n '(tcp[13] == 2) or (tcp[13] == 18)'<br>
+
+</blockquote>
+
+<p>which prints out all TCP SYN and SYN/ACK packets. For example, intercepted knocks on 42, 196, and 69 would look like <a name="re2"></a><a href="0411ge2.html">Example 2</a>. A Perl script (<a name="rl1"></a><a href="#l1">Listing One</a>) can quickly parse tcpdump's output to determine which SYN packets received a SYN/ACK (hence, were real connections) and which were silently dropped (and hence could be a knock), then produce the output:</p>
+
+<blockquote>
+Knock on 192.168.0.3:42<br>
+Knock on 192.168.0.3:196<br>
+Knock on 192.168.0.3:69<br>
+
+</blockquote>
+
+<p>Once the knock is known, it can be repeated by a third party to open the SSH port for their use at any later time.</p>
+
+<p>Because of this vulnerability, encryption of the knock is essential (for more information on encryption techniques, see http://www.portknocking.org/). The knock needs to be nonreplayable (that is, eavesdroppers can't reuse the knock for their own use), nonspoofable (eavesdroppers can't reuse the knock from a different IP address), and should not be easily decodable.</p>
+<h3>Tumbler</h3>
+
+<p>The Tumbler protocol (named for the parts of a lock that tumble into place when the right key is inserted) implements the spirit of port knocking with robust security using a well-known hashing algorithm. Tumbler provides protection against replay attacks (the knock is timestamped and cannot be reused after a short interval) and spoofing (the knock can only be used from a specific IP address). </p>
+
+<p>In addition to the protocol, a Perl implementation is available under the General Public License at http://tumbler.sf.net/. Of course, there's no reason whyTumbler has to be implemented in Perl&#151;the protocol is simple and could easily be built into other applications (for example, SSH could include a --<i>tumbler</i> option to perform the appropriate knock before connecting).</p>
+
+<p>The protocol consists of a single UDP packet in the form:</p>
+
+<blockquote>
+TUMBLER&lt;v&gt;: &lt;knock&gt;<br>
+
+</blockquote>
+
+<p>where <i>&lt;v&gt;</i> is the protocol version number, currently 1, and <i>&lt;knock&gt;</i> is a hexadecimal string containing the knock. For example, the UDP packet might contain:</p>
+
+<blockquote>
+TUMBLER1:844c17eee03d848cc0a60e90f6<br>
+                 08d5ea11f417d9bf0d2c1af2b5<br>
+
+</blockquote>
+
+<p>There is no response to the message. Either the process listening for Tumbler messages accepts it or it is silently dropped.</p>
+
+<p>The <i>&lt;knock&gt;</i> is created by hashing the following three pieces of information using the SHA256 algorithm (http://csrc.nist.gov/CryptoToolkit/tkhash.html):</p>
+
+
+
+<ul>
+  <li>The current Zulu date/time in the format YYYMMDDHHmm (YYY is the number of years since 1900, MM is the month starting with January as 0, DD is the day of the month starting with 1, HH is the Zulu hour in a 24-hour clock, mm is the Zulu minutes).</li>
+  <li>The dotted decimal representation of the sender's IP address (192.168.0.5, for example).</li>
+  <li>A shared secret password string.</li>
+  </ul>
+
+<p>SHA256 is used because it is a known secure hash algorithm (in fact, it's an NIST Standard) that produces a one-way hash of its plain text. Because Tumbler only needs to recognize the validity of a message, and doesn't need to decode it, a secure hash algorithm is appropriate. When a Tumbler message is received, the host creates a hash based on:</p>
+
+
+
+<ul>
+  <li>The current Zulu date/time on the machine.</li>
+  <li>The IP address of the person sending the Tumbler messages.</li>
+  <li>The shared secret password string.</li>
+</ul>
+
+
+
+<p>It then compares the two hashes to see if the message is valid. If the hash matches, then the host can proceed to open the firewall. If any part of the message is different (for instance, the time is wrong, the IP address doesn't match, or the secret password is incorrect), then a different hash is generated and the host discards the Tumbler message.</p>
+
+<p>If the host has multiple possible knocks, then each is configured with a different shared secret and the host runs through all the possible hashes looking for a match. </p>
+<h3>Implementation</h3>
+
+<p>In the Perl implementation (available electronically; see "Resource Center," page 5), a script named "tumbler" sends the knock using <a name="re3"></a><a href="0411ge3.html">Example 3</a> (with <i>$secret</i> containing the user's secret password). It grabs the Zulu time by calling <i>gmtime</i>, gets the machine's IP address in dotted format by calling <i>inet_ntoa</i> (on an <i>IO::Socket</i> called <i>$socket</i>), then hashes the message using <i>sha256_hex</i> (which is part of the Perl module Digest::SHA; http://search.cpan.org/~mshelor/DigestSHA5.02/SHA.pm) and returns a hex string containing the SHA256 hash. Finally, it sends a single UDP packet containing the Tumbler message.</p>
+
+<p>The receiving machine runs another Perl script named "tumblerd" (also available electronically), which is configured through the configuration file tumblerd.conf to listen on a UDP port for Tumbler messages and perform commands. In <a name="rl2"></a><a href="#l2">Listing Two</a>, <i>tumblerd</i> has been configured to allow SSH connections once a knock with the password <i>open-pAsSwOrD</i> has been made, and there's even a knock that closes the port again (password <i>close-pAsSwOrD</i>).</p>
+
+<p>For example, to open the SSH port, the remote user runs:</p>
+
+<blockquote>
+tumbler --open tumbler:<br>
+                //open-pAsSwOrD@host:8675/<br>
+
+</blockquote>
+
+<p>or alternatively:</p>
+
+<blockquote>
+tumbler --open tumbler://host:8675/<br>
+
+</blockquote>
+
+<p>and then types in the secret password <i>open-pAsSwOrD</i>. The <i>tumblerd</i> runs through all the configured secrets looking for a hash match and, when it finds one, it runs the appropriate command.</p>
+
+<p>A simple shell script containing three commands could establish an SSH connection to the host after opening the port with a knock and close the port again when the SSH connection is complete:</p>
+
+<blockquote>
+#!/bin/bash<br>
+tumbler --open tumbler:<br>
+                //open-pAsSwOrD@host:8675/<br>
+ssh host<br>
+tumbler --open tumbler:<br>
+              //close-pAsSwOrD@host:8675/<br>
+
+</blockquote>
+<h3>Security Properties</h3>
+
+<p>Tumbler clearly shares with port knocking the idea that ports are closed by default, and the use of a shared secret to open ports. To maintain the "vow of silence," <i>tumblerd</i> does not respond to packets sent, but it is possible to discover the existence of <i>tumblerd</i> using nmap UDP scanning if the firewall is not configured to drop unknown UDP packets. </p>
+
+<p>To run a UDP scan a host with nmap, type:</p>
+
+<blockquote>
+nmap -sU host -p1-65535<br>
+
+</blockquote>
+
+<p>This detects the <i>tumblerd</i> daemon running:</p>
+
+<blockquote>
+Starting nmap 3.30 <br>
+         ( http://www.insecure.org/nmap/ )<br>
+Interesting ports on host (192.168.0.3):<br>
+Port State Service<br>
+8765/udp open unknown<br>
+
+</blockquote>
+
+<p>nmap UDP scanning works by sending a packet to each port scanned and looking for the ICMP "port unreachable" message sent when the port is closed. If there's no port unreachable reply, then the port is open. To prevent that from happening, configure iptables to drop all UDP packets except those destined for <i>tumblerd</i>:</p>
+
+<blockquote>
+iptables -A INPUT -p udp <br>
+                      --dport 8675 -j ACCEPT<br>
+iptables -A INPUT -p udp -j DROP<br>
+
+</blockquote>
+
+<p>Dropping the packets means that they are silently discarded. Tumbler guards against replay attacks, where eavesdroppers intercept Tumbler packets and try to reuse them in two ways:</p>
+
+
+
+<ul>
+  <li>Embedded in the hash is the Zulu time the knock was sent with an accuracy of one minute. The <i>tumblerd</i> daemon only accepts valid hashes; hence, the packet times out automatically. </li>
+  <li><i>tumblerd</i> automatically discards duplicate hashes. Not only is the packet useless in under a minute, repeated use of it within the same minute has no effect. </li>
+  </ul>
+
+<p>To guard against spoofing, where eavesdroppers use an intercepted knock from a different IP address, Tumbler includes the IP address of the sender in the hash. For attackers to spoof the Tumbler protocol, they must intercept a packet and reuse it in under 60 seconds from the same IP address as the packet was originally sent.</p>
+
+<p>Since the <i>tumblerd</i> passes the IP address of the sender to commands that it executes, the attacker would only be able to repeat exactly the same command as the original knock.</p>
+
+<p>Tumbler is easier to sniff than a TCP SYN-based port knocking implementation because, once a single Tumbler packet has been intercepted, the destination port is known and can be tracked using tcpdump:</p>
+
+<blockquote>
+tcpdump 'dst port 8675'<br>
+
+</blockquote>
+<h3>Other Implementations</h3>
+
+<p>Tumbler is just one implementation of the port knocking idea. In addition to reading http://www.portknocking.org/, check out the following interesting projects: doorman (http://doorman.sourceforge.net/) and knockd (http://www.zeroflux.org/knock/). Most interesting of all is cd00r (http://www.phenoelit.de/stuff/cd00rdescr .html), which was intended for use in malware. An academic look at port knocking comes in the form of a research paper from Intel Research (http://www.intelresearch.net/Publications/Berkeley/012720031106_111.pdf).</p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>#!/usr/bin/perl -w
+use strict;
+my knocks;
+while ( &lt;&gt; ) {
+   my $packet = $_;
+   $packet =~ /^((\d+\.){3}\d+)\.(\d+) &gt; ((\d+\.){3}\d+)\.(\d+)/;
+   my ($src_ip,$src_port,$dest_ip,$dest_port ) = ($1,$3,$4,$6);
+   if ( $packet =~ / ack / ) {
+      knocks = grep( !/^$src_ip:$src_port$/, knocks );
+   } else {
+      push knocks, "$dest_ip:$dest_port";
+   }
+}
+foreach my $k (knocks) {
+   print "Knock on $k\n";
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre># The common section contains configuration options for the tumblerd daemon,
+#  here we set the UDP port to listen on to 8675 and a log file
+[common]
+   port = 8675
+   log = /var/log/tumblerd.log
+# Each door that a user can knock on is defined by a unique [door-X] section, 
+# the first section is for opening the SSH port, and second for closing
+#
+# Each door has a secret (i.e. the password for this
+# door that is part of the knock) and a command to execute.
+#
+# In the command it's possible to use the macros %IP% for the IP address of 
+# the person who knocked and %NAME% for the name of the door (in the 
+# first door here the name is open-ssh)
+[door-open-ssh]
+   secret = open-pAsSwOrD
+   command = iptables -I INPUT -p tcp -s %IP% --dport 22 -j ACCEPT
+[door-close-ssh]
+   secret = close-pAsSwOrD
+   command = iptables -D INPUT -p tcp -s %IP% --dport 22 -j ACCEPT</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

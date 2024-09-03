@@ -1,0 +1,447 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+  <title>Dynamic DNS Updates with Perl - The Perl Journal, Winter 1999</title><!-- end head -->
+  <meta name="generator" content=
+  "HTML Tidy for Linux/x86 (vers 12 April 2005), see www.w3.org">
+  <meta name="vscategory" content="Perl">
+  <meta name="vsisbn" content="">
+  <meta name="vstitle" content="Dynamic DNS Updates with Perl">
+  <meta name="vsauthor" content="Jon Drukman">
+  <meta name="searchdescription" content=
+  "This article talks about the Net::DNS::Update module, and how you can use it to remotely update information on a DNS server.">
+  <meta name="vsimprint" content="The Perl Journal">
+  <meta name="vspublisher" content="Earthweb">
+  <meta name="vspubdate" content="Winter 1999">
+  <!-- always update the article title and issue -->
+
+</head>
+
+<body>
+  <font face="verdana" size="1">Issue 16, Winter 1999</font>
+
+  <h2 align="center">Dynamic DNS Updates with Perl</h2>
+
+  <h4><i>Jon Drukman</i></h4>
+  <!-- packages described, if necessary -->
+
+  <div align="center">
+    <table border="1" cellspacing="0" cellpadding="5">
+      <tr>
+        <td bgcolor="#CCCC99">
+          <div align="center">
+            <b>Packages Used</b>
+          </div>
+        </td>
+      </tr>
+
+      <tr>
+        <td>Net::DNS modules
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;CPAN<br>
+
+        BIND&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;
+        http://www.isc.org/bind.html</td>
+      </tr>
+    </table>
+  </div>
+
+  <p>This article talks about the Net::DNS::Update module, and how
+  you can use it to remotely update information on a DNS server.
+  You might do this if you are a DNS administrator wanting to
+  balance load between a range of machines, or if you are the owner
+  of a domain and want to programmatically update the information
+  in that domain even though you don't have access to the DNS
+  server's configuration files.</p>
+
+  <h3>DNS Basics</h3>
+
+  <p>Whenever you send mail or visit a web site, your computer has
+  to know how to reach a remote computer. In particular, it has to
+  translate a name like "perl.com" to its Internet address,
+  199.45.135.9. Only when that address is known can your mail
+  program send mail to webmaster@perl.com and your web browser
+  display http://www.perl.com/CPAN/.</p>
+
+  <p>The act of translating hostnames to Internet addresses is
+  called <i>name resolution</i>, and the infrastructure supporting
+  it is called the Domain Name System, or DNS. In this article,
+  I'll demonstrate how to access some of the new features of The
+  Berkeley Internet Name Daemon (BIND) Version 8 with the Net::DNS
+  modules. In particular, I'll focus on Net::DNS::Update, which
+  allows you to change the information stored in a nameserver on
+  the fly. You could use this technique to take a crashed box in a
+  server farm out of rotation, manage PPP or DHCP clients, or
+  perform load balancing.</p>
+
+  <p>To get the most out of this article you should have a decent
+  knowledge of the workings of DNS and BIND, a BIND version 8
+  nameserver, and a zone to play around with. A <i>zone</i> is
+  similar to a domain such as perl.com, but it could also refer to
+  a subdomain such as test.perl.com. While it is possible that the
+  code examples will work with other RFC 2136-compliant
+  nameservers, I haven't tested anything other than BIND 8 running
+  on Unix.</p>
+
+  <p>A full description of DNS is beyond the scope of this article.
+  For those who want the full story, I highly recommend O'Reilly's
+  <i>DNS &amp; Bind</i> book by Albitz &amp; Liu.</p>
+
+  <h3>DNS Servers</h3>
+
+  <p>Without doubt, the most popular nameserver is BIND
+  (http://www.isc.org/bind.html). The current BIND implementation,
+  BIND 8, is maintained by the Internet Software Consortium (ISC),
+  and supports a feature called dynamic update; see
+  http://www.isi.edu/in-notes/rfc2136.txt for the low-level
+  description of the <i>dynamic update</i> protocol. BIND 8 has
+  been in production use since May 1997, so you shouldn't fear
+  upgrading.</p>
+
+  <p>One way to tell if your system is running BIND 8 is to look at
+  how your <i>named</i> gets started. If it uses a file called
+  <tt>named.conf</tt>, it is version 8. The older model, version 4,
+  which is still quite common, uses <tt>named.boot</tt>. You could
+  also look at the <i>named</i> log messages when it starts up.
+  Mine looks like this:</p>
+  <pre>
+Dec 16 11:41:09 hudsucker named[14993]: starting. named 
+                         8.1.2 Thu Jan  8 12:47:42 PST 1998
+jsd@hudsucker.gamespot.com:/usr/home/jsd/build/bind/src/bin/named
+
+
+</pre>
+
+  <p>If your system uses version 4, you should upgrade to version
+  8, since that's the only version being actively maintained and
+  developed. BIND 4 has been deprecated by the ISC.</p>
+
+  <h3>Dynamic Update</h3>
+
+  <p>Originally, zone files (the files that map IP addresses to
+  names and vice versa) were fairly static. You'd set up a machine,
+  give it an address, and that was the end of the story. Most
+  machines on the net were mainframes then, so there was no
+  compelling need for a flexible, dynamic protocol.</p>
+
+  <p>In this day of dialup PPP, DHCP, and server farms, things are
+  clearly different. We need a way to dynamically update entries in
+  a zone file on the fly. Enter RFC 2136 and Net::DNS::Update.</p>
+
+  <p>Net::DNS is a collection of object-oriented modules designed
+  to interface with nameservers. The author, Michael Fuhr, claims
+  they're slow, but I've never encountered any debilitating speed
+  problems. Usually you have more than enough latency in your
+  network to offset any problems with script speed!</p>
+
+  <h3>Setting Up Your Nameserver</h3>
+
+  <p>Before you can start writing code, you must configure your
+  nameserver to accept dynamic updates. I recommend creating a
+  separate zone for dynamic updates because BIND writes out the
+  zone file when it changes, and it writes it out in a compact form
+  without any formatting or comments you might have put in the
+  original.</p>
+
+  <p>So, say your zone is test.com and you want to create
+  <tt>dyn.test.com</tt> to hold the dynamic updates. Put the
+  following lines in your <tt>named.conf</tt> file:</p>
+  <pre>
+   zone "dyn.test.com" {
+     type master;
+     file "db.dyn.test.com";
+     allow-update { 10.0.0.0/24; };
+   };
+</pre>
+
+  <p>There are several salient features in this entry. First, the
+  zone name, which is self-evident. The <tt>type</tt> is either
+  <tt>master</tt> or <tt>slave</tt>. In this case we are
+  authoritative for <tt>test.com</tt> and all its subdomains, so we
+  are the <tt>master</tt>.</p>
+
+  <p>The filename can be whatever you want; it is created in the
+  directory specified in the options section of your configuration
+  file. The really important feature is the <tt>allow-update</tt>
+  directive. Without this, the nameserver rejects all updates for
+  the zone. I have specified the hosts in the IP/Netmask form. The
+  number after the slash is the number of "one" bits in the
+  netmask, counted from the left hand side. So, rendering the above
+  in binary would give us:</p>
+  <pre>
+          00001010 00000000 00000000 00000000  host address
+          11111111 11111111 11111111 00000000  netmask
+</pre>
+
+  <p>In English, this means that any IP address starting with
+  10.0.0 is allowed to update the zone.</p>
+
+  <p>If this discussion of host addresses and netmasks has you
+  dizzy, don't worry. You aren't the first to be perplexed.
+  However, I recommend that you spend some time learning about
+  them, because if you deal with DNS or other Internet protocols on
+  a regular basis, you will undoubtedly encounter them over and
+  over again.</p>
+
+  <h3>Delegating The Zone</h3>
+
+  <p>Now that you have created a new zone, you need to tell your
+  nameserver where to get information on it. In the
+  <tt>test.com</tt> zone file, you need to add the following
+  line:</p>
+  <pre>
+         dyn IN NS nameserver.test.com
+</pre>
+
+  <p>This assumes that <tt>test.com</tt> is already being served by
+  <tt>nameserver.test.com</tt> and that you are creating
+  <tt>dyn.test.com</tt> on the same machine. Now when people ask
+  <tt>nameserver.test.com</tt> about <tt>dyn.test.com</tt>, it
+  sends them a response which points right back at the same
+  machine. Obviously that's redundant in this case, but remember
+  that one of the key features of DNS is its distributed nature --
+  you could just have easily directed queries about dyn.test.com to
+  a machine on the other side of the world. This process is known
+  as <i>delegation</i>.</p>
+
+  <p>Incidentally, you can declare yourself authoritative for any
+  zone, regardless of whether or not this is actually the case.
+  What happens in this situation is that any clients using your
+  nameserver for resolution will take whatever it says as gospel,
+  whereas the rest of the net will get different information from
+  the real authoritative nameservers. This could be extremely
+  confusing, so if you are unsure whether you are authoritative for
+  a zone, double check with the appropriate registry, or use dig to
+  find the answer. dig is an excellent tool bundled with the BIND
+  package. It is invaluable for diagnosing DNS problems.</p>
+  <pre>
+ $ dig test.com
+ 
+ ; &lt;&lt;&gt;&gt; DiG 2.2 &lt;&lt;&gt;&gt; test.com 
+ ;; res options: init recurs defnam dnsrch
+ ;; got answer:
+ ;; -&gt;&gt;HEADER&lt;&lt;- opcode: QUERY, status: NOERROR, id: 6
+ ;; flags: qr rd ra; Ques: 1, Ans: 1, Auth: 2, Addit: 2
+ ;; QUESTIONS:
+ ;;      test.com, type = A, class = IN
+ 
+ ;; ANSWERS:
+ test.com.       3568    A       207.206.9.99
+ 
+ ;; AUTHORITY RECORDS:
+ test.com.       3571    NS      mercury.xa.com.
+ test.com.       3571    NS      grail.BOOKS.com.
+</pre>
+
+  <p>It turns out that the real world test.com is served by
+  <tt>mercury.xa.com</tt> and <tt>grail.books.com</tt>. Replies
+  coming from any other sources are <i>non-authoritative</i>. The
+  reverse of this situation, where a server is designated
+  authoritative but is not responding authoritatively for a
+  request, is called a <i>lame delegation</i>. If you run
+  <i>named</i> with the default logging levels, you will see plenty
+  of lame delegation warning messages!</p>
+
+  <p>We're still not done setting up. In the example below, we are
+  going to dynamically change the address of <tt>ftp.test.com</tt>.
+  Except that to avoid messing up the test.com zone, we are really
+  going to change <tt>ftp.dyn.test.com</tt>. We need to make an
+  alias that maps <tt>ftp.dyn.test.com</tt> to
+  <tt>ftp.test.com</tt>. In DNS jargon, such an alias is called a
+  CNAME, which means "canonical name."</p>
+
+  <p>So put the following line in the test.com zone file:</p>
+  <pre>
+       ftp IN CNAME ftp.dyn.test.com.
+</pre>
+
+  <p>It's time to restart the nameserver. I recommend using the
+  <tt>ndc restart</tt> command. See your BIND documentation for
+  details.</p>
+
+  <p>Now that we've configured a nameserver and delegated the zone,
+  we can actually get down to writing some Perl code!</p>
+
+  <h3>Using Net::DNS::Update</h3>
+
+  <p>For this example, let's imagine that you have two FTP servers,
+  <tt>ftp1.test.com</tt> and <tt>ftp2.test.com</tt>, both
+  containing the same content. Their IP addresses are 10.0.0.1 and
+  10.0.0.2, respectively. You want users who come to ftp.test.com
+  to end up on either of those machines, and you want the load
+  distributed evenly between them. (Note that you don't need a
+  script like this to achieve a round-robin distribution. That
+  functionality is already built into BIND; this example is meant
+  to be instructive rather than practical.) Here's the Perl
+  script:</p>
+  <pre>
+
+ 1 use strict;
+ 2 use Net::DNS;
+ 3 
+ 4 while (1) {
+ 5   set_dns('10.0.0.1');
+ 6   sleep 300;
+ 7   set_dns('10.0.0.2');
+ 8   sleep 300;
+ 9 }
+10 
+11 sub set_dns {
+12   my $new_ip=shift;
+13   my $update = new Net::DNS::Update('dyn.test.com');
+14      $update-&gt;push('update', rr_del('ftp.dyn.test.com'));
+15      $update-&gt;push('update', 
+                      rr_add("ftp.dyn.test.com 1800 A $new_ip"));
+16   
+17   my $res = new Net::DNS::Resolver;
+18      $res-&gt;nameservers('nameserver.test.com');
+19   my $reply = $res-&gt;send($update);
+20   if (defined $reply) {
+21     if ($reply-&gt;header-&gt;rcode ne "NOERROR") {
+22       print $reply-&gt;header-&gt;rcode,"\n";
+23     } else {
+24       print "Update to $new_ip succeeded!\n";
+25     }
+26   } else {
+27     print 'Update failed: ', $res-&gt;errorstring, "\n";
+28   }
+29 }
+</pre>
+
+  <p>In lines 4-8, we set up an infinite loop that changes the IP
+  address and sleeps for five minutes. The interesting stuff
+  happens in the <tt>set_dns()</tt> subroutine. In line 12, we grab
+  the IP address that we're going to associate with
+  <tt>ftp.dyn.test.com</tt>, and create a new Net::DNS::Update
+  object in line 13. Lines 14 and 15 push data into the update
+  packet.</p>
+
+  <p>Update packets are processed atomically -- once the nameserver
+  determines that you are allowed to initiate your change, all of
+  the requests in your packet are serviced in order, with no
+  possibility of any other requestor changing data out from under
+  you while your changes are being made. So, in our packet, we have
+  a request to delete the current RR (resource record) set for
+  <tt>ftp.dyn.test.com</tt>, followed by an immediate request to
+  insert a new RR for <tt>ftp.dyn.test.com</tt>. The format of the
+  string passed to <tt>rr_add()</tt> is a little odd, but should be
+  familiar to anyone who's worked with zone files. The first field
+  is the hostname, of course. The second field is the
+  <i>time-to-live</i> for the entry, expressed in seconds. This one
+  says that this record is valid for 300 seconds (5 minutes), at
+  which point any nameserver caching it should throw it out and
+  request a new one from another nameserver. (Unfortunately the DNS
+  resolver clients in MacOS and Windows are broken to various
+  degrees, and often ignore the timeouts. Sometimes it appears that
+  your machine is fixated on a given IP address; the only way to
+  get it to look up the new information is to reboot.)</p>
+
+  <p>Now we have a nice packet of data. Net::DNS::Update doesn't
+  actually do anything with the data besides put it in a format
+  that a nameserver recognizes. Now we have to bring in
+  Net::DNS::Resolver. This is a somewhat misleading name, with
+  roots in history. As I mentioned earlier, it used to be that
+  nameservers were largely read-only. Clients that talked to DNS
+  servers were known as <i>resolvers</i>, since resolving names to
+  IP addresses was their exclusive function. Nowadays even though
+  DNS clients can read and write, they are still called
+  "resolvers."</p>
+
+  <p>In line 17, we create the resolver object, and in line 18, we
+  tell it that the nameserver it will talk to is
+  <tt>nameserver.test.com</tt>. Line 19 is where all the magic
+  happens. The <tt>send()</tt> method sends our carefully crafted
+  update packet off to the nameserver specified in the resolver
+  object.</p>
+
+  <p>At this point, you should check your nameserver logfiles to
+  see if there are any messages about your action. A common
+  mistake, such as not setting the permissions in
+  <tt>named.conf</tt> properly, results in an error message like
+  this:</p>
+  <pre>
+   Jan  7 10:29:38 ns1 named[12691]: unapproved update
+ from [205.216.163.199].3251 for dyn.test.com
+</pre>
+
+  <p>If you don't see any errors, check the zone file directory for
+  a file named <tt>dyn.test.com.log</tt>. This contains a log of
+  your update requests, in a format like this:</p>
+  <pre>
+
+   [DYNAMIC_UPDATE] id 804 from [205.216.163.199].1541 at 
+                                  915837961 (named pid 84):
+   zone:   origin dyn.test.com class IN serial 199817937
+   update: {delete} ftp.dyn.test.com. IN 
+   update: {add} ftp.dyn.test.com. 1800 IN A 10.0.0.1
+</pre>
+
+  <p>Lines 20-28 do some error-checking on the response. If the
+  update fails because the nameserver is unavailable or some other
+  network-related error occurred, <tt>$reply</tt> is undefined, and
+  an error message is available in <tt>$res-&gt;errorstring</tt>.
+  On the other hand, if the nameserver accepts the packet, it puts
+  a cryptic shorthand message indicating the status of the request
+  in <tt>$reply-&gt;header-&gt;rcode</tt>. For example, NOERROR
+  means the update was accepted and performed. Some other common
+  return codes are listed below.</p>
+  <pre>
+  Common Nameserver Return Codes
+
+
+  <b>Return Code</b>    <b>Meaning </b>
+
+  NOTAUTH       This nameserver is not authoritative for the zone 
+                you requested. 
+
+
+  REFUSED       The nameserver refused your request for security 
+                reasons. (Your IP address is probably not listed in     
+                named.conf.)
+
+ 
+  NOTZONE       A name in the update packet does not exist in the 
+                target zone. 
+</pre>
+
+  <p>At this point, your IP change has taken effect. Remember that
+  due to the distributed nature of DNS, your change may not be
+  instantly visible everywhere. Any client that previously looked
+  up <tt>ftp.test.com</tt> will hang on to the old response until
+  it expires, at which point it will request a new one.</p>
+
+  <h3>Paths For Further Exploration</h3>
+
+  <p>As I mentioned, the above script is merely an example, in that
+  each IP address is active for only five minutes. Although
+  round-robin is quite useful as a basic method of load balancing,
+  what happens when <tt>ftp1</tt> crashes, or is taken down for
+  routine maintenance? When you put it back up, it has zero users,
+  but even though <tt>ftp2</tt> has many users, new connections are
+  still assigned in a round-robin fashion. You need a way to
+  intelligently know how many connections are active and reassign
+  the IP address to the least-loaded machine. If you alter the
+  <tt>while</tt> loop at the top of the example program to query
+  each machine and determine its load, you can then intelligently
+  decide whether to change the IP address to <tt>ftp1</tt>.</p>
+
+  <p>As you've seen, the basics of dynamic update are easy to learn
+  and implement. Using this framework you could write an
+  application which queries several machines to find out which one
+  is best able to service new requests, or monitor a pool of
+  machines and take a crashed box out of rotation. Some other ideas
+  include: having <tt>name.mydomain.com</tt> be your laptop no
+  matter how it's connected, providing aliases for servers on a
+  network with free resources say, (freedisk.domain.com,
+  freecpu.domain.com, freeram.domain.com), or using mod_perl to
+  configure Apache and the DNS server from one virtual host
+  configuration file.</p>
+
+  <p>_ _END_ _</p>
+  <hr>
+  <i>Jon Drukman is the Director Of Technology for ZDNet's
+  GameSpot. He has released techno CDs as Bass Kittens and Random.
+  He currently lives in San Francisco with his wife and cat.</i> 
+  <!-- end of article -->
+  <!-- end of file -->
+</body>
+</html>

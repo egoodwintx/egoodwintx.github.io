@@ -1,0 +1,525 @@
+<HTML>   
+     <HEAD>
+<TITLE>April 2003/Implementing RMI for C++ Objects</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2 ALIGN="center">Implementing RMI for C++ Objects</H2>
+<H3 ALIGN="center">Vladimir Batov</H3>
+
+<HR>
+
+<H3>Introduction</H3>
+
+<p>Distributed systems require that computations running in different address spaces, potentially on different hosts, are able to communicate. &quot;Raw&quot; communications via sockets require applications to engage in application-level protocols to encode and decode messages. The design of such protocols is cumbersome and time consuming.</p>
+<p>RPC (Remote Procedure Call) abstracts the communication interface to the level of a procedure call. RPC, however, does not translate well into distributed object systems, where communications are needed between program-level objects in different address spaces. </p>
+<p>To match the semantics of object invocation, distributed object systems require RMI (Remote Method Invocation) <a href="#1">[1]</a>. RMI provides the ability to call a method on a remote object using the same syntax as for a local object. It essentially allows objects residing on another machine to be treated like they are almost local to your machine.</p>
+<p>In this article, I discuss some ideas that accomplish the RMI access mechanism for remote C++ objects. This technique is not limited to communications between applications written in C++. It is equally effective for implementing RMI access to remote C++ objects from clients written in, say, Java.</p>
+<p>The sheer number of acronyms associated with distributed programming is overwhelming &#151; COM, DCOM, IIOP, CORBA, XML-RPC, SOAP, etc. Is there room for RMI? More so, is there room for your own RMI? I believe the answer is &quot;yes.&quot; RMI occupies its own very distinct functional niche. It does not compete with the CORBA environment and the likes. CORBA objectives are substantially more ambitious. Associated expenses and limitations of the imposed framework are often not justified for projects that do not have application distribution as their primary focus.</p>
+<p>As in real life where your modest Toyota Corolla is often a reasonable, faster, and cheaper alternative to a Rolls Royce, your own communications infrastructure is often better suited for your purposes. Although straightforward implementations are common (with C++ objects packed into an XML message, sent over the wire, and unpacked), an RMI infrastructure is a better choice.</p> 
+<p>Similarly RMI does not compete with and has not been made obsolete by the SOAP (Simple Object Access Protocol) initiative. RMI is rather an infrastructure that provides access to remote objects via a familiar interface. SOAP, on the other hand, is an XML-based communication protocol that COM, CORBA, or RMI implementations might employ for communication purposes.</p>
+
+<H3>Design</H3>
+
+<p>The basic idea behind RMI is fairly straightforward and well developed. It is a classic case of the Remote Proxy pattern thoroughly discussed in <a href="#2">[2]</a>. The idea is to provide a local proxy object through which all communications with the actual remote object will be channeled. The main responsibilities of such a proxy as described in <a href="#2">[2]</a> are:</p>
+
+<UL><LI>Providing an interface identical to the real object.</LI>
+<LI>Controlling creation, access to, and destruction of the real object.</LI>
+<LI>Encoding requests to and decoding replies from the real object.</LI>
+</UL>
+
+<p>These goals provide clear guidance for implementation. The interesting part 
+  is providing a sufficiently powerful and flexible infrastructure that encapsulates 
+  common RMI functionality and enables easy implementation (and even auto-generation) 
+  of the RMI code based on the declaration of an actual class. Thanks to C++'s 
+  exceptional power and versatility, the implementation of a working prototype 
+  is a matter of two evenings' work. However, the devil is in the details. It 
+  actually took four times longer to iron out some &quot;wrinkles.&quot; <a href="web0304c_fig1.htm" target="_blank">Figure 
+  1</a> shows the proxy connection path to the remote object and relationships 
+  between classes comprising the RMI infrastructure.</p> 
+
+<H3>Getting Started</H3>
+
+<pre>
+// Original classes.
+class Widget
+{
+  public: 
+
+  virtual ~Widget();
+  Widget(const std::string&amp; name);
+
+  private: ...
+};
+class Circle : public Widget
+{
+  public: 
+
+  ~Circle();
+  Circle(const std::string&amp; name,
+         const Point&amp; center, 
+         int radius);
+
+  private: ...
+};
+
+// Client-based proxy classes
+// generated in rmi_widget.h and
+// rmi_circle.h declaration files.
+namespace RMI {
+
+struct Widget : public RMIB
+{
+  ~Widget();
+  Widget(const std::string&amp; name);
+  Widget(const Widget&amp;);
+  Widget&amp; operator=(const Widget&amp;);
+  // RMI support ctor.
+  Widget(const Call&amp; c) : RMIB(c) {}
+};
+struct Circle : public Widget
+{
+  // No dtor needed.
+  Circle(const std::string&amp; name,
+         const Point&amp; center, 
+         int radius);
+  Circle(const Circle&amp;);
+  Circle&amp; operator=(const Circle&amp;);
+  // RMI support ctor.
+  Circle(const Call&amp; c) : Widget(c) {}
+};
+} // End of RMI namespace.
+</pre>
+
+<p>The code fragment above shows two stripped-down classes and the corresponding RMI proxies generated for them. Proxies are essentially interface classes. Therefore, they dutifully replicate public interfaces of the original classes. Unlike their real counterparts, proxies do not have the luxury of implicit function generation, and they always add their own &quot;maintenance&quot; <b>RMI::Proxy::Proxy(const RMI::Call&amp;)</b> constructors.</p> 
+<p>Generated proxy declarations can be used to write the following code on the client:</p>
+
+<pre>
+// Include proxy declarations.
+#include &lt;rmi_widget.h&gt;
+#include &lt;rmi_circle.h&gt;
+
+using namespace RMI;
+
+int main()
+{  ...
+  // Connect to the server.
+  RMI::connect(...);
+  ...
+  Point center(11, 22);
+  // A RMI::Circle proxy (not the real
+  // Circle object) is created on the
+  // client.
+  Circle circle(&quot;Circle&quot;, center, 33);
+}</pre>
+
+<p>That ordinary looking (that was the goal!) example does a lot more &quot;under the hood&quot; than it shows. The <b>RMI::Circle</b> proxy constructor communicates with the server, which in turn remotely creates a <b>Circle</b> instance and returns an RMI reference to the instance. When the <b>circle</b> proxy goes out of scope, it destroys the remote <b>Circle</b> object that it created and represented.</p>
+<p>The necessary steps for building an RMI-enabled distributed system are essentially very similar to those required by the Java RMI <a href="#1">[1]</a>:</p>
+
+<OL>
+<LI>Write <b>Widget</b> and <b>Circle</b> classes.</LI>
+<LI>Run these classes through the RMI code generator to generate declarations for corresponding <b>RMI::Widget</b> and <b>RMI::Circle</b> proxies and the necessary client/server infrastructure.</LI>
+<LI>Compile generated server code.</LI>
+<LI>Write and compile the client application using generated RMI proxies.</LI>
+<LI>Run the system. </LI></OL>
+
+<p>The Java concept of dynamic class loading from the server is not supported. Unlike Java (a programming environment), C++ (a programming language) does not specify bytecode formats. That makes implementation of such a feature unrealistic. </p>
+
+<H3>Extending the Interface</H3>
+
+<pre>
+class Widget
+{ ...
+  const std::string&amp; name() const;
+};
+class Circle : public Widget
+{ ...
+  const Point&amp; center() const;
+  void center(const Point&amp;);
+};
+
+namespace RMI {
+
+struct Widget : public RMIB
+{ ...
+  std::string name() const;
+};
+struct Circle : public Widget
+{ ...
+  Point center() const;
+  void center(const Point&amp;);
+};
+} // End of RMI namespace.
+</pre>
+
+<p>Given the interface, writing the client code to create, access, and delete remote objects is hardly different than using real <b>Circle</b> instances locally:</p> 
+
+<pre>
+using namespace RMI;
+using std::string;
+
+int main()
+{ ...
+  Point center(11, 22);
+  Circle circle(&quot;Circle&quot;, center, 33);
+  string name = circle.name();
+  circle.center(Point(33, 44));
+}
+</pre>
+
+<p>You might have noticed that unlike their real counterparts proxy member functions do not return references or pointers (in a C++ sense). It is hardly surprising. All the data resides on the server. There is nothing in the client address space to which the proxy can return a reference or pointer. Therefore, return values from remote methods are returned (and arguments to remote methods are passed internally) by an RMI reference (proxy) or by value, using object serialization. Any data of any type can be passed to or from a remote method as long as the data is a registered remote object (having an RMI proxy generated for it), or a serializable object (having conversion functions implemented for the type). </p> 
+<p>However, it should be mentioned that some object types must not be sensibly passed to or returned from a remote method by value. Most of these objects, such as a file descriptor, encapsulate information that makes sense only within a single address space. </p>
+
+<H3>Adding Your Own Types</H3>
+
+<p>So far I have not mentioned the <b>Point</b> class used in the examples above. Although it is a no-brainer to deduce the class's declaration, it is impossible to figure out if <b>Point</b> instances are being created locally or remotely. That is the remarkable degree of transparency provided by the discussed RMI infrastructure. However, for the code to compile, <b>Point</b> needs to be integrated into your distributed environment. In order to do that, you need to decide if <b>Point</b> instances are to be created in one of the two following ways:</p>
+
+<OL><LI>Remotely (on the server) and returned or passed by an RMI reference.</LI>
+<LI>Locally (on the client or the server) and, therefore, returned or passed by value.</LI></OL>
+
+<p>If you go with the first option, you'll need to generate an <b>RMI::Point</b> proxy in the same way you did for <b>Widget</b> and <b>Circle</b>:</p>
+
+<pre>
+// The original class
+class Point
+{ ...
+  Point(int x, int y);
+  ...
+  int x_;
+  int y_;
+};
+
+// Generated RMI proxy
+namespace RMI {
+
+struct Point : public RMIB
+{
+  ~Point(); 
+  Point(int x, int y);
+  Point(const Point&amp;);
+  Point operator=(const Point&amp;);
+  // RMI support ctor.
+  Point(const Call&amp; c) : RMIB(c) {}
+};
+} // End of RMI namespace.
+</pre>
+
+<p>Easy. However, this approach is likely to be somewhat inefficient for small or transient objects. Consider:</p>
+
+<pre>
+{  ...
+  RMI::Point center(11, 22);
+  RMI::Circle* circle =
+    new RMI::Circle(&quot;new&quot;, center, 33);
+}
+</pre>
+
+<p>This trivial fragment will result in the following message exchange between the client and the server:</p>
+
+<OL><LI>The client creates an <b>RMI::Point</b> proxy and sends a request to create a remote <b>Point</b> object.</LI>
+<LI>The server sends the reply with the reference to the new <b>Point</b> object.</LI>
+<LI>The client sends a request to create a remote <b>Circle</b> object passing the <b>RMI::Point</b> reference as an argument.</LI>
+<LI>The server sends the reply with the reference to the new <b>Circle</b> object.</LI>
+<LI>The client sends a request to delete the remote <b>Point</b> object when <b>center</b> goes out of scope.</LI>
+<LI>The server sends the confirmation of successful deletion.</LI></OL>
+
+<p>This is quite a &quot;conversation&quot; for just two lines of code. More so, for every proxy on the client, there is a real object on the server allocated using <b>operator new</b>. Remotely allocating and destroying a small and transient <b>Point</b> object is likely to be unnecessarily expensive performance-wise and resource-wise. Instead you might prefer creating <b>Point</b> objects locally and simply passing them by value.</p>
+
+<pre>
+{  ...
+  Point center(11, 22);
+  RMI::Circle* circle = new
+    RMI::Circle(&quot;new&quot;, center, 33);
+}
+</pre>
+
+<p>I use full type qualifications to highlight a subtle change &#151; a <b>Point</b> instance is created instead of an <b>RMI::Point</b> proxy. The client-server dialog shrinks considerably:</p>
+
+<OL><LI>The client sends a request to create a remote <b>Circle</b> object passing a locally created <b>Point</b> object by value as an argument.</LI>
+<LI>The client receives the reply with the reference to the new <b>Circle</b> object.</LI></OL>
+
+<p>This approach requires the <b>Point</b> class to be serializable. Object serialization is the process of converting a complete object from the memory-based format into a format better suited for storing the object on disk, sending it over the network, etc. In the context of the discussed RMI infrastructure, the serialization requirement translates into having a pair of conversion routines for the <b>Point</b> type:</p> 
+
+<pre>
+namespace RMI
+{
+  string
+  convert(const Point&amp; point)
+  {
+    ostringstream stream;
+    stream &lt;&lt; point.x()
+           &lt;&lt; &quot; &quot;
+           &lt;&lt; point.y();
+    return stream.str();
+  }
+  template&lt;&gt; 
+  Point
+  convert&lt;Point&gt;(const string&amp; str)
+  {
+    int x, y;
+    istringstream stream(str);
+    stream &gt;&gt; x &gt;&gt; y;
+    return Point(x, y);
+  }
+}
+</pre>
+
+<p>The RMI infrastructure already provides serialization routines for some classes and primitive types (<b>int</b>, <b>double</b>, <b>std::string</b>, etc.). The RMI namespace is open &#151; add serialization routines for more types when the need arises.</p>
+<p>However, I must warn you against getting too adventurous serializing your classes. Java RMI uses a technology called object serialization to transform an object into a linear format. That technology essentially flattens an object and any objects it references. An object can be simple and self-contained or it can refer to other objects in complex graph-like (or even cyclical graph) structures. In general terms, serializing an object is not a trivial task. Unlike Java, C++ does not address the issue, and you'll have to integrate libraries, taking care of serialization if you want to use it extensively. A safer approach would be to limit the use of serialization and rely on passing objects by an RMI reference. This sensible approach is favored by Java RMI and the &quot;remote object&quot; parameter type.</p>
+
+<H3>Behind the Interface</H3>
+
+<p><a href="web0304c_list1.htm" target="_blank">Listing 1</a> shows the implementation 
+  generated for the discussed examples. You may find it boring &#151; it was meant 
+  to be so for easy auto-generation. The RMI infrastructure classes are working 
+  &quot;double shift&quot; for those generated functions to be as uninteresting 
+  as they are. All the client-server communication complexity is hidden inside 
+  the <b>RMI::Call</b> class. </p> 
+
+<pre>
+class Call
+{ ...
+  typedef Parameter arg; 
+
+  Call(const RMIB&amp; object_id,
+       const char* func_signature, 
+       const arg&amp; arg1 = arg::none(),
+       const arg&amp; arg2 = arg::none(),
+       const arg&amp; arg3 = arg::none())
+  : result_(call(instance, func,
+                 arg1, arg2, arg3))
+  {
+  }
+  ...
+  private: Parameter result_;
+};
+static
+
+Parameter 
+call(
+  const RMIB&amp; instance,
+  const char*      func, 
+  const Parameter&amp; arg1, 
+  const Parameter&amp; arg2, 
+  const Parameter&amp; arg3)
+{
+  write(pack(
+    instance, func, arg1, arg2, arg3));
+  return unpack(read()).arg(0);
+}
+</pre>
+
+<p>The <b>Call</b> constructor provides data (<b>pack</b>), sends it over to the 
+  server (<b>write</b>), reads and unpacks the reply (<b>read</b> and <b>unpack</b>), 
+  and stores the return value in <b>Call::result_</b>. <b>Call</b> takes the remote 
+  object ID (its memory address in the server address space), the signature of 
+  the remote method, and the arguments for the method. When an RMI proxy constructor 
+  or a static function is called, you have no remote object ID. Therefore, <b>null</b> 
+  is passed instead (see the constructors in <a href="web0304c_list1.htm" target="_blank">Listing 
+  1</a>). I chose function signatures to be in the familiar C++ declaration form. 
+  For example, the <b>Circle</b> constructor signature will be <b>Circle::Circle(const 
+  std::string&amp;, const Point&amp;, int)</b>. The choice is arbitrary and can 
+  be any string that uniquely identifies the remote method.</p>
+
+<pre>
+Point center(11, 22);
+Circle circle(&quot;new&quot;, center, 33);
+</pre>
+
+<p>For the fragment, the remote call to the <b>Circle::Circle(const std::string&amp;, const Point&amp;, int)</b> function will be packed in one of the following formats:</p>
+
+<pre>
+&quot;0x0^Circle::Circle(const std::string&amp;, 
+  const Point&amp;, int)^new^0x47180^33&quot; 
+&quot;0x0^Circle::Circle(const std::string&amp;, 
+  const Point&amp;, int)^new^11 22^33&quot;
+</pre>
+
+<p>depending on the <b>center</b> passed by reference (<b>&quot;0x47180&quot;</b>) or by value (<b>&quot;11 22&quot;</b>). The format is a simple ASCII string &#151; <b>&quot;object-id^function-signature^arg1^arg2^arg3&quot;</b>. This format is not critical and can be ASCII or binary, proprietary, proprietary XML, XML-based SOAP, etc. as long as the client and the server understand each other. However, you might want to consider Java-supported protocols (JRMP, RMI-IIOP, etc.) for easier integration with the standard Java RMI. For my C++-only testing purposes, the overhead of something like XML and SOAP was not justified as transferred data is well structured and variability is minimal.</p>
+<p>Once packed, a request is simply sent over to the server. I'll get to the details of the request's processing by the server later. At the moment, it is sufficient to know that the server:</p>
+
+<OL><LI>Reads and unpacks the message.</LI>
+<LI>Calls the appropriate remote method on the appropriate remote object.</LI>
+<LI>Packs the return value back to the message.</LI>
+<LI>Returns the message to the client.</LI></OL>
+
+<p>Therefore, the client will get back something like <b>&quot;0x0^Circle::Circle(const std::string&amp;, const Point&amp;, int)^0x47280&quot;</b>. The only argument (<b>&quot;0x47280&quot;</b>) represents the return value from the remote method. For the remote call to <b>Circle::Circle(...)</b>, that value will be the address of a newly created remote <b>Circle</b> instance.</p> 
+<p>While still within the <b>RMI::Call</b> constructor, the reply is unpacked, the return value is converted to a <b>Parameter</b> instance, and stored. Then via the chain of <b>Proxy(const Call&amp;)</b> constructors, the newly created <b>Call</b> instance is transferred to the <b>RMIB</b> base-class constructor where the object ID is initialized with the call's result.</p>
+
+<pre>
+RMI::RMIB::RMIB(const Call&amp; call)
+: id_(call.result()), bound_(false)
+{
+}
+</pre>
+
+<H3>Handling Different Types of Arguments</H3>
+
+<p>In order to uniformly process arguments of different types, <b>Call</b> uses the help of the <b>Parameter</b> class. <b>Parameter</b> is simple but very convenient. It encapsulates type conversion functionality and employs <b>convert</b> serialization functions to do the job:</p>
+
+<pre>
+class Parameter
+{ ...
+  // Create a Parameter instance
+  // using conversion routines.
+
+  template&lt;class Type&gt;
+  Parameter(const Type&amp; value)
+  : value_(RMI::convert(value)) {}
+
+  // Implicit conversion back
+  // to the original types.
+
+  template&lt;class Type&gt;
+  operator Type() const
+  {
+    return RMI::convert&lt;Type&gt;(value_);
+  }
+  static const Parameter&amp; none();
+
+  private: std::string value_;
+};
+</pre>
+
+<H3>Processing Remote Calls on the Server</H3>
+
+<p>During generating code for RMI proxies, the corresponding server-based infrastructure 
+  is being generated as well. <a href="web0304c_list2.htm" target="_blank">Listing 
+  2</a> shows the server code generated for the <b>Widget</b> and <b>Circle</b> 
+  examples. When the server is running, it merely reads a message from the client, 
+  unpacks the message, looks up in the functions map for the function matching 
+  the provided function signature, calls the function, packs the result, and sends 
+  it back to the client.</p> 
+
+<pre>
+void
+RMI::Server::run() const
+{
+  typedef Functions::iterator Fit;
+
+  // Enable connectivity infrastructure.
+  RMI::connect(...);
+
+  for (;;)
+  {
+    Message msg = unpack(RMI::read());
+    const string&amp; func = msg.function();
+    Fit it = functions_.find(func);
+
+    if (it == functions_.end())
+    {
+      // Function not found.
+   }
+   else 
+   {
+      // Call function,
+      // pack the result,
+      // send back to the client.
+      RMI::write(
+        it-&gt;second(msg).pack());
+   }
+  }
+}
+</pre>
+
+<H3>Server-Based Object Persistency</H3>
+
+<p>A remote <b>Foo</b> instance on the server is created and destroyed by the 
+  corresponding <b>RMI::Foo</b> proxy constructor and destructor on the client. 
+  When created, remote objects are bound to their proxies. (Note the <b>bind()</b> 
+  calls in the proxy constructors in <a href="batov_list1.htm" target="_blank">Listing 
+  1</a>.) The existence of server-based objects is defined by the existence of 
+  their client-based proxies. Consequently, the termination of a client-based 
+  session will lead to the destruction of all server-based objects created by 
+  that session. It is not always the desired behavior.</p>
+<p>A modest part of the <b>RMIB</b> interface provides the means for configuring the link between a local proxy and the remote object. That functionality allows extending lifespan of the server-based object beyond the one client session that created the object.</p>
+
+<pre>
+class RMIB
+{ ...
+  RMIB&amp; rmi_name(const string&amp;);
+  RMIB&amp; bind(bool =true);
+  bool is_bound() const;
+};
+
+template&lt;class T&gt; 
+T find(const string&amp; object_name);
+</pre>
+
+<p>When a proxy is being destroyed, the destruction message is sent to the corresponding 
+  remote object only if the object is still bound to the proxy being deleted (see 
+  proxy destructors in <a href="batov_list1.htm" target="_blank">Listing 1</a>). 
+  Otherwise, the remote object outlives the proxy that originally created it and 
+  remains in the server address space. If a name is assigned to the remote object, 
+  it can be later identified by that name and associated with a new proxy.</p> 
+
+<pre>
+{
+  Point center(11, 22);
+  Circle circle(&quot;Circle&quot;, center, 33);
+
+  // Assign a name to the rem. object
+  // and break the proxy-object bond.
+  circle.rmi_name(&quot;My circle&quot;);
+  circle.bind(false);
+
+  // RMI proxy goes out of scope and is
+  // deleted. The remote object remains
+  // in the server address space.
+}
+...
+{
+  // Find the remote object and
+  // associate new proxy with it.
+  Circle circle = RMI::find&lt;Circle&gt;(
+                  &quot;My circle&quot;);
+
+  // Bind proxy and rem. object.
+  circle.bind();
+
+  // Proxy goes out of scope.
+  // Destroys the bound remote object.
+}
+</pre>
+
+<H3>Versioning with RMI</H3>
+
+<p>Once the initial version of a product is shipped, further software development usually becomes substantially more difficult. Developers must take into consideration the existing, already installed product base and ensure backward compatibility. Versioning difficulties in CORBA are well discussed in <a href="#4">[4]</a>. The discussed RMI makes the remote classes' modifications totally transparent to the existing clients as long as the function methods' signatures already used by those clients remain the same.</p>
+
+<H3>More Things to Do</H3>
+
+<p>As I mentioned earlier, the provided code (available for download at <a href="c:\www.cuj.com/code/">&lt;www.cuj.com/code&gt;</a>) is merely a working prototype. Its sole purpose is to illustrate the ideas discussed in this article. Many aspects of C++ functionality have not been addressed in an attempt to stay focused on the principle idea and to keep the article within reasonable limits. Therefore, I am sure the implementation has a lot of room for improvement and further development. For example, you won't find many safety checks. You might want to check for the correct number of passed arguments. Although the RMI code generator builds the code for the client and the server at the same time and I didn't need such a check for my testing purposes, it might be necessary to enable client/server independent upgrades. </p> 
+<p>The examples and the code on the <i>CUJ</i> website are far from being exhaustive. However, they employ and demonstrate some commonly used C++ functionality like inheritance, static member functions, implicitly generated member functions, virtual functions, etc. Although that functionality might be sufficient for many applications, many aspects of C++ still have not been addressed, such as <b>const</b> attributes, template classes, multiple inheritance, exception handling, special cases like <b>Foo::Foo(const Foo&amp;, int =0)</b> where the same constructor is the copy constructor and a non-copy constructor, and much more. </p>
+
+<H3>The RMI Code Generator</H3>
+
+<p>The code implementing RMI proxies is very regular if not boring. Writing such 
+  code is better left to an automatic code generator like the Java rmic compiler. 
+  I won't go into the implementation details of such a code parser. It can be 
+  written using your favorite tools such as Korn shell, sed, yacc, lex, Perl, 
+  or even &quot;raw&quot; C++. Figures <a href="web0304c_fig2.htm" target="_blank">2</a> 
+  and <a href="web0304c_fig3.htm" target="_blank">3</a> show the state transition 
+  diagram for such a parser.</p>
+
+<H3>Environment</H3>
+
+<p>The code was compiled using gcc 3.0 on Sun SPARC running Solaris 2.6. Do not waste your time trying to compile the code using non-ANSI-compliant &quot;oldies&quot; such as Sun's C++ 5.0 or Microsoft Visual C++ 6.0.</p>
+
+<H3>References</H3>
+
+<p><a name="1"></a>[1] jGuru. <i>Fundamentals of RMI</i>, <a href="http://developer.java.sun.com/developer/onlineTraining/rmi/RMI.html">&lt;http://developer.java.sun.com/developer/onlineTraining/rmi/RMI.html&gt;</a>.</p>
+<p><a name="2"></a>[2] Erich Gamma, Richard Helm, Ralph Johnson, and John Vlissides. <i>Design Patterns: Elements of Reusable Object-Oriented Software</i> (Addison-Wesley, 1995)</p>
+<p><a name="3"></a>[3] Mary Campione, Kathy Walrath, and Alison Huml. <i>The Java Tutorial</i> (Addison-Wesley, 2000), <a href="http://java.sun.com/docs/books/tutorial/java/nutsandbolts/datatypes.html">&lt;http://java.sun.com/docs/books/tutorial/java/nutsandbolts/datatypes.html&gt;</a>.</p>
+<p><a name="4"></a>[4] Douglas C. Schmidt and Steve Vinoski. &quot;Object Interconnections: CORBA and XML, Part 1: Versioning,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, May 2001, <a href="c:\www.cuj.com/experts/1905/vinoski.htm">&lt;www.cuj.com/experts/1905/vinoski.htm&gt;</a>.</p>
+
+<H3>Download the Code</H3>
+
+<p><a href="ftp://ftp.cuj.com/pub/2003/2104/batov.zip">&lt;batov.zip&gt;</a></p>
+
+<H3>About the Author</H3>
+
+<p>With a beginning in machine code (yes, those zeros and ones) some 25 years ago, <b>Vladimir Batov</b> has developed software ever 
+since for nuclear power stations, air traffic control, military radar, many other things, and just for fun. These days apart from his main 
+interest in C++ and software design, he enjoys good books, tennis, sunset over the bay in Melbourne, Australia, and digging on the beach 
+with his three-year-old daughter. He can be reached at <a href="mailto:batov@alphalink.com.au">batov@alphalink.com.au</a>.</p>
+
+
+</BODY></HTML>

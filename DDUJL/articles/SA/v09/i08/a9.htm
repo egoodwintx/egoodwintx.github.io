@@ -1,0 +1,86 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v09, i08: Merging Files Without Disk Space</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink>Article</a></span></td>
+		<td><span class=navbarLink><a href="a9_l1.htm">Listing 1</a></span></td>
+		<td><a href="../../../../source/SA/2000/aug2000.tar"><b class=codeListing>aug2000.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<! -- Insert Content ------ >
+
+<H1>Merging Files Without Disk Space</H1><p>
+<P>Kerry Miles
+<P>
+A coworker recently presented me with a challenge: how can two files be merged when there is not enough space for <B>cat part2 &gt;&gt;part1; rm part2</B> and no other filesystem can accommodate <B>cat part1 part2 &gt;&gt;/another_fs/whole</B>? I have been faced with this dilemma more than once, most frequently while manipulating log files or data exports. Barring wizardly manipulation of the inodes and indirect blocks that track which filesystem blocks belong to the files, I thought there was no way &#151; but this time a solution dawned upon me.<P>
+<B>Sparse Files</b><p>The solution relies upon sparse files, a rarely mentioned feature of UNIX by which a file can have a &#147;hole&#148; that does not take space from the filesystem. For a demonstration of sparse files, run these commands (this example assumes your filesystem block size is 4 KB):<P>
+<pre>
+echo "This is block 1" &gt;testfile
+echo "This is block 6" | dd bs=4k seek=5 of=testfile
+du -sk testfile
+ls -l testfile
+</pre>
+The <B>dd</B> command seeks 5 blocks and writes &#147;This is block 6&#148; into block 6, leaving a 5-block hole. <B>ls</B> reports that &#147;testfile&#148; contains 20,496 bytes (4 KB * 5 + 16 bytes from <B>echo</B>), but since <B>du</B> only reports filesystem space that is allocated to a file, it shows 8 KB: 4 KB for block 1 and 4 KB for block 6. (Note that some filesystems support &#147;block fragments&#148; to reduce the amount of space wasted by files smaller than the filesystem block size, in which case <B>du</B> will show an even smaller number.) A sparse file can even be larger than the filesystem it is in! This is the feature of sparse files upon which <B>merge.pl</B> (Listing 1) relies. (Listings are available at: <B>http://www.sysadminmag.com</B>.)<P>
+If you examine the contents of &#147;testfile&#148; (try <B>od -Cv testfile</B>), the holes appear as a series of nulls. Many administrators learn about sparse files the hard way: when they attempt to restore files and they no longer fit into the filesystem. Since most commands, including <B>cp</B>, <B>mv</B> (to a different filesystem), <B>tar</B>, and <B>cpio</B> do not preserve sparseness, true null-filled blocks will replace the holes in files, causing them to consume more space. GNU <B>tar</B>&#146;s <B>-S</B> option preserves sparseness, as may other alternatives in your environment.<P>
+<B>An Overview of the Utility</b><p>The <B>merge.pl</B> utility works by reading the last block in <B>file1</B>, then truncating <B>file1</B> to relinquish that block&#146;s space. It then seeks past the end of <B>file2</B> and writes the block from <B>file1</B>, leaving a hole large enough to fit the rest of <B>file1</B>. For example, if <B>file1</B> is 4 blocks and <B>file2</B> is 6, the utility will write the content of block 4 from <B>file1</B> into block 10 of <B>file2</B>, leaving a hole in place of blocks 7, 8, and 9. By reading and truncating blocks from the end of <B>file1</B> and writing them into <B>file2</B>, the hole is filled. Back to the example, block 3 from <B>file1</B> would be written into block 9 of <B>file2</B>, 2 into 8, and finally 1 into 7. When <B>file1</B> is empty, the merge is complete and <B>file1</B> is removed.<P>
+<B>The Gory Details</b><p>The utility begins with the assignment of two constants: <B>$fs_bs</B> and <B>$my_bs</B>. <B>$fs_bs</B> should be set to your filesystem block size; <B>$my_bs</B> is the size of the blocks that <B>merge.pl</B> will migrate. To improve performance, <B>$my_bs</B> is larger than <B>$fs_bs</B> and is a multiple of <B>$fs_bs</B>.<P>
+If fewer than 3 blocks are free in the filesystem, the way that UNIX keeps track of a file&#146;s blocks can present a problem. The two files may require more space when combined than when separate! Since the dawn of journaled filesystems when <B>fsck</B> came to be like the Maytag repair man, some administrators have been able to forget about inodes and indirect blocks. For these lucky ones, here is a brief refresher.<P>
+The inode table is a fixed size, and blocks belonging to a small file are tracked exclusively by &#147;direct pointers&#148; in an inode within this table. As a file grows, a block of free space is taken to hold a &#147;single indirect block&#148;, which stores more pointers to the file&#146;s blocks. When the file has too many blocks for a single indirect block, another free block is taken for a &#147;double indirect block&#148;, which holds pointers to blocks that in turn hold pointers to the file&#146;s blocks. Implementations of this scheme vary greatly. For instance, of the systems that I tested, AIX&#146;s <B>jfs</B> holds up to 8 direct pointers in the inode; Solaris&#146;s <B>ufs</B> and Linux&#146;s <B>ext2fs</B> hold the more typical 12. AIX relocates the direct pointers to the first single indirect block; Solaris and Linux do not. Some filesystems allow even larger files by using triple indirect blocks, adding one layer more of indirection than double indirect blocks; others support larger files using more efficient methods that involve fewer indirect blocks (in which case the logic in <B>num_indirect()</B> will err on the safe side).<P>
+The worst-case scenario is if a file with no indirect blocks is merged with one on the verge of requiring a triple indirect block. This will require 3 free blocks: the triple indirect block, pointing to a new indirect block, pointing to a new block for file pointers. If such a situation arises and the space is not available, the merge will be incomplete. Therefore, <B>merge.pl</B> first calculates how many indirect blocks are needed for <B>file1</B> and <B>file2</B>, and how many will be needed for the merged file. It then adjusts for the block that would be saved if the last block of <B>file1</B> and <B>file2</B> were only partially used and could fit in one block. Finally, if it determines that more space will be needed by the merged file, it issues a warning. The utility could be enhanced to check how much space is free, but this test would not be portable (the available <B>Filesys::DiskFree</B> <B>Perl</B> module currently only supports 4 UNIX variants).<P>
+<B>merge.pl</B> then begins the real work of migrating the data from <B>file1</B> to <B>file2</B>. Two subroutines are called upon. The first, <B>get_block</B>, checks whether this is the first time it has been called. If so, it adjusts the initial block size such that subsequent reads from <B>file1</B> will be aligned with the block size, for performance. It then sets <B>$f1_size</B> to the the soon-to-be size of <B>file1</B>, seeks to that byte offset, reads the block, and truncates <B>file1</B> to the new size.<P>
+<B>get_block</B> returns a reference to an anonymous hash containing the data and the offset at which it was read, which is pushed onto the array <B>@buffered</B>. When <B>$num_buf</B> has been reached, the anonymous hash references in <B>@buffered</B> begin to be shifted off and passed to <B>put_block</B>. <B>put_block</B> simply seeks in <B>file2</B> to <B>$f2_size</B> (the original size of <B>file2</B>) plus the offset saved in the hash and writes the data. When <B>file1</B> is empty, <B>put_block</B> is passed the remaining buffered data, and <B>file1</B> is unlinked.<P>
+<B>Using merge.pl</b><p>I have tested <B>merge.pl</B> with an AIX <B>jfs</B> filesystem, a Solaris <B>ufs</B> filesystem, and a Linux <B>ext2fs</B> filesystem, but most UNIX filesystems support sparse files. Testing was performed with Perl version 5.005_03; any 5.x version should suffice. You must have read and write access to both files, the files should not be in use, and your file size limit (reported by <B>ulimit -a</B>) must accommodate the combined file size. Most importantly, you should have a backup of the files! Since <B>file1</B> is truncated as each block is added to <B>file2</B>, the files will be corrupt if the process does not complete.<P>
+As explained in the previous section, the filesystem block size (<B>$fs_bs</B>) and the indirect block calculation in the <B>num_indirect()</B> subroutine are system dependent. Their purpose is to predict whether additional space will be required for indirect blocks when the files are merged, in which case a warning is displayed. Verify that <B>$fs_bs</B> and the calculation are correct for your filesystem, or have at least 3 filesystem blocks free to be safe.<P>
+Of course, test the utility on your system before relying on it. A simple way to build files of a specific size for testing is with <B>/dev/zero</B>, which provides an endless supply of nulls. For example, the following <B>dd</B> commands will build a 700 KB and an 800 KB test file:<P>
+<pre>
+dd if=/dev/zero bs=1k count=700 of=file1
+dd if=/dev/zero bs=1k count=800 of=file2
+</pre>
+Once merged, <B>ls -l</B> should report that the merged file contains 1,536,000 bytes (1,500 KB).<P>
+The command to append <B>file1</B> to <B>file2</B> is:<P>
+<pre>
+merge.pl file1 file2
+</pre>
+If a warning indicates that additional blocks may be required, ensure that the space is available and re-run <B>merge.pl</B> with the <B>-spaceok</B> flag:<P>
+<pre>
+merge.pl -spaceok file1 file2
+</pre>
+<p>
+<h1>About the Author</h1><p>
+Kerry Miles is a Senior Systems Administrator for a major North Carolina health insurance company and has 10 years of UNIX administration and development experience. He can be reached at: kgmiles@usa.net.
+
+
+
+<! -- Begin Content ------ >
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

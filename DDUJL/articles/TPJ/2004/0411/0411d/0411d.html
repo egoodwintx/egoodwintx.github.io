@@ -1,0 +1,410 @@
+
+<html>
+<head>
+<title>November, 2004: Using the  Web as a GUI</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Using the  Web as a GUI</h1>
+<p><i>The Perl Journal</i> November, 2004</p>
+<h2></h2>
+
+
+<h3>By Simon Cozens</h3>
+
+
+<I>Simon is a freelance programmer and author, whose titles include Beginning Perl (Wrox Press, 2000) and Extending and Embedding Perl (Manning Publications, 2002). He's the creator of over 30 CPAN modules and a former Parrot pumpking. Simon can be reached at simon@ simon-cozens.org.</I>
+
+<hr>
+
+
+
+
+
+<p>I could never get on with GUI programming at all. I don't think very well in terms of the event loop paradigm. I don't want to spend a lot of time laying out widgets and connections, but I don't like the look of those toolkits like Tk that require you to pack widgets together. And to cap it all, I at least like to pretend that my applications are cross platform, and most GUI widget sets just aren't.</p>
+
+<p>At the same time, I've been using HTML and CSS for pretty much everything&#151;layout of documents for printing, presentation slides, you name it. And of course I'd been writing lots of web applications with Maypole. Why shouldn't I use a web browser to provide the GUI to a nominally web-based application instead of writing a true GUI program?</p>
+
+<p>Of course, it's hardly a new idea. Activestate's Komodo is an example of a sophisticated application based on top of the Mozilla browser platform. I recently had to write a Windows application, but develop it on the Mac, so I chose to write it using HTML and CSS for the display, Javascript for the client side, and a Maypole back-end to connect the whole thing to a database. The application runs in a web browser, using a local web server, but the end user doesn't need to know or care&#151;from their point of view, a window pops up on the screen and they interact with it.</p>
+
+<p>This, of course, requires a local web server, a copy of Perl, and almost half of CPAN, some things that Windows is notorious for not providing. Additionally, we don't really want the user to go through a laborious process of installing and setting up all these complicated systems. Ideally, we want the single executable to do everything itself, with no installation required. To make this happen, we're going to have to write our own web server and package it all up&#151;the server, the application, the browser, the templates to be displayed, and everything else&#151;into a single binary.</p>
+
+<p>Let's first look at the web server.</p>
+<h3>The Web Server</h3>
+
+<p>I'll start by saying that none of the ideas that I've used in this article are original; we all stand on the shoulders of giants. There are many modules and methods for creating a web server in Perl, but I've used the <i>standalone_httpd</i> from the RT web application (http://www.bestpractical.com/rt/). RT is trying to do the same sort of thing that we're doing&#151;having a web server that only knows how to talk to the RT application so that it can all be bundled into a single program.</p>
+
+<p><i>standalone_httpds</i> a simply designed server, with the emphasis on portability and speed. Let's take a look at how it's constructed and how we adapt it for our Maypole application. We'll be talking about Maypole for our purposes, but similar considerations would be applicable to any situation where you're trying to build a compact web server around an application.</p>
+
+<p>First, we use the old-fashioned Socket operations to bind to the web server port and listen for connections. It may be ugly, but it's fast, and that's what counts here. We're looking for a real-time response, just like you'd get with a conventional GUI application, without the overhead of making HTTP connections, so we need to cut down as much extraneous stuff as possible.</p>
+
+<blockquote>
+<pre>
+my $port = shift;
+my $tcp  = getprotobyname('tcp');
+
+socket( HTTPDaemon, PF_INET, SOCK_STREAM, $tcp )
+       or die "socket: $!";
+setsockopt( HTTPDaemon, SOL_SOCKET, SO_REUSEADDR,
+           pack( "l", 1 ) ) or warn "setsockopt: $!";
+bind( HTTPDaemon, sockaddr_in( $port, INADDR_ANY ) )
+     or die "bind: $!";
+listen( HTTPDaemon, SOMAXCONN ) or die "listen: $!";
+
+print("You can connect to your RT server at 
+       http://localhost:$port/\n");
+
+</pre>
+</blockquote>
+
+<p>Now that we've set up the listening socket, we can take requests:</p>
+
+<blockquote>
+<pre>
+while (1) {
+
+    for ( ; accept( Remote, HTTPDaemon ); 
+                          close Remote ) {
+        *STDIN  = *Remote;
+        *STDOUT = *Remote;
+        chomp( $_ = &lt;STDIN&gt; );
+
+</pre>
+</blockquote>
+
+<p>We accept the remote socket, and then set up standard input and standard output to read from and print to that, respectively; this mimics the usual CGI environment. We also read the first line of the HTTP request from the socket. Again, we could use <i>HTTP::Request</i> to do this, but we need to keep it lean and lightweight.</p>
+
+<p>From this line of the request, we can read off the method, the URI, any GET parameters, and check that we're looking at a valid request:</p>
+
+<blockquote>
+<pre>
+my ( $method, $request_uri, $proto, undef ) = split;
+
+my ( $file, undef, $query_string ) =
+ ( $request_uri =~ /([^?]*)(\?(.*))?/ ); # split at ?
+
+last if ( $method !~ /^(GET|POST|HEAD)$/ );
+
+</pre>
+</blockquote>
+
+<p>Next, we dispatch to a function that turns all of these things into the kind of CGI environment variables that we would expect:</p>
+
+<blockquote>
+<pre>
+build_cgi_env( method		=&gt; $method,
+               query_string	=&gt; $query_string,
+               path		=&gt; $file,
+               method		=&gt; $method,
+               port		=&gt; $port,
+               peername	=&gt; "localhost",
+               peeraddr	=&gt; "127.0.0.1",
+               localname	=&gt; "localhost",
+               request_uri	=&gt; $request_uri );
+
+</pre>
+</blockquote>
+
+<p>We won't go into all the details of how that does its job, but we should know that at this point, our program looks very much like an ordinary CGI script. So it shouldn't be much of a surprise that the RT standalone HTTP server now just creates a CGI object and runs it through its <i>HTML::Mason</i> handler, which does all the processing and spits out the output to the client:</p>
+
+<blockquote>
+<pre>
+RT::ConnectToDatabase();
+my $cgi = CGI-&gt;new();
+print "HTTP/1.0 200 OK\n";    # probably OK by now
+eval { $h-&gt;handle_cgi_object($cgi); };
+
+</pre>
+</blockquote>
+
+<p>And that's basically it&#151;a web server that contains everything it needs to respond to a request and hand it over to RT. Now we want to modify this so that instead of running an <i>HTML::Mason</i> handler, it runs our Maypole application.</p>
+<h3>Adjustments for Maypole</h3>
+
+<p>We wrap this program up into <i>Maypole::HTTPD</i> and customize the part that responds to the CGI request. Maypole already has a CGI driver, <i>CGI::Maypole</i>, so it's reasonable to use that. However, Maypole uses <i>CGI::Simple</i>, and it turns out for some reason that <i>CGI::Simple</i> doesn't like our CGI environment; additionally, the RT server always returns 200 OK, but we might not want to do that on some occasions. Finally, a Mason request will automatically handle static files that need to be served from the application, such as logos, CSS and XSL files, and so on, but we don't have code in Maypole to handle this, so we need to be able to serve files as well as pass things through the Maypole process. Thankfully, in the application I had, I knew that every URL containing /static/ related to a static file that we needed to serve up.</p>
+
+<p>So we'll begin by laying out the things our code will need to do&#151;serve a file, or pass the request to Maypole and send the output:</p>
+
+<blockquote>
+<pre>
+if ($path =~ /static/) { return $self-&gt;serve($path) }
+
+print "HTTP/1.1 200 OK\n"; 
+# Do something Maypole here
+
+</pre>
+</blockquote>
+
+<p>Let's deal with serving files, which is the normal use of a web server but rather incidental to what we're doing. With <i>serve</i>, we're given a path, and we need to turn this into a file and serve it up with the correct MIME type:</p>
+
+<blockquote>
+<pre>
+use File::Spec::Functions qw(canonpath);
+use File::MMagic;
+use URI::Escape;
+
+sub serve {
+    my ($self, $path) = @_;
+    $path = "./".canonpath(uri_unescape($path));
+    if (-e $path and open FILE, $path) {
+        binmode FILE;
+        print "HTTP/1.1 200 OK\n"; 
+        my $magic = File::MMagic-&gt;new();
+        print "Content-type: ", 
+           $magic-&gt;checktype_filename($path), "\n\n";
+        print &lt;FILE&gt;;
+        return;
+    }
+    print "HTTP/1.1 400 Not found\n";
+}
+
+</pre>
+</blockquote>
+
+<p>We're using three common CPAN modules here: <i>File::Spec::Functions</i> is not only used to handle filenames in a platform-agnostic way, its <i>canonpath</i> function allows us to stop any file access attacks&#151;if the user looks for http://localhost/../../../etc/passwd, then we need to stop that. <i>canonpath</i> treats the path as being absolute, so it strips out the initial ../s, leaving us with ./etc/passwd thats, we hope, won't be found.</p>
+
+<p><i>URI::Escape</i> allows us to convert the filenames from their encoded form&#151;with %20 for space, for instance&#151;to the form that the filenames would take on the disk. If after these two measures, we can open a filehandle, then we have a file to serve and we can finally send the OK status code.</p>
+
+<p>At this point, we need to know what MIME type to send to the browser so that the file can be displayed properly; a PNG file to be used as a logo, for instance, needs to be served with type image/png. The <i>File::MMagic</i> module sniffs the first few bytes of a filehandle and determines the appropriate MIME type to send. Then we can send the payload of the file, and all is fine.</p>
+
+<p>Next is the more common case of processing a request through Maypole. To make this happen, we need to know in our main loop the name of the Maypole application to call, we need to ensure it's based on <i>CGI::Maypole</i>, and then we can use the handy <i>run</i> method to process the request, much like Mason's <i>handle_cgi_object</i>. So we modify our <i>main_loop</i> to take an application name as well as a port:</p>
+
+<blockquote>
+<pre>
+sub main_loop {
+    my ($self, $module, $port) = @_;
+    $port ||= 8080;
+
+</pre>
+</blockquote>
+
+<p>Next, we check that the application is loaded, and then fiddle it so that it's based on <i>CGI::Maypole</i>:</p>
+
+<blockquote>
+<pre>
+$module-&gt;require;
+{ no strict;
+    local *isa = *{$module."::ISA"};
+    unshift @isa, "CGI::Maypole"
+        unless $isa[0] eq "CGI::Maypole"
+}
+
+</pre>
+</blockquote>
+
+<p>Finally, when we come to handle the request, we just need to say</p>
+
+<blockquote>
+<pre>
+$module-&gt;run;
+
+</pre>
+</blockquote>
+
+
+
+<p>and we have a working server.</p>
+<h3>The Client</h3>
+
+<p>To give the impression that this is not a client-server application but a standard GUI application, we need to write a wrapper program that starts up the server, starts up a web browser, and points it at the right address. This is where we need to be slightly platform specific, but thankfully the driver script is very short. Here's the driver for the application I was writing, called "Songbee":</p>
+
+<blockquote>
+<pre>
+use Songbee;
+use Maypole::HTTPD;
+
+$x = fork or Maypole::HTTPD-&gt;main_loop("Songbee");
+system("firefox http://localhost:8080/");
+kill 1, $x, $$;
+
+</pre>
+</blockquote>
+
+<p>This works well enough on both Windows and UNIX; it forks a process to run the web server part, and then runs the web browser. When the web browser is done, it kills both processes. It needs to do this because on Activestate windows, the "forked" process isn't really forked, it's just a thread of the main process, so we need to kill <i>$$</i>.</p>
+
+<p>Now we come to the most difficult bit&#151;working out how to package together all these elements, plus all the associated data, into a single file.</p>
+<h3>PARring the Code Together</h3>
+
+<p>This is where Autrijus Tang's "PAR" comes in. PAR stands for Perl ARchive, and is a Perl analogue of Java's JAR system&#151;essentially a Zip file of a program and everything that Perl needs to run it.</p>
+
+<p>At its very simplest, PAR is just a mechanism that allows you to read modules from inside a zip file. Once you've created the zip file, like so:</p>
+
+<blockquote>
+<pre>
+% zip modules.par lib/Songbee.pm lib/Songbee/HTTPD.pm ...
+
+</pre>
+</blockquote>
+
+
+
+<p>you can use the PAR module to treat it as an include path:</p>
+
+<blockquote>
+<pre>
+use PAR;
+use lib "modules.par"; # Now we can find 
+                       # Songbee and friends
+use Songbee::HTTPD;
+
+</pre>
+</blockquote>
+
+<p>Of course, just loading Songbee.pm and the other files is no good if you don't have the modules that they depend on. Thankfully, there's a very helpful tool called <i>Module::ScanDeps</i> that reports on the dependencies of a given Perl program. So running it on the driver that we wrote earlier, we get a whole raft of dependencies that are going to need to go into our PAR when we run the program on a "clean" Windows computer without Perl installed:</p>
+
+<blockquote>
+<pre>
+% scandeps.pl songbee.pl
+'Class::DBI::Loader'		=&gt; '0.02',
+'Songbee'			=&gt; 'undef',
+'Songbee::HTTPD'		=&gt; 'undef',
+'Compress::Zlib'		=&gt; '1.32',
+'CGI::Simple'			=&gt; '0.075',
+'Maypole'			=&gt; '1.5',
+'CGI::Simple::Cookie'		=&gt; '0.02',
+'CGI::Simple::Util'		=&gt; '0.002',
+'Class::DBI::ColumnGrouper'	=&gt; 'undef',
+'Class::Data::Inheritable'	=&gt; '0.02',
+...
+
+</pre>
+</blockquote>
+
+<p>Now all we need to do is put these things together&#151;the driver, the archive of the modules, the automated dependency scanning&#151;so that we run one command and end up with an archive that contains the program and everything we need to run it. Thankfully, PAR does that, too.</p>
+
+<p>PAR comes with a binary called the "Perl Packager" (pp). This does everything that we need, such that we can say:</p>
+
+<blockquote>
+<pre>
+% pp -a -o songbee.par songbee.pl
+
+</pre>
+</blockquote>
+
+
+
+<p>This will create songbee.par from songbee.pl and all its dependent Perl modules. Now we can use the PAR Loader, parl, to run this:</p>
+
+<blockquote>
+<pre>
+% parl songbee.par
+
+</pre>
+</blockquote>
+
+
+
+<p>and we find that...it doesn't work. Unfortunately, pp only statically analyzes the program for modules that are used or required; it knows nothing about modules that are required dynamically. For instance, Songbee uses SQLite as its database, but this is only determined at runtime&#151;nowhere is there an explicit <i>use DBD::SQLite</i>, so the module is not picked up by pp. We can provide a list of additional modules for pp to pick up by mentioning them on the command line:</p>
+
+<blockquote>
+<pre>
+% pp -a -o songbee.par -MDBD::SQLite -M... songbee.pl
+
+</pre>
+</blockquote>
+
+
+
+<p>But since there are a lot of them, I found it easier just to add explicit use statements to the driver:</p>
+
+<blockquote>
+<pre>
+use DBD::SQLite;
+use DBIx::ContextualFetch;
+use Class::DBI::Loader;
+use Class::DBI::Loader::SQLite;
+use Class::DBI::SQLite;
+use Class::DBI::Relationship::HasA;
+use Class::DBI::Relationship::HasMany;
+use Maypole::Model::CDBI;
+use Maypole::View::TT;
+use Template::Plugin::XSLT;
+
+</pre>
+</blockquote>
+
+<p>Now everything works. Well, sort of. That last line, <i>use Template::Plugin::XSLT</i>, also pulls in <i>XML::LibXML</i> and <i>XML::LibXSLT</i>, and they in turn require some dynamically loaded C libraries to be available.</p>
+
+<p>This is no problem for pp, so long as we inform it, and we can use the <i>-l</i> switch to point it at the libraries in question:</p>
+
+<blockquote>
+<pre>
+pp -a -l c:\perl\bin\libxml2.dll -l c:\perl\bin\libxslt_win32.dll -l c:\perl\bin\libexslt_win32.dll -o songbee.par songbee.pl
+
+</pre>
+</blockquote>
+
+
+
+<p>(It was at this point that I switched to a batch file to construct my PAR files.)</p>
+
+<p>Now we've gotten rid of most of the dependencies into the one PAR file: What remains outside are the templates, the browser, and, of course, Perl itself. Thankfully, the last bit is easy to get rid of&#151;by dropping the <i>-a</i> option, pp will no longer simply produce a .par file but will also bundle up the Perl interpreter with it and produce a standalone executable:</p>
+
+<blockquote>
+<pre>
+pp -l c:\perl\bin\libxml2.dll -l c:\perl\bin\libxslt_win32.dll -l c:\perl\bin\libexslt_win32.dll -o songbee.exe songbee.pl
+
+</pre>
+</blockquote>
+
+
+
+<p>We run this program, the browser window pops up, the templates are loaded and work, and the end user just sees an application on his screen. All is well.</p>
+
+<p>Now the final piece of the puzzle is to hide all the data inside the .exe as well.</p>
+<h3>PARring Data</h3>
+
+<p>PAR provides us with a way of packaging up files, and indeed, entire directories inside our PAR Zip files, as well as the Perl modules that live in there. When a PAR-based application runs, PAR extracts the contents of the Zip file to a temporary directory. It then provides a hook into the <i>@INC</i> mechanism so that module files can be found via the temporary directory. Additionally, it puts the name of the temporary directory in the environment variable <i>PAR_TEMP</i>, and provides the subroutine <i>PAR::read_file</i> to read a data file from the archive.</p>
+
+<p>So the first problem is getting all the data files into the archive. I did this by creating a manifest file, like so:</p>
+
+<blockquote>
+<pre>
+static
+custom
+factory
+playitem
+playlist
+song
+workship.db
+firefox.exe
+...
+
+</pre>
+</blockquote>
+
+<p>I could then feed this to pp with the <i>-A</i> parameter. Most of the entries in this file are directories, but pp includes all the files in them recursively.</p>
+
+<p>Now we have a significantly larger PAR file, but we're not using the data in it yet. To do this, we could fix our application to use <i>PAR::read_file</i> every time it wants to open a data file, but this is pretty difficult&#151;as well as rewriting the part of the web server that serves up static files, we'd have to reach into the bits of Maypole that look for templates.</p>
+
+<p>A much easier way is to simply change to the directory that all the data is in. We add this to our driver:</p>
+
+<blockquote>
+<pre>
+$ENV{PAR_TEMP} &amp;&amp; chdir($ENV{PAR_TEMP});
+
+</pre>
+</blockquote>
+
+
+
+<p>And of course, everything will work without further modification.</p>
+<h3>The Proof of the Pudding</h3>
+
+<p>Now we can serve up files, start the Firefox browser, and everything else, in the right place&#151;with all of the code and data coming out of the single .exe file produced by pp.</p>
+
+<p>As a test&#151;and since this is exactly what I need to do when I deploy the program&#151;I sent the executable to a friend who I knew didn't have Perl, Firefox, or anything else installed; he double-clicked the nice icon, and up popped a window. No messy installation, tedious set-up, or anything.</p>
+
+<p>By using HTML elements as the GUI, I've saved myself a lot of bother with GUI programming and have been able to use Maypole to get the application coded quickly. And by using this client-server mechanism, I've been able to develop on Macintosh, run on Linux, and ship to friends on Windows.</p>
+
+
+<p><b></b></p>
+<p><b></b></p>
+<p><b>TPJ</b></p>
+
+
+
+
+</body>
+</html>

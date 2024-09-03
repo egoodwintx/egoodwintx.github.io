@@ -1,0 +1,338 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal May 1997: Inside Windows Cabinet Files</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Inside Windows Cabinet Files</h1>
+
+<p><i>Dr. Dobb's Journal</i> May 1997
+</p>
+<h2>Data compression for Windows 95/NT</h2>
+
+<h3>By Sven B. Schreiber</h3>
+
+<I>Sven, a developer in Herzogenaurach, Germany, can be contacted at 100557.177@compuserve.com.</I>
+
+<hr>
+
+<p>Over the years, Windows has provided us with a long list of file formats, some of which have been well documented, others only sparsely. Windows 95 surprised us with yet another archive file format for compressed installation disks -- the cabinet file format. Subsequently, Microsoft has used this format in a number of packages, including Office 95, Internet Explorer, and the MSDN Library CD.</p>
+
+<p>Generally, the only place you could get useful information on the cabinet file format was a shell extension demo for Windows 95 called "CabView," a utility available with full MFC source code at http://www.microsoft.com/win32dev/apiext/cabview.zip. The file FDI.h contains many (albeit not all) details about the internals of cabinet files. For instance, you learn that cabinets are processed using the Diamond File Decompression Interface (FDI) and File Compression Interface (FCI).</p>
+
+<p>Microsoft has recently decided to give cabinets an important role in its Java strategy. On Microsoft's Java workshop web pages, cabinet files are touted as a means to reduce download times of Java class files (see cab.htm, overview.htm, and diamond2.htm at http://www.microsoft.com/ workshop/java/). Meanwhile, CAB development and resource kits are publicly available (cabdevkt.exe and cabrsckt.exe in the same directory). It's mainly the resource kit that's of interest to you, since it contains some .h and .lib files needed to write cabinet processing utilities.</p>
+
+<p>If you are writing a CAB extraction utility, your source code must include TYPES.h and FDI_INT.h (in this order) from the resource kit. In addition, you have to add FDIZ.lib to the linker's list of object/library modules. For a CAB creation utility, you'll need TYPES.h, FCI_INT.h, and FCIZ.lib, respectively. At this writing, however, the CAB resource kit is still in prerelease, and I had considerable problems with its header and import-library files. I didn't get the header files to compile without error, and FDIZ.lib put code into my executable that made it unstable under Win32s. Therefore, I'm still using the FDI files from Microsoft's Win32 SDK and the CabView sample program, which work perfectly.</p>
+
+<p>The resource kit's README file says: "Microsoft is committed to making CAB an open technology." And a bit later, "A detailed description of the CAB file format will be provided in the next release." That's good news, but who knows when the next release will arrive? After reading this article, however, you should know almost everything you need to know about the internals of cabinet files. Furthermore, I provide a reusable CAB management DLL and sample CAB extraction utility (available electronically; see "Availability" page 3).</p>
+
+<h3>Structure of a CAB File</h3>
+
+<p>A CAB file consists of a header and a data section. Although FDI.h from the CabView sample program gives some important insights into some CAB handling issues, it tells you nothing about the internal structure of these sections. <a name="rl1"><a href="9705b.htm#l1">Listing One</A> an excerpt from one of the sample header files, shows some of the missing details. The member names used in the structures are actually the original ones, taken from the debug information of the FDI import library.</p>
+
+<p>At the beginning, you'll always find a fixed-length, 36-byte main header structure, CAB_HEADER. To find out if a given file is a CAB, it usually suffices to check the first four bytes (that is, the <i>sig</i> member), which should consist of the characters MSCF (Microsoft CAB File). Additionally, it's a good idea to check the <i>version</i> member, currently set to 0x0103, which probably signifies Version 1.3 (see CAB_VERSION in <a href="9705b.htm#l1">Listing One</A>). The remaining parts of the CAB file header section may vary in length, depending on what's in the file. </p>
+
+<p>The CAB data is basically organized in folders. Unlike the folders of an operating-system file system, CAB folders can't contain subfolders. A folder is a logical group of files that share the same properties. All files in a folder are compressed using the same algorithm. Moreover, compression is applied to folders, not individual files -- it runs across all files in a folder. This means that extraction of a single file from a folder is possible only after all other files in the same folder have been decompressed.</p>
+
+<p>If you examine the CAB files on the Windows 95 setup disks, it's striking that most of them are of exactly the same size. The CAB file format allows files to start in one CAB and continue in a subsequent CAB; CAB files contain a chaining mechanism that ties them together in a logical sequence.</p>
+
+<p>In some cases, a CAB file may contain extra data for special purposes. For instance, Microsoft recommends reserving 6144 bytes for code signing of CABs containing Java classes. This extra data is inserted after the CAB_HEADER structure, and consists of a DWORD specifying the number of reserved bytes and the reserved area itself. To indicate the presence of extra data, the CAB_FLAG_ RESERVE bit (bit 2, see <a href="9705b.htm#l1">Listing One</A>) in the <i>flags</i> member of the CAB_HEADER is set.</p>
+
+<p>To implement chaining, the CAB_ HEADER structure and a potential reserved area can be followed by one or two link entries. To see if and how many link entries are present, check the <i>flags</i> member of the main header. In <a href="9705b.htm#l1">Listing One</A>, the CAB_FLAG_HASPREV (bit 0) and CAB_ FLAG_HASNEXT (bit 1) bit masks are defined. Depending on which bits are set, you'll find none, one, or two link entries. In the latter case, the previous-CAB link will always precede the next-CAB link.</p>
+
+<p>The link entries consist of two null-terminated strings, where the first is the filename (without path) of the preceding CAB file, and the second indicates the disk name. In Microsoft CABs, the latter is usually a disk number, used when the system is prompting you to insert a setup CD or diskette.</p>
+
+<h3>Folders and Files</h3>
+
+<p>Next are one or more CAB_FOLDER structures. If neither the CAB_FLAG_RESERVE nor the CAB_FLAG_HASPREV nor the CAB_FLAG_HASNEXT flags are set, the first CAB_FOLDER follows immediately after the CAB_HEADER. To find out how many folders are present, check the <i>cFolders</i> member of the CAB_HEADER.</p>
+
+<p>The CAB_FOLDER structure indicates what compression method is used (member <i>typeCompress</i>). Microsoft currently uses the MSZIP algorithm, indicated by a value of 0x0001 (tcompTYPE_MSZIP in FDI.h), but other methods might come into play later. The <i>coffCabStart</i> member contains the file offset where the folder data starts. This member is also of considerable importance for quickly determining the size of the header portion of a CAB file.</p>
+
+<p>The final part of the CAB header section is the file directory, and it is probably the most important subsection for CAB extraction utility writers. It specifies what files are in the CAB, and contains information on the individual files -- size, date/time stamp, and attributes. The file directory is a sequence of CAB_ENTRY structures (see <a href="9705b.htm#l1">Listing One</A>), where each CAB_ENTRY is followed by a null-terminated filename string. The <i>cFiles</i> member of the main CAB header indicates how many entries are to be expected.</p>
+
+<p>The <i>cbFile</i> member states the uncompressed size of a file. The <i>date</i> and <i>time</i> members contain the original date/time stamp of the file, as known from DOS. Similarly, the <i>attribs</i> member indicates the file's attributes in DOS format (see the CAB_ ATTRIB_* constants in <a href="9705b.htm#l1">Listing One</A> for details). <i>uoffFolderStart</i> is the offset of the file after decompression. Remember that compression works on whole folders, not single files, so this value is needed to find out at which offset in the decompressor's data stream a given file is located.</p>
+
+<p>Finally, there's the <i>iFolder</i> member in each CAB_ENTRY. Its value tells you how to handle this entry while extracting files. Usually, this member contains 0x0001 (CAB_ FILE_NEXT in <a href="9705b.htm#l1">Listing One</A>), except for the first file in a folder, where it is set to 0x0000 (CAB_FILE_FIRST). However, you'll also observe values of 0xFFFE (CAB_ FILE_SPLIT) and 0xFFFD (CAB_FILE_CONTINUED). The former appears when a file starts in one CAB, but ends in another. In this case, the subsequent CAB file will contain a directory entry for the same file, but be tagged with an <i>iFolder</i> value of CAB_FILE_CONTINUED. That's the way the CAB file format allows files to span multiple CABs.</p>
+
+<p>The file directory completes the header section of a CAB file. The compressed data follows immediately after the last CAB_ENTRY and its associated filename string. The offset of the data section is the value that's stored as the <i>coffCabStart</i> member of the CAB's first CAB_FOLDER structure and is of vital importance for CAB utility developers, since it tells you how many bytes must be read from the beginning of the CAB to catch all header information. Thus, to read the complete header section of a CAB, you should:</p>
+
+<p>1. Read the CAB_HEADER.</p>
+
+<p>2. Read more data up to the offset indicated by the <i>coffFiles</i> member. This member tells you at which offset the CAB directory starts.</p>
+
+<p>3. Skip the reserved data area if the <i>flags</i> member has the CAB_FLAG_RESERVE bit set.</p>
+
+<p>4. Skip the previous-CAB link if the <i>flags</i> member has the CAB_FLAG_HASPREV bit set.</p>
+
+<p>5. Skip the next-CAB link if the <i>flags</i> member has the CAB_FLAG_HASNEXT bit set. This takes you to the first CAB_FOLDER structure inside the CAB.</p>
+
+<p>6. Read more data up to the file offset indicated by the <i>coffCabStart</i> member.</p>
+
+<p>After step 6, you can be sure that you've loaded all CAB_FOLDERs and the complete CAB directory in just three takes. The <i>OpenCabinet()</i> function from the sample DLL I present here does exactly that.</p>
+
+<h3>The File Decompression Interface</h3>
+
+<p>The data area is a sequence of compressed folders, where each folder is a concatenation of files. To decompress a folder, you need to know the algorithm used to compress them. Fortunately, it's not necessary to write the decompression code from scratch. The FDI.lib import library, distributed as part of the Win32T SDK for Windows NT 4.0, contains everything you need. If you don't have the Win32T SDK, use the FDI.lib that comes with Microsoft's CabView sample program.</p>
+
+<p>Unlike many import libraries, FDI.lib does not simply contain stub entries that establish links to some external DLL. Instead, FDI.lib contains the FDI code itself. There's no such thing as FDI.dll. When you link FDI.lib into your program, the FDI code is thrown into your executable. </p>
+
+<p>The FDI.lib import library contains a set of APIs, four of which are documented in FDI.h. <i>FDICreate()</i> must be called before any of the other APIs can be used. This function expects a series of callback functions and allocates 2052 bytes of heap memory as scratch space. The pointer to this storage area is called a "FDI Context Handle" (defined as HFDI in FDI.h). To destroy the context handle on cleanup, the <i>FDIDestroy()</i> API is available. This function closes all file handles that might still hang around, and deallocates all memory used by the FDI context, including the context handle block itself.</p>
+
+<p><i>FDIIsCabinet()</i> tests if the specified file handle refers to a CAB file. To do so, it tries to read the first 36 bytes (that is, the CAB_HEADER). If it succeeds, it examines the <i>sig</i> and <i>version</i> members. If this sanity check turns out okay, <i>FDIIsCabinet()</i> copies some values from the CAB_HEADER structure to the supplied FDICABINETINFO structure (defined in FDI.h). Since <i>FDIIsCabinet()</i> operates on file handles only, you have to open the file to be examined prior to calling this API. Finally, there's <i>FDICopy()</i>, a multipurpose function whose main task is to extract files from a series of CABs.</p>
+
+<p>The FDI code doesn't use any Win32 APIs or C run-time library calls. Instead, it relies on callbacks into its host program when it has to interact with its environment. This is kind of a miniature client/server technology, with the FDI code acting as the client and the main program as the server. FDI uses callbacks to manipulate files, allocate and deallocate memory, and iterate through the directories of CAB files. Most callback functions are passed to the FDI client via the <i>FDICreate()</i> API. <a name="re1"><a href="9705be1.htm">Example 1</A> is its prototype.</p>
+
+<p>Arguments starting with "pfn" are callback function pointers, prototypes of which are defined in FDI.h. FDI accepts functions that conform to the standard C run-time library functions <i>malloc()</i>, <i>free()</i>, <i>_open()</i>, <i>_read()</i>, <i>_write()</i>, <i>_close()</i>, and <i>_lseek()</i>. It's up to you whether you want to use these standard functions or write your own. In CabLib.c (available electronically), I define them exclusively in terms of Win32 API calls, because this saves executable from being bloated with C run-time library code.</p>
+
+<p>Callback implementation is trivial, except for the <i>open</i> function, where it is a game of patience until all possible <i>_open()</i> flags are mapped to their corresponding Win32 <i>CreateFile()</i> counterparts. This task is rendered more difficult because some <i>CreateFile()</i> flags don't work as expected in some networking environments. For instance, I recommend you refrain from using the TRUNCATE_EXISTING and FILE_FLAG_ WRITE_THROUGH flags. To work around TRUNCATE_EXISTING, use <i>SetEndOfFile()</i> immediately after opening the target file. This seems to work on all platforms.</p>
+
+<p>The <i>cpuType</i> argument is ignored under 32-bit Windows and should be set to <i>cpuUNKNOWN</i>. <i>perf</i> is a pointer to a global ERF structure that contains error information after an FDI call has failed. ERF is defined in FDI.h, too.</p>
+
+<h3>Extracting Files</h3>
+
+<p>What seems to be missing in the previous FDI discussion is an API to scan the contents of a CAB file -- something analogous to the Win32 APIs <i>FindFirstFile()</i> and <i>FindNextFile()</i>. How are you supposed to find out what files are stored inside a CAB? As it turns out, scanning a CAB directory is a special case of extracting files without actually writing them to disk. Hence, <i>FDICopy()</i> is the function of choice; see <a name="re2"><a href="9705be2.htm">Example 2</A>.</p>
+
+<p>Again, FDI uses callbacks to do the dirty work. The <i>pfnfdin</i> argument points to a notification function called by FDI whenever there's something to do. After calling <i>FDICopy()</i>, the calling program should be prepared to handle numerous notification callbacks. The callback function receives (among others) a notification for every file that starts in the CAB specified as <i>pszCabinet</i> (notification code 2 = <i>fdintCOPY_FILE</i>). The notification function can decide what to do with this information: It decompresses and writes this file to disk, or adds the file's name to a listbox control without actually extracting it.</p>
+
+<p>The fully specified path of the cabinet file to be scanned is built from the <i>pszCabPath</i> and <i>pszCabinet</i> arguments. The former specifies the path without a filename, while the latter is just a filename without any path information. This separation makes sense when you remember that FDI sometimes has to extract a file that spans multiple CABs. In this case, FDI can read the name of the next cabinet from the CAB header section and simply prepend it with the path information. <i>pszCabPath</i> must always contain a trailing backslash; otherwise, <i>FDICopy()</i> will fail.</p>
+
+<p>FDICopy() does not return until either the entire cabinet has been scanned or the operation is aborted. The notification function usually returns 1 to signal okay, or 0 if an error occurs. In the special case of <i>fdintCOPY_FILE</i>, 0 means that <i>FDICopy()</i> should proceed to the next file without extracting the current file. For all notifications not handled by the callback routine, it's best to return 1, since this will always be interpreted as success. Returning -1 aborts the callback immediately and forces <i>FDICopy()</i> to return an error code, which you may look up in the ERF structure you supplied earlier to <i>FDICreate()</i>.</p>
+
+<p>Along with the notification code, the <i>FDICopy()</i> callback routine receives a pointer to a FDINOTIFICATION structure (see FDI.h). This structure supplies data the callback function might need to complete its mission. For example, the <i>psz1</i> member points to the name of the next file in the CAB's directory if the notification code is <i>fdintCOPY_FILE</i>. The callback function uses this information to decide whether this is one of the files it wants to extract. On <i>fdintCLOSE_FILE_INFO</i>, <i>hf</i> is the file handle to be closed, and <i>date</i> and <i>time</i> contain its time stamp information that should be put on the target file before it's closed.</p>
+
+<p>The <i>pv</i> member of FDINOTIFICATION plays a crucial role. This is a user-defined PVOID that may point to anything the application would like to. Typically, this is a pointer to an application-dependent structure containing state information. One possible use might be a pointer to the name of the file to be extracted. The sample code I provide here uses this member as a pointer to a structure that holds, among other data, the main dialog's window handle, so the callback function is able to pop up modal error windows if it needs to.</p>
+
+<p>In any case, the callback function should sometimes expect to receive an <i>fdintNEXT_CABINET</i> notification. This code is passed in if a file that's currently extracted is continued in a different CAB file. On this notification, the function should check if the next CAB file is available and return -1 if this is not the case. Failing to detect a missing CAB and returning okay blindly will most probably cause your application to hang. Don't expect to get a second chance for error handling!</p>
+
+<h3>The Sample Code</h3>
+
+<p>The complete source code for this article is available electronically (again, see "Availability," page 3). <a name="rl2"><a href="9705b.htm#l2">Listing Two</A> is a typical <i>FDICopy()</i> callback function used to extract a single file from a CAB. Here, <i>FDIOpen()</i> and <i>FDIClose()</i> are FDI callbacks to open and close files, pointers to which are supplied to <i>FDICreate()</i> as <i>pfnopen</i> and <i>pfnclose</i> arguments. These could be the standard <i>_open()</i> and <i>_close()</i> C run-time functions as well. And <i>printfMessage()</i> is a convenient function that applies the features of <i>printf()</i> to message boxes. I use it here to format error messages.</p>
+
+<p>The sample code is structured in two main parts: CabLib.dll, a general-purpose CAB extraction DLL you can reuse, as is, in your own applications, and a sample dialog-based Cabinet Manager application that shows how to use the various APIs exported from CabLib.dll. I thought about calling it CabMan.exe, but, with so many "male" managers available (ProgMan, TaskMan, and the like), I preferred to call it "CabWoman.exe." I've tested CabLib and CabWoman under Windows NT 4.0, Windows NT 3.51, Windows 95, and Windows 3.11 with Win32s 1.30c.</p>
+
+<p><a name="rt1"><a href="9705bt1.htm">Table 1</A> lists the functions exported from CabLib.dll. CabWoman.c (available electronically) shows how the APIs interact in a real-world application. In short, the CabLib philosophy rests on the assumption that CAB file processing is done in two stages: The CAB directory is first obtained, then individual files inside the CAB are processed.</p>
+
+<p>In stage one, <i>OpenCabinet()</i> prepares the CAB for processing. Then, <i>ScanCabinet()</i> is called until it returns False. On each <i>ScanCabinet()</i> call, directory information for one file is made available. In a GUI application, this info is typically stored in a dialog listbox. <i>CloseCabinet()</i> closes the CAB file and returns the number of bytes processed so far. This value will be needed later for <i>FindCabinetEntry()</i>. At the end of stage one, you have obtained a complete CAB directory.</p>
+
+<p>In stage two, individual CAB contents are manipulated. You can use <i>FindCabinetEntry()</i> to retrieve directory data for a specified file, or <i>ExtractFileFromCabinet()</i> to write a file to disk. <i>FindCabinetEntry()</i> requires the return value of <i>CloseCabinet()</i> as its <i>dOffset</i> argument, which allows this function to read just as many data bytes as needed to find the required directory entry. <i>ExtractFileFromCabinet()</i> uses the FDI interface function <i>FDICopy()</i>, as well as the <i>FDIExtract()</i> callback function (see <a href="9705b.htm#l2">Listing Two</A>) to do its job.</p>
+
+<p>CabWoman.exe is a middle-of-the-road, dialog-based GUI application that acts like a simple file manager, restricted to CAB files. Unlike the CabView sample program from Microsoft, CabWoman does not operate on single CABs, but instead lists the contents of all CAB files found in the selected directory in a single listbox. This makes much sense, since CAB files are usually chained and constitute a single entity. </p>
+
+<p>Navigation inside CabWoman's main dialog is simple. In all of the four listboxes, a double-click or the Enter key triggers some action. In the volume and directory lists, the respective item is selected. In the cabinet list, internal information about the CAB file is shown in a separate window (see <a name="rf1"><a href="9705bf1.htm">Figure 1</A>). In the file list, the double-clicked file is selected for extraction. This is the same as clicking on the Extract button. Moving the section bar in the volume and file listboxes updates the information fields at the right margin of the main dialog window. CabWoman stores the current navigation status in a file named CabWoman.ini in the Windows root directory, so you can continue where you left off in your next CabWoman session.</p>
+
+<p>Windows NT 3.51 users need to install CTL3D32.dll in the %systemroot%\SYSTEM32 directory to get 3-D effects in CabWoman's dialog boxes. CabWoman.c contains extra code for this, trying to locate, load, and initialize CTL3D32.dll. If it doesn't succeed, no error is reported, but no 3-D effects will appear. If you don't have a CTL3D32.dll, try the one included in the sample code archive. Win32s users are out of luck -- there's no 3-D library for this flavor of Win32.</p>
+
+<h3>Summary</h3>
+
+<p>The CAB file format has been Microsoft's favorite archive format since Windows 95 was released. However, little information about CAB internals has been available so far. This is likely to change, since Microsoft promotes the CAB format as a means to bundle and compress Java class files to save download time. While prerelease versions of a CAB file SDK and resource kit are distributed now, the internals of CAB files are still undocumented. As this article shows, however, knowing about CAB's inner structure and support DLLs makes it easy to include CAB extraction support in your own applications.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>// =================================================================// CAB FILE LAYOUT
+// =================================================================
+/*
+(1) CAB_HEADER structure
+(2) Reserved area, if CAB_HEADER.flags &amp; CAB_FLAG_RESERVE
+(3) Previous cabinet name, if CAB_HEADER.flags &amp; CAB_FLAG_HASPREV
+(4) Previous disk name, if CAB_HEADER.flags &amp; CAB_FLAG_HASPREV
+(5) Next cabinet name, if CAB_HEADER.flags &amp; CAB_FLAG_HASNEXT
+(6) Next disk name, if CAB_HEADER.flags &amp; CAB_FLAG_HASNEXT
+(7) CAB_FOLDER structures (n = CAB_HEADER.cFolders)
+(8) CAB_ENTRY structures / file names (n = CAB_HEADER.cFiles)
+(9) File data (offset = CAB_FOLDER.coffCabStart)
+*/
+// =================================================================
+// MACROS
+// =================================================================
+#define SWAPWORD(x)  ((WORD) (((x) &lt;&lt; 8) | ((x) &gt;&gt; 8)))
+#define SWAPDWORD(x) ((SWAPWORD ((WORD) (x)) &lt;&lt; 16) | \
+                      (SWAPWORD ((WORD) ((x) &gt;&gt; 16))))
+// =================================================================
+// CONSTANTS
+// =================================================================
+#define CAB_SIGNATURE        SWAPDWORD ('MSCF')
+#define CAB_VERSION          0x0103
+<p></p>
+#define CAB_FLAG_HASPREV     0x0001
+#define CAB_FLAG_HASNEXT     0x0002
+#define CAB_FLAG_RESERVE     0x0004
+<p></p>
+#define CAB_ATTRIB_READONLY  0x0001
+#define CAB_ATTRIB_HIDDEN    0x0002
+#define CAB_ATTRIB_SYSTEM    0x0004
+#define CAB_ATTRIB_VOLUME    0x0008
+#define CAB_ATTRIB_DIRECTORY 0x0010
+#define CAB_ATTRIB_ARCHIVE   0x0020
+<p></p>
+#define CAB_FILE_FIRST       0x0000
+#define CAB_FILE_NEXT        0x0001
+#define CAB_FILE_SPLIT       0xFFFE
+#define CAB_FILE_CONTINUED   0xFFFD
+<p></p>
+#define CAB_NOTIFY_OK        1
+#define CAB_NOTIFY_ERROR     0
+#define CAB_NOTIFY_SKIP      0
+#define CAB_NOTIFY_ABORT     (-1)
+<p></p>
+// =================================================================
+// CABINET STRUCTURES
+// =================================================================
+typedef struct _CAB_HEADER
+    {
+    DWORD sig;              // file signature 'MSCF' (CAB_SIGNATURE)
+    DWORD csumHeader;       // header checksum (0 if not used)
+    DWORD cbCabinet;        // cabinet file size
+    DWORD csumFolders;      // folders checksum (0 if not used)
+    DWORD coffFiles;        // offset of first CAB_ENTRY
+    DWORD csumFiles;        // files checksum (0 if not used)
+    WORD  version;          // cabinet version (CAB_VERSION)
+    WORD  cFolders;         // number of folders
+    WORD  cFiles;           // number of files
+    WORD  flags;            // cabinet flags (CAB_FLAG_*)
+    WORD  setID;            // cabinet set id
+    WORD  iCabinet;         // zero-based cabinet number
+    }
+    CAB_HEADER, *PCAB_HEADER;
+#define CAB_HEADER_ sizeof (CAB_HEADER)
+<p></p>
+//  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  -- -
+typedef struct _CAB_FOLDER
+    {
+    DWORD coffCabStart;     // offset of folder data
+    WORD  cCFData;          // ???
+    WORD  typeCompress;     // compression type (tcomp* in FDI.h)
+<p></p>
+    }
+    CAB_FOLDER, *PCAB_FOLDER;
+#define CAB_FOLDER_ sizeof (CAB_FOLDER)
+<p></p>
+//  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  --  -- -
+typedef struct _CAB_ENTRY
+    {
+    DWORD cbFile;           // uncompressed file size
+    DWORD uoffFolderStart;  // file offset after decompression
+    WORD  iFolder;          // file control id (CAB_FILE_*)
+    WORD  date;             // file date stamp, as used by DOS
+    WORD  time;             // file time stamp, as used by DOS
+    WORD  attribs;          // file attributes (CAB_ATTRIB_*)
+    }
+    CAB_ENTRY, *PCAB_ENTRY;
+#define CAB_ENTRY_ sizeof (CAB_ENTRY)
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>// =================================================================// FILE EXTRACTION CALLBACK
+// =================================================================
+typedef struct _EXTRACT_FILE
+    {
+    HWND hWnd;
+    PBYTE pbEntry;
+    PBYTE pbFile;
+    }
+    EXTRACT_FILE, *PEXTRACT_FILE;
+#define EXTRACT_FILE_ sizeof (EXTRACT_FILE)
+<p></p>
+int DIAMONDAPI FDIExtract (FDINOTIFICATIONTYPE fdint,
+                           PFDINOTIFICATION    pfdin)
+    {
+    FILETIME ft, lft;
+    BYTE     abFile [MAX_PATH];
+    int      hf, iResult;
+<p></p>
+    switch (fdint)
+        {
+        case fdintCOPY_FILE:
+            if (lstrcmpi (pfdin-&gt;psz1,
+                          ((PEXTRACT_FILE) pfdin-&gt;pv)-&gt;pbEntry))
+                {
+                iResult = CAB_NOTIFY_SKIP;
+                }
+            else
+                {
+                hf = FDIOpen (((PEXTRACT_FILE) pfdin-&gt;pv)-&gt;pbFile,
+                              _O_RDWR | _O_CREAT | _O_TRUNC,
+                              _S_IREAD | _S_IWRITE);
+                if (hf != -1)
+                    {
+                    iResult = hf;
+                    }
+                else
+                    {
+                    printfMessage
+                        (((PEXTRACT_FILE) pfdin-&gt;pv)-&gt;hWnd,
+                          MB_ICONERROR | MB_OK,
+                          "CabLib Error",
+                          "Unable to create file \"%s\"",
+                          ((PEXTRACT_FILE) pfdin-&gt;pv)-&gt;pbFile);
+                    iResult = CAB_NOTIFY_ABORT;
+<p></p>
+                    }
+                }
+            break;
+        case fdintNEXT_CABINET:
+            if (lstrlen (pfdin-&gt;psz3) + lstrlen (pfdin-&gt;psz1)
+                &lt; MAX_PATH)
+                {
+                lstrcpy (abFile, pfdin-&gt;psz3);
+                lstrcat (abFile, pfdin-&gt;psz1);
+                hf = FDIOpen (abFile, _O_RDONLY, 0);
+                }
+            else
+                {
+                hf = -1;
+                }
+            if (hf != -1)
+                {
+                FDIClose (hf);
+                iResult = CAB_NOTIFY_OK;
+                }
+            else
+                {
+                printfMessage (((PEXTRACT_FILE) pfdin-&gt;pv)-&gt;hWnd,
+                               MB_ICONERROR | MB_OK,
+                               "CabLib Error",
+                               "Unable to open file \"%s%s\"",
+                               pfdin-&gt;psz3,
+                               pfdin-&gt;psz1);
+                iResult = CAB_NOTIFY_ABORT;
+                }
+            break;
+        case fdintCLOSE_FILE_INFO:
+            DosDateTimeToFileTime (pfdin-&gt;date, pfdin-&gt;time, &amp;lft);
+            LocalFileTimeToFileTime (&amp;lft, &amp;ft);
+            SetFileTime ((HANDLE) pfdin-&gt;hf, &amp;ft, &amp;ft, &amp;ft);
+<p></p>
+            if (FDIClose (pfdin-&gt;hf) == -1)
+                {
+                printfMessage (((PEXTRACT_FILE) pfdin-&gt;pv)-&gt;hWnd,
+                               MB_ICONERROR | MB_OK,
+                               "CabLib Error",
+                               "Unable to close file \"%s\"",
+                               ((PEXTRACT_FILE) pfdin-&gt;pv)-&gt;pbFile);
+                }
+            iResult = CAB_NOTIFY_OK;
+            break;
+        default:
+            iResult = CAB_NOTIFY_OK;
+            break;
+        }
+    return iResult;
+    }
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

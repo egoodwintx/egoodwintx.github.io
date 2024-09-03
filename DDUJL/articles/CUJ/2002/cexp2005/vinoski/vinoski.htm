@@ -1,0 +1,228 @@
+<HTML>   
+     <HEAD>
+<TITLE>May 2002 C++ Experts Forum/Object Interconnection</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../20.05/tocmay.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Object Interconnections: Real-time CORBA, Part 4: Protocol Selection and Explicit Binding</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Douglas C. Schmidt and Steve Vinoski</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>This is the fourth and final installment in our series of columns describing how CORBA has evolved to support DRE (distributed real-time and embedded) applications. Our previous columns motivated the need for the capabilities offered by Real-time CORBA <a href="#1">[1]</a>, described the Real-time CORBA policies and mechanisms that enable clients and servers to indicate the relative priorities of their requests so that ORBs can enforce these priorities end-to-end <a href="#2">[2]</a>, and examined Real-time CORBA's support for thread pools and synchronizers <a href="#3">[3]</a>. This column explores Real-time CORBA features that allow DRE applications to select protocol properties and to explicitly bind clients to server objects using pre-allocated connections, priority bands, and private connections.</p> 
+<p>As in our earlier columns, we'll illustrate key Real-time CORBA capabilities using the planetary mapping system described in <a href="#1">[1]</a>. In this system, semi-autonomous drone vehicles are involved in a distributed computation to map a planet's surface. Human operators define high-level exploration goals for the drones via a <b>Base_Station</b> object, which provides set points for <b>Controller</b> objects. <b>Controller</b> objects control the drones remotely using <b>Drone</b> objects, which reside on the drone vehicles. <b>Drone</b> objects expose operations for monitoring and controlling individual drone behavior. Each drone sends information obtained from its sensors back to the <b>Base_Station</b> via its <b>Controller</b> object. The <b>Base_Station</b>, <b>Controller</b>, and <b>Drone</b> objects are all described using CORBA IDL, as outlined in <a href="fig1.htm">Figure 1</a>.</p>
+<p>In this column, we'll apply the Real-time CORBA features shown in <a href="tab1.htm">Table 1</a> to address a number of design challenges related to controlling protocol selection and explicit bindings of network resources between client and server objects. The remainder of this column illustrates how to apply the Real-time CORBA features outlined in <a href="tab1.htm">Table 1</a> to address key protocol and networking design challenges that arise in our planetary mapping application. Although we describe these design challenges in the context of planetary mapping, they are relevant to many other DRE applications, such as avionics mission computing, telecom call processing, and process control systems. In particular, strict control over the association of operations, threads, and networking resources is essential for many DRE applications. Earlier versions of CORBA provided no standard way for clients or servers to configure their protocol properties or explicitly  bind networking resources between clients and server objects. These features are necessary, however, to minimize end-to-end priority inversion, as well as to bound latency and jitter for distributed applications with deterministic real-time QoS (quality of service) requirements. </p>
+
+<H3><FONT COLOR="#000080">Selecting and Configuring Protocol Properties in Real-time CORBA</FONT></H3>
+
+<p>CORBA uses inter-ORB communication mechanisms to exchange requests between clients and servers.  These mechanisms are built upon lower level protocols that provide various types of QoS. IOP (Inter-ORB protocol) instances are composed of both an ORB protocol and a mapping to a specific underlying transport protocol.  For example, the IIOP (Internet Inter-ORB Protocol) is a mapping of the GIOP (General Inter-ORB Protocol) onto TCP/IP.  Thus, an IOP consists of two protocol layers &#151; ORB and transport &#151; each having its own set of protocol properties, such as queueing sizes, packet routing strategies, and latency characteristics.</p>
+<p>Unfortunately, the standard Internet protocols based on TCP/IP do not provide end-to-end <i>real-time</i> response. Communication between DRE application objects must therefore often use different protocols, such as VME or Link 16. In particular, some requests exchanged between <b>Drone</b> and <b>Controller</b> objects cannot be delayed due to flow control or queueing. Real-time CORBA therefore defines an interface that permits applications to specify ORB- and transport-specific protocol properties that control various network protocol features, such as ATM virtual circuits or Link 16 dynamic channel allocation settings. Each ORB/transport protocol property is defined by a <b>Protocol</b> structure that ultimately resides in a sequence of structures called a <b>ProtocolList</b>, which is defined by the following CORBA IDL:</p>
+
+<pre>
+interface ProtocolProperties;
+
+struct Protocol { 
+ IOP::ProfileId protocol_type;
+ ProtocolProperties orb_protocol_properties;
+ ProtocolProperties transport_protocol_properties;
+};
+typedef sequence &lt;Protocol&gt; ProtocolList;
+</pre>
+
+<p>The order in which protocol properties appear in the <b>ProtocolList</b> is significant &#151; it allows applications to indicate the order of their protocol preferences. For example, our planetary mapping application specifies that Link 16 is more preferable than other protocol combinations, such as IIOP.</p>
+<p>To allow applications to select and configure their desired ORB/transport protocol properties, Real-time CORBA defines the QoS policies described below:</p>
+
+<UL>
+<LI><b>Server-side protocol properties</b>. CORBA servers can use the <b>ServerProtocol</b> policy to select which protocol(s) to configure into an object reference. This policy can be passed with other POA policies when the <b>create_POA</b> operation is invoked on the <b>PortableServer::POA</b> interface. The <b>ServerProtocol</b> policy has two purposes: it (1) publishes a list of available protocols to clients and (2) defines protocol configuration attributes for server connections. The POA ensures that the ordering of profiles in object references conforms to the ordering of protocols specified in the <b>ServerProtocol</b> policy. A server can therefore export its protocol preferences to clients by passing them in object references whose profiles are arranged in a particular order. When a client receives the object reference, it can either accept the server's preference or use a different selection criterion.</LI> 
+<LI><b>Client-side protocol properties</b>. Client applications can use the <b>ClientProtocol</b> policy to select which protocol(s) to use when they connect to objects. This policy is applied when a client obtains a binding to an object. The <b>ClientProtocol</b> policy indicates the protocol properties a client is interested in, as well as the ordering of its preferences. The <b>ClientProtocol</b> policy can be set either by a client or server, but not by both for the same object reference. Servers can publish particular protocol requirements and preferences on a per-object basis. In contrast, clients can use this policy to change protocol policies on a per-invocation basis. If the <b>ClientProtocol</b> policy is set on the server, it's propagated to the client in the object reference, as shown in <a href="fig2.htm">Figure 2</a>.</LI> 
+</UL>
+
+<p><a href="fig2.htm">Figure 2</a> illustrates how a server can designate the protocols available to the client. The server publishes the Link16 and VME protocols, in that order, in a tagged component contained within the object reference, which allows a server to enforce specific inter-ORB protocol requirements on its clients. <a href="fig3.htm">Figure 3</a> illustrates how tagged components are contained within an object reference.</p> 
+<p>The client must abide by the <b>ClientProtocol</b> policy propagated by the server and select from one of the protocols designated as tagged components, ignoring any protocols that it does not support. In the case of the planetary mapping system, it selects the Link 16 protocol since that works over a radio link between drones and the base station controller. </p> 
+<p>The particular properties for specific protocols can be defined via interface inheritance.  For example, the standard TCP protocol properties are shown below:</p>
+
+<pre>
+interface TCPProtocolProperties: ProtocolProperties { 
+ attribute long send_buffer_size;
+ attribute long recv_buffer_size;
+ attribute boolean keep_alive;
+ attribute boolean dont_route;
+ attribute boolean no_delay;
+};
+</pre>
+
+<p>This protocol property interface permits applications to set common attributes of TCP endpoints. For example, the <b>send_buffer_size</b> and <b>receive_buffer_size</b> attributes can set the size of endpoint socket queues. Many TCP implementations use these values to determine the TCP window size, which in turn affects end-to-end throughput. If the <b>keep_alive</b> attribute is enabled, TCP will send a probe on inactive connections to verify that they are still valid. Finally, the <b>no_delay</b> attribute disables TCP's Nagle algorithm so that small requests can be sent even if earlier requests have not yet been acknowledged.</p> 
+<p>It's ironic that the only protocol property interface specified by Real-time CORBA is for TCP/IP, which is <i>not</i> suitable for most DRE applications! The reason for this, of course, is that TCP/IP is such a ubiquitous protocol that it's possible to standardize its protocol properties in a portable interface. Hopefully, the OMG will eventually be able specify standard interfaces for more common real-time protocols, such as VME and Link 16. </p>
+<p>For completeness, we'll show how to configure a <b>ProtocolList</b> containing the TCP/IP and (imaginary) Link 16 protocol properties. As usual, we start by using the standard <b>CORBA::ORB_init</b> factory operation to obtain an object reference to the ORB:</p>
+
+<pre>
+CORBA::ORB_var orb = CORBA::ORB_init (argc, argv);
+</pre>
+
+<p>We then use <b>resolve_initial_references</b> and <b>_narrow</b> to obtain an object reference to a Real-time CORBA ORB:</p>
+
+<pre>
+CORBA::Object_var obj =
+ orb-&gt;resolve_initial_references (&quot;RTORB&quot;);
+RTCORBA::RTORB_var rt_orb = RTCORBA::RTORB::_narrow (obj);
+</pre>
+
+<p>Using the <b>rt_orb</b> object reference, we create the protocol properties for TCP/IP as follows:</p>
+
+<pre>
+RTCORBA::ProtocolProperties_var tcp_properties =
+ rt_orb-&gt;create_tcp_protocol_properties (
+    64 * 1024, /* send buffer */
+    64 * 1024, /* recv buffer */
+    false, /* keep alive */
+    true, /* dont_route */
+    true  /* no_delay */);
+</pre>
+
+<p>Next, we'll configure the list of protocols to use:</p>
+
+<pre>
+RTCORBA::ProtocolList plist; plist.length (2);
+plist[0].protocol_type =
+  IOP::LINK16_PROTOCOL_IOP; /* This is non-standard */
+plist[0].trans_protocol_props =
+  /* Use a proprietary ORB interface for Link 16 */
+plist[1].protocol_type =  IOP::TAG_INTERNET_IOP; 
+plist[1].trans_protocol_props = tcp_properties;
+RTCORBA::ClientProtocolPolicy_var policy =
+  rt_orb-&gt;create_client_protocol_policy (plist);
+</pre>
+
+<p>The <b>ClientProtocol</b> policy can be applied at the time of binding on the client, or during POA creation on the server. When applied on the server, this policy, together with all the other <i>client-exposed</i> policies, are embedded inside an IOR-tagged component and passed to clients for inspection.</p>
+
+<H3><FONT COLOR="#000080">Explicit Binding Mechanisms in Real-time CORBA</FONT></H3>
+
+<p>Before Real-time CORBA was standardized, the CORBA specification only supported <i>implicit</i> <i>binding</i>. In this model, resources along the path between a client and its server object are established on-demand (e.g., after a client's first invocation on the server). Implicit binding helps preserve location transparency by allowing clients to access remote objects or collocated objects using a common programming model. In addition, it helps conserve OS and networking resources, such as socket handles or ATM virtual circuits, by deferring the creation of network connections until they are actually used. Although not strictly part of the implicit binding model, many ORBs also allow multiple client threads in a process to be multiplexed through shared network connections to their corresponding server.</p> 
+<p>Unfortunately, implicit binding and connection multiplexing are inadequate for DRE applications with stringent QoS requirements. In particular, deferring connection establishment until run time can increase latency and jitter significantly. Moreover, the use of connection multiplexing can yield substantial priority inversion due to head-of-line blocking associated with connection queues that are processed in FIFO order. <a href="fig4.htm">Figure 4</a> illustrates these problems in the context of our planetary mapping system.</p>
+<p><a href="fig4.htm">Figure 4</a> shows a multithreaded <b>Base_Station</b> server that sends <b>stop</b>, <b>turn</b>, and <b>query_state</b> requests to a <b>Drone</b>. Although the <b>stop</b> and <b>turn</b> requests run in higher priority threads than the <b>query_state</b> request, an ORB that's configured to use implicit binding and multiplexed connections may end up sending <b>query_state</b> first. Unfortunately, this will cause head-of-line-blocking and priority inversions if the communication channel is processed in FIFO order.</p>
+<p>To avoid these problems, the Real-time CORBA specification defines a group of orthogonal <i>explicit binding</i> mechanisms that support the following capabilities:</p>
+
+<UL>
+<LI>A <b>connection pre-establishment</b> mechanism, which eliminates a common source of operation jitter.</LI>
+<LI>A <b>PriorityBandedConnection</b> policy, where the invocation priority of the client determines which connection is used.</LI>
+<LI> A <b>PrivateConnection</b> policy, which guarantees non-multiplexed connections.</LI>
+</UL>
+
+<p>We discuss each of these policies and mechanisms below and explain how they help to improve the predictability and responsiveness of our planetary mapping application.</p>
+<p><b>Connection pre-establishment.</b> To pre-establish network connections, we use the <b>_validate_connection</b> operation defined in the <b>CORBA::Object</b> interface. This operation enables clients to pre-establish connections to servers and to control how client requests are sent over these connections. For example, the following code illustrates how the <b>Base_Station</b> can pre-establish a connection with a <b>Drone</b>. We start by getting an object reference to a <b>Drone</b>, which could be obtained via a Naming Service or some pre-configured header file:</p>
+
+<pre>
+Drone_var drone = ...; 
+</pre>
+
+<p>We then pre-establish a connection by invoking <b>_validate_connection</b> on the drone object reference:</p>
+
+<pre>
+CORBA::PolicyList_var invalid_policies;
+CORBA::Boolean success =
+ drone-&gt;_validate_connection (invalid_policies);
+</pre>
+
+<p>This operation causes a <b>_bind_priority_band</b> implicit request to be sent to the server. Implicit requests are implemented by the ORB, not by an application object, and are used for internal inter-ORB communication and configuration. When the server receives the <b>_bind_priority_band</b> request, it allocates resources to handle the connection.</p>
+<p><b>Priority banded connections.</b> In addition to pre-established connections, DRE applications also often require their ORB end systems to minimize priority inversions, so that high-priority operations are not queued behind low-priority operations. Real-time CORBA enables applications to use different connections for different priority ranges via the <b>PriorityBandedConnection</b> policy.</p>
+<p>Priority-banded connections allow clients to do the following:</p>
+
+<UL><LI>Specify explicit priorities for each network connection.</LI>
+<LI>Select the appropriate connection at run time based on the CORBA priority of the thread that invoked an operation.  </LI></UL>
+
+<p>Clients can specify policies that define one or more priority bands when they establish connections explicitly. The policy can also be set by a server at POA creation time, in which case the ORB exposes it to clients by embedding it inside an IOR-tagged component. This policy should be set only on the client or the server, but not on both, or an attempt to bind will fail.</p>
+<p>Priority band information is exported to the server within the service context of the first invocation sent across the connection. For instance, this information can be passed in the <b>_bind_priority_band</b> requests shown in <a href="fig5.htm">Figure 5</a>. The requested priority is passed along in the service context field associated with the <b>_bind_priority_band</b> operation. Subsequent requests on these connections are then processed at the requested priority levels. If a client does not send a <b>_bind_priority_band</b> request, an implicit bind will be performed when the first invocation is sent over the connection. The service context of this request must contain the CORBA priority range (i.e., minimum and maximum values) for the banded connection. The server then allocates any necessary resources to ensure subsequent requests arriving on this connection will be processed at the desired priority.</p>
+<p>To illustrate the use of priority-banded connections in our planetary mapping client application, we'll start by creating the priority bands:</p>
+
+<pre>
+RTCORBA::PriorityBands bands (2); bands.length (2);
+</pre>
+
+<p>We then initialize the bands with a range of priorities, such as:</p>
+
+<pre>
+bands[0].low = 0;
+bands[0].high = 150;
+</pre>
+
+<p>We can also initialize a &quot;range&quot; of a single priority:</p>
+
+<pre>bands[1].low = 200; 
+bands[1].high = 200;
+</pre>
+
+<p>We then pass the bands to the <b>create_priority_banded_connection_policy</b> factory method:</p>
+
+<pre>
+CORBA::Policy_var policy =
+ rt_orb-&gt;create_priority_banded_connection_policy (bands);
+</pre>
+
+<p>As a result of applying this policy to our planetary mapping client, the <b>stop</b> and <b>turn</b> operations will now use a different connection than the <b>query_state</b> operation since they run in different threads at different priorities (see <a href="fig6.htm">Figure 6</a>).</p>
+<p><b>Private connections.</b> Many ORBs support multiplexed connections, which are designed to conserve connections and other limited OS resources. However, DRE applications often require so-called &quot;private&quot; (i.e., non-multiplexed) connections, which cannot be reused for another two-way request until the reply for the previous request is received. For example, the <b>stop</b> operation in our planetary mapping application should use a dedicated connection to avoid head-of-line blocking with other operations. To support this use case, Real-time CORBA defines a <b>PrivateConnection</b> policy, which allows clients to select private connections that minimize the duration of any end-to-end priority inversions. Oddly, there is no API in Real-time CORBA to explicitly request a multiplexed connection (i.e., this is considered an ORB implementation detail).</p> 
+<p><a href="fig7.htm">Figure 7</a> illustrates the use of priority banded, private connections between our planetary mapping client and a server.</p>
+<p>Each client operation (i.e., <b>stop</b>, <b>turn</b>, and <b>query_state</b>) running in a different thread is sent to the server over a pre-allocated connection that's assigned to a fixed priority range. The server ORB then processes the corresponding servant upcall at the specified priority and sends the reply across the same non-multiplexed connection. This combination of features ensures that end-to-end priorities are maintained and that key sources of priority inversion are eliminated.</p>
+<p>We can program the <b>PrivateConnection</b> policy in our client application as follows:</p>
+
+<pre>
+policies[0] = rt_orb-&gt;create_private_connection_policy ();
+CORBA::Object_var object = drone-&gt;_set_policy_overrides
+ (policies, CORBA::ADD_OVERRIDES);
+</pre>
+
+<p>The code fragment shown above first creates the <b>PrivateConnection</b> policy using the factory method <b>create_private_connection_policy</b> and then applies the policy on the drone object reference via the <b>_set_policy_overrides</b> operation. This operation overrides the policy at the <b>Object</b> scope.  Client policies can be specified at three &quot;overriding levels&quot;: </p>
+
+<OL>
+<LI>ORB-level via <b>CORBA::PolicyManager</b>.</LI>
+<LI>Thread-level via <b>CORBA::PolicyCurrent</b>.</LI>
+<LI>Object-level via calls to <b>_set_policy_overrides</b> on an object reference, as shown above.</LI>
+</OL>
+
+<p><a href="fig8.htm">Figure 8</a> illustrates the order in which these overrides take precedence, from highest to lowest.</p>
+<p>Server policies can also be specified at three overriding levels:</p>
+
+<OL><LI>ORB-level through <b>CORBA::PolicyManager</b>.</LI>
+<LI>POA-level passed as arguments to <b>POA::create_POA</b>.</LI>
+<LI>Some policies, such as object priority, can be set at the <b>Object</b>-level via operations on the <b>RTPOA</b>.</LI>
+</OL>
+
+<H3><FONT COLOR="#000080">Concluding Remarks</FONT></H3>
+
+<p>The Real-time CORBA specification adds powerful QoS capabilities to regular CORBA to improve application predictability by bounding priority inversions and managing system resources end-to-end. The Real-time CORBA standardization effort began in 1997.  By the time the Real-time CORBA 1.0 specification was officially integrated into the CORBA 2.4 document <a href="#4">[4]</a> in October 2000, implementations of Real-time CORBA ORBs, such as TAO from OCI (&lt;http://theaceorb.com/&gt;), ORBExpress from OIS (&lt;www.ois.com&gt;), and HighComm from Highlander (&lt;www.highcomm.com&gt;), had matured to the point where they were being used in a wide-range of mission-critical DRE systems, such as process control, avionics mission computing, telecommunication call processing, and missile defense. The remarkably rapid success of Real-time CORBA for DRE applications has stemmed from substantial R&amp;D efforts over the past decade that focused on developing <i>patterns</i> and <i>frameworks</i> as a means to promote the development and reuse of successful middleware technology. </p>
+
+<UL><LI>Patterns capture successful solutions to commonly occurring software problems that arise in a particular context <a href="#5">[5]</a>. Patterns can simplify the design, construction, and performance tuning of middleware and applications by codifying the accumulated expertise of developers who have confronted similar problems before. Patterns also raise the level of discourse in describing software design and programming activities. </LI> 
+<LI>Frameworks are concrete realizations of groups of related patterns <a href="#6">[6]</a>. Well-designed frameworks reify patterns in terms of functionality provided by the middleware itself, as well as functionality provided by an application. A framework also integrates various approaches to problems where there are no <i>a priori</i>, context-independent, optimal solutions. Middleware frameworks <a href="#7">[7]</a> can include strategized selection and optimization patterns so that multiple independently developed capabilities can be integrated and configured automatically to meet the functional and QoS requirements of particular applications.</LI>
+</UL>
+
+<p>It's important to recognize that the Real-time CORBA specification addresses <i>some </i> &#151; but by no means all &#151; important real-time application development challenges. For example, it focuses primarily on &quot;fixed-priority&quot; real-time applications. In addition to Real-time CORBA 1.0, the OMG has adopted the following related specifications in the past three years:</p>
+
+<UL><LI><i>Minimum CORBA</i>, which removes non-essential features from the full OMG CORBA specification to reduce footprint so that CORBA can be used in memory-constrained embedded systems.</LI>
+<LI><i>CORBA Messaging</i>, which exports additional QoS policies, such as timeouts, request priorities, and queueing disciplines, to applications.</LI>
+<LI><i>Fault-tolerant CORBA</i>, which uses entity redundancy of objects to support replication, fault detection, and failure recovery.</LI>
+</UL>
+
+<p>Robust implementations of these CORBA capabilities and services are now available from multiple vendors. The OMG is also expanding the scope of open systems to include an even wider range of applications with the advent of emerging standards, such as Dynamic Scheduling Real-Time CORBA <a href="#8">[8]</a> and the Real-time Notification Service. Future columns will discuss some of these specifications. </p>
+<p>A PowerPoint tutorial version of our columns on the Real-time CORBA specification is available at &lt;www.cs.wustl.edu/~schmidt/RT-CORBA.ppt&gt;. If you have comments, questions, or suggestions regarding CORBA or our column, please let us know at <b>object_connect@cs.wustl.edu</b>.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1] D.C. Schmidt and S. Vinoski. &quot;Object Interconnections: Real-time CORBA, Part 1: Overview and Motivation,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, December 2001, &lt;www.cuj.com/experts/1912/vinoski.htm&gt;.</p>
+<p><a name="2"></a>[2] D. Schmidt and S. Vinoski. &quot;Object Interconnections: Real-time CORBA, Part 2: Applications and Priorities,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, January 2002, &lt;www.cuj.com/experts/2001/vinoski/vinoski.htm&gt;.</p>
+<p><a name="3"></a>[3] D. Schmidt and S. Vinoski. &quot;Object Interconnections: Real-time CORBA, Part 3: Thread Pools and Synchronizers</a>,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, March 2002, &lt;www.cuj.com/experts/2003/vinoski.htm&gt;.</p>
+<p><a name="4"></a>[4] Object Management Group. &quot;The Common Object Request Broker: Architecture and Specification Revision 2.4,&quot; <i>OMG Technical Document formal/01-02-33</i>, October 2000, &lt;www.omg.org/cgi-bin/doc?formal/01-02-33&gt;.</p>
+<p><a name="5"></a>[5] D. Schmidt, M. Stal, H. Rohnert, and F. Buschmann. <i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects</i> (Wiley and Sons, 2000), &lt;www.cs.wustl.edu/~schmidt/POSA/&gt;.</p>
+<p><a name="6"></a>[6] D. Schmidt and S. Huston. <i>C++ Network Programming: Systematic Reuse of ACE and Frameworks</i>, (Addison-Wesley, 2002), &lt;www.cs.wustl.edu/~schmidt/ACE/book2&gt;.</p>
+<p><a name="7"></a>[7] Richard E. Schantz and Douglas C. Schmidt. &quot;Middleware for Distributed Systems: Evolving the Common Structure for Network-centric Applications</a>,&quot; <i>Encyclopedia of Software Engineering</i> (Wiley and Sons, 2002), &lt;www.cs.wustl.edu/~schmidt/PDF/middleware-chapter.pdf&gt;.</p>
+<p><a name="8"></a>[8] Object Management Group. &quot;Dynamic Scheduling Real-Time CORBA 2.0 Joint Final Submission,&quot; OMG Document orbos/01-06-09, April 2001, &lt;http://cgi.omg.org/cgi-bin/doc?orbos/01-06-09.pdf&gt;</a>.</p>
+
+<H3><FONT COLOR="#000080">About the Authors</FONT></H3>
+<p><i><B>Steve Vinoski</B> is vice president of Platform Technologies and chief architect for IONA Technologies and is also an IONA Fellow. A frequent speaker at technical conferences, he has been giving CORBA tutorials around the globe since 1993. Steve helped put together several important OMG specifications, including CORBA 1.2, 2.0, 2.2, and 2.3; the OMG IDL C++ Language Mapping; the ORB Portability Specification; and the Objects By Value Specification. In 1996, he was a charter member of the OMG Architecture Board. He is currently the chair of the OMG IDL C++ Mapping Revision Task Force. He and Michi Henning are the authors of </i>Advanced CORBA Programming with C++<i>, published in January 1999 by Addison Wesley Longman. Steve is also IONA's primary representative to the W3C (World Wide Web Consortium) Web Services Architecture Working Group.</i></p> 
+<p><i><B>Doug Schmidt</B> is an associate professor at the University of California, Irvine. His research focuses on patterns, optimization principles, and empirical analyses of object-oriented techniques that facilitate the development of high-performance, real-time distributed object computing middleware on parallel processing platforms running over high-speed networks and embedded system interconnects.  He is the lead author of the books </i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects<i>, published in 2000 by Wiley and Sons, and </i>C++ Network Programming: Mastering Complexity with ACE and Patterns<i>, published in 2002 by Addison-Wesley. He can be contacted at <b>schmidt@uci.edu</b>. </p>
+
+</BLOCKQUOTE></BODY></HTML>

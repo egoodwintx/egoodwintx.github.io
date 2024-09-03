@@ -1,0 +1,174 @@
+<HTML>
+<HEAD><TITLE>DDJ, Spring1997: Portable Multithreaded Server</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+
+
+
+<H1>A Portable Multithreaded Web Server</H1>
+Spring 1997 <I>Dr. Dobb's Journal</I>
+<H2>Using a microkernel to write a fast, portable server
+</H2>
+<H3><I>by Pieter Hintjens and Pascal Antonnaux</I></H3>
+
+Pieter and Pascal are programmers in Belgium. They can be reached,  respectively, at <I>ph@imatix.com</I> and <I>pascal@imatix.com.</I>
+<HR>
+<IMG SRC="9718gins.gif" WIDTH=130 HEIGHT=144 ALIGN=LEFT HSPACE=6 VSPACE=3 ALT="Insert">
+
+Portability and performance are two of the most desirable attributes for a web server, yet most servers lack one or the other. Some of the more portable offerings tend to be simplistic, while the high-performance servers are generally system specific.
+
+<P>
+To address this problem, we designed the XITAMI web server, a multithreaded, portable server that is 
+freely available.
+
+
+XITAMI supports both HTTP and the echo protocol, and runs on UNIX (we've tested it on Linux, HP/UX, IBM AIX, and SunOS), Windows 95/NT, and Digital VMS. It should be easily portable to OS/2. 
+
+<P>
+We built XITAMI on top of the iMatix Simple Multithreading (SMT) kernel. The SMT kernel provides an internally multithreaded, event-driven structure for developing industrial-scale Internet servers and other types of event-driven programs. Thanks to the SMT kernel, the main server program is only a few lines long (<A HREF="9718glis.htm#1">see Listing One</A>). The SMT kernel provides the HTTP and echo server functionality, whereas the main XITAMI code merely binds these two into one executable unit. In this article, we explain how the SMT kernel works and how we used it to build XITAMI. (The XITAMI server, the SMT kernel, Libero, and the Standard Function Library are available at <A HREF="http://www.imatix.com/">http://www.imatix.com/</A>.)
+
+<H2>
+Design Considerations
+</H2>
+
+The main difficulty when designing an Internet server is determining how to handle multiple connections at once (concurrency) while remaining efficient. The classic way to achieve concurrency is to use the operating system's multitasking functions. This is generally straightforward. For instance, in a typical UNIX server implementation, the server process clones copies of itself using the fork() system call. At any given moment, there might be multiple copies of the server process, each handling one connection. The operating system switches rapidly between these processes, thus providing concurrency.
+
+<P>
+This approach has several problems for heavy-duty work. First, it's not portable. For example, not all operating systems have a fork() system call. Second, this particular implementation also has performance problems. Each fork() call duplicates the server program in memory. This duplication takes time, as does the eventual removal of the process. HTTP deals with a large number of short-term connections; a heavily accessed site with, for example, 16 million daily hits must create and destroy about 200 connections each second. In addition to the time waste, each additional instance of the server process consumes system resources, thus limiting the maximum number of server connections.
+
+<P>
+Variations on this forking model eliminate some of the problems. For instance, you can create a fixed number of instances of the server upon startup, then allow that number of simultaneous connections. This eliminates the cost of creating and removing server processes, but does not raise the ceiling on the maximum number of connections.
+
+<P>
+A more sophisticated approach is to handle multiple connections within a single process. This is relatively simple to do using the standard socket select() function. The select() function waits for activity on a set of sockets, and returns the subset of sockets ready for input or output.  This function is the core of most programs that handle multiple sockets in "parallel." This single-process approach lets a program wait for activity on a set of open sockets, handle the activity, and repeat. We get concurrency by repeatedly handling each socket. The cost of creating and managing a new connection is low&#151;about the cost of creating the socket.
+
+<P>
+When the requirements for "handling the activity" is simple, this approach works well. For example, we could use such a design for a server that accepts input messages and routes them to some destination. In general, however, the work required to handle a connection is more complex than simple message passing and involves activity such as reading or writing to files or manipulating several sockets at once.
+
+<P>
+In our experience, a good way of handling the logic of the server is to use a finite state machine (FSM), since FSMs are an effective method for describing complex event-driven logic. An FSM-based program can easily handle errors and is self documenting. An FSM describes the events you expect, the various states of the program, and the work that the program does to handle each event. Once we have described the program as an FSM, we create an instance of the FSM for each connection. Each instance is considered a thread. We then execute each FSM thread step by step, effectively giving concurrency. We call this internal multithreading.
+
+<P>
+The iMatix Libero tool lets you design programs as FSMs, then generate code in various languages. We can choose what language Libero should generate in order to run the state machine. Libero generates code using a schema (a file that contains a template of the code to generate). Using different templates, Libero generates C, C++, Perl, Cobol, and various other languages. We built a multithreading kernel&#151;a set of functions to manage threads, queues, events, and other objects&#151;and wrote a special Libero schema that generates C code to interface with this kernel. The result is a technique for building multithreaded FSM programs. (For more information on Libero, see "The Libero Development Environment," by Pieter Hintjens, <I>Dr. Dobb's Sourcebook</I>, July/August 1996.) 
+
+<H2>
+The SMT Kernel
+</H2>
+
+The SMT kernel looks like an operating-system microkernel. We first heard of the concept of using a kernel to implement portable multitasking in 1990, when Leif Svalgaard (<I>leif@ibm.net</I>) wrote a tiny multitasking monitor for MS-DOS that was based on an event-passing kernel. It worked well and could multitask several DOS sessions simply and efficiently. It only took one long weekend to write and required very little memory (several kilobytes) to run. Leif based this project on his earlier work in operating-systems design, and his approach defined the core principles of our SMT kernel.
+
+<P>
+An SMT application is built on an internal, modular, client-server model. The main entities are "agent" programs that can act both as server and client. Agent programs send each other messages to request services. For instance, in the XITAMI web server, the HTTP agent sends a request to the socket agent, asking it to monitor port 80. The socket agent collects events from this and all other open Internet sockets. When it receives a connection request on port 80, it returns a message to the HTTP agent. The socket agent also reads and writes to sockets on behalf of other agents.
+
+<P>
+This modular approach allowed us to supply prebuilt and tested components that you can quickly reuse in new applications. SMT provides a number of standard agents:
+
+<P>
+<UL>
+<LI> The socket agent handles all Internet socket access.
+<LI> The logging agent handles log files.
+<LI> The console agent handles errors.
+<LI> The timer agent provides alarm events.
+<LI> The echo agent provides the Internet echo protocol.
+<LI> The HTTP agent provides the Internet HTTP protocol.
+</UL>
+<P>
+Each agent program runs one or more threads. The SMT kernel uses the select() approach to implement multithreading and provides a level of abstraction (through agents) that makes the approach practical for large-scale problems. SMT uses nonblocking mode for its socket access and encapsulates this in the socket agent. For file access, SMT uses nonblocking I/O, safely repeating operations that would 
+otherwise block. For instance, if there is a resource delay in writing to a log file, other threads will continue to work while the thread in question slowly retries the operation. This is essential in an internally multithreaded application, where one blocked thread will block the entire application.
+
+<P>
+You can create one or several threads, where each thread executes a copy of the FSM. Threads send each other events that are queued and delivered by the SMT kernel to the state machine that controls each thread. Threads and agents run asynchronously, driven by internal events sent by other agents and coming from the socket interface.
+
+<P>
+During each execution cycle, each thread consumes and processes one incoming event. A thread can also cooperatively relinquish control. Threads and events have priorities. Typically, we give most threads and events a "normal" priority. An event like SHUTDOWN&#151;which the SMT kernel broadcasts to all threads to end an application&#151;gets a high priority. The socket agent thread has a low priority, so that the select() operation only occurs when no other threads have work to do. Event priorities are determined by the recipient, not the sender. Only the recipient can make a safe choice about how to process an event, including the relative priority of events.
+
+<P>
+The SMT kernel uses events to communicate between agents. For instance, to wait until input arrives on a socket, a thread sends an INPUT event to the socket agent. The socket agent will respond with an OK event, or perhaps an ERROR or CLOSED event. When a thread receives an event, it is moved to the active list. After it has finished processing that event, it is moved off the list. Once the active list is empty and all events have been processed, the application halts.
+
+<P>
+The Libero tool builds an event-driven FSM program. We can therefore arrange for the SMT events to be automatically converted into events that the program can use. This happens transparently. Figure 1 and <A HREF="9718glis.htm#2">Listing Two </A>show the echo agent state machine and program code. It is feasible, but not very practical, to build an SMT agent program without Libero.
+
+<P>
+<B>Figure 1: </B><I>State machine for echo agent.</I><P>
+
+<IMG SRC="9718gfig1.gif" WIDTH=302 HEIGHT=900 ALIGN=TOP ALT="Diagram">
+
+
+<P>
+The number of threads is limited only by the memory available to the process. Creating or removing a thread is fast, so new connections are established more quickly than if we were using a fork() call. As far as the operating system is concerned, there is just one process, so there is a lower cost.
+
+<P>
+Many operating systems provide native multithreading internally. However, native multithreaded applications are not really portable and are quite difficult to program. One typical problem with multithreaded programming is that threads must do extra work to synchronize access to shared resources such as data. If you do not take care of this, a program may work well during testing, then fail under heavy use.
+
+<P>
+SMT achieves much the same as native multithreading, but is easier to program for several reasons: It uses (or rather, imposes) the Libero tool; thread code always runs as a "critical section," so shared resources can be accessed with no risk; and it is fully portable, providing a simpler environment than a native multithreading environment. Some of the differences between the SMT approach and native multithreading are:
+
+<P>
+<UL>
+<LI> The SMT approach does not require critical sections or semaphores to access common resources. Threads are only switched at well-specified boundaries. All code between these boundaries can safely access common resources. SMT does provide semaphores, but as an alternative to events for synchronization.
+
+<LI> In an SMT program, a looping thread will block the application, while a native multithreading system allows individual threads to loop or wait for input/output.
+
+<LI> The SMT kernel will not make use of multiple CPUs as will a native multithreaded system. This is not a concern, at present, since multiprocessor systems are not that common. We are developing a distributed-processing technology that will allow SMT applications to work on multiprocessor systems and across heterogeneous networks.
+
+<LI> The SMT kernel, in combination with the Libero FSM methodology, provides a rich environment and toolkit for application development. SMT is more than an API; it is a framework for building internal client/server applications.
+
+<LI> A native multithreading approach does not impose any programming method, while SMT is designed to work with Libero. The FSM approach has limitations for certain problems; for instance, you cannot use recursion.
+</UL>
+<P>
+The SMT kernel is written in ANSI C, and uses the iMatix Standard Function Library (SFL) to encapsulate nonportable, system-specific functions. For instance, all socket I/O is handled by functions in the SFL. Figure 2 shows the structure of an SMT application like XITAMI.<P>
+
+<P>
+<B>Figure 2: </B><I>SMT application structure.<P>
+</I>
+<IMG SRC="9718gfig2.gif" WIDTH=170 HEIGHT=56 ALIGN=TOP ALT="Diagram">
+
+
+<H2>Object-Oriented API</H2>
+
+The SMT kernel API defines a number of objects that are arranged in a structural, rather than a morphological, hierarchy (they do not inherit attributes from each other). Figure 3 shows the main SMT objects.
+
+<P>
+<B>Figure 3: </B><I>Main SMT objects</I><P>
+<IMG SRC="9718gfig3.gif" WIDTH=125 HEIGHT=131 ALIGN=TOP ALT="Diagram">
+
+
+<P>
+An SMT application consists of one or more agent objects. An agent is written as a single program, based on one Libero FSM definition. The agent declares one or more Method objects that it can process. These are formal declarations of the Event objects that the agent is prepared to accept. An agent that declares a method OPEN will accept events called OPEN.
+
+<P>
+An agent contains one or more event Queue objects. When you send an event somewhere, you send it to an event queue. These queues are handled by one or more Thread objects that are instances of the FSM program. An event queue contains zero or more events that will be processed by the queue's thread or threads. Generally, one thread will service one queue. Alternatively, several threads can service the same queue.
+
+<P>
+Agents, methods, threads, and events are all named. Queues are unnamed and are referred to by a QUEUE ID block, a token that the SMT kernel generates when it creates a new queue. This queue identification is stored in events, providing a return path for replies. 
+
+<H2>Building the XITAMI Web Server</H2>
+
+We designed XITAMI as several agent components:
+
+<P>
+<UL>
+<LI> An echo protocol agent (smtecho).
+
+<LI>An HTTP protocol agent (smthttp).
+
+<LI>An authorization agent (smtauth).
+</UL>
+<P>
+After writing these components, we wrote the main() function to tie the various protocols together. We did this by calling the "initialize" entry point in each agent. As you can see from <A HREF="9718glis.htm#1">Listing One</A>, the code is simple and short. The architecture is extensible. We can add support for another protocol (such as ftp or gopher) by writing a new agent component and adding one line of code to the main program.<P>
+
+<H2>Conclusion</H2>
+
+There is no real need to resort to system-dependent functionality to build a fast, industrial-scale web server. An internally multithreaded model, coupled with an appropriate design tool like Libero, allows you to build a fast and portable server.
+
+<P>
+The SMT kernel provides a framework for developing industrial-scale Internet servers and complex real-time applications. We designed this software to be a general-purpose toolkit from the ground up. The XITAMI web server is just a sample application.
+
+<P>
+XITAMI runs quickly with little slowdown even when multiple clients are connected. The current version is still somewhat simple: It does not keep statistics, nor does it handle advanced security features such as secure sockets. However, it installs and runs with little work. We are continually developing and improving XITAMI.<P>
+
+<A HREF="9718glis.htm"> Listings </A> 
+
+<P>
+
+</BODY></HTML>
+

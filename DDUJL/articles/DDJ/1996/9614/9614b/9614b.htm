@@ -1,0 +1,699 @@
+<HTML> <HEAD> <!-- This document was built using HyperWriter Professional by NTERGAID Inc. -->
+<META NAME="year" CONTENT="1996">
+<TITLE>SP 96: Fast Interrupt Processing in Windows 95</TITLE></HEAD> <body bgcolor="FFFFFF"> <h1>Fast Interrupt
+Processing in Windows 95<a name="029c_00e1"><a name="029c_00e1"><a name="029c_00df"><a name="029c_0000"></h1><P>
+
+<h2>Improving Windows' real-time performance</h2><P>
+
+<h3>Victor Webber</h3><P>
+
+<P> <i><a name="029c_00e0"><a name="029c_0000">Victor is an independent consultant in Silicon
+Valley. He is presently writing a book on device-driver development for Windows NT and Windows 95. He
+can be contacted at 73553 .3533@compuserve.com.</i></p><hr><P>
+
+When DOS was king, a vibrant market for real-time 80x86 systems existed. Many small manufacturers
+produced single-board PCs that served both as an embedded system and as a user interface. Even IBM made
+an &quot;Industrial PC.&quot; But they were all DOS-based machines, employing sophisticated ISRs hooked
+into the 8254 timer hardware interrupt (IRQ 0). This DOS environment allowed you to easily create
+algorithms that fully exploited every real-time machine cycle of the motherboard microprocessor. The
+proliferation of the mighty TSR hooked to IRQ 0 was probably due to the demands of this real-time
+market.<P>
+
+With the introduction of Windows, however, we are saddled with the inability to do real-time work. For
+example, a 66-MHz 80486 running DOS can process timer interrupts at a frequency of 20,000 Hz with a
+ten-microsecond ISR latency. The same machine running Windows 95 using the standard virtual device
+driver (VxD) calls for manipulating the timer interrupt might be able to process timer interrupts at a
+frequency of 500 Hz with a 300-microsecond ISR latency. Further, the latency gets worse for the Windows
+machine when the ISR is in a DLL instead of a VxD.<P>
+
+In this article, I'll discuss why documented methods are inadequate for increasing the accuracy and
+responsiveness of the real-time aspects of Windows. I'll also point out how these artificial limitations can
+be overcome and present a utility that modifies Windows 95 internals to reduce the number of instructions
+required per interrupt from approximately 3200 to about 660. Finally, I'll provide a new real-time utility
+for Windows 95 that will narrow the gap between the real-timer power of the new machines and the
+real-time power harnessed by Windows 95. This utility installs interrupt-service routines into the kernel
+and processes interrupts at frequencies over 40,000 Hz with a ten-microsecond ISR latency on a 66-MHz
+80486 machine. The essence of this algorithm is an undocumented Windows function. When this function is
+used it causes a twist in the internal architecture of Windows, making it more real-time sensitive. <P>
+
+<h3><a name="029c_00e2">Artificial Limitations<a name="029c_00e2"></h3><P>
+
+The current generation of PCs provide awesome real-time power, which, unfortunately, is underutilized by
+Windows 95. Consider <I>VTD_Begin_Min_Int_Period(int PeriodLength)</I>, the Windows 95 routine that
+increases the sensitivity of its scheduler. This call can easily be upgraded to increase its efficiency by at
+least a factor of 10. The parameter (<I>int PeriodLength</I>) decreases the timer interrupt (IRQ 0) period,
+thus increasing the timer interrupt frequency. This increases the accuracy and responsiveness of the
+scheduler, which is hooked into IRQ 0. To illustrate the inefficiency of this call, I'll calculate the number of
+instructions executed during a minimum interrupt period on an ancient 386 16-MHz machine. I'll then use
+this instruction count as a benchmark, and calculate the possible minimum interrupt period on the new,
+faster machines. The discrepancy between this actual limit and the artificial Microsoft limit is
+surprising.<P>
+
+The calculation in <a href="1996029f.htm">Figure 1</A> uses dimensional analysis to conclude the
+number of instructions executed in a single timer interrupt when the minimum interrupt period is reduced to
+its Microsoft limit of one millisecond. (This limit is derived from the minimum parameter passed to
+<I>VTD_Begin_Min_Int_Period()</I>.) <a href="1996029f.htm">Figure 1</A> shows that Microsoft
+allows you to interrupt the machine every 3200 instructions. For comparison, the calculation in <a href="199602a0.htm">Figure 2</A> shows the minimum interrupt period on a 150-MHz Pentium,
+assuming at least 3200 instructions per interrupt period. <P>
+
+The calculation shows that if a timer interrupt can be accommodated every 3200 instructions, then on a
+150-MHz Pentium, we should be able to accomodate a minimum interrupt period of .045 milliseconds for no
+other reason than Windows imposes an unnecessary limit on the parameter passed to <I>VTD_B_MIP()</I>.
+This illustrates that Microsoft has not even upgraded one of its most important real-time functions, even
+though all that is required is a change in parameter limits.<P>
+
+<h3><a name="029c_00e3">Limitations of New Structure<a name="029c_00e3"></h3><P>
+
+Certainly, the real-time internals of Windows 95 can be improved. But, by how much? <a href="9614a2f3.gif">Figure 3</A> calculates the minimum interrupt period that might be achieved given
+an entirely new, more-efficient internal interrupt architecture. A minimum interrupt period of 0.009
+milliseconds represents a frequency of greater than 100,000 Hz. This is too fast even to do I/O work on
+the slow ISA bus. We need to be on a PCI or VESA bus to exploit this power.<P>
+
+<h3><a name="029c_00e4">Windows 95 Internals<a name="029c_00e4"></h3><P>
+
+Windows supplies several internal components, including the Virtual Machine Manager (VMM), VxDs, BIOS,
+and Dynamic Link Libraries (DLLs). The utility I present here uses the VMM, the programmable interrupt
+controller virtual device (VPICD.386), and the timer virtual device (VTD.386). The VMM, VPICD.386, and
+the VTD.386 are instantiated in WIN386.EXE. The VMM is the first component loaded, then VPICD.386, and
+finally the VTD.386.<P>
+
+The VMM provides a large variety of services to applications and to the device-specific components. These
+services fall into more than 15 categories including memory-management services, virtual machine
+interrupt and callback services, primary scheduler services, time-slice scheduler services, event
+services, timer services, and processor fault services. <a href="199602a3.htm">Figure 4</A> shows
+the hierarchical relationship between the VMM and other components.<P>
+
+The VPICD.386 virtualizes the interrupt controller and presents the functionality to the virtual machines
+running the application software. The virtualization process involves receiving a hardware interrupt
+indication and knowing which virtual machine owns it. It also involves trapping requests for interrupt
+controller services and arbitrating the actual state of the interrupt controller with the state of the
+interrupt controller as seen by the requesting application. For example, when the application sends an end of
+interrupt (EOI), the VPICD.386 provides a response to the application indicating it was written to the
+interrupt controller hardware, whereas, in most cases, it is not actually written to the controller. <P>
+
+The VPICD.386 initializes by setting up interrupt-service routines for every interrupt request line (IRQ) on
+the master and slave programmable interrupt controllers. These ISRs are either global or owned. When a
+global hardware interrupt is generated, it is reflected into any virtual machine that is currently running.
+When an owned hardware interrupt is generated, it is reflected into the virtual machine that owns it; see
+<a href="199602a3.htm">Figure 4</A>.<P>
+
+The VTD.386 virtualizes the hardware timer, presenting services to other virtual devices. These services
+involve reporting information about the internals of the VTD.386, such as providing the present minimum
+timer interrupt period. They also involve changing the internals of the VTD.386. For example, the VTD.386
+offers a function to change the minimum timer interrupt period, <I>VTD_ Begin_Min_Int_Period()</I>. <P>
+
+<h3><a name="029c_00e5">The Loading Process<a name="029c_00e5"></h3><P>
+
+The VMM is the first component loaded and it creates IDT entries for all the hardware interrupts on the
+interrupt controllers. In <a href="199602a5.htm">Figure 5</A>, area 1 shows the architecture of the
+system after the VMM creates the initial IDT and adds the vectors. The VPICD.386 loads next and calls into
+the VMM to hook all the interrupts. The VPICD.386 uses the VMM's fault hooking services for this operation.
+In a sense, it creates a secondary IDT for all the interrupts from the interrupt controllers and creates
+vectors to default ISRs. Furthermore, the VPICD.386 reads the programmable interrupt controller
+registers to determine which are owned and which are global. Thus its own interrupt hooking services know
+which interrupts other users can be allowed to hook. Area 2 of <a href="199602a5.htm">Figure 5</A>
+shows the architecture of the system after the VPICD.386 is loaded and all the hardware interrupts have
+been provided with default ISRs. <P>
+
+The VTD.386 loads hooking the timer interrupt, IRQ 0, which is connected to the 8254 timer. It uses the
+VPICD virtualization functions for this operation. The VTD.386 obtains exclusive ownership of IRQ 0. In
+Windows 95, it reprograms the timer to interrupt every 20 ms. (In Windows 3.1 it uses 50 ms, and in
+Windows for Workgroups it uses 20 ms.) It also arbitrates all further requests to change this minimum
+interrupt period; see <a href="199602a5.htm">Figure 5</A>, area 3.<P>
+
+The process for handling an interrupt is predictable. The interrupt vectors from the VMM IDT to the VMM
+ISR. The VMM ISR saves all the registers, does some administrative work and then passes control to
+whoever has hooked the interrupt with the fault hooking services of the VMM. This almost always is the
+VPICD .386 code. The VPICD.386 handles all the administrative work of virtualizing the interrupts. Its first
+action is to send out an EOI, then issue a CLI. Next, it passes control to whoever has virtualized the
+interrupt with the VPICD.386 services. In the case of IRQ 0, which has been hooked by the VTD.386, control
+passes to the ISR within VTD.386. <P>
+
+<h3><a name="029c_00e6">Interrupt Handling<a name="029c_00e6"></h3><P>
+
+The process for handling a single interrupt is simple, as long as you assume the microprocessor is in a
+single monolithic mode. However, the 80386 generation of microprocessors has protected paging circuitry
+and runs in three different hardware modes. All of these hardware modes must be handled by the
+operating-system software-interrupt structure. Windows 95 creates three corresponding software modes
+for this purpose: <P>
+<ul>
+<li>Protected mode (PM).</li> <li>Virtual 86 mode (V86).</li> <li>Virtual machine monitor mode
+(VMM).</li>
+</ul>
+Again, these operating-system software modes correspond to the actual hardware modes of
+the microprocessor. The different modes of the microprocessor, along with the different modes of the
+operating system, are entered by writing to the microprocessor hardware. PM software mode is active
+when the microprocessor is at privilege level 3 and in protected mode. V86 software mode is active when
+the microprocessor is at privilege level 3 and in V86 mode. VMM software mode is active when the
+microprocessor is at privilege level 0 and in protected mode. When standard Windows applications are
+executing, PM mode is active. When kernel code is executing, VMM mode is active. When a DOS box is
+executing, V86 mode is active. <P>
+
+Arbitration between the modes is done in the VPICD.386. The VPICD.386 keeps a table of vectors for each
+different mode. When the VPICD.386 loads and initializes all the vectors, it uses the VMM fault hooking
+services to hook each interrupt 3 times, once for each mode. It uses <I>Hook_PM_Fault(), Hook_
+V86_Fault(),</I> and <I>Hook_VMM_Fault()</I> from the VMM fault hooking services. When an interrupt
+occurs, it goes through the IDT, which never changes, and the VPICD.386 directs the vector as a function of
+the mode of the microprocessor. Generally the ISRs do similar work in the different modes. <a href="199602af.htm">Figure 6</A> shows the architecture of the system when all the interrupts are
+hooked in all the different modes. <P>
+
+<h3><a name="029c_00e7">Fast Interrupt Processing<a name="029c_00e7"></h3><P>
+
+With the technical background out of the way, I'll now turn to the algorithm which provides for this fast
+interrupt processing. At this point, the technique should be rather obvious -- you hook the interrupt service
+routine mechanism closer to the hardware so it does not go through all the software components every time
+it executes. You do not use the standard virtualization functions of the VPICD.386 because the ISR would
+only get control after the interrupt processing goes through the VMM and the VPICD.386 code. Instead, you
+hook the hardware interrupt with an undocumented function, or more correctly, you hook the hardware
+interrupt by using a documented function in an undocumented manner. Quite simply, you hook the hardware
+interrupt with the <I>Hook_XX_Fault()</I> routines. Even though the official Microsoft documentation
+clearly states that this function cannot be used for hooking hardware interrupts, it can. Officially, these
+routines are provided only for hooking software interrupts.<P>
+
+The VxD in <a href="9614b.htm#029c_00ea">Listing One</A> hooks the IRQ 0 timer interrupt,
+reprograms the timer to interrupt at a higher frequency, steals all the interrupts which occur, and only
+passes control to the original interrupt handler at the original frequency. This hooking code is complicated
+because the interrupt-service routine no longer uses the VPICD.386 to administer the specifics of handling
+the programmable interrupt controller chip, such as sending out the EOI command. <a href="199602a8.htm">Figure 7</A> shows the architecture of the system when the timer interrupt (IRQ
+0) is hooked. The VxD code is initialized and uninitialized when standard VxD system messages are received.
+<a href="199602a9.htm">Figure 8</A> provides an explanation of a few important procedures. <P>
+
+<a href="9614b.htm#029c_00ea">Listing One</A> demonstrates the viability of this algorithm.
+However, not all the demands of the system are satisfied. Some additional features should be added to make
+the utility more robust. Specifically, some VTD.386 functions are unreliable because they are unaware that
+the timer has been reprogrammed and these VTD .386 functions receive unexpected values when they read
+the timer registers. This problem can be eliminated by overriding <I>VTD_Begin_Min_Int_Period()</I>,
+<I>VTD_ End_Min_Int_ Period()</I>, <I>VTD_Get_ Real_Time()</I>, and <I>TD_
+Update_System_Clock()</I>. The new functions must maintain an internal database for the timer.<P>
+
+<h3><a name="029c_00e8">Other Enhancements <a name="029c_00e8"></h3><P>
+
+Fast interrupts are hardly the only enhancement needed to make Windows 95 an adequate real-time
+operating system. Another simple (yet important) enhancement is ensuring that the system interrupts are
+not turned off for long periods of time. This is such an important point that analyzing the entire system for
+excessively long periods of cleared interrupts is warranted. One extremely offensive module is the file
+system. It turns off system-level interrupts for periods of several milliseconds, and a sensitive real-time
+system can only tolerate periods of cleared interrupts for a few hundred microseconds. In Windows 3.1,
+this is a difficult problem because the offensive file system is hard to replace. In Windows 95, however,
+you have installable file systems, and you can easily replace the offensive default file system with a
+real-time file system. <P>
+
+Another important enhancement involves the implementation of a real-time scheduler. The real-time
+scheduler needs to be preemptive. That is, if some event occurs in an ISR which precipitates rescheduling,
+the rescheduling must take place at that instant. In addition to being preemptive, the scheduler should use an
+algorithm that respects the temporal requirements of the various tasks. This refers to how the scheduler
+decides which task runs when several tasks are ready to be executed. Some popular algorithms are rate
+monotonic, least-laxity first, earliest-deadline first, and maximum-urgency first. Also, the scheduler
+should support numerous priorities. Most dedicated real-time operating systems support at least 256 levels
+of priorities. Windows' lack of such a real-time scheduler may be the biggest impediment to its becoming a
+truly real-time operating system.<P>
+
+If you really wanted to pick nits, you could reprogram the master and slave 8259 programmable interrupt
+controller so it runs in special fully nested mode, instead of running in fully nested mode. Of all the
+different modes of the 8259 programmable interrupt controller, this is the most real-time sensitive. It
+speeds up interrupt servicing by 50 to 120 instructions. <P>
+
+Even if we add a real-time file system, we still have to deal with the problem that Windows has no
+specifications for the maximum duration of disabled interrupts. Hopefully, Microsoft will publish this in the
+future.<P>
+
+Are fast interrupts a big deal? Yes. The interrupt overhead in unmodified Windows is so bad that it
+precludes involving the system board in any relevant real-time processing. This is truly a shame because of
+the awesome power of the new system-board microprocessors. Not only do they have greater
+computational power, but they have greater real-time functionality. (The 80586/Pentium has a 64-bit
+counter of system clock cycles, which allows near-picosecond time stamps and never rolls over.) Intel has
+already cracked this market with its ProShare video conferencing package. This is the first product to use
+system-board microprocessor CODECs instead of peripheral-card DSP CODECs. Surely, a more-real-time
+sensitive Windows would cause a flood of such products to appear. We could do sound-card work without a
+sound card, speech-processing work with a DSP speech card. The new 80x86 PCs can win work from the
+peripheral cards in the same way they won work from the mainframes.<P>
+
+<h4><B><a href="1996029f.htm">Figure 1</A></B> Minimum instructions per ISR in a 16-MHz
+80386.</h4><P>
+
+<h4><B><a href="199602ab.htm">Figure 2</A></B> Potential minimum interrupt period on a 150-MHz
+Pentium.</h4><P>
+
+<h4><B><a href="9614a2f3.gif">Figure 3</A></B> Potential interrupt length on a 150-MHz Pentium
+using the new ISR hook.</h4><P>
+
+<h4><B><a href="199602a3.htm">Figure 4</A></B> Subsystem hierarchy.</h4><P>
+
+<h4><B><a href="199602a5.htm">Figure 5</A></B> ISR hierarchy.</h4><P>
+
+<h4><B><a href="199602af.htm">Figure 6</A></B> Interrupt hierarchy for different modes.</h4><P>
+
+<h4><B><a href="199602b0.htm">Figure 7</A></B> System hierarchy with the new ISR hook
+included.</h4><P>
+
+<h4><B><a href="199602b1.htm">Figure 8</A></B> Call graph for the major functions in Listing
+One.</h4><P>
+
+<P>
+
+<h4><a name="029c_00e9"><a name="029c_00ea">Listing One<a name="029c_00ea"></h4><pre>
+;-
+; File Name..........: VHKD.ASM
+; File Description...: Installs interrupt hooks to demonstrate the 
+;  undocumented fault hooking process.
+; Author.............: Victor Webber
+;-
+; Build Notes:
+;-
+;   set include=\ddk\include
+;   masm5 -p -l -w2 hk.asm;
+;   link386 hk,vhkd.386,,,hk.def
+;   addhdr vhkd.386
+;
+; The following segment must be placed into hk.def
+;
+; LIBRARY VHKD
+; DESCRIPTION VHKD VIRTUAL DEVICE (VERSION 1.0)
+; EXETYPE DEV386
+; SEGMENTS
+;  _LTEXT PRELOAD NONDISCARDABLE
+;  _LDATA PRELOAD NONDISCARDABLE
+;  _ITEXT CLASS ICODE DISCARDABLE
+;  _IDATA CLASS ICODE DISCARDABLE
+;  _TEXT  CLASS PCODE NONDISCARDABLE
+;  _DATA  CLASS PCODE NONDISCARDABLE
+; EXPORTS
+;  VHKD_DDB @1
+;
+;-
+; Operation Notes:
+;-
+;  1) Add device=vhkd.386 to the [386Enh] section of the SYSTEM.INI file
+;  2) Open this VxD and call functions from a DLL.  
+;
+;
+;               A S S E M B L E R   D I R E C T I V E S
+;
+.386p
+;
+;                      I N C L U D E   F I L E S 
+;
+INCLUDE VMM.INC
+;
+;                     E X T E R N A L   L I N K S   
+;
+;
+;                   E Q U A T E S
+;
+; The device ID  get your own ID from vxdid@microsoft.com
+VHKD_VXD_ID             EQU 28C2h
+VERS_MAJ                EQU 1
+VERS_MIN                EQU 0
+VERSION                 EQU ((VERS_MAJ SHL 8) OR VERS_MIN)
+;- Equates used in reprogramming the 8254
+; Number of reg 0 ticks which equal 1 milli sec
+TMR_MTICK               EQU 04A9h
+; The count down value in Windows 3.1  
+TMR_W31_CNT_DWN         EQU (TMR_MTICK*50)
+; The count down value in Windows for Workgroups
+TMR_WWG_CNT_DWN         EQU (TMR_MTICK*20)
+TMR_OLD_CNT_DWN         EQU TMR_WWG_CNT_DWN
+; Count down value for a tick every 15 milli secs
+TMR_NEW_CNT_DWN         EQU (TMR_MTICK*15)
+; 8254 Registers
+CTRL_8254               EQU 043h  
+RWCNT_8254              EQU 034h  
+DATA_8254               EQU 040h  
+; 8259 values
+VPICD_SP_EOI_0          EQU 60h
+VPICD_CMD_M8259         EQU 20h
+; Identifies interrupt to hook
+TMR_IRQ0                EQU 050h
+; Mode id
+VMM_MODE_ID             EQU 0
+PM_MODE_ID              EQU 1
+V86_MODE_ID             EQU 2
+CFLAG                   EQU 1
+;
+;                 S T R U C T U R E S
+;
+;
+;
+HK_ST     STRUC
+;
+; State of the hook system
+wSt                     dw  ?
+ ; Known uninitilized state
+ ;HK_UNINIT      EQU 1
+ ; All fault hooks initialized
+ ;HK_INIT        EQU 2
+;
+; Frequency counters
+dwNewFreq               dw  ?   
+dwOldFreq               dw  ?   
+;
+; Old 8254 count down value
+dwOldTmrCntDwn          dw  0
+; New 8254 count down value
+dwNewTmrCntDwn          dw  0
+;
+; System Accumulator
+dwCntDwnAccum           dw  0
+;
+; System VM Handle
+ddSysVM                 dd  0  
+;
+; Array to hold old vectors
+aVctr                   dd  3 dup (?)
+HK_ST     ENDS
+ ; Known uninitilized state
+ HK_UNINIT      EQU 1
+ ; All fault hooks initialized
+ HK_INIT        EQU 2
+;
+;        V I R T U A L   D E V I C E   D E C L A R A T I O N
+;
+Declare_Virtual_Device VHKD, VERS_MAJ, VERS_MIN, _VhkdVxDControl, \
+    VHKD_VXD_ID, Undefined_Init_Order, \
+    _VhkdAPIHandler, _VhkdAPIHandler,
+;
+;           R E A L   M O D E   I N I T I A L I Z A T I O N
+;
+VXD_REAL_INIT_SEG
+_real_init proc near
+    mov      ah, 9
+    mov      dx, offset claim
+    int      21h
+    xor      ax, ax          ; set up to tell Windows its okay 
+    xor      bx, bx          ; to keep loading this VxD
+    xor      si, si
+    xor      edx, edx
+    ret
+_real_init endp
+claim     db  VHKD.386  VHKD  v. 1.0,0dh,0ah
+          db  Copyright (c) 1995 and 96 Victor Webber. All Rights Reserved.
+          db  0dh,0ah,$
+VXD_REAL_INIT_ENDS
+;
+;                D A T A   S E G M E N T S
+;
+VxD_DATA_SEG
+;-
+; State Vars
+ 
+sHK     HK_ST &lt; HK_UNINIT, 0, 0, TMR_OLD_CNT_DWN &gt;
+;-
+; API jump table
+VhkdAPICall    label dword
+                dd  offset32 _HkGetNewFreq
+                dd  offset32 _HkGetOldFreq
+VHKD_API_MAX EQU ( $ - VhkdAPICall ) / 4
+VxD_DATA_ENDS
+;
+;           L O C K E D   C O D E   S E G M E N T
+;
+VxD_LOCKED_CODE_SEG
+;
+BeginProc   _VhkdAPIHandler
+; - In: ebp.Client_AX :: function index
+;
+; - Description:
+;  - This is the handler which funnels all service calls.
+; - Out:
+;  - Calls indexed function
+; - Return:
+;  - ebp.Client_EFlags :: CFLAG set is error
+;  - ebp.Client_EFlags :: CFLAG clear is error
+;  - See individual function
+;
+    movzx    eax, [ebp.Client_AX]            ; get callers AX register
+    cmp      eax, VHKD_API_MAX               ; valid function number?
+    jae      short fail
+    and      [ebp.Client_EFlags], NOT CFLAG  ; clear carry for success
+    call     VhkdAPICall[eax * 4]            ; call through table
+    ret
+fail:
+    or       [ebp.Client_EFlags], CFLAG
+    ret
+EndProc     _VhkdAPIHandler
+;-
+BeginProc _VhkdVxDControl
+; - In: void
+;-
+; - Description:
+;  - Process system messages
+; - Out:
+;  - Call message handlers
+; - Return:
+;  - void
+;-
+    Control_Dispatch Sys_Critical_Init, _VhkdCritInitMsg
+    Control_Dispatch Sys_Critical_Exit, _VhkdCritExitMsg
+    clc    
+    ret
+EndProc _VhkdVxDControl
+;
+BeginProc _VhkdCritInitMsg
+; In: void
+;
+; - Description:
+;  - Process Crit Init message.  This message occurs 
+;  during system initialization.
+; - Out:
+;  - Filles database with control information
+;  - Init Fault Hooks
+;  - Init first stage of tmr 
+; - Return:
+;  - cy clr :: success, everything installed
+;  - cy set :: error, nothing has been installed
+;
+    VMMcall  Get_Sys_VM_Handle
+    
+    mov      sHk.ddSysVM, ebx
+    ; Install hooks, but keep hook system uninitialized.
+    call     _HkInstallHooks
+    jc       CI_EXIT
+    ; Increase frequency of hook system
+    call     _HkScheduleFreq
+    clc  
+    CI_EXIT:
+    ret
+EndProc _VhkdCritInitMsg
+          
+;
+BeginProc _VhkdCritExitMsg
+;
+; - Description:
+;  - Process Crit Exit message
+; - Out:
+;  - Uninit Fault Hooks
+; - Return:
+;  - cy clr :: error, nothing has been installed
+;
+    ; Reset hook system
+    call     _HkUnScheduleFreq
+    clc
+    ret
+EndProc _VhkdCritExitMsg
+;
+BeginProc _HkInstallHooks
+; - In: Void
+;
+; - Description:
+;  - Hook the Timer faults. This should be the last 
+;  hook of these faults. No Hook should occur after this.
+; - Out:
+;  - Call Hooking procedures
+;  - Fill structure with address of old fault hooks
+; - Return:
+;  - cy set :: error, no handlers installed
+;  - cy clr :: success
+;
+                                                  
+    push     esi
+    mov      eax, TMR_IRQ0
+    mov      esi, OFFSET32 _HkPmIRQ0FaultHook
+    VMMcall  Hook_PM_Fault
+    jc       short HK_ERR
+    mov      sHK.aVctr[PM_MODE_ID*4], esi
+    
+    mov      esi, OFFSET32 _HkV86IRQ0FaultHook
+    VMMcall  Hook_V86_Fault
+    jc       short HK_ERR
+    mov      sHK.aVctr[V86_MODE_ID*4], esi
+    
+    mov      esi, OFFSET32 _HkVMMIRQ0FaultHook
+    VMMcall  Hook_VMM_Fault
+    jc       short HK_ERR
+    mov      sHK.aVctr[VMM_MODE_ID*4], esi
+    HK_ERR:
+    pop     esi
+    ret
+EndProc _HkInstallHooks
+;
+BeginProc _HkScheduleFreq
+; - In: void
+;
+; - Description:
+;  - Reprograms the 8254 to interrupt at a higher frequency. 
+;  - Changes database for higher frequency
+; - Out:
+;  - Reprograms 8254
+;  - Sets minimum interrupt period reload variable
+; - Return:
+;  - void
+;
+    ; Turn off interrupt
+    cli
+    ; Initialize hook system variables
+    mov      sHK.wSt, HK_INIT
+    mov      sHK.dwCntDwnAccum, TMR_NEW_CNT_DWN
+    ; Load new count down into 8254
+    cCall    _HkReload8254 &lt; TMR_NEW_CNT_DWN &gt;
+    ; Write reload values into structure
+    mov      sHK.dwNewTmrCntDwn, TMR_NEW_CNT_DWN
+    ; Turn on interrupts
+    sti
+EndProc _HkScheduleFreq
+;
+; H O O K   P R O C S
+; - In: void
+;
+; - Desc:
+;  - ISRs for the PM mode, V86 mode, and the VMM mode
+;  - All registers have been saved prior to the ISR being called.
+; - Out:
+; - Call another function
+; - Return:
+;  - void
+; - Uses:
+;  - eax 
+;
+BeginProc _HkPmIRQ0FaultHook
+    mov      eax, PM_MODE_ID
+    call     _HkGenIRQ0FaultHook
+    ret
+EndProc _HkPmIRQ0FaultHook
+BeginProc _HkV86IRQ0FaultHook
+    mov      eax, V86_MODE_ID
+    call     _HkGenIRQ0FaultHook
+    ret
+EndProc _HkV86IRQ0FaultHook
+BeginProc _HkVmmIRQ0FaultHook
+    mov      eax, VMM_MODE_ID
+    call     _HkGenIRQ0FaultHook
+    ret
+EndProc _HkVmmIRQ0FaultHook
+;
+BeginProc _HkGenIRQ0FaultHook, PUBLIC
+; eax = FAULT ID
+;
+; - Desc:
+;  - Checks if critical frequency is reached.  Increment variables
+; - Out:
+;  - Increment Variables
+; - Return:
+;  - void
+; - Uses: 
+; - Nothing
+;
+    ; Check if timer initialize, exit if not
+    cmp      sHK.wSt, HK_UNINIT
+    je       short GEN_EXIT
+    ;Increment the count for new frequency
+    inc      sHK.dwNewFreq
+    ; Check if old frequency reached
+    sub      sHK.dwCntDwnAccum, TMR_NEW_CNT_DWN
+    jc       GEN_EXIT
+    ; Send EOI to 8259
+    mov      al, VPICD_SP_EOI_0
+    out      VPICD_CMD_M8259, al
+    ret
+    GEN_EXIT:
+    ;Increment the count for old frequency
+    inc      sHK.dwNewFreq
+    mov      sHK.dwCntDwnAccum, TMR_OLD_CNT_DWN
+    call     sHK.aVctr[eax*4]
+    ret
+EndProc _HkGenIRQ0FaultHook, PUBLIC
+;
+BeginProc _HkUnScheduleFreq
+; - In: void
+;
+; - Description:
+;  - Resets 8254 to original state
+; - Out:
+;  - Reprograms 8254
+;  - Resets hook system control variables
+; - Return:
+;  - void
+;
+    ; Turn off interrupt
+    cli
+    
+    ; Uninitialize the hook system variables
+    mov      sHK.wSt, HK_UNINIT
+    ; Load original count down into 8254
+    cCall   _HkReload8254 &lt; TMR_OLD_CNT_DWN &gt;
+    ; Turn on interrupts
+    sti
+EndProc _HkUnScheduleFreq
+;
+BeginProc   _HkGetNewFreq
+; - In: ebp :: pointer to client register structure
+;
+; - Desc:
+;  - Reports frequency count for new 8254 period
+; - Out:
+;  - Read hook system structure
+; - Return:
+;  - Client_AX :: Frequency count
+;
+            
+    mov     ax, sHK.dwNewFreq
+    mov     [ebp.Client_AX], ax
+EndProc     _HkGetNewFreq
+;
+BeginProc   _HkGetOldFreq
+; - In: ebp :: pointer to client register structure
+;
+; - Desc:
+;  - Reports frequency count for old 8254 period
+; - Out:
+;  - Read hook system structure
+; - Return:
+;  - Client_AX :: Frequency count
+;
+            
+    mov     ax, sHK.dwOldFreq
+    mov     [ebp.Client_AX], ax
+EndProc     _HkGetOldFreq
+;
+BeginProc   _HkReload8254, PUBLIC
+; - In: Word value to write into 8254
+_HkRld STRUC 
+     dd ?  ;bp
+     dd ?  ;ret
+rl1  dd ? 
+_HkRld ENDS   
+;
+; - Desc:
+;  - Reload the 8254 with a new IPC
+;  - Interrupts should be disabled throughout this process. 
+; - Out:
+;  - Write value into 8254
+; - Return:
+;  - void
+;
+            
+    push    ebp
+    mov     ebp, esp
+    mov     al, RWCNT_8254
+    out     CTRL_8254, al 
+    mov     ax, WORD PTR [ebp.rl1]
+    out     DATA_8254, al
+    shr     ax, 8   
+    out     DATA_8254, al   
+    pop     ebp
+    ret
+EndProc _HkReload8254
+VxD_LOCKED_CODE_ENDS
+    END
+</pre>
+
+</BODY></HTML>

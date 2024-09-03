@@ -1,0 +1,159 @@
+<HTML>   
+     <HEAD>
+<TITLE>Java Solutions August 2002/The Tattletale Technique</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocjaug.htm"></A><FONT COLOR="#FF0000">   Java Solutions</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">The Tattletale Technique</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Toby Reyelts</FONT></H3>
+
+<BLOCKQUOTE>
+<p>With this technique and a new 1.3 feature, finding resource leaks has never been so easy.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Basic Resource Management</FONT></H3>
+
+<p>Practical experience has taught many Java developers one thing: critical resources (mutexes, database connections, transactions, file handles, etc.) require timely and systematic release. Unfortunately, Java&#146;s garbage collector is not up to that job. According to the Java Language Specification, there are no guarantees when a garbage collector will run, when it will collect an object, or when it will finalize an object &#151; if ever. Even more unfortunately, Java&#146;s counterpart to the C++ destructor (the finally block) is both tedious and error-prone, requiring developers to constantly remember and duplicate resource-releasing code. Consequently, even good Java developers can forget to release critical resources.</p>
+<p>There is a light at the end of the tunnel. Java may make it easier to leak critical resources, but it also provides the necessary mechanisms to easily track them down. The Tattletale technique is a simple method for designing new classes and retrofitting existing classes to quickly and easily detect the offending code responsible for leaking resources.</p>
+
+<H3><FONT COLOR="#000080">A Typical Scenario</FONT></H3>
+<p>You are a senior engineer on your company&#146;s software engineering team. You&#146;ve been called to a customer site because their server has been habitually hanging. You find the following error message scattered throughout the server&#146;s log file:</p>
+
+<pre>
+Connection Pool Timeout: None of the pooled connections are available for use.
+</pre>
+
+<p>The problem is obvious. At least one place in the application code is leaking database connections. The real question is, where? You don&#146;t have the time to search through hundreds of thousands of lines of code, but what other choice do you have? You decide to use the Tattletale technique to track down the code that is forgetting to close the connections.</p>
+<p>The first step in implementing the technique is to discover where the client is allocating the resource. In this case, your team may have written code with bugs in it, but that doesn&#146;t mean they don&#146;t understand good design. They&#146;ve created a factory to centralize the retrieval of database connections, and that is where the clients are allocating their resources.</p>
+
+<pre>
+class ConnectionFactory {</p>
+  Connection getConnection() {</p>
+    // return allocate();</p>
+  }</p>
+}</p>
+</pre>
+
+<p>The next step is to figure out which clients are allocating which resources. Java can tell you which client code is calling the <B>getConnection</B> method through a stack trace. You also can get a stack trace by creating a new <B>Throwable</B>. Now, your only problem is associating stack traces with <B>Connection</B>s. You decide that the most sensible way to do that is to embed a <B>Throwable</B> with <B>Connection</B>. So, you create an implementation of the <B>Connection</B> interface that allocates a new <B>Throwable</B> upon creation. Your <B>Connection</B> implementation isn&#146;t anything special &#151; it just delegates to a real <B>Connection</B>.</p>
+
+<pre>
+class TtConnection
+  implements Connection {
+
+  private Throwable trace;
+  private Connection contained;
+
+  TtConnection( Connection c ) {
+    contained = c;
+    trace = new Throwable();
+  } 
+
+  // Other methods required to
+  // implement the interface
+  // with methods that do nothing
+  // but call the similarly named
+  // method in "contained"
+}
+</pre>
+
+<p>Now, when clients call <B>ConnectionFactory.getConnection</B>, you return them a new <B>TtConnection</B> that wraps the real underlying <B>Connection</B>.</p>
+
+<pre>
+class ConnectionFactory {
+  Connection getConnection() {
+    // Connection c = allocate();
+    return new TtConnection( c );
+  }
+}
+</pre>
+
+<p>Finally, the last step is to detect when a client actually &#147;leaks&#148; the resource. In order to release a connection, the client must call its <B>close</B> method. The garbage collector doesn&#146;t collect objects until they&#146;ve become unreferenceable. Given that knowledge, you update <B>TtConnection</B> so that it prints out a message if it has become unreferenceable and hasn&#146;t been closed:</p>
+
+<pre>
+class TtConnection
+  implements Connection {
+
+  private boolean hasBeenClosed = false;
+  private Throwable trace;
+  private Connection connection;
+
+  TtConnection( Connection c ) {
+    connection = c;
+    trace = new Throwable();
+  } 
+
+  public void close()
+    throws SQLException {
+    hasBeenClosed =  true;
+    connection.close();
+  }
+
+  public void finalize() {
+    if ( ! hasBeenClosed ) {
+      System.out.println(
+      "The client did not close " +
+      "a connection created at " );
+      trace.printStackTrace();
+      // Close connection here
+    }
+  }
+
+  // Other methods required to implement the interface 
+  // go here.
+}
+</pre>
+
+<p>With that taken care of, you recompile your code and re-deploy your application. Lo and behold, you start receiving stack traces pointing directly to the client code that has been leaking connections. With a quick edit and recompile, you fix the bug and save the day, all in a matter of minutes. Your company rewards you with a large bonus. (Okay, maybe not.)</p>
+
+<H3><FONT COLOR="#000080">A Generic Tattletale</FONT></H3>
+
+<p>Perhaps there are a lot of different types of critical resources that you would like to track down in the case of a leak. Unfortunately, implementing all of the required classes might take a significant amount of time and effort. Since the implementation doesn&#146;t really vary between the different types of resources, it seems like there should be some way to reuse code &#151; and there is.</p>
+<p>Starting with Java 1.3, Sun introduced a new <B>Proxy</B> class in the <B>java.lang.reflect</B> package, which can be used to create dynamic proxy classes at run time. These dynamic proxy classes allow you to insert crosscutting (fundamentally common) behavior into otherwise unrelated classes, in a manner very akin to aspect-oriented programming. In this case, it is the Tattletale behavior that you&#146;ll be inserting into orthogonal classes.</p>
+<p>First, decide how the generic Tattletale will determine when its resource has been released. Generally speaking, most resources have a single public method that is used to release the resource (e.g., <B>close</B> or <B>dispose</B>). So, the generic Tattletale will mark an object as released if a specified method has been called.</p>
+<p>Next, actually codify this behavior. To create a dynamic <B>Proxy</B>, it&#146;s necessary to specify two pieces of information: 1) the set of interfaces that the <B>Proxy</B> will implement, and 2) the <B>InvocationHandler</B> for the <B>Proxy</B>. <B>Proxy</B> works by delegating all of the method calls on the interfaces that it implements to <B>InvocationHandler</B>. This is where the logic for <B>Proxy</B> has to be implemented. In the Tattletale implementation of <B>InvocationHandler</B> (see <a href="list1.htm">Listing 1</a>, <B>TtHandler.java</B>), the logic very closely mimics that of <B>TtConnection</B>. Upon construction, the handler stores away a stack trace. The only difference in construction is that the handler also requires the name of the method that cleans up the resource. The method handling is also the same as <B>TtConnection</B>. If the user calls any method, it is delegated back to the object that is being wrapped by <B>InvocationHandler</B>. If the user calls the method that releases the resource, the handler sets a flag. Finally, the implementation of <B>finalize</B> is also the same as <B>TtConnection</B>. If the resource-release method has not been called, then the handler prints a trace to the client that allocated the resource. That&#146;s all there is to it.</p>
+<p>For example, to use the generic Tattletale instead of <B>TtConnection</B>, you can change <B>ConnectionFactory</B> as follows:</p>
+
+<pre>
+class ConnectionFactory {
+
+ static interfaces = new Class[] {
+   Connection.class
+ };
+
+ Connection getConnection() {
+   // Connection c = allocate();
+   return (Connection)
+Proxy.newProxyInstance(
+     c.getClass().getClassLoader(),
+     interfaces,
+     new TtHandler( c, "close" )
+   );
+ }
+}
+</pre>
+
+<H3><FONT COLOR="#000080">Tracking Classes That Can&#146;t Be Subclassed</FONT></H3>
+
+<p>Up to this point, I&#146;ve only demonstrated how to track resources that have interfaces (like <B>Connection</B>). It&#146;s fairly trivial to extend the Tattletale technique to work with any resource that can be subclassed. For resources that can&#146;t be subclassed, either because they are final or have private constructors, it&#146;s a non-trivial task to make the Tattletale technique work. In fact, it&#146;s not possible to make the technique work without actually modifying the resource class.</p>
+<p>The basic problem is that it&#146;s impossible to tell when a client leaks the resource without explicit cooperation from the resource. One might be tempted to use the <B>Reference</B> and <B>ReferenceQueue</B> classes from the <B>java.lang.ref</B> package, but they can&#146;t detect the leak either. <B>Reference</B>s and <B>ReferenceQueue</B>s work well to determine when an object has become weakly referenceable or eligible for finalization. However, once the virtual machine notifies you of the change in the reference status, you can no longer reference the original object to determine whether it was properly released. <B>RefTest.java</B> (available for download at &lt;www.cuj.com/java/code.htm&gt;) contains an application that demonstrates this problem. Although the virtual machine does clear the reference in <B>MutexRef</B> and place it onto the <B>ReferenceQueue</B>, it does this without calling <B>MutexRef.clear</B>. In addition, once <B>MutexRef</B> has been placed on the <B>ReferenceQueue</B>, the reference to the <B>Mutex</B> object has been cleared, as demonstrated by the output of the program: <B>"Mutex reference: null"</B>. Finally, <B>MutexRef</B> can&#146;t keep an internal reference to <B>Mutex</B>, otherwise <B>Mutex</B> won&#146;t be collected.</p>
+<p>Besides actually changing the source code for the resource class, which is often not an alternative, one possible option for implementing the Tattletale technique in this case is to modify the bytecode in the resource class. For example, the free and open-source Byte Code Engineering Library available at &lt;http://bcel.sf.net&gt; provides an intuitive API for reading and modifying Java bytecode. In fact, it comes with several examples for reading in class files and making non-trivial changes to the bytecode instructions in method definitions.</p>
+
+<H3><FONT COLOR="#000080">Shortcomings</FONT></H3>
+
+<p>The Tattletale technique has a few shortcomings.</p>
+<p>The main problem with Tattletale as implemented is that there is no absolute guarantee that a garbage collector will finalize an object. The old <B>Runtime.runFinalizationOnExit</B> method has been deprecated (because it just didn&#146;t &#151; and can&#146;t &#151; work in a multithreaded environment). One alternative is not to use finalizers at all. Rather, the constructor can create a <B>Runnable</B> object that checks whether or not the object has been closed and then can pass that object to <B>Runtime.addShutdownHook</B>. This way the check is guaranteed to occur. Although the Java Language Specification doesn&#146;t make any promises about garbage collection, practically speaking, all of the existing implementations work more than well enough to make this technique useful.</p>
+<p>A second weakness is that it can be tough to make the technique work if clients do not allocate their resources from a modifiable, central source. For example, if clients allocated database connections directly using <B>DriverManager.getConnection</B>, you couldn&#146;t alter the <B>DriverManager</B> source to return your own special <B>Connection</B> implementation (although you could, with more effort, implement a <B>Driver</B> wrapper).</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+<p>The design decisions made in the implementation of Java can make it difficult to consistently release critical resources. The Tattletale technique makes it easy to track down and eliminate resource leaks.</p>
+
+<p><i><B>Toby Reyelts</B> has been working with Java since before its 1.0.2 release and with C++ circa the initial ARM release. His work ranges from low-level JVM integration and JNI implementation to high-level distributed application design. He is currently a software architect responsible for the overall design and implementation of custom enterprise software solutions, primarily built upon the J2EE. He graduated from Georgia Tech with a bachelor&#146;s degree in computer science degree and a specialization in operating systems and digital systems design and implementation. With the little free time he has, he likes to research hardware, operating systems, and computer languages.</i></p>
+
+<h4><a href="../../../source/2002/jaug02/reyelts.zip"></a></h4>
+</blockquote></body></html>

@@ -1,0 +1,533 @@
+
+<html>
+<head>
+<title>December, 2003: Protocol Debugging with POE</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Protocol Debugging with POE</h1>
+<p><i>The Perl Journal</i> December, 2003</p>
+<h2></h2>
+
+
+<h3>By Simon Cozens</h3>
+
+
+<I>Simon is a freelance programmer and author, whose titles include Beginning Perl (Wrox Press, 2000) and Extending and Embedding Perl (Manning Publications, 2002). He's the creator of over 30 CPAN modules and a former Parrot pumpking. Simon can be reached at simon@ simon-cozens.org.</I>
+
+<hr>
+
+
+
+
+
+<p>Last time we met, I talked about the very important work I'd been doing in allowing Perl hackers to waste a lot of time on Internet Poker servers, with the Online Poker Protocol and <i>Games::Poker::OPP</i>.</p>
+
+<p>I also mentioned that when I wrote that module, I needed a protocol debugger to help me understand how the binary protocol works, which turned out to be an interesting little project in its own right.</p>
+<h3>The Problem</h3>
+
+<p>In the good old days, when people set out to create a communications protocol, they did so following the UNIX design philosophies, keeping the protocols simple, easy for humans to debug and understand, and, primarily, text-based. (Eric Raymond has a lot to say about this in "The Importance of Being Textual," Chapter 5 of <i>The Art of Unix Programming</i>; see http://www.catb.org/ ~esr/writings/taoup/html/ch05s01.html.)</p>
+
+<p>For instance, if I have a problem with a mail server, I know that I can happily telnet to port 25 on the offending machine and type commands in SMTP to help understand the problem and the server's responses. (In fact, I've been putting together a guide to help people do just this at http://simon-cozens.org/programmer/ phrasebook.html) This is a major bonus if I'm writing clients for the protocol since I can telnet in and chat away with the server myself, discovering what responses to expect in edge cases.</p>
+
+<p>Then the discipline of computer science progressed, and people began designing and implementing binary-based protocols, generally with fixed-width commands making them difficult to extend, and removing the ability to effectively debug them via telnet.</p>
+
+<p>Unfortunately, the poker protocol I began implementing last month is one such protocol. I wanted to check that I was packing the data correctly and getting the responses I expected, but I didn't yet have a working client that I could use to confirm that! In short, the problem is that my keyboard doesn't have a NULL key, nor would I be able to read the output I get back even if it did.</p>
+
+<p>So I decided that the nicest way around the problem was to create a version of telnet that could easily send null characters and the like, and could translate any such characters it got back into something visible.</p>
+<h3>The Overengineering Stage</h3>
+
+<p>Of course, there were many ways I could implement such a beast. One idea would be to write a wrapper around netcat, which would turn binary data into something readable and pack user input into binary data. But I started thinking that I'd like to have line-editing capabilities and other bits and pieces, and I could foresee this nice little program turning into a massive monster.</p>
+
+<p>But then someone pointed me at the lovely <i>Term::Visual</i> module, which provides a Curses-based terminal front end to an application. Anyone who's used a text-mode IRC client will be familiar with the sort of interface provided by <i>Term::Visual</i>; see <a name="rf1"></a><a href="0312cf1.html">Figure 1</a>.</p>
+
+<p>There's a title line at the top, a couple of status lines near the bottom, a line for user input underneath that, and the main "conversation" goes on in the middle. <i>Term::Visual</i> does its magic by hooking into the POE module. POE is both a Perl module and a way of programming; it provides many of the features of a time-scheduling operating system, so before we get into looking at <i>Term::Visual</i> in any depth, let's take a look at how POE works.</p>
+<h3>POEtry in Motion</h3>
+
+<p>When Linus Torvalds announced the source of his new operating system to Usenet, apparently he was particularly excited to be able to start a process that wrote "aaaaa..." to standard output and another one that wrote "bbbbb..." and have the two processes run simultaneously:</p>
+
+<blockquote>
+<pre>
+abababababab...
+
+</pre>
+</blockquote>
+
+
+
+<p>Let's emulate that great moment with POE. The POE equivalent to a process is called a session.</p>
+
+<blockquote>
+<pre>
+use POE;
+POE::Session-&gt;create();
+POE::Session-&gt;create();
+
+</pre>
+</blockquote>
+
+<p>At the moment, these sessions don't do very much. This is for two reasons. The first reason is that we haven't given them much in the way of code. Unlike operating-system processes, POE sessions don't do anything by themselves, but only respond to <i>interrupts</i>, which POE calls <i>events</i>. There are certain system-defined events, such as <i>_start</i>, which are posted to sessions by POE itself, but other events need to be defined and posted explicitly.</p>
+
+<p>The second reason this won't do very much is that, just as with an operating system, having two processes around isn't all that useful unless the kernel is running. POE has a kernel as well, and we need to tell it to run when we're ready.</p>
+
+<p>Let's address these two issues and come up with a slightly expanded version of the code:</p>
+
+<blockquote>
+<pre>
+use POE;
+POE::Session-&gt;create(
+    inline_states =&gt; {
+        _start =&gt; sub { $_[KERNEL]-&gt;alias_set("a_process") }
+    });
+POE::Session-&gt;create(
+    inline_states =&gt; {
+        _start =&gt; sub { $_[KERNEL]-&gt;alias_set("b_process") }
+    });
+POE::Kernel-&gt;run;
+
+</pre>
+</blockquote>
+
+<p>Now we're getting further, but not much further. The kernel wakes up and runs the <i>_start</i> events of each session. The <i>_start</i> events are associated with subroutine references, and these subroutines tell the kernel the name it should give to each session. If you're wondering what <i>$_[KERNEL]</i> is, that's simply looking at the <i>KERNEL</i>th element of the parameters passed to the subroutine, where <i>KERNEL</i> is a constant exported by POE, which specifies where in the argument list the <i>POE::Kernel</i> object will come.</p>
+
+<p>However, once we've named each session, there's little else to do, so the kernel quits. Let's rectify that by creating and calling some user-defined events:</p>
+
+<blockquote>
+<pre>
+use POE;
+POE::Session-&gt;create(
+    inline_states =&gt; {
+        _start =&gt; sub { $_[KERNEL]-&gt;alias_set("a_process") },
+        say_something =&gt; \&amp;say_a
+    });
+POE::Session-&gt;create(
+    inline_states =&gt; {
+        _start =&gt; sub { $_[KERNEL]-&gt;alias_set("b_process") },
+        say_something =&gt; \&amp;say_b
+    });
+$|++;
+POE::Kernel-&gt;post("a_process", "say_something");
+POE::Kernel-&gt;run;
+
+sub say_a { print "a"; $_[KERNEL]-&gt;post("b_process", "say_something"); }
+sub say_b { print "b"; $_[KERNEL]-&gt;post("a_process", "say_something"); }
+
+</pre>
+</blockquote>
+
+<p>Unlike Linux, POE's event loop isn't preemptively multitasking; instead, sessions need to cede time to each other. In this case, our <i>a</i> session responds to the <i>say_something</i> event by printing an "a" and then posting another <i>say_something</i> to the <i>b</i> session. Similarly, the <i>b</i> session prints its "b" and sends a <i>say_something</i> event to the <i>a</i> session. All we need is an initial <i>say_something</i> event to be posted to one of the sessions to kick the whole thing off, and:</p>
+
+<blockquote>
+<pre>
+ababababababab....
+
+</pre>
+</blockquote>
+
+
+
+<p>Hoorah. Our two sessions can talk to each other and process events. Now we can reveal the secret: <i>Term::Visual </i>works by providing a ready-made session that turns events it receives from POE into Curses graphics on the screen. But what can we use to generate these events?</p>
+<h3>Hymn of the Big Wheel</h3>
+
+<p>POE communicates with the outside world primarily through a mechanism called a wheel. A wheel is a Perl object that not only provides an interface to some kind of filehandle, but is also capable of posting events into POE. For instance, here's a POE session that emulates <i>tail -f</i>:</p>
+
+<blockquote>
+<pre>
+POE::Session-&gt;create(
+  inline_states =&gt; {
+     _start =&gt; sub {
+        my $log_watcher = POE::Wheel::FollowTail-&gt;new(
+            Filename =&gt; "my_log_file.txt",
+            InputEvent =&gt; "got_record",
+        );
+
+        $_[HEAP]-&gt;{watcher} = $log_watcher;
+     },
+     got_record =&gt; sub { print $_[ARG0],"\n"; }
+  }
+);
+
+</pre>
+</blockquote>
+
+<p>When this session starts up, it creates a new <i>POE::Wheel::FollowTail</i>. This wheel opens a file and watches for new lines being added to it. When it sees a new line, it posts whatever event we've defined as being its <i>InputEvent</i>&#151;in our case, that's <i>got_record</i>.</p>
+
+<p>Now, we don't want this object to be immediately destroyed at the end of the <i>_start</i> block, so we need to stash it somewhere for safe keeping. POE provides another named parameter, the <i>HEAP</i>, which is a hash reference that sessions can use to keep stuff in. Accordingly, we file away our log watcher in the heap.</p>
+
+<p>This time when our kernel runs, as well as spewing out <i>a'</i>s and <i>b</i>'s, it will detect when lines are put on the end of the log file, and call our session's <i>got_record</i> event. The event gets passed an argument&#151;the line that has been added, which is passed as the named parameter <i>ARG0</i>, and so we print it out.</p>
+
+<p>That's a simple wheel; there are more complex ones, as we'll see when we dissect the protodebug program. But for now, that's all the POE we need to know. Let's take a quick detour into how we're going to present the data flowing between the client and the server before diving back into <i>Term::Visual</i>.</p>
+<h3>Come On, Feel the Noise</h3>
+
+<p>There are two data presentation problems with our protocol debugger; the first is that we want to display binary data in a way that's not going to freak out the user. This happens in protodebug's <i>to_visual</i> subroutine:</p>
+
+<blockquote>
+<pre>
+sub to_visual {
+  my $out;
+  for (split //, shift) {
+      if (/\r/) { $out .= "\\r\n"; }
+      elsif (/\n/) { $out .= "\\n\n"; }
+      elsif (/[[:print:]]/) { $out .= $_; }
+      else { $out .= sprintf(" 0x%02x ", ord $_) }
+  }
+  return $out;
+}
+
+</pre>
+</blockquote>
+
+<p>This caters to three types of data coming from the wire. The first type is end-of-line characters, in one form or another; these are made visible as "\n" or "\r", but additionally a "real" newline is added to the output. This means that an SMTP conversation would appear something like this:</p>
+
+<blockquote>
+<pre>
+220 alibi.simon-cozens.org ESMTP Exim 3.35 blah blah blah\r
+&gt;&gt;&gt; HELO sailor\n
+250 alibi.simon-cozens.org Hello sailor [195.188.xx.yy]\r
+
+</pre>
+</blockquote>
+
+<p>which is more or less what you'd expect; the newline stops the display from looking absolutely hideous, but the representation of the newline ("\r" or "\n") tells you what sort of newline it actually was.</p>
+
+<p>The second class of data is data that is already visible, and so we don't need to do anything specific to it. The POSIX character class <i>[:print:]</i> describes this case neatly for us:</p>
+
+<blockquote>
+<pre>
+elsif (/[[:print:]]/) { $out .= $_; }
+
+</pre>
+</blockquote>
+
+
+
+<p>And the third class is obviously just generic binary spew, which we escape as a hex character:</p>
+
+<blockquote>
+<pre>
+else { $out .= sprintf(" 0x%02x ", ord $_) }
+
+</pre>
+</blockquote>
+
+
+
+<p>This means that a "logged in" reply from a Poker server would look like this:</p>
+
+<blockquote>
+<pre>
+0x00 0x00 0x00 0x15
+
+</pre>
+</blockquote>
+
+
+
+<p>Now we need to turn to the other way around, where we have to give the user a friendly way of specifying a binary stream. We try to make this as flexible as possible by providing multiple ways to describe the same binary byte. We use a "nibbling" tokenizer to shift tokens off the user's input and add them to the binary output stream; first, we handle the "0x.." case for specifying a hex byte:</p>
+
+<blockquote>
+<pre>
+sub to_binary {
+  my $output;
+  my $input = shift;
+  while ($input) {
+      $input =~ s/^0x([\da-fA-F]+)// 
+        and do { $output .= chr(hex($1)); next};
+
+</pre>
+</blockquote>
+
+<p>We also want to handle backslash notation for characters like "\0", "\n", "\cJ", and so on:</p>
+
+<blockquote>
+<pre>
+$input =~ s/^\\(\w+|\s)// 
+    and do { $output .= eval "\"\\$1\""; next; };
+
+</pre>
+</blockquote>
+
+<p>Then, of course, there are ordinary printable characters that can be reached from the keyboard:</p>
+
+<blockquote>
+<pre>
+$input =~ s/^([\x21-\x5b\x5d-\x7e]+)// 
+    and do { $output .= $1; next };
+
+</pre>
+</blockquote>
+
+<p>But not space, it may surprise you to note! The reason for this is to allow the user to break up bytes and control sequences in a readable manner; you don't want to type, for instance:</p>
+
+<blockquote>
+<pre>
+0x3\0\0\0test\0\04\n
+
+</pre>
+</blockquote>
+
+
+
+<p>if you have the opportunity to type:</p>
+
+<blockquote>
+<pre>
+0x3 \0\0\0 test\0 \04 \n
+
+</pre>
+</blockquote>
+
+
+
+<p>To make this possible, a literal space has to be input using "\", but other whitespace is ignored:</p>
+
+<blockquote>
+<pre>
+$input =~ s/^\s// and next;
+
+</pre>
+</blockquote>
+
+
+
+<p>The nibbler technique, categorized by this <i>s/$^regexp// and do { ...; next;}</i> idiom, is a great way to make simple tokenizers; for instance, it's allowed us to give backslash-space priority over a space on its own.</p>
+
+<p>Finally, if we now come across a character we haven't catered for, we should give an error:</p>
+
+<blockquote>
+<pre>
+  $vt-&gt;print($window_id, "Couldn't understand ".to_visual($input));
+  return;
+}
+
+</pre>
+</blockquote>
+
+<p>Those are the two subroutines that marshal data from and to the user.</p>
+<h3>Sound and Vision</h3>
+
+<p>Now let's slip back into interfacing these routines, the TCP connection and <i>Term::Visual</i>. First, we'll set up a new <i>Term::Visual</i> object and specify some color preferences for it:</p>
+
+<blockquote>
+<pre>
+my $vt = Term::Visual-&gt;new( Alias =&gt; "interface" );
+$vt-&gt;set_palette( ncolor        =&gt; "white on black",
+                  st_frames     =&gt; "bright cyan on blue",
+                  st_values     =&gt; "bright white on blue",
+                  stderr_bullet =&gt; "bright white on red",
+                  stderr_text   =&gt; "bright yellow on black",
+                  err_input     =&gt; "bright white on red",
+                 );
+
+</pre>
+</blockquote>
+
+<p>The <i>Alias</i> parameter to the constructor is just like the <i>alias_set</i> method we used in our POE sessions&#151;we give the terminal an alias so that we can post events to it during the course of the program.</p>
+
+<p>The next stage is to set up our window, which will contain the two-line status bar. We need to tell <i>Term::Visual </i>what the status bar is going to look like. We do this with a set of <i>printf</i>-like format strings:</p>
+
+<blockquote>
+<pre>
+my $window_id = $vt-&gt;create_window(
+       Window_Name =&gt; $0,
+       Status =&gt; { 0 =&gt;
+                   { format =&gt; " [%8.8s] ",
+                     fields =&gt; [qw( time )],
+                   },
+                   1 =&gt; {
+                     format =&gt; " %s to: %s:%s",
+                     fields =&gt; [qw( status host port )]
+                   },
+                 },
+       Buffer_Size =&gt; 1000,
+       History_Size =&gt; 50,
+       Title =&gt; "Protocol debugger" );
+
+</pre>
+</blockquote>
+
+<p>This will set up one line to contain a little clock, of the form "[08:30 AM]", and another line to tell us about the connection status&#151;whether "connecting to somehost:1234" or "connected to somehost:1234." It will also set the title line at the top of the screen, and set up buffers and history appropriately.</p>
+
+<p>Now we're ready to go. We need to create the main POE session that is going to handle all the action, and then we can run the POE kernel. Here's what the main session looks like:</p>
+
+<blockquote>
+<pre>
+POE::Session-&gt;create
+  (inline_states =&gt;
+    { _start          =&gt; \&amp;start_guts,
+      update_time     =&gt; \&amp;update_time,
+
+      connect_success =&gt; \&amp;switch_wheels,
+      connect_failure =&gt; sub {
+            $vt-&gt;print($window_id, "An error occured!: $_[ARG2]");
+      }
+
+      got_term_input  =&gt; \&amp;handle_term_input,
+      got_packet      =&gt; sub { $vt-&gt;print($window_id, to_visual($_[ARG0])) },
+    }
+  );
+
+</pre>
+</blockquote>
+
+<p>There aren't that many events we need to cater for: First, when the kernel starts up, we need to start connecting to the remote server and kick off something to update the clock on the status bar. <i>start_guts</i> handles all this. Then there's the event that gets fired every minute to actually do the clock update.</p>
+
+<p>After we've established the connection, we need to turn our initial TCP socket into a filehandle (or rather, a wheel) that we can send data to and get data back from; the <i>connect_success</i> and <i>connect_failure</i> states deal with what happens here.</p>
+
+<p>And when we're up and running, if the user says something, we need to tell the server about it; similarly, if the server says something, we need to tell the user about it. This last state is so easy to handle, we do so on the spot: we run the data we've received from the server through the <i>to_visual </i>routine discussed above, then tell the terminal object to display it on our main window.</p>
+
+<p>Let's start our analysis with the <i>_start</i> state. First, we need to tell <i>Term::Visual</i> how it should inform us about new input. We have to register a callback state so that it knows what to do with any input it receives. We do this by posting the name of a state to its <i>send_me_input </i>state. Our input handler state, as we've defined above, is called <i>got_term_input</i>, so that's what we'll send it:</p>
+
+<blockquote>
+<pre>
+sub start_guts {
+  my ($kernel, $heap) = @_[KERNEL, HEAP];
+  $kernel-&gt;post( interface =&gt; send_me_input =&gt; "got_term_input" );
+
+</pre>
+</blockquote>
+
+<p>We also call the <i>update_time</i> state; this will not only update the clock once, it will schedule itself to be called again every minute, keeping the clock updated:</p>
+
+<blockquote>
+<pre>
+$kernel-&gt;yield( "update_time" );
+
+</pre>
+</blockquote>
+
+
+
+<p>And finally, we connect to the remote server. We'll first update the status bar to say something like "Connecting to myserver:1234":</p>
+
+<blockquote>
+<pre>
+$vt-&gt;set_status_field( $window_id, host =&gt; $host, 
+                     port =&gt; $port, status =&gt; "Connecting" );
+
+</pre>
+</blockquote>
+
+<p>And we create a new wheel to connect to the host; as before, we store this on the heap. As well as telling it what host and port to go to, we need to tell it what to do on success and failure; as before, these are the states we've named in the previous session constructor:</p>
+
+<blockquote>
+<pre>
+$heap-&gt;{connector} = POE::Wheel::SocketFactory-&gt;new
+( RemoteAddress =&gt; $host,
+  RemotePort    =&gt; $port,
+  SuccessEvent  =&gt; 'connect_success',
+  FailureEvent  =&gt; 'connect_failure',
+);
+
+</pre>
+</blockquote>
+
+<p>Updating the time is pretty easy, although we'll borrow some help from <i>POSIX</i>'s <i>strftime</i> function to handle the formatting for us:</p>
+
+<blockquote>
+<pre>
+sub update_time {
+  use POSIX qw(strftime);
+  $vt-&gt;set_status_field( $window_id, 
+                         time =&gt; strftime("%I:%M %p", localtime) );
+  $_[KERNEL]-&gt;alarm( update_time =&gt; int(time() / 60) * 60 + 60 );
+}
+
+</pre>
+</blockquote>
+
+<p>POE's <i>alarm</i> method will arrange for us to be called back at the beginning of the next minute.</p>
+
+<p>When the connection happens, we need to create a new wheel that can be used to talk to the remote host. The <i>SocketFactory</i> wheel's success state (<i>connect_success</i>) will be called with the TCP socket, and so we set up another wheel that communicates with that socket:</p>
+
+<blockquote>
+<pre>
+sub switch_wheels {
+  my ($heap, $kernel, $connected_socket) = @_[HEAP, KERNEL, ARG0];
+  delete $heap-&gt;{connector};
+  $vt-&gt;set_status_field( $window_id, host =&gt; $host, port =&gt; $port,
+                                     status =&gt; "Connected" );
+  $heap-&gt;{socket_wheel} = POE::Wheel::ReadWrite-&gt;new
+    ( Handle =&gt; $connected_socket,
+      Driver =&gt; POE::Driver::SysRW-&gt;new,
+      Filter =&gt; POE::Filter::Stream-&gt;new,
+      InputEvent =&gt; 'got_packet',
+    );
+}
+
+</pre>
+</blockquote>
+
+<p>Again, we need to tell the new wheel what to do when it gets some data; specifying callback events is a big part of the POE I/O model. This is the <i>got_packet</i> event that was so simple to implement above.</p>
+
+<p>The final event we need to handle is the input by the user. <i>Term::Visual</i> will call the callback event we registered, <i>got_term_input</i>, with any data received from the terminal. This is mildly complicated because the input can be in one of three forms. First, it can be an exception: the user hits "^C" or "^\" and expects to be dumped out of the application. Thankfully, <i>Term::Visual</i> tells us about such an exception directly:</p>
+
+<blockquote>
+<pre>
+sub handle_term_input {
+  my ($heap, $input, $exception) = @_[HEAP, ARG0, ARG1];
+
+  if (defined $exception) {
+    warn "got exception: $exception";
+    $vt-&gt;delete_window($window_id);
+    exit;
+  }
+
+</pre>
+</blockquote>
+
+<p>The second form is a command; we handle this just like an IRC client, with a command being defined as a forward slash at the start of the line, followed by a command word. At the moment, the only command we care about is <i>QUIT</i>, but it would be easy enough to extend the program to support a <i>CONNECT</i> command to connect to a different server:</p>
+
+<blockquote>
+<pre>
+if ($input =~ s{^/\s*(\S+)\s*}{}) {
+    my $cmd = uc($1);
+    if ($cmd eq 'QUIT') { $vt-&gt;delete_window($window_id); exit; }
+    warn "Unknown command: $cmd";
+    return;
+}
+
+</pre>
+</blockquote>
+
+<p>Anything else we encode using the <i>to_binary</i> routine we previously detailed, and then send the result out to the server through the connection wheel. We also echo the output to the terminal, so the user can see what was said:</p>
+
+<blockquote>
+<pre>
+my $output = to_binary($input);
+if ($output) {
+      $heap-&gt;{socket_wheel}-&gt;put($output);
+      $vt-&gt;print($window_id, "&gt;&gt;&gt; ".to_visual($output)."\n");
+}
+
+</pre>
+</blockquote>
+
+<p>And that's it! All our states are defined, all our bases are covered, and all we need to do is kick off the POE kernel and let the user talk to the server:</p>
+
+<blockquote>
+<pre>
+POE::Kernel-&gt;run;
+
+</pre>
+</blockquote>
+
+
+
+<p>The protocol debugger comes in at just over 150 lines of code, and swiftly became an invaluable tool in implementing the poker modules, as well as debugging several other network issues I came across. And, thanks to POE and <i>Term::Visual</i>, it has a friendly interface that makes it not too much of a burden to use, and was crafted up in little under an hour.</p>
+
+<p>POE is a wonderfully flexible set of tools for developing event-based applications in Perl. There are a whole range of components like <i>Term::Visual</i>, which can take the pain out of programming servers and clients for all kinds of protocols. Take a look at the POE home page (http://poe.perl.org) to learn more.</p>
+
+
+<p><b></b></p>
+<p><b></b></p>
+<p><b></b></p>
+<p><b>TPJ</b></p>
+
+
+
+
+</body>
+</html>

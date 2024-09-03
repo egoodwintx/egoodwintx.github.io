@@ -1,0 +1,326 @@
+<HTML>   
+     <HEAD>
+<TITLE>October 2002/C++ Made Easier</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tococt.htm"></A><FONT COLOR="#FF0000">   C/C++ Contributing Editors</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">C++ Made Easier: Handles and Exception Safety, Part 2: Intrusive Reference Counting</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Andrew Koenig and Barbara E. Moo</FONT></H3>
+
+<BLOCKQUOTE>
+<p>More on handle classes. This time you&#146;ll see how to optimize them.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>We began our last article by showing how a handle class can simplify memory management in object-oriented programs. We continued by noting that it is possible for such classes to have problems with exception safety, particularly in contexts that involve creating new objects as copies of existing ones.</p>
+<p>We learned that it is often possible to forestall such problems by following a general rule: do everything that might throw an exception before doing anything that changes the state of the system. That way, if the exception occurs, there is no need to undo any state changes as part of dealing with the exception.</p>
+<p>We also saw that our handle class has a potentially serious drawback: copying a handle always copies the corresponding object. In this article, we&#146;ll see how to remove that drawback while maintaining exception safety. The classic solution to this problem is reference counting. Interestingly, reference counting does just what we want and gives us exception safety almost for free, provided that we use an intrusive strategy &#151; one that makes the reference count part of the object itself. Intrusive reference counting is a fine strategy if we are able to change the class associated with the objects that we are counting so as to include a reference count. Our next article will deal with non-intrusive reference counts, and there we shall see that exception safety is much harder to attain. For the time being, we&#146;ll stick with the simpler intrusive technique.</p>
+<p>Our basis for this series of articles is the classic example of a hierarchy of geometric shapes rooted in a common base class:</p>
+
+<pre>
+class Shape_base {
+public:
+   virtual void draw() const = 0;
+   virtual Shape_base* clone() const = 0;
+   virtual ~Shape_base();
+};
+</pre>
+
+<p>Here, the <B>draw</B> function does whatever is needed to display a shape, and the <B>clone</B> function makes a new copy of whatever kind of shape the object is and returns a pointer to the copy.</p>
+<p>Each shape in the hierarchy is responsible for defining these two functions appropriately:</p>
+
+<pre>
+class Circle: public Shape_base {
+public:
+   // Every kind of shape must
+   // define these two functions
+   virtual void draw() const;
+   virtual Shape_base* clone() const;
+private:
+   double diameter;
+};
+</pre>
+
+<p>As a convenience to our users, we defined a handle class, named <B>Shape</B>, to manage objects of classes derived from <B>Shape_base</B>:</p>
+
+<pre>
+class Shape {
+public:
+   Shape(Shape_base* p0): p(p0) { }
+   ~Shape() { delete p; }
+
+   void draw() const { p-&gt;draw(); }
+   // other functions as needed
+
+   Shape(const Shape&amp;);
+   Shape&amp; operator=(const Shape&amp;);
+private:
+   Shape_base* p;
+};
+</pre>
+
+<p>and we arranged for the copy constructor and assignment operator to copy the corresponding objects as needed:</p>
+
+<pre>
+Shape::Shape(const Shape&amp; s):
+   p(s.p-&gt;clone()) { }
+
+Shape&amp; Shape::operator=
+   (const Shape&amp; source)
+{
+   Shape_base *new_p =
+      source-&gt;clone(); // might throw
+
+   // No exceptions possible beyond
+   // this point
+   delete p;
+   p = new_p;
+   return *this;
+}
+</pre>
+
+<p>A guiding design principle for these classes is that every <B>Shape</B> object corresponds to a single object of a class derived from <B>Shape_base</B>. For example, if we execute:</p>
+
+<pre>
+Shape s = new Circle;
+</pre>
+
+<p>then we have the following situation:</p>
+
+<IMG SRC="fig1.gif">
+
+<p>and if we then execute:</p>
+
+<pre>
+Shape s1 = s;
+</pre>
+
+<p>the situation will look like this:</p>
+
+<IMG SRC="fig2.gif">
+
+<p>Although this principle of making every <B>Shape</B> object correspond to an object from our hierarchy is easy to implement in code, it also copies objects needlessly. For example, so long as our program modifies neither <B>s</B> nor <B>s1</B>, there is no reason for <B>s</B> and <B>s1</B> to refer to distinct <B>Circle</B> objects. We could do just as well with a data structure like this:</p>
+
+<IMG SRC="fig3.gif">
+
+<p>The remainder of this article will discuss one way of achieving this state of affairs.</p>
+
+<H3><FONT COLOR="#000080">Reference Counting</FONT></H3>
+
+<p>The difficulty in having multiple handles pointing to a single object is in knowing when to delete the object. For instance, we might continue our most recent example by destroying <B>s1</B> and then <B>s</B>. How does the program know that it cannot destroy the <B>Circle</B> object when we destroy <B>s1</B>, but can (and should) do so after we destroy <B>s</B>?</p>
+<p>The classical solution to this problem is to add a member to the base class; this member counts how many handles are attached to the corresponding object. So, for example, we might make our <B>Shape_base</B> class look like this:</p>
+
+<pre>
+class Shape_base {
+   friend class Shape;      // added
+public:
+   Shape_base(): refcnt(0) { }  // added
+   virtual void draw() const = 0;
+   virtual Shape_base* clone() const = 0;
+   virtual ~Shape_base();
+private:
+   unsigned refcnt;         // added
+};
+</pre>
+
+<p>Every <B>Shape_base</B> object will now have a member, named <B>refcnt</B>, which will keep track of how many handles are attached to that particular object. We made the counter unsigned because the number of references can never be negative. We also added a constructor to <B>Shape_base</B> to initialize the counter to <B>0</B>, because when we create a shape object, there are not yet any handles attached to it. Finally, we have made the <B>Shape</B> handle class a friend, because we intend for operations on <B>Shape</B> objects to be able to affect the value of the reference count.</p>
+<p>Let us now turn our attention to the <B>Shape</B> class. We will first change the constructor and destructor to take notice of the reference count:</p>
+
+<pre>
+class Shape {
+public:
+   // We changed these two functions
+   Shape(Shape_base* p0): p(p0) {
+      ++p-&gt;refcnt;
+   }
+   ~Shape() {
+      if (--p-&gt;refcnt == 0)
+         delete p;
+   }
+   void draw() const { p-&gt;draw(); }
+
+   // other functions as needed
+
+   // We intend to change these
+   // two functions also
+   Shape(const Shape&amp;);
+   Shape&amp; operator=(const Shape&amp;);
+
+private:
+   Shape_base* p;
+};
+</pre>
+
+<p>When we construct a <B>Shape</B> object from a pointer to an object of a class derived from <B>Shape_base</B>, we are attaching a handle to the object that did not previously exist. Therefore, we increment the object&#146;s reference count. For example, we might execute:</p>
+
+<pre>
+Shape s = new Circle;
+</pre>
+
+<p>Here, the newly allocated <B>Circle</B> object has a reference count of zero (because we added a constructor to class <B>Shape_base</B> that sets the reference count to zero), and after we have finished constructing <B>s</B>, the reference count will be one. As another example, we might write:</p>
+
+<pre>
+Shape_base* p = new Circle;
+Shape s = p;
+Shape s1 = p;
+</pre>
+
+<p>Here, we wish to make <B>s</B> and <B>t</B> refer to the same object. Accordingly, when we allocate the object, the reference count will be zero, and after we have initialized <B>s</B> and <B>s1</B>, the reference count will be two:</p>
+
+<IMG SRC="fig4.gif">
+
+<p>When we destroy <B>s1</B>, the <B>Shape</B> destructor will decrement the reference count, because doing so does not bring the reference count to: zero, it will not destroy the circle object itself:</p>
+
+<IMG SRC="fig5.gif">
+
+<p>At this point, when we destroy <B>s</B>, the <B>Shape</B> destructor will discover that the reference count is now zero and will delete the <B>Circle</B> object accordingly.</p>
+<p>The copy constructor for the <B>Shape</B> class is simplicity itself:</p>
+
+<pre>
+Shape::Shape(const Shape&amp; s): p(s.p) {
+   ++p-&gt;refcnt;
+}
+</pre>
+
+<p>We are creating a <B>Shape</B> object as a copy of another one, so we know that the copy will refer to the same object as the original, and that the reference count will be one more than it was previously. Accordingly, we initialize <B>p</B> (i.e., <B>this-&gt;p</B>) as a copy of <B>s.p</B> and increment the reference count of the object to which <B>p</B> points.</p>
+<p>It is only the assignment operator that requires any thought to speak of:</p>
+
+<pre>
+Shape&amp; operator=(const Shape&amp; s)
+{
+   ++s.p-&gt;refcnt;
+   if (--refcnt == 0)
+      delete p;
+   p=s.p;
+   return *this;
+}
+</pre>
+
+<p>To understand what&#146;s happening here, let&#146;s start with the assumption that <B>s</B> and <B>t</B> refer to distinct objects:</p>
+
+<IMG SRC="fig6.gif">
+
+<p>Now, let&#146;s see what happens when we execute:</p>
+
+<pre>
+s = t;
+</pre>
+
+<p>The first thing that happens is that we increment the reference count of the assignment&#146;s source, in this case the object referred to by <B>t</B>, because that object will eventually have one more handle referring to it than it did previously:</p>
+
+<IMG SRC="fig7.gif">
+
+<p>Next, we decrement the reference count corresponding to the assignment&#146;s destination, in this case the object referred to by <B>s</B>:</p>
+
+<IMG SRC="fig8.gif">
+
+<p>Doing so brings the reference count to zero, so we delete that object:</p>
+
+<IMG SRC="fig9.gif">
+
+<p>Finally, we make the destination&#146;s pointer point at the source object:</p>
+
+<IMG SRC="fig10.gif">
+
+<p>What we did not mention about the assignment operator was the importance of incrementing <B>t.p-&gt;refcnt</B> before decrementing <B>p-&gt;refcnt</B>. To understand this importance, look at what happens if we begin with a single <B>Shape</B> object:</p>
+
+<IMG SRC="fig11.gif">
+
+<p>and attempt to assign it to itself by executing:</p>
+
+<pre>
+s = s;
+</pre>
+
+<p>First, we increment <B>s.p-&gt;refcnt</B>:</p>
+
+<IMG SRC="fig12.gif">
+
+<p>Then, we decrement <B>p-&gt;refcnt</B>, which in this case refers to the same object as <B>s.p-&gt;refcnt</B>:</p>
+
+<IMG SRC="fig13.gif">
+
+<p>When the smoke has cleared, we are back where we started. However, if we had decremented <B>p-&gt;refcnt</B> before incrementing <B>s.p-&gt;refcnt</B>, self-assignment would lead to disaster, because we would have decremented <B>p-&gt;refcnt</B> to zero, deleted the object, and then attempted to increment its reference count again.</p>
+
+<H3><FONT COLOR="#000080">Exception Safety and Copying</FONT></H3>
+
+<p>If we now take a step back and look at these classes together, we make a surprising discovery: there are no exception-safety problems anywhere in this code! The reason is simple: nowhere have we done anything that is capable of throwing an exception. The only operation that is capable of throwing an exception is creating an object of one of the classes in the <B>Shape_base</B> hierarchy, and we never create such objects &#151; only our users do.</p>
+<p>Of course, this happy state of affairs comes about only because we have surrendered a facility that our earlier solution had. In that version, copying a <B>Shape</B> object copied the object to which it was attached. In the present version, nothing we can do will ever copy an object from the <B>Shape_base</B> hierarchy. Clearly that won&#146;t do.</p>
+<p>A classical solution to this problem is to make it possible for the user of a <B>Shape</B> object to say &#147;I would like to be able to write to the object to which this <B>Shape</B> is attached without affecting any other part of the system.&#148; That requirement, in turn translates into &#147;If the reference count of an object to which this <B>Shape</B> is attached is not <B>1</B>, make a new copy of that object and attach my <B>Shape</B> to it.&#148; A plausible name for such an operation is <B>make_unique</B>. So, for example, if we have the following situation:</p>
+
+<IMG SRC="fig14.gif">
+
+<p>and we call <B>s.make_unique</B>, we would then like the situation to be:</p>
+
+<IMG SRC="fig15.gif">
+
+<p>We can achieve this state of affairs by adding a declaration of <B>make_unique</B> to our <B>Shape</B> class:</p>
+
+<pre>
+class Shape {
+public:
+   Shape(Shape_base* p0): p(p0) {
+      ++p-&gt;refcnt;
+   }
+   ~Shape() {
+      if (--p-&gt;refcnt == 0)
+         delete p;
+   }
+
+   void make_unique();
+   void draw() const { p-&gt;draw(); }
+
+   // other functions as needed
+   Shape(const Shape&amp;);
+   Shape&amp; operator=(const Shape&amp;);
+
+private:
+   Shape_base* p;
+};
+</pre>
+
+<p>and defining this function as follows:</p>
+
+<pre>
+void Shape::make_unique()
+{
+   if (p-&gt;refcnt &gt; 1) {
+      Shape_base* new_p = p-&gt;clone();
+      --p-&gt;refcnt;
+      ++new_p-&gt;refcnt;
+      p = new_p;
+   }
+}
+</pre>
+
+<p>Why did we define <B>new_p</B> as a local variable rather than doing the following?</p>
+
+<pre>
+// What is wrong with this code?
+   if (p-&gt;refcnt &gt; 1) {
+      --p-&gt;refcnt;
+      p = p-&gt;clone();
+      ++p-&gt;refcnt;
+   }
+</pre>
+
+<p>The reason is that <B>p-&gt;clone</B> is the one operation that can possibly throw an exception, and the easiest way to make our code exception safe is to do everything that might throw an exception before we do anything that changes the state of our system. If we change <B>p-&gt;refcnt</B> before we call <B>p-&gt;clone</B>, and <B>p-&gt;clone</B> throws an exception, we have changed the system in a way that is difficult to undo without catching the exception. By calling <B>p-&gt;clone</B> first and saving its result, we are assured that throwing an exception will cause no harmful consequences.</p>
+
+<H3><FONT COLOR="#000080">Discussion</FONT></H3>
+
+<p>Our last article discussed a handle class with the property that copying the handle always copies the corresponding object. Such classes are easy to write and to use, but it is better to avoid needless copies if possible.</p>
+<p>We can avoid such copies by adding a reference count to the objects to which we attach our handles. Such a reference count is called intrusive, because it requires a change to the subject class, not just to the handle. Once we have added such a reference count, all of our exception-safety problems go away, because we don&#146;t copy any objects.</p>
+<p>In practice, however, we cannot get away with never copying any objects. In particular, a program may wish to modify an object without affecting any other handles that might be attached to it. A logical name for such an operation is <B>make_unique</B>.</p>
+<p>Because <B>make_unique</B> potentially copies an object, we must consider exception safety when we design it. As we saw in our previous article, we can avoid problems by following the general principle of doing everything that might throw an exception before making any changes to the state of our system.</p>
+<p>In our next article, we will change our reference-counting strategy so that it is no longer intrusive. This change makes it possible to design a reference-counted handle class that can be attached to classes written by others. However, it turns out to be significantly more difficult to make such a class exception-safe.</p>
+
+<p><i><B>Andrew Koenig</B> is a member of the Large-Scale Programming Research Department at AT&amp;T&#146;s Shannon Laboratory, and the Project Editor of the C++ standards committee. A programmer for more than 30 years, 15 of them in C++, he has published more than 150 articles about C++ and speaks on the topic worldwide. He is the author of </I>C Traps and Pitfalls<I> and co-author of </I>Ruminations on C++<I>.</i></p>
+<p><i><B>Barbara E. Moo</B> is an independent consultant with 20 years&#146; experience in the software field. During her nearly 15 years at AT&amp;T, she worked on one of the first commercial projects ever written in C++, managed the company&#146;s first C++ compiler project, and directed the development of AT&amp;T&#146;s award-winning WorldNet Internet service business. She is co-author of </I>Ruminations on C++<I> and lectures worldwide.</i></p>
+
+</blockquote></body></html>

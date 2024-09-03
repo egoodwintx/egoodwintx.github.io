@@ -1,0 +1,206 @@
+<HTML>   
+     <HEAD>
+<TITLE>November 2002 C++ Experts Forum/Object Interconnections</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../20.11/tocnov.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Object Interconnections: Dynamic CORBA, Part 3 &#151; The Dynamic Skeleton Interface</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">by Douglas C. Schmidt and Steve Vinoski</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>Welcome to the third installment of our four part series covering Dynamic CORBA. In Part 1 <a href="#1">[1]</a>, we discussed the CORBA DII (Dynamic Invocation Interface), which allows applications to invoke operations on target objects without having compile-time knowledge of target interfaces. In Part 2 <a href="#2">[2]</a>, we explained the basics of the Dynamic Any, which enables applications to handle any value of any IDL type, whether simple or complex, without having compile-time information about that type. The Dynamic Any is essential for constructing truly dynamic CORBA client or server applications.</p>
+<p>In this column, we present the CORBA DSI (Dynamic Skeleton Interface), which is essentially the server-side counterpart of the DII. Some server applications, such as gateways or monitors, cannot know <i>a priori</i> the types or identities of the objects they must serve. The DSI enables CORBA developers to construct such applications portably. There are many capabilities associated with the DSI, so we first cover the basics and then present the more advanced features.</p> 
+
+<H3><FONT COLOR="#000080">Dynamic Skeleton Basics</FONT></H3>
+
+<p>To build working C++ DSI applications, you need to understand the following two key classes:</p>
+
+<OL>
+<LI>The <b>CORBA::ServerRequest</b> class, which is a pseudo-object that is the server-side equivalent to the client-side <b>CORBA::Request</b>. When the POA dispatches a request to a DSI servant, it passes an instance of <b>ServerRequest</b> to communicate all information about the request needed to allow the servant to fulfill it.</LI>
+<LI>The <b>PortableServer::DynamicImplementation</b> servant base class, from which concrete DSI servant classes inherit. This base class provides the following pure virtual methods that DSI servant classes are expected to override:</LI>
+<UL>
+<LI><b>void invoke (ServerRequest_ptr server_request)</b>, which is upcalled by the POA to allow the servant to handle requests. The POA passes the <b>ServerRequest</b> representing the request being processed to this method.</LI> 
+<LI><b>RepositoryId _primary_interface (const ObjectId&amp; id, POA_ptr poa)</b>, which is called by the ORB/POA run time when it needs the repository ID string identifying the most-derived interface of the object that the servant is incarnating. The ORB run time passes <b>ObjectId</b> for the specific object whose repository ID is requested by a DSI servant since such a servant normally incarnates multiple objects. The second argument supplies a reference to the particular POA in which the repository ID request is occurring. The <b>_primary_interface</b> method is called when the application calls POA methods, such as <b>servant_to_reference</b> and <b>id_to_reference</b>, so that the run time can create object references containing the appropriate repository ID.</LI>
+</UL>
+<p>The <b>_primary_interface</b> method is straightforward, so our examples below focus on the complexities of the <b>invoke</b> method. </LI>
+</OL>
+
+<p>In our first example, we return to the simple IDL we used in Part 1 of this series, but this time we use it to show a simple DSI server.</p>
+
+<pre>
+// IDL
+
+interface A {
+ void op ();
+};
+</pre>
+
+<p>When a client invokes <b>A::op</b> on an object incarnated by a DSI servant, the dispatching POA delivers a <b>ServerRequest</b> object to the <b>invoke </b>method on the servant. <b>ServerRequest</b> supplies methods that allow the servant to deal with all aspects of the request, including determining its name, examining its input arguments and setting its output arguments, setting a return value, and raising exceptions.</p> 
+<p>The first thing the servant must do to handle a request in its <b>invoke</b> method is to determine which operation is being invoked. It does this by calling the <b>operation</b> method on <b>ServerRequest</b>, like this:</p>
+
+<pre>
+std::string op = server_request-&gt;operation ();
+if (op == &quot;op&quot;) {
+  // process op
+request
+}
+</pre>
+
+<p>The <b>operation</b> method returns the simple name of the IDL operation being invoked. Note that we store the returned name into a C++ <b>std::string</b>. Like the methods provided by the DII <b>Request</b> class, <b>ServerRequest</b>'s methods do not follow normal C++ mapping rules. Since the <b>operation</b> method returns a <b>const char*</b> for which it maintains ownership, we're able to copy the returned string into a <b>std::string</b> here without creating a memory leak.</p> 
+<p>After the servant determines which operation it's servicing, it must then deal with the operation's arguments. With the DSI, the servant is responsible for informing the ORB of the number of arguments the operation expects, along with their types and their directions (i.e., whether the argument is <b>in</b>, <b>inout</b>, or <b>out</b>). The situation is actually the same for static skeleton invocation on the server. In that case, however, the skeletons generated automatically by the IDL compiler take care of providing argument information to the ORB, thereby shielding the servant developer from these details. </p> 
+<p>You might think that the ORB would automatically know what's in a marshaled request. To minimize time and space overhead, however, CORBA is designed such that the receiver knows what to expect. CORBA does not mandate self-describing requests because it would mean that unnecessary information would be sent over the network for the majority of cases. As a result, IIOP requests never contain <b>TypeCode</b>s to describe the argument types (except, of course, for the <b>TypeCode</b>s that are always marshaled for <b>Any</b> parameters). When a server ORB receives a request, the request's header provides only enough information to allow the ORB and POA to dispatch the request. Until the skeleton tells it how to demarshal everything, therefore, the server ORB must view the arguments as an array of indecipherable bytes.</p> 
+<p>The servant tells the ORB what arguments to expect by calling the <b>ServerRequest::arguments</b> method. Although the <b>op</b> method in our example has no arguments, the servant must still call <b>arguments </b>exactly once, whether the invoked operation has arguments or not. The servant passes argument information in the form of an <b>NVList</b>, as shown below:</p> 
+
+<pre>
+CORBA::NVList_var args;
+orb-&gt;create_list (0, args);
+</pre>
+
+<p>The ORB's <b>create_list</b> method takes two parameters: (1) a count of the number of items the list should contain and (2) an <b>out</b> <b>NVList</b> argument that the ORB uses to return the result. In our example, we expect zero arguments, so <b>create_list</b> returns an empty <b>NVList</b>, which we then pass to the <b>arguments</b> operation, like this:</p>
+
+<pre>
+server_request-&gt;arguments (args);
+</pre>
+
+<p>Our next example will show the details of argument processing.</p>
+<p>The final step is to complete the operation invocation by either returning normally or by raising an exception. To indicate a normal return, the servant calls <b>ServerRequest::set_result</b>, as we'll show in our next example. To raise an exception, the servant calls <b>ServerRequest::set_exception</b>. For example, the code below shows how to throw a <b>BAD_OPERATION</b> exception to inform clients that they've invoked a method that the target object does not support:</p> 
+
+<pre>
+CORBA::BAD_OPERATION exception;
+CORBA::Any any;
+any &lt;&lt;= exception;
+server_request-&gt;set_exception (any);
+</pre>
+
+<p>Both <b>set_result</b> and <b>set_exception</b> take a single <b>Any</b> parameter. For <b>set_result</b>, <b>Any</b>'s type must match the return type of the invoked operation. For <b>set_exception</b>, <b>Any</b> must contain an exception that is allowed by the operation's <b>raises</b> clause. A servant may call either <b>set_result</b> or <b>set_exception</b>, but not both. Moreover, whichever one it calls, it can call it only once.</p> 
+
+<H3><FONT COLOR="#000080">A More Realistic DSI Use Case</FONT></H3>
+
+<p>Our example above was straightforward, but overly simplistic since in practice DSI servants usually deal with arguments and return values. To show this, let's return to our stock <b>Info</b> example from our previous column. The IDL for this example is shown below:</p>
+
+<pre>
+// IDL
+module Stock {
+  exception Invalid_Stock {};
+
+  struct Info {
+    long high;
+    long low;
+    long last;
+  };
+
+  interface Quoter {
+    Info get_quote (in string stock_name) raises 
+      (Invalid_Stock);
+  };
+};
+</pre>
+
+<p>Let's focus on the argument handling required to implement <b>get_quote</b> in a DSI servant. We create an <b>NVList</b> as before, but this time, we must populate it with type and argument direction information. For simplicity, our example will assume that our servant already knows the necessary information, so it doesn't need to interact with the IFR (Interface Repository).</p>
+
+<pre>
+CORBA::NVList_var args;
+orb-&gt;create_list (1, args);
+args-&gt;add (CORBA::ARG_IN)-&gt;value ()-&gt;replace 
+  (CORBA::tk_string, 0);
+server_request-&gt;arguments (args);
+</pre>
+
+<p>Here, we've changed the second line to create an <b>NVList</b> with one argument. The most significant differences occur on the third line, however, where we add a <b>NamedValue</b> to our <b>NVList</b> and indicate that it will be an <b>in</b> argument by setting its <b>Flag</b> value to <b>CORBA::ARG_IN</b>. The <b>add</b> method returns this new <b>NamedValue</b>, for which the <b>NVList</b> retains ownership. On this returned <b>NamedValue</b>, we invoke the <b>value</b> method to gain access to the <b>Any</b> it holds, and on that <b>Any</b> we use the <b>replace</b> method to set the argument type. In our example, the argument's type is <b>string</b>, so we use the <b>CORBA::tk_string</b> enumerator to indicate this. The second argument to <b>replace</b> is normally a pointer to the value to be stored in <b>Any</b>. In our case, however, the value will be demarshaled by the ORB, so we simply indicate that we are not setting the value by passing a null pointer.</p> 
+<p>When we pass this populated <b>NVList</b> to the <b>arguments</b> method, the ORB demarshals the <b>string</b> argument and inserts it into the <b>Any</b> inside the <b>NVList</b>. After <b>arguments</b> returns, we can access the value of the argument using regular <b>Any</b> extraction or by using the Dynamic Any. We'll use the latter, since we explained the Dynamic Any in our previous column <a href="#2">[2]</a> and also because we'll need to use it to deal with the <b>Info</b> return value. We first obtain a Dynamic Any factory, which we then use in conjunction with the argument stored in the <b>NVList</b> to create a Dynamic Any:</p>
+
+<pre>
+CORBA::Object_var obj = 
+  orb-&gt;resolve_initial_references (&quot;DynAnyFactory&quot;);
+DynamicAny::DynAnyFactory_var dynfactory =
+  DynamicAny::DynAnyFactory::_narrow (obj);
+DynamicAny::DynAny_var dynany = 
+  dynfactory-&gt;create_dyn_any (*args-&gt;item (0)-&gt;value ());
+CORBA::String_var stock = dynany-&gt;get_string ();
+</pre>
+
+<p>Since we know that our argument is a <b>string</b>, we can easily access its value through the basic <b>DynAny</b> interface and store it into our <b>stock</b> variable.</p>
+<p>After we've obtained the stock name, our servant would presumably use it to access a database of stock information to retrieve the values needed to populate our <b>Info</b> return value. Let's assume we've already retrieved the necessary data and stored it into three <b>long</b> variables named <b>stock_high_value</b>, <b>stock_low_value</b>, and <b>stock_current_value</b>. Let's also assume that we've already created a Dynamic Any to hold our <b>Info</b> <b>struct</b>, exactly as shown in our previous column <a href="#2">[2]</a>. We then insert our stock values into our <b>Info</b> <b>struct</b> as follows:</p> 
+
+<pre>
+dynstruct-&gt;insert_long (stock_high_value);
+dynstruct-&gt;next ();
+dynstruct-&gt;insert_long (stock_low_value);
+dynstruct-&gt;next ();
+dynstruct-&gt;insert_long (stock_current_value);
+</pre>
+
+<p>To return this <b>Info</b> value from our DSI servant's <b>invoke</b> method, we obtain an <b>Any</b> from our Dynamic Any and then call <b>ServerRequest::set_result</b> to indicate that it's our return value.</p>
+
+<pre>
+CORBA::Any_var any = dynstruct-&gt;to_any ();
+server_request-&gt;set_result (any);
+</pre>
+
+<p>Alternatively, if the input argument is a stock name for which we have no information, we want to raise a <b>Stock::InvalidStock</b> exception. Assuming we had enough information to create a Dynamic Any to hold such an exception (for an actual dynamic application, we would need IFR access), we could raise it as our exception by obtaining its value as an <b>Any</b> and then passing that <b>Any</b> to <b>ServerRequest::set_exception</b>:</p>
+
+<pre>
+CORBA::Any_var any = dynexception-&gt;to_any ();
+server_request-&gt;set_exception (any);
+</pre>
+
+<H3><FONT COLOR="#000080">POA Considerations</FONT></H3>
+
+<p>A DSI servant normally incarnates multiple CORBA objects concurrently. Under these circumstances, the DSI servant is best used as a default servant <a href="#3">[3]</a>, which means that it incarnates all objects served by the POA in which it's registered. Such a POA should be created with the following policies:</p>
+
+<UL>
+<LI><b>USE_DEFAULT_SERVANT</b>, which directs the POA to dispatch requests to its default servant that's set by the application using the <b>POA::set_servant </b>method.</LI>
+<LI><b>MULTIPLE_ID</b>, which allows the default servant to incarnate multiple objects simultaneously.</LI>
+<LI><b>USER_ID</b>, which indicates that the application, not the system, supplies the object IDs used to identify objects in this POA.</LI>
+<LI><b>NON_RETAIN</b>, which means we're not registering any other servants with our POA other than our default servant, so this policy ensures that the POA avoids wasting space and time by creating and looking up servants in an Active Object Map.</LI></UL>
+
+<p>With these POA policies in place, including the default <b>ORB_CTRL_MODEL</b> (which allows a POA to process multiple requests simultaneously), a DSI servant can expect to service requests for multiple CORBA objects concurrently. This introduces another problem, however: for any given request, how does the servant know which object it's expected to incarnate?</p>
+<p>We have shown how a DSI servant can obtain the name of the operation it's servicing, via the <b>ServerRequest::operation </b>method. While the target object ID is technically part of the server request as well, it cannot be obtained through <b>ServerRequest</b>. Instead, the servant must obtain this information from the dispatching POA via its <b>Current</b> object, which supplies the following operations:</p> 
+
+<UL><LI><b>get_POA</b>, which returns the POA that's dispatching the current request.</LI>
+<LI><b>get_object_id</b>, which returns the ID of the target object for the current request.</LI>
+<LI><b>get_reference</b>, which returns an object reference for the target object.</LI>
+<LI><b>get_servant</b>, which returns the servant that's incarnating the target object for the current request.</LI></UL>
+
+<p>The DSI servant gains access to the POA <b>Current</b> through the ORB's <b>resolve_initial_references</b> call:</p>
+
+<pre>
+CORBA::Object_var obj =
+  orb-&gt;resolve_initial_references (&quot;POACurrent&quot;);
+PortableServer::Current_var current =
+  PortableServer::Current::_narrow (obj);
+</pre>
+
+<p>Since the POA <b>Current</b> resides in thread-specific storage <a href="#4">[4]</a>, each thread can access the POA <b>Current</b> in this manner to obtain information about its specific target object, even when the same servant is servicing multiple requests for separate objects concurrently.</p>
+
+<H3><FONT COLOR="#000080">Concluding Remarks</FONT></H3>
+
+<p>The CORBA DII discussed in <a href="#1">[1]</a> provides the means to assemble and invoke a request dynamically, which is useful only to an application playing the role of a CORBA client.  CORBA servers can also benefit from this type of dynamically request-processing capability, however. Dynamic CORBA therefore provides the DSI that enables servers to receive and handle requests without compile-time knowledge of operations or their signatures. In Dynamic CORBA, the DSI defines a <b>ServerRequest</b> that contains methods that allow the servant's <b>invoke </b>method to demarshal request arguments into <b>NamedValue</b> and <b>NVList</b> containers, as well as to marshal the reply to the client.</p> 
+<p>This column described the Dynamic CORBA DSI mechanisms and illustrated how these mechanisms can be applied to develop a server that's more flexible than one developed using static skeletons. There are two primary tradeoffs between using DSI and static skeletons in a CORBA server:</p>
+
+<OL>
+<LI><i>Static versus dynamic type information.</i> A static skeleton has all necessary type information about arguments and return values compiled into it, which enables the IDL compiler to perform advanced optimizations <a href="#5">[5]</a>. In contrast, the DSI approach normally requires type information to be discovered at run time, which is much more flexible but harder to optimize. The normal source for this information is the IFR. Our DII and DSI examples in this column series to date have not used the IFR, which we will show in our next and final column on Dynamic CORBA.</LI>
+<LI><i>Complexity versus flexibility</i>. A static skeleton turns an operation invocation into an ordinary call on the servant's C++ method call that implements the operation, which is easy to program but not very flexible since the servant's type must be known at compile time. A DSI servant, on the other hand, is much more flexible since it is possible for it to implement a wide range of operations that aren't known until run time. It is much more complex to program the DSI, however, since servant developers must not only implement the operation(s), but it must also follow the precise protocol required to inform the ORB of the number and types of arguments to demarshal, and to set the return value or raise an exception.</LI>
+</OL>
+
+<p>Because of these issues, the skill set required for Dynamic CORBA is greater than that required for developing static CORBA applications. Because static applications follow a natural function invocation paradigm, a minimum of C++ programming knowledge is needed to write a simple static CORBA client and server. Getting started is easy, given that ORB installations usually contain demo applications that a novice can easily modify to create a working system. Some ORBs even supply programming wizards or code generators that handle all of the details for you, allowing you to make quick work of all your small to medium static CORBA applications. Dynamic CORBA, on the other hand, requires a much broader understanding of CORBA's facilities, including <b>Request</b> and <b>ServerRequest</b> pseudo-objects, <b>TypeCode</b>s, <b>Any</b>, Dynamic Any, <b>NVList</b>s, <b>NamedValue</b>s, and for truly dynamic applications, the IFR and all of its constituent interfaces and data types. It's no surprise, therefore, that most CORBA C++ developers stick with static applications.</p> 
+<p>If you have comments, questions, or suggestions regarding Dynamic CORBA or our column in general, please let us know at <b>mailto:object_connect@cs.wustl.edu</b>.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1] Steve Vinoski and Douglas C. Schmidt. &quot;Object Interconnections: Dynamic CORBA: Part 1, The Dynamic Invocation Interface,&quot; <i>C/C++ Users Journal</i>, July 2002, &lt;www.cuj.com/experts/2007/vinoski.htm&gt;.</p>
+<p><a name="2"></a>[2] Steve Vinoski and Douglas C. Schmidt. &quot;Object Interconnections: Dynamic CORBA: Part 2, Dynamic Any,&quot; <i>C/C++ Users Journal</i>, September 2002, &lt;www.cuj.com/experts/2009/vinoski.htm&gt;.</p>
+<p><a name="3"></a>[3] Michi Henning and Steve Vinoski. <i>Advanced CORBA Programming with C++</i> (Addison-Wesley, 1999).</p>
+<p><a name="4"></a>[4] Douglas C. Schmidt, Michael Stal, Hans Rohnert, and Frank Buschmann. <i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects</i> (Wiley and Sons, 2000).</p>
+<p><a name="5"></a>[5] Eric Eide, Kevin Frei, Bryan Ford, Jay Lepreau, and Gary Lindstrom. &quot;Flick: A Flexible, Optimizing IDL Compiler,&quot; Proceedings of ACM SIGPLAN '97 Conference on Programming Language Design and Implementation (PLDI), Las Vegas, NV, June 1997.</p>
+
+<p><i><B>Steve Vinoski</B>, &lt;www.iona.com/hyplan/vinoski/&gt;, is vice president of Platform Technologies and chief architect for IONA Technologies and is also an IONA Fellow. A frequent speaker at technical conferences, he has been giving CORBA tutorials around the globe since 1993. Steve helped put together several important OMG specifications, including CORBA 1.2, 2.0, 2.2, and 2.3; the OMG IDL C++ Language Mapping; the ORB Portability Specification; and the Objects By Value Specification. In 1996, he was a charter member of the OMG Architecture Board. He is currently the chair of the OMG IDL C++ Mapping Revision Task Force. He and Michi Henning are the authors of </i>Advanced CORBA Programming with C++<i>, published in January 1999 by Addison Wesley Longman. Steve also represents IONA in the W3C (World Wide Web Consortium) Web Services Architecture Working Group.</p> 
+<p><i><B>Doug Schmidt</B>, &lt;www.ece.uci.edu/~schmidt/&gt;, is an associate professor at the University of California, Irvine. His research focuses on patterns, optimization principles, and empirical analyses of object-oriented techniques that facilitate the development of high-performance, real-time distributed object computing middleware on parallel processing platforms running over high-speed networks and embedded system interconnects.  He is the lead author of the books </i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects<i>, published in 2000 by Wiley and Sons, and </i>C++ Network Programming: Mastering Complexity with ACE and Patterns<i>, published in 2002 by Addison-Wesley. He can be contacted at <b>schmidt@uci.edu</b>. </p>
+
+</BLOCKQUOTE></BODY></HTML>

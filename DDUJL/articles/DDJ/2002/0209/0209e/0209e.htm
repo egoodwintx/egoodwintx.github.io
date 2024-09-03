@@ -1,0 +1,425 @@
+<html>
+<head>
+<title>Sep02: Adding Exceptions  & RTTI to the  Windows CE Compiler:  Part II</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Adding Exceptions  &amp; RTTI to the  Windows CE Compiler:  Part II</h1>
+<p><i>Dr. Dobb's Journal</i> September 2002</p>
+<h2>Tweaking  the TCU library</h2>
+
+<h3>By Dani Carles</h3>
+
+<I>
+Dani is a senior software engineer for Silicon &amp; Software Systems (http://www .s3group.com/). He can be contacted at dani.carles@s3group.com.</I>
+
+<hr>
+
+<p>In the first installment of this two-part article, I described why Silicon &amp; Software Systems (where I work) had to reengineer an RTOS-based application so it could run under Windows CE. The problem, you recall, is that the Windows CE 3.0 compiler doesn't support C++ exception handling and Run Time Type Identification (RTTI). The freely available TCU library (see "Resource Center," page 5), which emulates exception handling and RTTI, came to the rescue &#151; to a point. For a number of reasons, we ended up modifying the library to solve our problem. This month, I'll present those workarounds.</p>
+
+
+<h3>The TCU Library</h3>
+
+
+<p>The TCU library defines two types of stacks that are built dynamically at run time: </p>
+<DDJADVERTISEMENT INLINE>
+
+
+
+<ul>
+  <li>The destruction stack is a list of pointers to <i>tcu__Xsc</i> objects that need to be destroyed during stack unwinding.
+  <li>The <i>try</i> block stack is a list of pointers to <i>try</i> block descriptors. These descriptors are pushed and popped from this list as the code works its way though the call stack. In the working case I presented last month, the <i>try</i> block in <i>main()</i> would be the only member in the stack. If <i>foo()</i> had a <i>try</i> block of its own, a descriptor for it would be added to the top of the stack, and so on. 
+
+</ul>
+
+
+<p>When an exception is thrown, the execution flow is implemented in terms of the C Runtime Library <i>setjmp()</i>/<i>longjmp()</i> functions. Every <i>try</i> block descriptor contains a <i>jmp_buf</i> array used by <i>setjmp()</i>/<i>longjmp()</i> to save/restore the program environment. <i>try</i> block descriptors also contain a pointer where the current top of the destruction stack is saved, a pointer to the previous top of the <i>try</i> stack, and a pointer to the currently thrown exception, if any. </p>
+
+<p>Code helps in understanding how a <i>try-catch</i> clause is implemented by TCU. <A NAME="rl4"><A HREF="#l4">Listing Four</A> is the implementation of the <i>try-catch</i> block in Listing Three (presented last month). A local <i>try</i> block descriptor is instantiated on the stack along with a local pointer to the current exception. The <i>catch</i> clauses are implemented as <i>if-else</i> branches of a <i>setjmp()</i>. The conditions of those branches make use of RTTI to determine what exception handler to use. Once an exception handler is entered, a local reference to the current exception is made available. Then the pointer to the current exception is cleared to signify that the exception was successfully caught.</p>
+
+<p>Every execution thread stores a pointer to its exception-handling context in Thread Local Storage (TLS) memory. This context contains pointers to the top of the current destruction stack, top of the <i>try</i> block stack, and current exception object.</p>
+
+<p>Every time an object derived from <i>tcu__Xsc</i> is constructed, its address is pushed onto the current destruction stack. When it is destroyed, the address is popped out of it. When a <i>try</i> block is encountered, its descriptor address is pushed onto the <i>try</i> block stack, the address of the current destruction stack is saved into the descriptor, and the current destruction stack is cleared from the context. This is because every <i>try</i> block only cleans up what was constructed within its own scope. When the <i>try</i> block is left either via normal exit or exception throwing, objects in its destruction stack are destroyed, the <i>try</i> block descriptor address is popped off the stack, and the saved destruction stack address is restored. If further unwinding takes place, these objects are the responsibility of the next <i>try</i> block up the call stack.</p>
+
+<p>The method that implements the actual throwing of an exception gets the top of the destruction stack from the context, and triggers the destruction of the objects it contains. When the destruction is complete, it jumps back to the nearest <i>try</i> block (which it gets from the context) via <i>longjmp()</i>. </p>
+
+
+
+<h3>Throwing from a <i>catch</i> Block</h3>
+
+
+<p>One problem we ran into when using the TCU library out-of-the-box, so to speak, involved throwing inside a <i>catch</i> block. <A NAME="rl5"><A HREF="#l5">Listing Five</A> is the problem reduced to its minimum expression. What happens when you run the program is that the final assertion fails. The condition in the assertion checks that as many <i>UnwindableObj</i> objects were destroyed as constructed. A quick inspection of this counter reveals a value of 1, suggesting there is one object whose destructor is never called. We found that the culprit was the first exception object created on the heap &#151; the exception object thrown from <i>bar()</i>. So what's the problem? A search within the TCU code reveals that the current exception is only deleted in two places &#151; inside <i>tcu_xTerminate()</i> and in the destructor of the <i>try</i> descriptor. Recall from <A NAME="rl4"><A HREF="#l4">Listing Four</A> that the <i>try</i> descriptor is only a local variable. Because you are exiting the <i>catch</i> clause by throwing a different exception (using <i>longjmp()</i>), the <i>try</i> descriptor destructor is never called, so the current exception is never cleaned up. If you want to allow exceptions to be thrown from inside <i>catch</i> blocks, what's needed is some way of forcing that destructor to be called. </p>
+
+
+<p>To make matters worse, this is only the tip of the problem. The fundamental problem with TCU is that it does not have enough context information to know if it is inside a <i>catch</i> block. <A NAME="rl6"><A HREF="#l6">Listing Six</A> presents a more serious consequence of the same problem. Suffice it to say that the TCU_X_RETHROW statement in <i>main()</i> does not behave as expected and the exception is not rethrown. The flow of execution continues as if no exception was thrown. What is actually happening is that the <i>try</i> block descriptor in <i>bar()</i> is wrongly clearing the current exception from the context. </p>
+
+
+
+<h3>Copy Constructors and Object Destruction Order</h3>
+
+
+<p>Another problem with the TCU library concerns unwinding the stack in the presence of implicit copy constructor calls. Remember that each object derived from <i>tcu__Xsc</i> points to the previous object on the destruction stack. It is this pointer to the previous object that TCU uses to reset the top of the stack when destroying an object. This works fine if the object being destroyed is indeed on the top of the stack, and this is the assumption TCU is making throughout. However, there is at least one case when this is not so. <A NAME="rl7"><A HREF="#l7">Listing Seven</A> shows this situation. In the example, function <i>printUnwObjList()</i> is only a debug aid that displays the contents of the destruction stack. </p>
+
+
+<p>In a standard conforming C++ implementation, the order of constructor and destructor calls should be:</p>
+
+<blockquote><p>
+ret.DerivedObj()</p>
+
+<p>
+d.DerivedObj(ret)</p>
+
+<p>ret.~DerivedObj()</p>
+
+<p>
+d.~DerivedObj()</p>
+
+</blockquote><p>where, for brevity, only the most derived constructor/destructor calls are shown. TCU relies on destructors being called in strict reverse order to that of construction. In other words, the object being removed from the stack must always be the top one. When <i>ret</i> is removed in this example, the object on the top is actually <i>d,</i> given the construction/destruction order just shown. TCU sets the top of the destruction stack in the current context to be <i>ret</i>'s previous object, in this case 0 or the end of the list. The result is that <i>d</i>'s destructor is never called.</p>
+
+
+
+
+<h3>The Modified Library</h3>
+
+
+<p>The library with our modifications that overcome the mentioned problems is available electronically. Here, I describe the changes we made and how they are implemented. </p>
+
+
+<p></p>
+
+<p><b>Adding </b><i><b>catch</i></b><b> blocks.</b> To support exception throwing from a <i>catch</i> block, you first need to be able to tell whether you are in a <i>catch</i> block. Once you know, you can modify the unwinding code to force a call of the <i>try</i> block descriptor destructor &#151; a call missing in the original TCU implementation. You can also make sure that the current exception object is only deleted when it is not rethrown and that the current exception pointer is only cleared from the context when no new exception is thrown. To this effect, I added a new class I call a "<i>catch</i> block descriptor," which exhibits this behavior: Its constructor registers itself with the current context, so that it is possible to tell from the context that the execution has entered a <i>catch</i> block. It then stores a pointer to the <i>try</i> block descriptor associated with this <i>catch</i> block (this pointer is needed during cleanup). Finally, it stores a pointer to the current context exception &#151; this is the exception caught by the <i>catch</i> block (the <i>try</i> block destructor needs access to this pointer). </p>
+
+
+<p>Its destructor unregisters itself from the current context, thereby indicating you are leaving the <i>catch</i> block. Next, it deletes the caught exception object only if it is not rethrown. Then it clears the current exception pointer from the context only if no new exception is thrown from this <i>catch</i> block.</p>
+
+<p>Finally, the new class has a <i>cleanup()</i> function that makes an explicit destructor call of this object and makes an explicit destructor call of the associated <i>try</i> block descriptor.</p>
+
+<p>The <i>try</i> block descriptor class needs to be modified so that:</p>
+
+
+<ul>
+  <li>A pointer to an associated <i>catch</i> block descriptor is added to the class members.
+  <li>In the constructor, if the current execution is inside a <i>catch</i> block, save the pointer to the <i>catch</i> block descriptor and unregister that pointer from the context. While inside this <i>try</i> block, you are effectively no longer in a <i>catch</i> block and must update the context accordingly.
+
+  <li>In the destructor, if a <i>catch</i> block descriptor was saved, register it back with the context. Get the current exception from the <i>catch</i> block descriptor and register it with the context.
+
+  <li>In the <i>unwind()</i> method, if you are inside a <i>catch</i> block, make a call to its <i>cleanup()</i> method. This forces both the <i>catch</i> block and <i>try</i> block destructors to be called before <i>longjmp()</i> is called.
+
+</ul>
+
+
+<p>A pointer to a <i>catch</i> block descriptor is also added to the context. Again, this lets you tell whether the execution path is inside a <i>catch</i> block (but not inside a nested <i>try</i> block). </p>
+
+<p>Finally, the TCU_CATCH_XX macros are modified to include the instantiation of a local <i>catch</i> block descriptor variable on the stack. This object has the same scope as the <i>catch</i> block itself, so its constructor is called when the block is entered and its destructor is called when the block is left. If the block is left via <i>longjmp()</i>, the destructor is still explicitly called by the <i>cleanup()</i> method. </p>
+
+<p><b>Searching the object list.</b> The second problem we encountered concerned the object destruction order. The workaround I implemented does not incur excessive overhead when the construction and destruction sequences are symmetrical. This is the usual case. For less common asymmetrical situations (such as with copy constructors), an extra list search occurs. This solution introduces an extra check to see whether the object being destroyed is the same as the top of the destruction stack. If it is, things proceed as before; otherwise, the destruction list is searched for a match and, if the pointer is found, removed from the list. We did not see any noticeable performance decrease in our application after this change was introduced. That said, our application wasn't hard real time, so functionality was more important than performance. That might differ in your case.<b></p>
+
+
+<p>RTTI and DLLs.</b> Again, RTTI does not work when objects cross DLL borders in the TCU library. Here's why: Our inspection of the original TCU code reveals the template class in <A NAME="re1"><A HREF="0209ee1.htm">Example 1</A>. This template class is used to get a unique ID for class <i>T</i>. This unique ID is, in fact, &amp;<i>tcu__RttiTypeIdImplementation&lt;T&gt;::s_id</i> and references to this address are made throughout the code. The problem with RTTI and DLLs is that every DLL has a different instantiation of the aforementioned template class and, therefore, the address of its only static data member will be different. The workaround I propose here was never integrated in our embedded product because the DLL issue was not a problem for us. However, we did test it in a Windows NT environment and it should work equally well for Windows CE. </p>
+
+<p>The template class in <A NAME="re1"><A HREF="0209ee1.htm">Example 1</A> can be rewritten as in <A NAME="re2"><A HREF="0209ee2.htm">Example 2</A>. All the direct references to <i>s_id</i>'s address in the code are replaced with calls to <i>GetUniqueId()</i>. Now, if you write a specialization of <i>GetUniqueId()</i> for classes whose objects may cross DLL borders, the problem goes away &#151; well, as long as the returned <i>const void </i>* is a unique number associated to that particular class. One way to do this in Win32 is by using the Win32 API <i>RegisterWindowMessageA()</i> function, which takes a string as an argument and returns an integer that is guaranteed to be unique throughout your system, even across different processes. Adding <A NAME="re3"><A HREF="0209ee3.htm">Example 3</A> to the API-specific part of TCU should do the trick.</p>
+
+
+
+<h3>Major Limitations</h3>
+
+
+<p>Of course, even the modified TCU library has limitations, including:</p>
+
+
+<p></p>
+
+<ul>
+  <li>Intrusive. You must change your code to use the TCU-specific syntax.
+  <li>Exception-sensitive classes must either directly or indirectly inherit from <i>tcu__Xsc</i>.
+
+  <li>It can turn single inheritance into multiple inheritance and may turn nonvirtual multiple inheritance into virtual multiple inheritance.
+
+  <li>Exception classes must be directly or indirectly derived from exception base class <i>tcu_Xc</i>; for instance, exceptions of class <i>int</i> or <i>std::string</i> cannot be thrown.
+
+  <li>All exception classes must provide a copy constructor.
+
+  <li><i>Try</i>, <i>throw</i>, and <i>catch</i> constructs must be replaced with library-specific macros.
+
+  <li>Exceptions inside constructors do not behave according to the C++ Standard. According to the Standard, an object is not considered fully constructed until its constructor has completed. Therefore, exceptions thrown from inside a constructor do not result in the object's destructor being called. The TCU library incurs a destructor call in this case. Both TCU and a C++ Standard conformant implementation call the destructors for the base class and any data members.
+
+  <li>Exception specifications are not supported.
+
+  <li>First operation in the constructor body of any class derived from <i>tcu__Xsc</i> should be TCU_X_RESET. This is true even for constructors with an empty body. This statement may or may not be omitted for classes that have no members derived from <i>tcu__Xsc</i>.
+
+  <li>When implicit copy constructor calls are involved, there is a performance penalty to be paid in the form of a list search. This is linear time so it can be noticeable for large lists.
+
+  <li>If objects of a particular class have to cross DLL borders, an extra template specialization is required as part of the class definition for RTTI to work as expected.
+
+</ul>
+
+<h3>Conclusion</h3>
+
+
+<p>The TCU library is no match for native exception handling and RTTI mechanisms implemented at compiler level. However, it offers a workable alternative for Windows CE embedded systems that are not bound by hard real-time deadlines. The usefulness of the TCU library is twofold:</p>
+
+
+<p></p>
+
+<ul>
+  <li>If you are writing code from scratch, it lets you avail of two missing but otherwise important C++ language features &#151; RTTI and exception handling.
+  <li>When porting code that relies on those features, this may be your only (cheap) option.
+
+</ul>
+
+
+<p>Obviously, if a more robust solution is desired, investing in a different compiler should be considered. There is at least one company that offers custom ports of their EDG C++ front end with a C back end tailored to your specific platform (&agrave; la cfront). This would not only give you RTTI and exception handling, but almost full C++ Standard compatibility including the most obscure features you can ever dream of. Almost, that is, because as I write this, nobody in the world has been able to implement the controversial <i>export</i> keyword. </p>
+
+
+
+<h3>Acknowledgments</h3>
+
+
+<p>Thanks to Dominic Herity and Oscar del Pozo for their helpful suggestions in improving the clarity of this article. I would also like to thank Derek Dwyer, Brian McNamara, Pavol Droba, and Clare McCormack at Silicon &amp; Software Systems for their help throughout a difficult project.</p>
+
+
+
+<p><b>DDJ</b></p>
+
+<P>
+<A HREF="#rl3">Back to Article</A>
+</P>
+<H4><A NAME="l4">Listing Four</H4>
+
+
+<pre>{
+    tcu__XTryBlock __tcuXtb__; 
+    tcu_Xc *__tcuXcPtr__; 
+    __tcuXcPtr__ = 0; 
+    
+    if (!_setjmp (__tcuXtb__.jmpBuf())) 
+    {
+        {
+            DerivedObj d;
+            foo();
+        }
+    } else if ((__tcuXcPtr__= 
+           tcu_rttiDynamicCast&lt;ExcDerived&gt;(__tcuXtb__.valuePtr())) != 0)
+    { 
+        ExcDerived &amp;e = *reinterpret_cast&lt;ExcDerived *&gt;(__tcuXcPtr__); 
+        __tcuXtb__.valuePtr() = 0;
+        {
+            cout &lt;&lt; "ExcDerived caught: " &lt;&lt; e.what() &lt;&lt; 
+                                        " (0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;        
+        }
+    } else if ((__tcuXcPtr__= 
+           tcu_rttiDynamicCast&lt;ExcBase&gt;(__tcuXtb__.valuePtr())) != 0)
+    { 
+        ExcBase &amp;e = *reinterpret_cast&lt;ExcBase *&gt;(__tcuXcPtr__); 
+        __tcuXtb__.valuePtr() = 0;
+        {
+            cout &lt;&lt; "ExcBase caught: " &lt;&lt; e.what() &lt;&lt; 
+                                     " (0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;
+        }
+    } else 
+    { 
+        __tcuXtb__.valuePtr() = 0;
+        {
+            cout &lt;&lt; "Unknown exception" &lt;&lt; endl;
+        } 
+    }
+}     
+</pre>
+<P>
+<A HREF="#rl4">Back to Article</A>
+</P>
+<H4><A NAME="l5">Listing Five</H4>
+
+
+<pre>#include &lt;iostream&gt;
+#include &lt;cassert&gt;
+#include "tcutest.h"
+
+using namespace std;
+
+// File scope functions
+namespace {
+void bar()
+{
+    cout &lt;&lt; "In bar() ..." &lt;&lt; endl;
+    UnwindableObj bar1,bar2;        
+    TCU_X_THROW(ExcDerived("A derived exception"));
+}
+void foo()
+{
+    cout &lt;&lt; "In foo() ..." &lt;&lt; endl;
+    UnwindableObj foo1,foo2;    
+    TCU_X_TRY
+    {            
+        bar();                 
+    }
+    TCU_X_CATCH_TYPE(ExcDerived) 
+    {       
+        UnwindableObj foo3,foo4;
+        cout &lt;&lt; "ExcDerived caught in foo " &lt;&lt; endl;        
+        TCU_X_THROW(ExcDerived("A different derived exception"));
+    } TCU_X_END_TRY
+}
+}
+// Static member definition
+unsigned int UnwindableObj::mv_nCount = 0;
+// main
+int main()
+{
+    cout &lt;&lt; "Throwing inside a catch block using the 
+                                 original TCU library" &lt;&lt; endl &lt;&lt; endl;
+    // EH test
+    TCU_X_TRY
+    {
+        DerivedObj d;
+        foo();      
+    }
+    TCU_X_CATCH(ExcDerived,e)
+    {
+      cout &lt;&lt; "ExcDerived caught: " &lt;&lt; e.what() &lt;&lt; 
+                                  " (0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;        
+    }
+    TCU_X_CATCH(ExcBase,e)
+    {
+      cout &lt;&lt; "ExcBase caught: " &lt;&lt; e.what() &lt;&lt; " (0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;
+    }
+    TCU_X_CATCH_ALL
+    {
+      cout &lt;&lt; "Unknown exception" &lt;&lt; endl;
+    } TCU_X_END_TRY     
+    assert(UnwindableObj::getCtorCount() == 0);
+    cout &lt;&lt; "Press Enter to exit" &lt;&lt; endl;
+    cin.get();
+    return 0;
+}
+</pre>
+<P>
+<A HREF="#rl5">Back to Article</A>
+</P>
+<H4><A NAME="l6">Listing Six</H4>
+
+
+<pre>#include &lt;iostream&gt;
+#include &lt;cassert&gt;
+#include "tcutest.h"
+using namespace std;
+// File scope functions
+namespace {
+void bar()
+{
+    TCU_X_TRY
+    {                      
+        cout &lt;&lt; "In bar() ..." &lt;&lt; endl;
+    }
+    TCU_X_CATCH_TYPE(ExcDerived) 
+    {               
+        cout &lt;&lt; "ExcDerived caught in bar " &lt;&lt; endl;                        
+    } TCU_X_END_TRY
+}
+void foo()
+{
+    cout &lt;&lt; "In foo() ..." &lt;&lt; endl;         
+    TCU_X_THROW(ExcDerived("A derived exception"));
+}
+}
+// Static member definition
+unsigned int UnwindableObj::mv_nCount = 0;
+// main
+int main()
+{    
+    bool bRethrownCaught = false;
+    TCU_X_TRY
+    {
+        TCU_X_TRY
+        {           
+            foo();      
+        }
+        TCU_X_CATCH(ExcDerived,e)
+        {
+            cout &lt;&lt; "ExcDerived caught: " &lt;&lt; e.what() &lt;&lt; 
+                                        " (0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;    
+            bar();
+            TCU_X_RETHROW;
+        } TCU_X_END_TRY 
+    }
+    TCU_X_CATCH(ExcDerived,e)
+    {
+        cout &lt;&lt; "Rethrown ExcDerived caught: " &lt;&lt; e.what() &lt;&lt; 
+                                             " (0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;   
+        bRethrownCaught = true;
+    } TCU_X_END_TRY
+    assert(bRethrownCaught);
+    cout &lt;&lt; "Press Enter to exit" &lt;&lt; endl;
+    cin.get();
+    return 0;
+}
+</pre>
+<P>
+<A HREF="#rl6">Back to Article</A>
+</P>
+<H4><A NAME="l7">Listing Seven</H4>
+
+
+<pre>#include &lt;iostream&gt;
+#include &lt;cassert&gt;
+#include "tcutest.h"
+
+using namespace std;
+
+// File scope functions
+namespace {
+
+DerivedObj bar()
+{
+    cout &lt;&lt; "In bar() ..." &lt;&lt; endl;
+    DerivedObj ret;  
+    printUnwObjList();
+    return ret;
+}
+void foo()
+{
+    cout &lt;&lt; "In foo() ..." &lt;&lt; endl;
+    printUnwObjList();
+    DerivedObj d = bar();
+    printUnwObjList();
+    TCU_X_THROW(ExcDerived("A derived exception"));
+}
+}
+// Static member definition
+unsigned int UnwindableObj::mv_nCount = 0;
+// main
+int main()
+{
+    cout &lt;&lt; "Showing destruction order problem using the original 
+                                              TCU library" &lt;&lt; endl &lt;&lt; endl;
+    // EH test
+    TCU_X_TRY
+    {
+        foo();      
+    }
+    TCU_X_CATCH(ExcDerived,e)
+    {
+      cout &lt;&lt; "ExcDerived caught:" &lt;&lt; e.what() &lt;&lt; "(0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;
+    }
+    TCU_X_CATCH(ExcBase,e)
+    {
+      cout &lt;&lt; "ExcBase caught: " &lt;&lt; e.what() &lt;&lt; " (0x" &lt;&lt; &amp;e &lt;&lt; ")" &lt;&lt; endl;
+    }
+    TCU_X_CATCH_ALL
+    {
+        cout &lt;&lt; "Unknown exception" &lt;&lt; endl;
+    } TCU_X_END_TRY     
+    assert(UnwindableObj::getCtorCount() == 0);
+    cout &lt;&lt; "Press Enter to exit" &lt;&lt; endl;
+    cin.get();
+    return 0;
+}</pre>
+<P>
+<A HREF="#rl7">Back to Article</A>
+</P>
+
+
+</body>
+</html>

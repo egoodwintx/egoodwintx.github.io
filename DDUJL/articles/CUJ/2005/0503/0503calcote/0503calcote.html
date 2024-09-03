@@ -1,0 +1,186 @@
+
+
+
+<html>
+<head>
+<title>March, 2005: Rich Error Information</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<p><i>C/C++ Users Journal</i> March, 2005</p>
+<h1>Rich Error Information</h1>
+<h2>Better diagnostics with composite errors</h2>
+
+
+<h3>By John Calcote</h3>
+
+
+<I>John Calcote is a senior software engineer for Novell and can be contacted at <a href="mailto:jcalcote@novell.com">jcalcote@novell.com</a>.</I>
+
+<hr>
+
+
+<p>Years ago, it was acceptable to simply return an integer error code from a procedure. In fact, many times, the system- or library-supplied error value was more than adequate. If programmers wanted to display a message regarding the returned error code, they just called <b>perror</b> to print it to the <b>stderr</b> stream, or <b>strerror</b> to convert it to a printable string.</p>
+
+<p>Today's software systems, however, are very complex and composed of many layers&#151;sometimes dozens of layers exist between the operating system and users. Each layer interprets error codes received from the layers below it. Each time such an interpretation occurs, there are three possible outcomes: The error code may be passed on to the layer above unchanged; it may be changed to reflect the semantics of the current layer; or it may be reinterpreted as a successful condition. In the case of a true error, the result of this possibly massive decision tree is a single error value returned to the top layer. </p>
+
+<p>If you're the support technician assigned to solve a customer issue and the only clue to the reason for the product failure is "Error 52" displayed on the command-line interface, or in a dialog box of your company's database application, then you already have three strikes against you:</p>
+
+
+
+<ul>
+  <li>You are not the engineer who wrote the code, so in general, you don't have a clue where to start.</li>
+  <li>Error 52 could have resulted from a nearly infinite number of possible code paths in the millions of lines of source code comprising the application&#151;depending, of course, on the nature of the error.</li>
+  <li>Your customer paid for a working application and wants the fix yesterday. You don't even have the luxury of the months it would take you to track down the most likely reason for error 52, much less determine a proper solution to the problem. </li>
+  </ul>
+
+<p>Most software developers recognize this problem and have traditionally solved it by sending diagnostic messages to a log file or other output device. When an error occurs in some lower layer, the reason can be described in the log file or on the trace screen by the originating code.</p>
+
+<p>Some developers have even (in a burst of innovation) tried to return more structured composite error information. Unfortunately, the structures required to hold such composites are difficult to pass around. Doing so generally requires that they be passed from the top-most layer as output parameters to lower functions because many systems and languages don't handle returning complex data types very well. C++, of course, excels at returning complex data types, but then the usual issues associated with returning objects must be dealt with. Who originates the object, who owns it, and where does it get destroyed? Do you copy it from place to place, or pass around a pointer or a reference to a single object?</p>
+
+<p>One example of returning such composite error information can be found in the <b>ERR_STATE</b> structure defined in the OpenSSL project source base [1]. Using this structure, OpenSSL attempts to pack as much useful error information as possible into a reasonably defined structure. The system uses a sort of homegrown thread-local-storage mechanism, using a hash table and thread identifier as the hash value. Unfortunately, the error-processing code is overly complex, even for a cryptography library (which has to deal with subtle security issues not usually associated with other types of libraries). One of the main issues with this mechanism is that it tries to take an object-oriented approach using C, a language that is not inherently object oriented. The system provides for pluggable error-handling routines using a handler table. This is nothing more or less than a C++ <b>vtable</b>&#151;with lots of extra syntax.</p>
+<h3>Rich Errors</h3>
+
+<p>Assuming you've had enough of trace screens and log files that never seem to provide the right information at the right time, and you want to retrofit a large software system with composite error information, you are now faced with a real problem: You have thousands of functions, each of which must be instrumented to add error information to the composite. How do you manage to meet looming deadlines and engineering budget restrictions while retrofitting your entire code base for composite errors&#151;an activity that, all too often, from upper management's perspective, appears (ironically) to add no real customer value?</p>
+
+<p>Enter the <b>RichError</b> class. <b>RichError</b> provides the ability to incrementally add rich composite error information to existing software systems with minimal impact. Here's how it works: The <b>RichError</b> class is implemented entirely in a header file as a small set of inline and static member functions. <b>RichError</b>'s default constructor either instantiates a new internal object in thread-local-storage for the current thread of execution, or acquires a reference to one, if it already exists on the current thread. This internal object conforms to the <b>IRichErrorStack</b> interface (<a href="0503calcotel1.html" target="_BLANK">Listing 1</a>), and provides a thread-specific global location in which to store error information from each instrumented level of the call stack.</p>
+
+<p><b>RichError</b> objects are usually created once at the top of the call stack, where error information is displayed or logged&#151;in the main routine, or in a top-level client request handling routine, or perhaps even at the thread start procedure for a background task.</p>
+
+<p>The library implementation of the <b>IRichErrorStack</b> interface is reference counted. After the first <b>RichError</b> object is created, each subsequent <b>RichError</b> object created in lower layers simply adds a reference to the existing error stack object stored in thread-local-storage. Whenever a <b>RichError</b> variable goes out of scope, a reference is released. When the top-level <b>RichError</b> object is destroyed, the error stack deletes itself through its release method.</p>
+
+<p>After returning from lower layers, the <b>RichError</b> object may now have access to composite error information to be displayed or logged. Generally, this can be determined by examining the return code of the lower level routine that was called:</p>
+
+<pre>
+void main (void)
+{
+   RichError re;
+   int err = descend_into_lower_layers();
+   if (err != 0)
+      cerr &lt;&lt; re;
+}
+
+</pre>
+
+<p>However, this is not necessary with <b>RichError</b>. There's no rule stating that error codes must be returned by your software's various layers. Many POSIX interfaces, in fact, return a status value (usually -1, in traditional UNIX style) to indicate that an error has occurred, at which point the caller must examine the value of the (thread-specific) global <b>errno</b> variable to determine the actual error code. With <b>RichError</b>, however, you need not return anything at all. <b>RichError</b>'s <b>haserr</b> member function will tell you if error information exists in the thread's error stack.</p>
+<h3>Instrumentation</h3>
+
+<p>At various points in the call stack, when errors must be returned to higher layers, just change your code so that it returns the error value through the <b>RePush</b> macro (a wrapper for a static member function defined by <b>RichError</b>&#151;a macro is used to allow the capture of source-file and line-number information provided by the <b>__FILE__</b> and <b>__LINE__</b> preprocessor macros). This causes the specified error value to be pushed onto the current thread's error stack before returning it to the caller:</p>
+
+<pre>
+int some_function(void)
+{
+   if (some_system_call() == -1)
+      return RePush(45);
+}
+
+</pre>
+
+<p>If your development team already supports the practice of returning error codes through a global function, just redefine your function as a macro that calls <b>RePush</b>. With a single definition, you've just instrumented your entire code base for minimal composite error diagnostic information.</p>
+
+<p>If not, don't worry&#151;adding the use of such a macro or function is a generally accepted programming practice among many development teams. For example, one common method of debugging the origin of a specific error value is to ensure that your source code always returns literal error values through such a function. A conditional breakpoint may then be set, causing the application to break into the debugger when the target value is passed through this function. Such instrumentation may also be added incrementally without negative side effects.</p>
+<h3>Extensibility</h3>
+
+<p><b>RichError</b> is based, in part, on the composite design pattern [2]. <b>RichError</b>, and the interfaces used by it, are derived from a single base class called <b>IRichErrorBase</b>, which defines a single member called <b>printerr</b>. The <b>printerr</b> member function looks like an <b>std::ostream</b> extractor class helper function, and in fact, it is just that. The <b>RichError</b> header also contains the inline definition for a global extraction operator for <b>IRichErrorBase</b>-derived classes. This operator lets you dump objects of any <b>IRichErrorBase</b>-derived class to objects of any <b>std::ostream</b>-derived class&#151;<b>cerr</b> or <b>clog</b>, for example.</p>
+
+<p>In addition to the basic <b>RePush</b> macro, the <b>RichError</b> header also defines <b>RePushStr</b> and <b>RePushStrXi</b>, which accept additional parameters for a description string, and an allocated object pointer, whose class is based on <b>IRichErrorBase</b>. In the simplest case, dumping the <b>RichError</b> object to the error stream displays a list of error codes and other information, one error level per line, in this manner:</p>
+
+<pre>
+Error: 11d, bh, {c:\dev\rerr\testrerr\testrerr.cpp, 41}
+Error: 31d, 1fh, {c:\dev\rerr\testrerr\testrerr.cpp, 34}
+Error: 72d, 48h, {c:\dev\rerr\testrerr\testrerr.cpp, 21}
+
+</pre>
+
+<p>If your code uses the more descriptive <b>RePushStr</b>, you might see output like this:</p>
+
+<pre>
+Error: 11d, bh, Remote host down. 
+   {c:\dev\rerr\testrerr\testrerr.cpp, 41}
+Error: 31d, 1fh, Transport failure.
+   {c:\dev\rerr\testrerr\testrerr.cpp, 34}
+Error: 72d, 48h, Network I/O failure. 
+   {c:\dev\rerr\testrerr\testrerr.cpp, 21}
+
+</pre>
+
+<p>In this case, the descriptive string is printed between the error codes and the source location. Finally, if you choose to use <b>RePushStrXi</b>, you might see output like this, assuming you used this particular macro only at the lowest level, on line 21 of testrerr.cpp:</p>
+
+<pre>
+Error: 11d, bh, Remote host down. 
+    {c:\dev\rerr\testrerr\testrerr.cpp, 41}
+Error: 31d, 1fh, Transport failure. 
+    {c:\dev\rerr\testrerr\testrerr.cpp, 34}
+Error: 72d, 48h, Network I/O failure. 
+    {c:\dev\rerr\testrerr\testrerr.cpp, 21}
+special error data
+
+</pre>
+
+<p>The extended error object pushed onto the error stack has complete control over the output of the extended error information that it manages, so its implementation of <b>printerr</b> should be written so as to properly fit into the flow of text surrounding it:</p>
+
+<pre>
+class ReXiSomeSysCallThing : public IRichErrorBase
+{
+      std::string m_special;
+   public:
+      ReXiSomeSysCallThing(const char * special) :
+                               m_special(special) {}
+      std::ostream &amp; printerr(std::ostream &amp; os, 
+                          const IRichErrorBase &amp; reb)
+         { return os &lt;&lt; m_special &lt;&lt; std::endl; }
+};
+
+</pre>
+
+<p>Furthermore, source code instrumented with calls to <b>RePushStrXi</b> should be crafted carefully, so as not to throw exceptions in error paths:</p>
+
+<pre>
+int some_function(void)
+{
+ if (some_system_call() == -1)
+   try { return RePushStrXi(45, "some_system_call failed", 
+       new ReXiSomeSysCallThing("special error data")); } 
+   catch(...) { return RePushStr(45, "some_system_call failed");}
+}
+
+</pre>
+
+<p>Note that in this case, the <b>try</b> block is protecting against failure to allocate a new <b>ReXiSomeSysCallThing</b>. The insertion of a new error level to the error stack is protected inside the <b>RichError</b> library itself. </p>
+
+<p>If the existing <b>RePush</b> macros don't do enough for you, a glance at their implementations should provide enough information for you to write some of your own variations.</p>
+<h3>Program Flow</h3>
+
+<p>Many times, errors provided by lower layers are reinterpreted by layers above as simply branch indicators. For example, a database file manager may attempt to open a database file. Finding it missing may not be an error from the file manager's perspective. Rather, it might be an indicator that a new database file should be created. However, the filesystem layer may have already pushed rich error information. </p>
+
+<p>In this case, the file manager layer should probably call <b>ReClear</b>&#151;another macro wrapped around a static member function. This clears the lower layer errors from the error stack so the application doesn't inadvertently return nonerror information to the top.</p>
+<h3>Portability</h3>
+
+<p><b>RichError</b> is completely portable to all Win32 platforms, and to all POSIX-compliant platforms supporting the pthreads thread-specific data interface (<b>pthread_key_create</b>, and so on). Portability issues have been isolated to a section at the top of the <b>RichError</b> library source file, so adding support for another platform's thread-local-storage API should be fairly trivial.</p>
+
+<p>The two required operating-system features are thread-local storage and mutex locking. On Win32 platforms, the Win32 <b>TLS</b> functions are used for thread-local storage, and critical section objects provide mutex support. On POSIX platforms, the <b>pthread_key</b> routines are used for thread-local storage, and <b>pthread</b> mutexes provide mutex functionality. These interfaces are similar enough on Win32 and UNIX to be trivially defined with macros. (The source code for rerr.h, rerr.cpp, and testerr.cpp is available at <a href="http://www.cuj.com/code/">http://www.cuj.com/code/</a>.)</p>
+
+<p>The only mutex used by the library guarantees single-threaded access to the <b>TLS</b> key singleton constructor. It is created at library load time by the global object constructor, and destroyed at unload time by the object's destructor. The single thread-local-storage key is used to store the error stack objects on each thread, and is created the first time it's accessed using the canonical Singleton implementation, with added support for thread safety.</p>
+<h3>Performance</h3>
+
+<p>The performance hit is minimal for instrumented code if no higher layers have instantiated a <b>RichError</b> object. The <b>RePush</b> function has intrinsic value, as mentioned earlier, and the only other action it takes is to call the <b>TLS</b> "get data" API in order to determine if there is an error stack object on the current thread. If a layer above has requested rich error information by instantiating a <b>RichError</b> object, then you pay the additional cost for allocating and storing additional information.</p>
+<h3>Enhancements</h3>
+
+<p>One nice enhancement might be to add a symbolic call stack to the bottom-most <b>RichErrorLevel</b> object pushed onto the error stack. This can be done by detecting the <b>pusherr</b> method of <b>RichErrorStack</b>, whether or not this is the first error pushed. The error stack is implemented as a vector of pointers, so we only have to check to see if the vector is empty. If so, we can simply generate a call stack object and store it in the new error level object. Otherwise, you just leave the call stack data member of the error level object empty, and don't display it in the <b>RichErrorLevel</b> <b>printerr</b> routine. A diagnostic symbolic call stack can be very useful in determining the root of a problem.</p>
+<h3>Conclusion </h3>
+
+<p><b>RichError</b> provides a mechanism to trivially instrument existing code bases for rich diagnostic composite error information with minimal engineering overhead. Furthermore, it's portable, extensible, and designed with tried and proven design patterns. </p>
+<h3>References</h3>
+
+  <p>[1]	<a href="http://www.openssl.org/">http://www.openssl.org/</a>.
+  <p>[2]	Gamma, Erich, et al. <i>Design Patterns: Elements of Reusable Object-Oriented Software</i>, Addison-Wesley, 1995. 
+
+
+
+
+
+
+</body>
+</html>

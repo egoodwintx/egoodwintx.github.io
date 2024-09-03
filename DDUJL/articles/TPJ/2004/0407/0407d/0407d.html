@@ -1,0 +1,428 @@
+
+<html>
+<head>
+<title>July, 2004: Designing for Pluggability</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Designing for Pluggability</h1>
+<p><i>The Perl Journal</i> July, 2004</p>
+<h2></h2>
+
+
+<h3>By Simon Cozens</h3>
+
+
+<I>Simon is a freelance programmer and author, whose titles include Beginning Perl (Wrox Press, 2000) and Extending and Embedding Perl (Manning Publications, 2002). He's the creator of over 30 CPAN modules and a former Parrot pumpking. Simon can be reached at simon@ simon-cozens.org.</I>
+
+<hr>
+
+
+
+
+
+<p>Someone once said that the mark of a great piece of software is that it can be used to do things that its author never anticipated. The key to this is building sufficient flexibility into the application and, in this article, I'm going to show you some of the modules and techniques in my toolbox for doing just that, starting from relatively humble beginnings and ending with a new way of creating extensible database applications that I'm quite proud of.</p>
+<h3><i>UNIVERSAL::require</i></h3>
+
+<p>We begin with the <i>UNIVERSAL::require</i> module. This isn't so much related to extensibility itself, but it will be used as a building block for many of the other techniques we'll look at.</p>
+
+<p><i>UNIVERSAL::require</i> is a simple module and does a simple job. When you need to load some code at runtime (the essence of pluggable design), you find there are several ways to do it in Perl. You can use <i>do</i> or <i>string eval</i> if you know where the code is coming from, but what if you have a module name instead of a file name? You can't use <i>use</i> because that takes place at compile-time and you can't use <i>require $module_name</i> because <i>require</i> with a variable, rather than a string constant, expects a filename, not a module name.</p>
+
+<p>So, if we're trying to programmatically load an extension module at runtime&#151;again, something we'll be doing a lot when developing pluggable software&#151;we end up writing fudges like:</p>
+
+<blockquote>
+<pre>
+eval "require $module_name";
+
+</pre>
+</blockquote>
+
+
+
+<p><i>UNIVERSAL::require</i> exists purely to tidy up this very case. It adds a <i>require</i> method to the <i>UNIVERSAL</i> namespace, meaning that we can call <i>require</i> on any class:</p>
+
+<blockquote>
+<pre>
+My::Module-&gt;require;
+
+</pre>
+</blockquote>
+
+
+
+<p>This method just does the <i>eval "require My::Module"</i> fudge with a little better error checking, so we can now say:</p>
+
+<blockquote>
+<pre>
+use UNIVERSAL::require;
+$module_name-&gt;require;
+
+</pre>
+</blockquote>
+
+
+
+<p>This is the first step on the road to building our own extensible applications.</p>
+<h3>Do-It-Yourself Pluggability</h3>
+
+<p>The Perl module <i>Mail::Miner</i> analyzes a piece of e-mail for various features, which it stores in a database table. It does this by calling a set of "recognizers," which are its plug-in modules. Here's how we load up the plug-in modules:</p>
+
+<blockquote>
+<pre>
+use File::Spec::Functions qw(:DEFAULT splitdir);
+
+my @files = grep length, map { glob(catfile($_,"*.pm"))  }
+    grep { -d $_ }
+    map { catdir($_, "Mail", "Miner", "Recogniser") }
+    exists $INC{"blib.pm"} ? grep {/blib/} @INC : @INC;
+
+my %seen;
+@files = grep {
+  my $key = $_;
+  $key =~ s|.*Mail/Miner/Recogniser||;
+   !$seen{$key}++
+} @files;
+
+require $_ for @files;
+
+</pre>
+</blockquote>
+
+<p>This is quite horrible but it's instructive to look at. We're trying to find all the files called "Mail/Miner/Recogniser/*something*.pm" in the include path, <i>@INC</i>, and the first <i>@files = statement</i> does this: It adds "Mail/Miner/Recogniser" to the end of each include path and checks to see if it is a directory. If it is, then we look for all the *.pm files in that directory.</p>
+
+<p>The blib.pm bit is to be used for testing new recognizers. If we've said <i>use blib</i> somewhere, then we're in a test suite and we're only interested in the recognizer modules underneath the blib staging directory. This allows us to ensure that we're loading up the new modules instead of already installed ones. When we say <i>use blib</i>, or indeed any other module, Perl turns the module name into a short filename (blib.pm, say, or "Mail/Miner/Mail.pm") and puts this in the <i>%INC</i> hash with the value being the full path of the module file. Hence, looking in <i>%INC</i> is a good way of telling whether a particular module is loaded.</p>
+
+<p>Next, we make sure we only have one copy of a given recognizer; this avoids problems when a module is installed in multiple places. Finally, we have a file name, so we can pass it to <i>require</i> and Perl will load the module.</p>
+
+<p>So now we have loaded up all the <i>Mail::Miner::Recogniser::*</i> modules that we can find on the system. That's solved one problem. The second problem is, now that we have them, what do we do with them? How do they relate to the rest of the system?</p>
+
+<p>The way <i>Mail::Miner</i> opted to do this was to have each of the plug-in modules write into a hash when they load and supply metadata about what they do:</p>
+
+<blockquote>
+<pre>
+package Mail::Miner::Recogniser::Phone;
+$Mail::Miner::recognisers{"".__PACKAGE__} =
+  {
+   title =&gt; "Phone numbers",
+   help  =&gt; "Match messages which contain a phone number",
+   keyword =&gt; "phone"
+};
+
+</pre>
+</blockquote>
+
+<p>Now <i>Mail::Miner</i> can look at the packages it has available in <i>%recognisers</i>, and call a particular interface on each one of them:</p>
+
+<blockquote>
+<pre>
+sub modules { sort keys %recognisers };
+
+for my $module (Mail::Miner-&gt;modules()) {
+  # ...
+  $module-&gt;process(%hash);
+}
+
+</pre>
+</blockquote>
+
+<p>This way, <i>Mail::Miner</i> can call out to additional installed modules without the author (me) knowing what plug-ins the user (you) has installed. Anyone can write a <i>Mail::Miner::Recogniser::Meeting</i> module; for instance, to attempt to identify meeting locations and times in an e-mail. Once it's installed in a Perl <i>include</i> path, it'll be automatically picked up and its <i>process</i> method will be called to examine an e-mail.</p>
+<h3><i>Module::Pluggable</i></h3>
+
+<p>As I said, that's how I used to do it&#151;until <i>Module::Pluggable</i> appeared. We've seen the two problems involved in developing pluggable applications: first, finding the plug-ins; and second, working out what to do with them. <i>Module::Pluggable</i> helps with the first. It does away with all the nasty code we saw earlier. Now, to find all the recognizers installed in the <i>Mail::Miner::Recogniser</i> namespace, I can rewrite my code as follows:</p>
+
+<blockquote>
+<pre>
+package Mail::Miner;
+use Module::Pluggable search_path =&gt; ['Mail::Miner::Recogniser'];
+
+</pre>
+</blockquote>
+
+<p>This gives me a <i>plugins</i> method that returns a list of class names just like the <i>modules</i> method did in our original code. If I wanted to make it completely compatible, I could also change the name of the method to <i>modules</i> with the <i>sub_name</i> configuration parameter:</p>
+
+<blockquote>
+<pre>
+use Module::Pluggable search_path =&gt; ['Mail::Miner::Recogniser'],
+            sub_name =&gt; "modules";
+
+</pre>
+</blockquote>
+
+<p>This doesn't actually cause the modules to be loaded, so we could say:</p>
+
+<blockquote>
+<pre>
+$_-&gt;require for Mail::Miner-&gt;modules;
+
+</pre>
+</blockquote>
+
+
+
+<p>but we can also have the <i>modules</i> method itself load up the plug-ins by passing another configuration parameter:</p>
+
+<blockquote>
+<pre>
+use Module::Pluggable search_path =&gt; ['Mail::Miner::Recogniser'],
+            sub_name =&gt; "modules",
+            require =&gt; 1;
+
+</pre>
+</blockquote>
+
+
+
+<p>This is a drop-in&#151;and much simpler&#151;replacement for all the messing about with paths and <i>@INC</i> we saw earlier; it even handles the test case when <i>blib</i> is loaded. But I haven't replaced <i>Mail::Miner</i>'s plug-in system with this and we'll see why later.</p>
+<h3>Making Callbacks with <i>Class::Trigger</i></h3>
+
+<p>First, though, another CPAN module that handles the second problem&#151;knowing what to do with your plug-ins when you have them. In <i>Mail::Miner</i>, we called a method that was assumed to be defined in all the plug-ins&#151;whether or not they wanted it.</p>
+
+<p>Sometimes this is the right way to do it, but often, an individual plug-in will want more control about what it responds to, especially if you're going to be calling your plug-ins on several different occasions for different things.</p>
+
+<p>In these cases, you might find the CPAN module <i>Class::Trigger</i> a better fit. <i>Class::Trigger</i> allows you to add "trigger points" to your objects or classes to which third parties can attach code to be called.</p>
+
+<p>For instance, if we have a method that displays some status information about an object, we could declare a trigger before printing the information out:</p>
+
+<blockquote>
+<pre>
+sub display_status {
+  my $object = shift;
+  my $message = $object-&gt;status;
+  $object-&gt;call_trigger("display_status", \$message)
+  print $message;
+}
+
+</pre>
+</blockquote>
+
+<p>Now individual plug-in modules can register with the class subroutine references to be called when the trigger is called. For instance, a module might want to modify the message because it's going to be sent out as HTML:</p>
+
+<blockquote>
+<pre>
+use HTML::Entities;
+MyClass-&gt;add_trigger( display_status =&gt; sub  {
+  my ($obj, $message) = @_;
+  $$message = encode_entities($$message);
+});
+
+</pre>
+</blockquote>
+
+<p>Notice how we pass in a reference to the message, so that we can modify the message. Another plug-in could provide links for all the URIs it finds in the message:</p>
+
+<blockquote>
+<pre>
+use URI::Find::Simple qw(change_uris);
+MyClass-&gt;add_trigger( display_status =&gt; sub  {
+  my ($obj, $message) = @_;
+  $$message = change_uris( $$message, 
+               sub { qq{&lt;a href="$_[0]"&gt;$_[0]&lt;/a&gt;} } );
+});
+
+</pre>
+</blockquote>
+
+
+
+<p>And now we come to a problem&#151;how do we know that the "mark up URIs" trigger is going to be loaded after the "escape HTML entities" trigger? If we can't guarantee the ordering of the two triggers, we could end up with our link tags denatured by the entity escaping.</p>
+
+<p>This was a problem that I came up against, albeit from a slightly different angle.</p>
+<h3>Pluggable Callbacks in <i>Email::Store</i></h3>
+
+<p>You see, the reason I haven't rewritten <i>Mail::Miner</i> in the new plug-in style with <i>Module::Pluggable</i> is that I've been working on a much more extensible and advanced framework for storing and data-mining e-mail, which I've called <i>Email::Store</i>. In the way <i>Email::Store</i> works, pretty much everything is a plug-in.</p>
+
+<p>When you store e-mail, <i>Email::Store</i> itself loads up the <i>Email::Store::Mail</i> plug-in, which sets up a placeholder database row for the mail. Then <i>Email::Store::Mail</i> calls all of the other plug-ins to examine the mail and file away the things they want to note about it&#151;what mailing lists it came from, what attachments it has, and so on.</p>
+
+<p>However, we also want these plug-ins to specify some kind of relative order in which they're called. For example, it's more efficient if the attachment handler strips the e-mail of its attachments before other plug-ins poke around in the e-mail body because, once you've gotten rid of the attachments, there's less e-mail body to poke around in.</p>
+
+<p>All great ideas have been had before, of course, and this made me think of the UNIX System V <i>init</i> process. When a UNIX machine starts up, it consults files in an "rc" directory to start up particular services. These files are named in a particular way so that, when the initialization process looks at the directory, it sees the services in the order that they should be started up. For instance, <i>S10sysklogd</i> means "start the system logger at position 10," and <i>S91apache</i> means "start the Apache web server at position 91;" the logger gets started first and Apache later. Now, this isn't perfect because there can be several things in position 10, and they get run in alphabetical order; and besides, nobody's policing the numbers anyway. If you think <i>S01foo</i> means "very early" and someone else comes along and installs <i>S00bar</i>, theirs gets run first. But it gives you a rough way of providing an order to the process.</p>
+
+<p>What I wanted to do was give my plug-ins a similar rough ordering: Attachment handling had to happen at position 1; working out the mailing list an e-mail came from was a low priority task and could happen at position 90 towards the end; everything else could go somewhere in the middle.</p>
+
+<p>I also didn't really like the <i>Class::Trigger</i> approach of specifying a subroutine reference to be called. I prefer just writing methods. So, plug-ins that want to influence the way an e-mail gets indexed can provide two methods:</p>
+
+<blockquote>
+<pre>
+package Email::Store::Summary;
+
+sub on_store_order { 80 }
+sub on_store {
+  my ($self, $mail) = @_
+  # ...
+}
+
+</pre>
+</blockquote>
+
+<p><i>on_store_order</i> is the position in which we'll be called by the indexing process; <i>on_store</i> is what we do when we get called. This is implemented in the <i>::Mail</i> class like so:</p>
+
+<blockquote>
+<pre>
+use Module::Pluggable::Ordered search_path =&gt; ["Email::Store"];
+
+sub store {
+  my ($class, $rfc822) = @_;
+  my $simple = Email::Simple-&gt;new($rfc822);
+  my $msgid = $class-&gt;fix_msg_id($simple);
+  my $self;
+  $self = $class-&gt;create ({ message_id =&gt; $msgid,
+                message    =&gt; $rfc822,
+                simple     =&gt; $simple });
+  $class-&gt;call_plugins("on_store", $self);
+  $self;
+}
+
+</pre>
+</blockquote>
+
+<p><i>Module::Pluggable::Ordered</i> provides the same functionality as <i>Module::Pluggable</i> but also provides a <i>call_plugins</i> method: You give it a name of a trigger and some parameters and it looks through your plug-ins, finds those that provide that method, orders them by their positions, and then calls them. In our normal <i>Email::Store</i> case, that one line would be the equivalent of:</p>
+
+<blockquote>
+<pre>
+Email::Store::Attachment-&gt;on_store($self);
+Email::Store::Entity-&gt;on_store($self);
+Email::Store::Summary-&gt;on_store($self);
+Email::Store::List-&gt;on_store($self);
+
+</pre>
+</blockquote>
+
+<p>As new modules are developed and dropped into place, they're ordered by their <i>on_store_order</i> if they provide an <i>on_store</i> method and then placed into the list of <i>on_store</i> calls&#151;all without <i>Email::Store::Mail</i> needing to know about them. The single <i>call_plugins</i> line combines both locating plug-ins and calling triggers to provide a facility for extending the indexing process.</p>
+<h3>Mixing Plug-Ins with Databases</h3>
+
+<p>Let's now go on to write the rest of the <i>Email::Store::Summary</i> class that we looked at earlier. This is going to store summary information about an e-mail so that it can be displayed in a friendly way&#151;we'll store the subject of the mail and the first line of original content; that is, the first thing we see after removing an attribution and a quote. These will go in the summary database table, so we need to inherit from <i>Email::Store::DBI</i> the <i>Class::DBI</i> class that knows about the current database, and we need to tell it about the table's columns:</p>
+
+<blockquote>
+<pre>
+package Email::Store::Summary;
+use base 'Email::Store::DBI';
+Email::Store::Summary-&gt;table("summary");
+Email::Store::Summary-&gt;columns(All =&gt; qw/mail subject original/);
+Email::Store::Summary-&gt;columns(Primary =&gt; qw/mail/);
+
+</pre>
+</blockquote>
+
+
+
+<p>We'll use <i>Text::Original</i>, a module extracted from the code of the Mariachi mail archiver, which hunts out the first piece of original text in a message body:</p>
+
+<blockquote>
+<pre>
+use Text::Original qw(first_sentence);
+
+sub on_store_order { 80 }
+sub on_store {
+  my ($self, $mail) = @_;
+  my $simple = $mail-&gt;simple;
+  Email::Store::Summary-&gt;create({
+    mail =&gt; $mail-&gt;id,
+    subject =&gt; scalar($simple-&gt;header("Subject")),
+    original =&gt; first_sentence($simple-&gt;body)
+  });
+}
+
+</pre>
+</blockquote>
+
+<p>When e-mail is indexed, the <i>on_store</i> callback is called and it receives a copy of the <i>Email::Store::Mail</i> object that's being indexed. The <i>simple</i> method returns an <i>Email::Simple</i> object, which we use to extract the subject header and the body of the e-mail. Then we create a row in the summary table for this e-mail.</p>
+
+<p>Next, for this to be useful, we need to tell <i>Email::Store::Mail</i> how this summary information relates to the mail:</p>
+
+<blockquote>
+<pre>
+Email::Store::Summary-&gt;has_a(mail =&gt; "Email::Store::Mail");
+Email::Store::Mail-&gt;might_have( 
+  summary =&gt; "Email::Store::Summary" =&gt; qw(subject original) 
+);
+
+</pre>
+</blockquote>
+
+<p>Now an <i>Email::Store::Mail</i> object has two new methods&#151;which, of course, we'll highlight in the documentation for our module. <i>subject</i> will return the first subject header and <i>original</i> will return the first sentence of original text. We use <i>might_have</i> to consider the summary table an extension of the mail table.</p>
+
+<p>But now comes the clever bit. If this is truly to be a drop-in plug-in module, where is the summary table going to come from? It's one thing to be able to add concepts to a database-backed application, but these new concepts have to be supported by tables in the database. For the plug-in module to be completely self contained, it must also contain information about the table's schema. And this is precisely what <i>Email::Store</i> plug-ins do. In the DATA section of <i>Email::Store::Summary</i>, we'll put:</p>
+
+<blockquote>
+<pre>
+__DATA__
+CREATE TABLE IF NOT EXISTS summary (
+  mail varchar(255) NOT NULL PRIMARY KEY,
+  subject varchar(255),
+  original text
+);
+
+</pre>
+</blockquote>
+
+<p>There's a mix-in module called <i>Class::DBI::DATA::Schema</i>, which is used by <i>Email::Store::DBI</i> (and hence anything that inherits from it), which provides the <i>run_data_sql</i> method. As its name implies, this method runs any SQL it finds in the DATA section of a class. So all we need to do is go through all of our plug-ins and run <i>run_data_sql</i> on them to create their tables:</p>
+
+<blockquote>
+<pre>
+sub setup {
+  for (shift-&gt;plugins()) {
+    $_-&gt;require or next;
+    if ($_-&gt;can("run_data_sql")) {
+      warn "Setting up database in $_\n";
+      $_-&gt;run_data_sql ;
+    }
+  }
+}
+
+</pre>
+</blockquote>
+
+
+
+<p>With this in place, a plug-in module is truly self contained: It specifies what to do at trigger points like <i>on_store</i>, it specifies the relationships that tie it in to the rest of the <i>Email::Store</i> application, and it specifies how to create the database table that it relates to.</p>
+
+<p>There's one more slight niggle&#151;because the end user specifies what SQL database to use and because not all databases use the same variant of SQL, what if the schema in a DATA section isn't appropriate for what the end user is using? <i>Class::DBI::DATA::Schema</i> handles this, too, by using <i>SQL::Translator</i> to automatically translate the schema to a different variant of SQL. We can say</p>
+
+<blockquote>
+<pre>
+use Class::DBI::DATA::Schema (translate =&gt; [ "MySQL" =&gt; "SQLite"] );
+
+</pre>
+</blockquote>
+
+
+
+<p>and write our DATA schemas in MySQL's SQL&#151;except that we don't know at compile time that the end user is going to choose SQLite for his database; in fact, we don't know until the database is set up. So we end up doing something like this:</p>
+
+<blockquote>
+<pre>
+package Email::Store::DBI;
+use base 'Class::DBI';
+require Class::DBI::DATA::Schema;
+
+sub import {
+  my ($self, @params) = @_;
+  if (@params) {
+    $self-&gt;set_db(Main =&gt; @params);
+    Class::DBI::DATA::Schema-&gt;import( translate =&gt; 
+      [ "MySQL" =&gt; $self-&gt;__driver ]
+    );
+  }
+}
+
+</pre>
+</blockquote>
+
+<p>When I say <i>use Email::Store 'dbi:SQLite:mailstore.db'</i>, <i>Email::Store::DBI</i> first sets up the database, and then it imports <i>CDBI::DATA::Schema</i>, telling it to translate between MySQL and SQLite, the <i>__driver</i> for our database. The reality is slightly more complex than this because we use <i>DBD::Pg</i> and <i>SQL::Translator</i> expects it to be called not "Pg" but "PostgreSQL." But the basics are there. See the source to <i>Email::Store::DBI</i> for the full story.</p>
+
+<p>We've looked at various tools to increase the pluggability of our applications, from merely requiring classes at runtime to using modules to help us find plug-ins and provide trigger points or callbacks for extensions to influence the behavior of a process. We put all these together in <i>Module::Pluggable::Ordered</i>, which also allows us to specify a rough ordering for the extension modules, and we added the concept of extending a database-based application by using <i>Class::DBI::DATA::Schema</i> to allow us to write fully self-contained database-backed plug-ins.</p>
+
+<p>Making your applications pluggable is an excellent way of reducing the complexity of a design&#151;<i>Email::Store::Mail</i> hardly does anything itself but delegates to plug-ins for almost all of its functionality. <i>Module::Pluggable::Ordered</i> and the database techniques we've looked at provide a low-effort way of doing that and allow your applications to be stretched and expanded in ways you might not imagine!</p>
+
+
+<p><b></b></p>
+<p><b></b></p>
+<p><b>TPJ</b></p>
+
+
+
+
+</body>
+</html>

@@ -1,0 +1,630 @@
+<HTML>
+<META NAME="year" CONTENT="1989">
+<HEAD>
+
+<TITLE>MAY89:  CREATING TSRS PROGRAMS WITH TURBO PASCAL: PART 1</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1> CREATING TSRS PROGRAMS WITH TURBO PASCAL: PART 1<a name="00e4_0003"><a name="00e4_0003"></h1><P>
+<h3><a name="00e4_0001"><a name="00e4_0000">Ken L. Pottebaum</h3><P>
+<p><i><a name="00e4_0002"><a name="00e4_0000">Ken Pottebaum is a professional mechanical engineer for the Small Disk Division of Imprimis, a subsidiary of Control Data Corporation.  He can be reached at 321 Redbud. Yukon. OK 73099.</i></p><hr><P>
+Can you write TSR (terminate and stay resident) programs in Turbo Pascal?  The answer is yes, and this two-part series shows how.  This month I'll talk about the basic requirements for TSR programs and present the tools (see TSRUNIT.PAS in <a href="8905a.htm#00e4_0008">Listing One</A> ) to create them.  Next month I'll develop an example program that illustrates installing the TSR program and changing its hot keys, using files, and doing other things that real-world TSR programs need to do.<P>
+The primary requirement for a TSR program is for it to be &quot;invisible&quot; to the operating system and other software.  The operation of such a program can be separated into two parts; its background mode, in which it waits to be popped up, and its activated mode.  In their background mode.  TSR programs intercept one or more interrupt vectors and monitor their calls to determine when to pop up.  These intercept routines are normally written in assembly language in order to be efficient and to preserve the contents of the registers.  Being invisible in the popped-up mode means preserving the computer's state when the TSR program pops up, and restoring its state when the program pops back down.  The main problem encountered when popping up a TSR program is dealing with nonreentrant routines.<P>
+Because nonreentrant routines cannot be reentered safely, two general approaches are used to eliminate the problem.  The simplest method is to avoid using any of the nonreentrant routines.  As many DOS I/O and file functions are nonreentrant, this approach would severely restrict the tasks that the TSR program could perform; however, it does lend itself to the creation of small, special-purpose TSR programs.  An approach that allows more versatile TSR programs is to avoid popping up the program while a nonreentrant routine is being executed --this is the method TSRUnit uses.<P>
+While waiting for their cue to pop up.  TSR programs normally monitor the keyboard input and then pop up when their hot keys are detected.  Either the BIOS hardware keyboard interrupt 09h or the BIOS software keyboard interrupt 16h can be intercepted and used to monitor the keyboard input.  Using interrupt 09h provides the advantages of quickly detecting the hot keys and of using key combinations that are not normally recognized.  Its quick response to the hot keys is because this is the hardware interrupt that is executed whenever a key is pressed or released.  Its immediate response is also a drawback because the computer could be executing a nonreentrant routine when the TSR program's activation keys are pressed.  Using interrupt 16h reduces the likelihood of the hot keys being detected while an unsafe routine is being executed because this software interrupt must be called by another routine; therefore it cannot be executed at any time, as can a hardware interrupt.  Unfortunately, it does not completely prevent the TSR program from being popped up during unsafe or nonreentrant routines.  The disadvantages of using interrupt 16h are that the Shift-key combinations used to make up the hot keys are reduced (they must be a combination that is normally interpreted by the keyboard input routines) and that the TSR program cannot be popped up until the software interrupt is called.<P>
+Recent versions of BIOS firmware contain a service function.  4Fh, of interrupt 15h that is intended to be intercepted by software programs.  This service provides a clean way of monitoring the keyboard input and modifying the input.  Making use of this feature would restrict the TSR programs created using TSRUnit to computers with the new BIOS function, however, so TSRUnit does not use interrupt 15h.<P>
+In order to have flexibility in hot-key combinations, quick detection of the hot keys, and the safety provided by the software interrupt, the method used in TSRUnit involves both keyboard interrupt vectors.<P>
+Although the specific maintenance tasks required for a general-purpose TSR program can best be seen by examining the tasks performed inside TSRUnit, the guidelines for intercepting interrupt vectors are explained in the following section.<P>
+<h3><a name="00e4_0004">Intercepting Interrupt Vectors<a name="00e4_0004"></h3><P>
+Routines to intercept interrupt calls are a vital part of a TSR program.  As with TSR programs, intercept routines must preserve the contents of the stack and the registers --including the flag register.  Interrupt routines are normally called by executing an Int instruction, which pushes the flags and then a two-word return address onto the stack.  The instruction also clears the interrupt bit of the flags, which disables further interrupts.<P>
+Although several methods of emulating an interrupt call exist, the simple and efficient method used in TSRUnit is to push the flags onto the stack and then perform a far indirect call.  Using the indirect call allows the register contents to be intact when the far call is executed --the call destination address is contained at the memory location specified in the call instruction.<P>
+With the exception of interrupts 25h and 26h, all interrupt routines leave the stack clean; that is, they exit by removing the return address and flags from the stack as they return to the calling routine.  The return can be performed by executing either an interrupt return, IRET, or a far return, RETF 2, that discards 2 bytes from the stack.<P>
+As previously mentioned, interrupts 25h and 26h --DOS absolute physical sector read and write routines --are atypical.  They leave the old flags on the stack, and so all routines that call them must clean up the stack by discarding the old flags after calling either interrupt.  Furthermore, intercept routines for them must leave the old flags on the stack when they exit.<P>
+<h3><a name="00e4_0005">Inside TSRUnit<a name="00e4_0005"></h3><P>
+TSRUnit performs three types of tasks.  One routine, TSRInstall, installs the TSR program. Once installed, the maintenance of the program is performed by INLINE code routines in ASM and the Pascal routine PopUpCode.  The remaining four routines provide auxiliary services for checking the printer status and for accessing lines of the saved text image.  For additional information on these auxiliary service routines see <a href="8905a.htm#00e4_0008">Listing One</A>.<P>
+TSRInstall is a straightforward routine that provides the TSR intercept routines with the information they will require.  Rather than storing all the data in the data segment, the TSR program stores the information required by the INLINE code routines in the code segment. Having their data in the code segment simplifies the INLINE routines by allowing them to access the data without using an additional segment register.  The following items are saved by the installation routine:<P>
+<ol>1.     The complete pointer to the top of the TSR program stack (obtained from the current stack pointer and then adjusted to its value prior to the call to TSRInstall)</ol><P>
+<ol>2.     The address of the routine to be called from PopUpCode</ol><P>
+<ol>3.     The original interrupt vectors for interrupts 09h, 16h, 21h, 25h, and 26h</ol><P>
+<ol>4.     The current video mode and the size of the cursor</ol><P>
+<ol>5.     Whether or not a math coprocessor is present</ol><P>
+<ol>6.     The size and address of the buffer for saving the screen image</ol><P>
+<ol>7.     The Shift-key combination code and the scan code of the activation key.  Although the command-line parameters are accessed and evaluated to determine the hot keys to be used, this is not critical to the TSR program.  The conversion of the activation character to a keyboard scan is performed by searching for the character in an array of allowed characters --the index of the array is the scan code.</ol><P>
+After saving the required items and displaying an installation message, the interrupt vectors for the five routines being intercepted are replaced.  The SwapVectors command is used to save Turbo Pascal's interrupt vectors and to restore previous vectors.  Before issuing the Keep command to exit and stay resident, the adjacent flag bytes, UnSafe and Flg, are cleared to enable the TSR program to be popped up.  Because their memory location is coincident with the first 2 bytes of the ASM procedure, their default values are nonzero and therefore prevent the TSR program from popping up while it is being installed.<P>
+The critical part of TSRUnit is contained in the INLINE code of procedure ASM.  Although the Turbo Pascal compiler sees ASM as one INTERRUPT procedure, it actually contains five intercept routines and some data-storage space.  The standard entry and exit codes to ASM are used only as locations for storing data --an additional block of space is also reserved for data storage at the beginning of the routine.  For programming convenience, ASM must be located at offset 0 in TSRUnit.  The untyped constants preceding the procedure then provide the offsets to data locations and INLINE code routines in TSRUnit.<P>
+OurIntr21, the first routine in ASM, is an intercept routine for the DOS function interrupt (interrupt 21h).  The routine checks whether the function is to be treated as nonreentrant by using the function number as the index to the array DosTab --array values of 1 indicate nonreentrant routines.  If it is considered unsafe to pop up the TSR program while the function is being executed, the UnSafe flag is set and then cleared upon returning from a far call to the intercepted routine.  Rather than toggling a single bit to indicate safe and unsafe conditions, a byte value is incremented and decremented; this allows the intercept routine to be reentrant.  If the function is considered safe, the registers are restored and a far jump to the intercepted routine is used to exit from OurIntr21.<P>
+The next two routines, OurIntr25 and OurIntr26, intercept the DOS absolute physical sector read and write interrupts in order to set the UnSafe flag while they are executed.  Notice that the two interrupts leave the old flags on the stack so the intercept routines discard the old flags from the stack after their call to the original interrupts by adding 2 to the stack pointer.  Also, they end with a RETF instruction that leaves the old flags on the stack.<P>
+Although the concept behind the intercept routine for BIOS 09h, OurIntr9, is simple, its implementation is not as simple as that of the previous intercept routines.  In effect, the intercept routine checks for the activation key combination and sets the pop-up bit in the flag Flg when it is detected --provided that it or the in-use bits are not already set.  All repeated hot-key scan codes --obtained by holding the hot key down --are discarded, as well as the initial one that causes the pop-up bit to be set.  The scan codes for repeated presses of the hot key while Flg is set are not discarded.<P>
+The actual implementation of OurIntr9 involves checking for multibyte and buffer-full scan codes, as well as keeping track of the previous scan code in order to discard repeated hot keys.  All the scan codes, except the hot-key code that set the pop-up flag and all repeated hot-key codes, are passed on to the normal interrupt 09h routine.  The multibyte scan codes are detected by checking for the scan codes 0E0h and 0F0h; whenever one of them is detected, the flag Flg9 is set and then cleared after the next byte is obtained.  Because buffer-full scan codes can separate repeated hot-key codes, the buffer-full scan codes 00h and 0FFh do not cause Prev --containing the previous scan code --to be updated.<P>
+OurIntr16, the intercept routine for the software keyboard interrupt, essentially checks Flg to determine whether the TSR program is to be popped up and whether any characters are to be inserted into the keyboard input steam.  It then executes the appropriate block of code.  As with the OurIntr9 routine, its implementation is not simple.  The main services provided by interrupt 16h are to read a character (services 00h and 10h) and to report whether a character is ready (services 01h and 11h).  The read-character services do not return until a character is available.  Because OurIntr9 discards the hot-key scan code, it does not provide the read-character service with a character to return.  If a read-character request is being executed and the hot key is pressed.  OurIntr9 will set the pop-up flag, but OurIntr16 will not be able to respond to it until another key is pressed --one that can be returned by the read-character service.  The solution to this problem is to emulate the read-character service with a loop of report-character-ready requests and allow a read request to be performed only when the report function indicates that a character is ready.  The loop contains separate checks for the pop-up flag and the insert-character flag.  When the pop-up signal is detected inside the loop, the interface routine ToPopUp is called to allow the TSR program to pop up. Because program execution returns to the read-character emulation loop when the TSR program is popped back down, the only two ways out of the loop are for the insert-character flag to be set or for a character to be reported ready.<P>
+Inserting characters into the input stream involves moving them into the AL register, setting the AH register to 0 (for a zero scan code), and exiting from the intercept routine. Naturally, the &quot;characters to insert&quot; counter is decremented and the character pointer incremented unless the service request is report character ready instead of read character. The report service still returns the character and scan code in AX, but the character should not be &quot;removed&quot; from the buffer and the zero flag must be cleared to indicate that a character is ready.  In order to return the modified flags, the old flags must be discarded instead of restored from the stack when the routine is exited.<P>
+In order to pop up the TSR program, OurIntr16 calls ToPopUp, which serves as an interface to PopUpCode.  If the UnSafe flag is set, ToPopUp immediately returns to OurIntr16.  If it is safe to pop up the TSR program, it adjusts the in-use flag and pop-up flags, changes to the TSR program stack, and emulates an interrupt call to PopUpCode.  Upon returning from PopUpCode, it restores the stack pointers and clears the in-use flag.  Simple disable- and enable-interrupt commands before and after the stack-changing commands are required to prevent interrupts from occurring while the stack pointer is being changed.<P>
+PopUpCode was written as an INTERRUPT routine so that the compiler would automatically insert the code to save all the registers and to load the DS register with the TSR program's data segment.  The code generated also restores the registers when PopUpCode is exited.  The first and last tasks performed in PopUpCode are calls to SwapVectors.  The first call to SwapVectors restores all of Turbo Pascal's interrupt vectors --these were saved when the TSR program was installed.  The second call restores the interrupt vectors to the settings they had when PopUpCode was called.<P>
+The code between the beginning and ending SwapVectors statements is divided into three sections.  The first section saves various information about the computer's current state and, if necessary, changes the video mode to the one in use when the TSR program was installed.  If the program is unable to save the screen image, PopUpCode will be exited without popping up the TSR program.  In order to keep the memory requirements down, PopUpCode was written to handle only text and CGA video modes.  The code in the second section performs a far call to the function address obtained when the TSR program was installed --the popping up of the program is completed.  This section also handles the number of characters to insert value, which is returned from the function call.  The final section restores everything that may have been changed.  Although a Copy command was used to obtain some of the video information, all the video information is restored using BIOS interrupt calls.<P>
+For a demonstration program illustrating how to use TSRUnit, check the next issue of DDJ.<P>
+<h3><a name="00e4_0006">References Used<a name="00e4_0006"></h3><P>
+Naturally, I used Borland's Turbo Pascal Reference Guide for information on Turbo Pascal.  For information on DOS and BIOS interrupt routines, I used The New Peter Norton Programmer's Guide to the IBM PC &amp; PS/2, published by Microsoft Press, 1988.  For additional information on keyboard modes and their scan codes, I consulted a copy of Compaq DeskPro 386/20 Technical Reference Guide.<P>
+<h3><a name="00e4_0007">Availability<a name="00e4_0007"></h3><P>
+All source code for articles in this issue is available on a single disk.  To order, send $14.95 (Calif. residents add sales tax) to Dr. Dobb's Journal, 501 Galveston Dr., Redwood City, CA 94063; or call 800-356-2002 (from inside Calif.) or 800-533-4372 (from outside Calif.).  Please specify the issue number and format (MS-DOS, Macintosh, Kaypro).<P>
+
+
+_Creating TSRs With Turbo Pascal, Part I_
+by Ken L. Pottebaum
+
+<a name="00e4_0008"><a name="00e4_0008">
+<a name="00e4_0009"></pre><B>[LISTING ONE]</B><pre><a name="00e4_0009">
+
+UNIT TSRUnit; {Create TSR programs with Turbo Pascal 5.0 &amp; TSRUnit}
+(*
+The author and any distributor of this software assume no responsi-
+bility for damages resulting from this software or its use due to
+errors, omissions, incompatibility with other software or with
+hardware, or misuse; and specifically disclaim any implied warranty
+of fitness for any particular purpose or application.
+*)
+
+{$B-,F-,I+,R-,S+} {Set compiler directives to normal values.}
+
+INTERFACE {=======================================================}
+USES DOS, CRT;
+CONST
+{*** Shift key combination codes.                                 }
+  AltKey = 8;  CtrlKey = 4;  LeftKey = 2;  RightKey = 1;
+
+  TSRVersion : WORD = $0202;       {Low byte.High byte = 2.02     }
+
+TYPE
+  String80  = STRING[80];
+  ChrWords  = RECORD CASE INTEGER OF
+                  1: ( W: WORD );
+                  2: ( C: CHAR; A: BYTE );
+              END;
+  LineWords = ARRAY[1..80] OF ChrWords;
+
+VAR
+  TSRScrPtr : POINTER; {Pointer to saved screen image.            }
+  TSRChrPtr : POINTER; {Pointer to first character to insert.     }
+  TSRMode   : BYTE;    {Video mode --------- before TSR popped up.}
+  TSRWidth  : BYTE;    {Number of screen columns-- &quot; &quot;    &quot;    &quot; .}
+  TSRPage   : BYTE;    {Active video page number-- &quot; &quot;    &quot;    &quot; .}
+  TSRColumn : BYTE;    {Cursor column number ----- &quot; &quot;    &quot;    &quot; .}
+  TSRRow    : BYTE;    {Cursor row number -------- &quot; &quot;    &quot;    &quot; .}
+{
+** Procedure for installing the TSR program.                      }
+PROCEDURE TSRInstall( PgmName,            {Ptr to a char. string. }
+                      PgmPtr   : POINTER; {Ptr to FUNCTION to call}
+                      ShiftComb: BYTE;    {Hot key--shift key comb}
+                      KeyChr   : CHAR );  {Hot Key--character key.}
+{
+  ShiftComb and KeyChr specify the default hot keys for the TSR.
+  ShiftComb may be created by adding or ORing the constants AltKey,
+  CtrlKey, LeftKey, and RightKey together.  KeyChr may be
+  characters 0-9 and A-Z.
+
+  The default hot keys may be overridden when the TSR is installed
+  by specifying optional parameters on the command line.  The
+  parameter format is:
+                       [/A] [/C] [/R] [/L] [/&quot;[K[&quot;]]]
+  The square brackets surround optional items--do not include them.
+  Any characters between parameters are ignored. The order of the
+  characters does not matter; however, the shift keys specified are
+  cummulative and the last character key &quot;K&quot; specified is the used.
+}
+{
+** Functions for checking status of printer LPT1.                 }
+FUNCTION PrinterStatus: BYTE;    {Returns status of printer.      }
+FUNCTION PrinterOkay:   BOOLEAN; {Returns TRUE if printer is okay.}
+
+{
+** Routines for obtaining one row of screen characters.           }
+FUNCTION ScreenLineStr( Row: BYTE ): String80; {Returns char. str.}
+PROCEDURE ScreenLine( Row: BYTE; VAR Line: LineWords; {Returns    }
+                                 VAR Words: BYTE );   {chr &amp; color}
+
+IMPLEMENTATION {==================================================}
+VAR
+  BuffSize, InitCMode : WORD;
+  NpxFlag             : BOOLEAN;
+  Buffer              : ARRAY[0..8191] OF WORD;
+  NpxState            : ARRAY[0..93] OF BYTE;
+  RetrnVal, InitVideo : BYTE;
+
+CONST    {Offsets to items contained in PROCEDURE Asm.            }
+  UnSafe = 0;    Flg   = 1;     Key     = 2;     Shft  = 3;
+  StkOfs = 4;    StkSs = 6;     DosSp   = 8;     DosSs = 10;
+  Prev  = 12;    Flg9  = 13;    InsNumb = 14;
+  Dos21 = $10;         Dos25  = Dos21+4;      Dos26  = Dos25+4;
+  Bios9 = Dos26+4;     Bios16 = Bios9+4;      DosTab = Bios16+4;
+  Our21 = DosTab+99;   Our25  = Our21+51;     Our26  = Our25+24;
+  Our09 = Our26+24;    Our16  = Our09+127+8;  InsChr = Our16+180-8;
+  PopUp = InsChr+4;    Pgm    = PopUp+4;
+
+PROCEDURE Asm; {Inline code--data storage and intercept routines. }
+INTERRUPT;
+BEGIN
+INLINE(
+{***  Storage for interrupt vectors.                              }
+      {Dos21:  }  &gt;0/&gt;0/    {DOS func. intr vector.               }
+      {Dos25:  }  &gt;0/&gt;0/    {DOS abs. disk read intr. vector.     }
+      {Dos26:  }  &gt;0/&gt;0/    {DOS abs. sector write intr.vector.   }
+      {Bios9:  }  &gt;0/&gt;0/    {BIOS key stroke intr. vector.        }
+      {Bios16: }  &gt;0/&gt;0/    {BIOS buffered keybd. input intr.vect.}
+
+      {DosTab: ARRAY[0..98] OF BYTE = {Non-reetrant DOS functions.}
+      0/0/0/0/0/0/0/0/  0/0/0/0/0/1/1/1/  1/1/1/1/1/1/1/1/
+      1/1/1/1/1/1/1/1/  1/1/1/1/1/1/0/1/  1/1/1/1/1/1/1/0/
+      1/0/0/0/0/0/1/1/  1/1/1/1/1/1/1/1/  1/1/1/1/1/1/1/1/
+      0/0/0/0/0/0/1/1/  0/0/0/0/1/0/1/1/  0/1/1/1/1/0/0/0/  0/0/0/
+
+{*** OurIntr21 ******* Intercept routine for DOS Function Intr.***}
+{  0} $9C/               { PUSHF            ;Save flags.          }
+{  1} $FB/               { STI              ;Enable interrupts.   }
+{  2} $80/$FC/$63/       { CMP  AH,63H      ;Assume unsafe if new }
+{  5} $73/&lt;22-7/         { JNB  IncF        ;function--skip table.}
+{  7} $50/               { PUSH AX          ;Save registers.      }
+{  8} $53/               { PUSH BX          ;Load offset to table.}
+{  9} $BB/&gt;DosTab/       { MOV  BX,[DosTab]                       }
+{ 12} $8A/$C4/           { MOV  AL,AH       ;Load table entry     }
+{ 14} $2E/               { CS:              ;index.               }
+{ 15} $D7/               { XLAT             ;Get value from table.}
+{ 16} $3C/$00/           { CMP  AL,0        ;If TRUE then set flag}
+{ 18} $5B/               { POP  BX          ;Restore registers.   }
+{ 19} $58/               { POP  AX          ;                     }
+{ 20} $74/$17/           { JZ   JmpDos21    ;Jump to orig. intr.  }
+{ 22} $2E/          {IncF: CS:              ;                     }
+{ 23} $FE/$06/&gt;UnSafe/   { INC  [UnSafe]    ;Set UnSafe flag.     }
+{ 27} $9D/               { POPF             ;Restore flags.       }
+{ 28} $9C/               { PUSHF            ;                     }
+{ 29} $2E/               { CS:              ;                     }
+{ 30} $FF/$1E/&gt;Dos21/    { CALL FAR [Dos21] ;Call orig. intr.     }
+{ 34} $FB/               { STI              ;Enable interrupts.   }
+{ 35} $9C/               { PUSHF            ;Save flags.          }
+{ 36} $2E/               { CS:              ;                     }
+{ 37} $FE/$0E/&gt;UnSafe/   { DEC  [UnSafe]    ;Clear UnSafe flag.   }
+{ 41} $9D/               { POPF             ;Restore flags.       }
+{ 42} $CA/$02/$00/       { RETF 2           ;Return &amp; remove flag.}
+
+{ 45} $9D/      {JmpDos21: POPF             ;Restore flags.       }
+{ 46} $2E/               { CS:              ;                     }
+{ 47} $FF/$2E/&gt;Dos21/    { JMP FAR [Dos21]  ;Jump to orig. intr.  }
+{ 51}
+{*** OurIntr25 ********** Intercept routine for DOS Abs. Read *** }
+{  0} $9C/               { PUSHF            ;Save flags.          }
+{  1} $2E/               { CS:              ;                     }
+{  2} $FE/$06/&gt;UnSafe/   { INC  [UnSafe]    ;Set UnSafe flag.     }
+{  6} $9D/               { POPF             ;Restore flags.       }
+{  7} $9C/               { PUSHF            ;                     }
+{  8} $2E/               { CS:              ;                     }
+{  9} $FF/$1E/&gt;Dos25/    { CALL FAR [Dos25] ;Call DOS abs. read.  }
+{ 13} $83/$C4/$02/       { ADD  SP,2        ;Clean up stack.      }
+{ 16} $9C/               { PUSHF            ;Save flags.          }
+{ 17} $2E/               { CS:              ;                     }
+{ 18} $FE/$0E/&gt;UnSafe/   { DEC  [UnSafe]    ;Clear UnSafe flag.   }
+{ 22} $9D/               { POPF             ;Restore flags.  Leave}
+{ 23} $CB/               { RETF             ;old flags on the stk.}
+{ 24}
+{*** OurIntr26 ********** Intercept routine for DOS Abs. Write ***}
+{  0} $9C/               { PUSHF            ;Save flags.          }
+{  1} $2E/               { CS:              ;                     }
+{  2} $FE/$06/&gt;UnSafe/   { INC  [UnSafe]    ;Set UnSafe flag.     }
+{  6} $9D/               { POPF             ;Restore flags.       }
+{  7} $9C/               { PUSHF            ;                     }
+{  8} $2E/               { CS:              ;                     }
+{  9} $FF/$1E/&gt;Dos26/    { CALL FAR [Dos26] ;Call DOS abs. write. }
+{ 13} $83/$C4/$02/       { ADD  SP,2        ;Clean up stack.      }
+{ 16} $9C/               { PUSHF            ;Save flags.          }
+{ 17} $2E/               { CS:              ;                     }
+{ 18} $FE/$0E/&gt;UnSafe/   { DEC  [UnSafe]    ;Clear UnSafe flag.   }
+{ 22} $9D/               { POPF             ;Restore flags.  Leave}
+{ 23} $CB/               { RETF             ;old flags on the stk.}
+{ 24}
+
+{*** OurIntr9 ********** Intercept for BIOS Hardware Keyboard Intr}
+{  0} $9C/               { PUSHF            ;Entry point.         }
+{  1} $FB/               { STI              ;Enable interrupts.   }
+{  2} $1E/               { PUSH DS          ;                     }
+{  3} $0E/               { PUSH CS          ;DS := CS;            }
+{  4} $1F/               { POP  DS          ;                     }
+{  5} $50/               { PUSH AX          ;Preserve AX on stack.}
+{  6} $31/$C0/           { XOR  AX,AX       ;Set AH to 0.         }
+{  8} $E4/$60/           { IN   AL,60h      ;Read byte from keybd }
+{ 10} $3C/$E0/           { CMP  AL,0E0h     ;If multi-byte codes, }
+{ 12} $74/&lt;75-14/        { JE   Sfx         ;then jump and set    }
+{ 14} $3C/$F0/           { CMP  AL,0F0h     ;multi-byte flag, Flg9}
+{ 16} $74/&lt;75-18/        { JE   Sfx         ;                     }
+{ 18} $80/$3E/&gt;Flg9/$00/ { CMP  [Flg9],0    ;Exit if part of      }
+{ 23} $75/&lt;77-25/        { JNZ  Cfx         ;multi-byte code.     }
+{ 25} $3A/$06/&gt;Key/      { CMP  AL,[Key]    ;Exit if key pressed  }
+{ 29} $75/&lt;88-31/        { JNE  PreExit     ;is not hot key.      }
+
+{ 31} $50/               { PUSH AX          ;Hot key was pressed, }
+{ 32} $06/               { PUSH ES          ;check shift key      }
+{ 33} $B8/$40/$00/       { MOV  AX,0040h    ;status byte.  First  }
+{ 36} $8E/$C0/           { MOV  ES,AX       ;load BIOS segment.   }
+{ 38} $26/               { ES:              ;                     }
+{ 39} $A0/&gt;$0017/        { MOV  AL,[0017h]  ;AL:= Shift key status}
+{ 42} $07/               { POP  ES          ;Restore ES register. }
+{ 43} $24/$0F/           { AND  AL,0Fh      ;Clear unwanted bits. }
+{ 45} $3A/$06/&gt;Shft/     { CMP  AL,[Shft]   ;Exit if not hot key  }
+{ 49} $58/               { POP  AX          ;shift key combination}
+{ 50} $75/&lt;88-52/        { JNE  PreExit     ;(Restore AX first).  }
+
+                         {                  ;Hot Keys encountered.}
+{ 52} $3A/$06/&gt;Prev/     { CMP  AL,[Prev]   ;Discard repeated hot }
+{ 56} $74/&lt;107-58/       { JE   Discard     ;key codes.           }
+{ 58} $A2/&gt;Prev/         { MOV  [Prev],AL   ;Update Prev.         }
+{ 61} $F6/$06/&gt;Flg/3/    { TEST [Flg],3     ;If Flg set, keep key }
+{ 66} $75/&lt;99-68/        { JNZ  JmpBios9    ;&amp; exit to orig. BIOS }
+{ 68} $80/$0E/&gt;Flg/1/    { OR   [Flg],1     ;9.  Else set flag and}
+{ 73} $EB/&lt;107-75/       { JMP SHORT Discard;discard key stroke.  }
+
+{ 75} $B4/$01/       {Sfx: MOV  AH,1        ;Load AH with set flag}
+{ 77} $88/$26/&gt;Flg9/ {Cfx: MOV  [Flg9],AH   ;Save multi-byte flag.}
+{ 81} $C6/$06/&gt;Prev/$FF/ { MOV  [Prev],0FFh ;Change prev key byte.}
+{ 86} $EB/&lt;99-88/        { JMP SHORT JmpBios9                     }
+
+{ 88} $3C/$FF/   {PreExit: CMP  AL,0FFh     ;Update previous key  }
+{ 90} $74/&lt;99-92/        { JE   JmpBios9    ;unless key is buffer-}
+{ 92} $3C/$00/           { CMP  AL,0        ;full code--a 00h     }
+{ 94} $74/&lt;99-96/        { JZ   JmpBios9    ;0FFh                 }
+{ 96} $A2/&gt;Prev/         { MOV [Prev],AL    ;Update previous key. }
+
+{ 99} $58/      {JmpBios9: POP  AX          ;Restore registers and}
+{100} $1F/               { POP  DS          ;flags.               }
+{101} $9D/               { POPF             ;                     }
+{102} $2E/               { CS:              ;                     }
+{103} $FF/$2E/&gt;Bios9/    { JMP  [Bios9]     ;Exit to orig. intr 9.}
+
+{107} $E4/$61/   {Discard: IN   AL,61h      ;Clear key from buffer}
+{109} $8A/$E0/           { MOV  AH,AL       ;by resetting keyboard}
+{111} $0C/$80/           { OR   AL,80h      ;port and sending EOI }
+{113} $E6/$61/           { OUT  61h,AL      ;to intr. handler     }
+{115} $86/$E0/           { XCHG AH,AL       ;telling it that the  }
+{117} $E6/$61/           { OUT  61h,AL      ;key has been         }
+{119} $B0/$20/           { MOV  AL,20h      ;processed.           }
+{121} $E6/$20/           { OUT  20h,AL      ;                     }
+{123} $58/               { POP  AX          ;Restore registers and}
+{124} $1F/               { POP  DS          ;flags.               }
+{125} $9D/               { POPF             ;                     }
+{126} $CF/               { IRET             ;Return from interrupt}
+{127}
+
+{*** OurIntr16 ***** Intercept routine for Buffered Keyboard Input}
+{  0} $58/     {JmpBios16: POP  AX          ;Restore AX, DS, and  }
+{  1} $1F/               { POP  DS          ;FLAGS registers then }
+{  2} $9D/               { POPF             ;exit to orig. BIOS   }
+{  3} $2E/               { CS:              ;intr. 16h routine.   }
+{  4} $FF/$2E/&gt;Bios16/   { JMP  [Bios16]    ;                     }
+
+{  8} $9C/     {OurIntr16: PUSHF            ;Preserve FLAGS.      }
+{  9} $FB/               { STI              ;Enable interrupts.   }
+{ 10} $1E/               { PUSH DS          ;Preserve DS and AX   }
+{ 11} $50/               { PUSH AX          ;registers.           }
+{ 12} $0E/               { PUSH CS          ;DS := CS;            }
+{ 13} $1F/               { POP  DS          ;                     }
+{ 14} $F6/$C4/$EF/       { TEST AH,EFh      ;Jmp if not read char.}
+{ 17} $75/&lt;48-19/        { JNZ  C3          ;request.             }
+
+                         {*** Intercept loop for Read Key service.}
+{ 19} $F6/$06/&gt;Flg/1/ {C1: TEST [Flg],1     ;If pop up Flg bit is }
+{ 24} $74/&lt;29-26/        { JZ   C2          ;set then call INLINE }
+{ 26} $E8/&gt;122-29/       { CALL ToPopUp     ;pop up routine.      }
+{ 29} $F6/$06/&gt;Flg/16/{C2: TEST [Flg],10h   ;Jmp if insert flg set}
+{ 34} $75/&lt;48-36/        { JNZ  C3          ;                     }
+{ 36} $FE/$C4/           { INC  AH          ;Use orig. BIOS       }
+{ 38} $9C/               { PUSHF            ;service to check for }
+{ 39} $FA/               { CLI              ;character ready.     }
+{ 40} $FF/$1E/&gt;Bios16/   { CALL FAR [Bios16];Disable interrupts.  }
+{ 44} $58/               { POP  AX          ;Restore AX and save  }
+{ 45} $50/               { PUSH AX          ;it again.            }
+{ 46} $74/&lt;19-48/        { JZ   C1          ;Loop until chr. ready}
+
+{ 48} $F6/$06/&gt;Flg/17/{C3: TEST [Flg],11h   ;Exit if neither bit  }
+{ 53} $74/&lt;-55/          { JZ   JmpBios16   ;of Flg is set.       }
+{ 55} $F6/$06/&gt;Flg/$01/  { TEST [Flg],1     ;If pop up Flg bit is }
+{ 60} $74/&lt;65-62/        { JZ   C4          ;set then call INLINE }
+{ 62} $E8/&gt;122-65/       { CALL ToPopUp     ;pop up routine.      }
+{ 65} $F6/$06/&gt;Flg/$10/{C4:TEST [Flg],10h   ;Exit unless have     }
+{ 70} $74/&lt;-72/          { JZ   JmpBios16   ;characters to insert.}
+{ 72} $F6/$C4/$EE/       { TEST AH,0EEh     ;If request is not a  }
+{ 75} $75/&lt;-77/          { JNZ  JmpBios16   ;chr. request, exit.  }
+
+                         {*** Insert a character.                 }
+{ 77} $58/               { POP  AX          ;AX := BIOS service no}
+{ 78} $53/               { PUSH BX          ;Save BX and ES.      }
+{ 79} $06/               { PUSH ES          ;                     }
+{ 80} $C4/$1E/&gt;InsChr/   { LES  BX,[InsChr] ;PTR(ES,BX) := InsChr;}
+{ 84} $26/               { ES:              ;AL := InsChr^;       }
+{ 85} $8A/$07/           { MOV  AL,[BX]     ;                     }
+{ 87} $07/               { POP  ES          ;Restore ES and BX.   }
+{ 88} $5B/               { POP  BX          ;                     }
+{ 89} $F6/$C4/$01/       { TEST AH,01h      ;IF AH IN [$01,$11]   }
+{ 92} $B4/$00/           { MOV  AH,00h      ;   THEN ReportOnly;  }
+{ 94} $75/&lt;114-96/       { JNZ  ReportOnly  ;Set Scan code to 0.  }
+{ 96} $FE/$06/&gt;InsChr/   { INC  [InsChr]    ;Inc( InsChr );       }
+{100} $FF/$0E/&gt;InsNumb/  { DEC  [InsNumb]   ;Dec( InsNumb );      }
+{104} $75/&lt;111-106/      { JNZ  SkipReset   ;IF InsNumb = 0 THEN  }
+{106} $80/$26/&gt;Flg/$EF/  { AND  [Flg],0EFh  ; Clear insert chr flg}
+{111} $1F/     {SkipReset: POP  DS          ;Restore BX, DS, and  }
+{112} $9D/               { POPF             ;FLAGS, then return   }
+{113} $CF/               { IRET             ;from interrupt.      }
+
+{114} $1F/    {ReportOnly: POP  DS          ;Report char. ready.  }
+{115} $9D/               { POPF             ;Restore DS and FLAGS.}
+{116} $50/               { PUSH AX          ;Clear zero flag bit  }
+{117} $40/               { INC  AX          ;to indicate a        }
+{118} $58/               { POP  AX          ;character ready.     }
+{119} $CA/&gt;0002/         { RETF 2           ;Exit &amp; discard FLAGS }
+
+                         {*** Interface to PopUpCode Routine.     }
+{122} $50/       {ToPopUp: PUSH AX          ;Save AX.             }
+{123} $FA/               { CLI              ;Disable interrupts.  }
+{124} $F6/$06/&gt;UnSafe/$FF/{TEST [UnSafe],0FFh ;IF UnSafe &lt;&gt; 0     }
+{129} $75/&lt;177-131/      { JNZ  PP2           ;      THEN Return. }
+{131} $A0/&gt;Flg/          { MOV  AL,[Flg]    ;Set in-use bit; clear}
+{134} $24/$FE/           { AND  AL,0FEh     ;pop up bit of Flg.   }
+{136} $0C/$02/           { OR   AL,2        ;Flg := (Flg AND $FE) }
+{138} $A2/&gt;Flg/          { MOV  [Flg],AL    ;        OR 2;        }
+                         {                  ;**Switch to our stack}
+{141} $A1/&gt;StkOfs/       { MOV  AX,[StkOfs] ;Load top of our stack}
+{144} $87/$C4/           { XCHG AX,SP       ;Exchange it with     }
+{146} $A3/&gt;DosSp/        { MOV  [DosSp],AX  ;stk.ptr, save old SP.}
+{149} $8C/$16/&gt;DosSs/    { MOV  [DosSs],SS  ;Save old SS.         }
+{153} $8E/$16/&gt;StkSs/    { MOV  SS,[StkSs]  ;Replace SS with our  }
+{157} $FB/               { STI              ;SS. Enable interrupts}
+
+{158} $9C/               { PUSHF            ;Interrupt call to pop}
+{159} $FF/$1E/&gt;PopUp/    { CALL FAR [PopUp] ;up TSR routine.      }
+
+{163} $FA/               { CLI              ;Disable interrupts.  }
+{164} $8B/$26/&gt;DosSp/    { MOV  SP,[DosSp]  ;Restore stack ptr    }
+{168} $8E/$16/&gt;DosSs/    { MOV  SS,[DosSs]  ;SS:SP.  Clear in-use }
+{172} $80/$26/&gt;Flg/$FD/  { AND  [Flg],0FDh  ;bit of Flg.          }
+
+{177} $FB/           {PP2: STI              ;Enable interrupts.   }
+{178} $58/               { POP  AX          ;Restore AX.          }
+{179} $C3 );             { RET              ;Return.              }
+{180}
+END; {Asm.} {END corresponds to 12 bytes of code--used for storage}
+
+PROCEDURE PopUpCode; {Interface between the BIOS intercept        }
+INTERRUPT;           {routines and your TSR function.             }
+CONST  BSeg = $0040;   VBiosOfs = $49;
+TYPE
+  VideoRecs = RECORD
+                VideoMode                      : BYTE;
+                NumbCol, ScreenSize, MemoryOfs : WORD;
+                CursorArea      : ARRAY[0..7] OF WORD;
+                CursorMode                     : WORD;
+                CurrentPage                    : BYTE;
+                VideoBoardAddr                 : WORD;
+                CurrentMode, CurrentColor      : BYTE;
+              END;
+VAR
+  Regs         : Registers;
+  VideoRec     : VideoRecs;
+  KeyLock      : BYTE;
+  ScrnSeg      : WORD;
+BEGIN
+  SwapVectors;                            {Set T.P. intr. vectors.}
+  Move( Ptr(BSeg,VBiosOfs)^, VideoRec,    {Get Video BIOS info.   }
+        SizeOf(VideoRec) );
+  WITH VideoRec, Regs DO BEGIN
+    IF (VideoMode &gt; 7) OR                  {Abort pop up if unable}
+       (ScreenSize &gt; BuffSize) THEN BEGIN  {to save screen image. }
+      SwapVectors;                         {Restore intr. vectors.}
+      Exit;
+    END;
+    KeyLock := Mem[BSeg:$0017];            {Save lock key states. }
+    IF VideoMode = 7 THEN ScrnSeg := $B000 {Save screen--supports }
+    ELSE ScrnSeg := $B800;                 {text, MGA &amp; CGA modes.}
+    Move( PTR( ScrnSeg, MemoryOfs )^, Buffer, ScreenSize );
+    AX := InitVideo;                       {If in graphics mode,  }
+    IF (VideoMode &gt;=4)                     {switch to text mode.  }
+       AND (VideoMode &lt;= 6) THEN Intr( $10, Regs );
+    AX := $0500;                           {Select display page 0.}
+    Intr( $10, Regs );
+    CX := InitCMode;                       {Set cursor size.      }
+    AH := 1;
+    Intr( $10, Regs );
+
+    TSRMode   := VideoMode;              {Fill global variables   }
+    TSRWidth  := NumbCol;                {with current information}
+    TSRPage   := CurrentPage;
+    TSRColumn := Succ( Lo( CursorArea[CurrentPage] ) );
+    TSRRow    := Succ( Hi( CursorArea[CurrentPage] ) );
+
+    IF NpxFlag THEN                      {Save co-processor state.}
+      INLINE( $98/ $DD/$36/&gt;NpxState );  {WAIT FSAVE [NpxState]   }
+{
+*** Call user's program and save return code--no. char. to insert.
+}
+    INLINE( $2E/$FF/$1E/&gt;Pgm/   { CALL FAR CS:[Pgm]   }
+            $2E/$A3/&gt;InsNumb ); { MOV CS:[InsNumb],AX }
+
+    IF Mem[CSeg:InsNumb] &gt; 0 THEN BEGIN  {Have char. to insert.   }
+      MemL[CSeg:InsChr] := LONGINT( TSRChrPtr );
+      Mem[CSeg:Flg]     := Mem[CSeg:Flg] OR $10;
+    END;
+{
+*** Pop TSR back down--Restore computer to previous state.
+}
+    IF NpxFlag THEN                      {Restore co-prcssr state.}
+      INLINE( $98/ $DD/$36/&gt;NpxState );  {WAIT FSAVE [NpxState]   }
+
+    Mem[BSeg:$17] :=                     {Restore key lock status.}
+      (Mem[BSeg:$17] AND $0F) OR (KeyLock AND $F0);
+
+    IF Mem[BSeg:VBiosOfs] &lt;&gt; VideoMode THEN BEGIN
+      AX := VideoMode;                   {Restore video mode.     }
+      Intr( $10, Regs );
+    END;
+    AH := 1;  CX := CursorMode;          {Restore cursor size.    }
+    Intr( $10, Regs );
+    AH := 5;  AL := CurrentPage;         {Restore active page.    }
+    Intr( $10, Regs );
+    AH := 2;  BH := CurrentPage;         {Restore cursor positon. }
+    DX := CursorArea[CurrentPage];
+    Intr( $10, Regs );                   {Restore screen image.   }
+    Move( Buffer, PTR( ScrnSeg, MemoryOfs )^, ScreenSize );
+
+    SwapVectors;                        {Restore non-T.P. vectors.}
+  END;
+END;  {PopUp.}
+{
+***** Printer Functions:
+}
+FUNCTION PrinterStatus: BYTE;             {Returns status of LPT1.}
+{ Definition of status byte bits (1 &amp; 2 are not used), if set then:
+ Bit: -- 7 ---  ---- 6 ----  -- 5 ---  -- 4 ---  -- 3 --  --- 0 ---
+      Not busy  Acknowledge  No paper  Selected  I/O Err. Timed-out
+}
+VAR Regs  : Registers;
+BEGIN
+  WITH Regs DO BEGIN
+    AH := 2;  DX := 0;    {Load BIOS function and printer number. }
+    Intr( $17, Regs );    {Call BIOS printer services.            }
+    PrinterStatus := AH;  {Return with printer status byte.       }
+  END;
+END; {PrinterStatus.}
+
+FUNCTION PrinterOkay: BOOLEAN;  {Returns TRUE if printer is okay. }
+VAR  S : BYTE;
+BEGIN
+  S := PrinterStatus;
+  IF ((S AND $10) &lt;&gt; 0) AND ((S AND $29) = 0) THEN
+    PrinterOkay := TRUE
+  ELSE PrinterOkay := FALSE;
+END;  {PrinterOkay.}
+{
+***** Procedures to obtain contents of saved screen image.
+}
+PROCEDURE ScreenLine( Row: BYTE; VAR Line: LineWords;
+                                 VAR Words: BYTE );
+BEGIN
+  Words := 40;                        {Determine screen line size.}
+  IF TSRMode &gt; 1 THEN  Words := Words*2;          {Get line's     }
+  Move( Buffer[Pred(Row)*Words], Line, Words*2 ); {characters and }
+END;  {ScreenLine.}                               {colors.        }
+
+FUNCTION ScreenLineStr( Row: BYTE ): String80; {Returns just chars}
+VAR
+  Words, i   : BYTE;
+  LineWord   : LineWords;
+  Line       : String80;
+BEGIN
+  ScreenLine( Row, LineWord, Words );   {Get chars &amp; attributes.  }
+  Line := '';                           {Move characters to string}
+  FOR i := 1 TO Words DO Insert( LineWord[i].C, Line, i );
+  ScreenLineStr := Line;
+END;  {ScreenString.}
+{
+***** TSR Installation procedure.
+}
+PROCEDURE TSRInstall( PgmName, PgmPtr: POINTER;
+                      ShiftComb: BYTE; KeyChr: CHAR );
+CONST
+  ScanChr = '+1234567890++++QWERTYUIOP++++ASDFGHJKL+++++ZXCVBNM';
+  CombChr = 'RLCA&quot;';
+VAR
+  PgmNamePtr, PlistPtr: ^STRING;
+  i, j, k             : WORD;
+  Regs                : Registers;
+  Comb, ScanCode      : BYTE;
+BEGIN
+  IF Ofs( Asm ) &lt;&gt; 0 THEN EXIT;           {Offset of Asm must be 0}
+  MemW[CSeg:StkSs]  := SSeg;              {Save pointer to top of }
+  MemW[CSeg:StkOfs] := Sptr + 308;        {TSR's stack.           }
+  MemL[CSeg:PopUp]  := LONGINT(@PopUpCode); {Save PopUpCode addr. }
+  MemL[CSeg:Pgm]    := LONGINT(PgmPtr);     {Save PgmPtr.         }
+  PgmNamePtr        := PgmName;        {Convert ptr to string ptr.}
+
+  Writeln('Installing Stay-Resident program: ',PgmNamePtr^);
+{
+*****  Save intercepted interrupt vectors: $09, $16, $21, $25, $26.
+}
+  GetIntVec( $09, POINTER( MemL[CSeg:Bios9] ) );
+  GetIntVec( $16, POINTER( MemL[CSeg:Bios16] ) );
+  GetIntVec( $21, POINTER( MemL[CSeg:Dos21] ) );
+  GetIntVec( $25, POINTER( MemL[CSeg:Dos25] ) );
+  GetIntVec( $26, POINTER( MemL[CSeg:Dos26] ) );
+{
+***** Get equipment list and video mode.
+}
+  WITH Regs DO BEGIN
+    Intr( $11, Regs );                  {Check equipment list for }
+    NpxFlag := (AL AND 2) = 2;          {math co-processor.       }
+    AH      := 15;                      {Get current video mode   }
+    Intr( $10, Regs );                  {and save it for when TSR }
+    InitVideo := AL;                    {is activated.            }
+    AH := 3; BH := 0;                   {Get current cursor size  }
+    Intr( $10, Regs );                  {and save it for when TSR }
+    InitCMode := CX;                    {is activated.            }
+  END;  {WITH Regs}
+{
+***** Get info. on buffer for saving screen image.
+}
+  BuffSize := SizeOf( Buffer );
+  TSRScrPtr := @Buffer;
+{
+*** Determine activation key combination.
+}
+  Comb := 0;  i := 1;                       {Create ptr to        }
+  PlistPtr := Ptr( PrefixSeg, $80 );        {parameter list.      }
+  WHILE i &lt; Length( PlistPtr^ ) DO BEGIN    {Check for parameters.}
+    IF PlistPtr^[i] = '/' THEN BEGIN        {Process parameter.   }
+      Inc( i );
+      j := Pos( UpCase( PlistPtr^[i] ), CombChr );
+      IF (j &gt; 0) AND (j &lt; 5) THEN Comb := Comb OR (1 SHL Pred(j))
+      ELSE IF j &lt;&gt; 0 THEN BEGIN             {New activation char. }
+        Inc( i );   k := Succ( i );
+        IF i &gt; Length(PlistPtr^) THEN KeyChr := #0
+        ELSE BEGIN
+          IF ((k &lt;= Length(PlistPtr^)) AND (PlistPtr^[k] = '&quot;'))
+             OR (PlistPtr^[i] &lt;&gt; '&quot;') THEN KeyChr := PlistPtr^[i]
+          ELSE KeyChr := #0;
+        END;  {ELSE BEGIN}
+      END;  {ELSE IF ... BEGIN}
+    END; {IF PlistPtr^[i] = '/'}
+    Inc( i );
+  END;  {WHILE ...}
+  IF Comb = 0 THEN Comb := ShiftComb;  {Use default combination.  }
+  IF Comb = 0 THEN Comb := AltKey;     {No default, use [Alt] key.}
+  ScanCode := Pos( UpCase( KeyChr ), ScanChr );  {Convert char. to}
+  IF ScanCode &lt; 2 THEN BEGIN                     {scan code.      }
+    ScanCode := 2;  KeyChr := '1';
+  END;
+  Mem[CSeg:Shft] := Comb;             {Store shift key combination}
+  Mem[CSeg:Key]  := ScanCode;         {and scan code.             }
+{
+*** Output an installation message:  Memory used &amp; activation code.
+}
+  Writeln( 'Memory used is approximately ',
+   ( ($1000 + Seg(FreePtr^) - PrefixSeg)/64.0):7:1,' K (K=1024).');
+  Writeln(
+'Activate program by pressing the following keys simultaneously:');
+  IF (Comb AND 1) &lt;&gt; 0 THEN Write(' [Right Shift]');
+  IF (Comb AND 2) &lt;&gt; 0 THEN Write(' [Left Shift]');
+  IF (Comb AND 4) &lt;&gt; 0 THEN Write(' [Ctrl]');
+  IF (Comb AND 8) &lt;&gt; 0 THEN Write(' [Alt]');
+  Writeln(' and &quot;', KeyChr, '&quot;.');
+{
+*** Intercept orig. interrupt vectors; Then exit and stay-resident.
+}
+  SetIntVec( $21, Ptr( CSeg, Our21 ) );
+  SetIntVec( $25, Ptr( CSeg, Our25 ) );
+  SetIntVec( $26, Ptr( CSeg, Our26 ) );
+  SetIntVec( $16, Ptr( CSeg, Our16 ) );
+  SetIntVec( $09, Ptr( CSeg, Our09 ) );
+  SwapVectors;                           {Save turbo intr.vectors.}
+  MemW[CSeg:UnSafe] := 0;                {Allow TSR to pop up.    }
+  Keep( 0 );                             {Exit and stay-resident. }
+END;  {TSRInstall.}
+END.  {TSRUnit.}
+
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1989, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

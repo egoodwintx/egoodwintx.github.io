@@ -1,0 +1,427 @@
+<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+
+<html>
+<head>
+  <title>Saving State with CGI.pm - The Perl Journal, Summer 1996</title>
+  <meta name="generator" content=
+  "HTML Tidy for Linux/x86 (vers 12 April 2005), see www.w3.org">
+  <meta name="vscategory" content="Perl">
+  <meta name="vsisbn" content="">
+  <meta name="vstitle" content="Saving State with CGI.pm">
+  <meta name="vsauthor" content="Lincoln Stein">
+  <meta name="searchdescription" content=
+  "If the world has state, why doesn't the World Wide Web? It would seem reasonable for the Web to have some memory. After all, people do tend to hang around a site for awhile, exploring here and there. It would seem only polite for a Web site to remember the user who's been rattling around inside it for the past hour. But the HTTP protocol is stateless. Each request for a document is a new transaction; after the document is delivered the Web server wipes its hands of the whole affair and starts fresh.">
+  <meta name="vsimprint" content="The Perl Journal">
+  <meta name="vspublisher" content="Earthweb">
+  <meta name="vspubdate" content="Summer 1996">
+  <!-- always update the article title and issue -->
+
+  <!-- end head -->
+</head>
+
+<body>
+  <font face="verdana" size="1">Issue 2, Summer 1996</font>
+
+  <h2 align="center">Saving State with CGI.pm</h2>
+
+  <h4><i>Lincoln Stein</i></h4>
+  <!-- packages described, if necessary -->
+  We live in a stateful world. Just to be certain of that fact, I
+  collected a few examples this morning:
+
+  <ol>
+    <li>Today I'm in a certain frantic state of mind because this
+    column is due: I'll be this way for at least the rest of the
+    afternoon, or until the column is done, whichever comes first.
+    This is an example of a short-term state.</li>
+
+    <li>The federal budget is in a dreadful state of affairs and
+    there's no hope of it being cleared up until the last state has
+    voted in the general election. This is an example of a
+    long-term state.</li>
+
+    <li>The weather is truly lovely today with balmy spring weather
+    and bright sunshine. Because this New England, however, it'll
+    stay nice only until sometime tonight, when the weather report
+    predicts a snowstorm followed by an iron frost. This is typical
+    of an unstable state.</li>
+  </ol>
+
+  <p>If the world has state, why doesn't the World Wide Web? It
+  would seem reasonable for the Web to have some memory. After all,
+  people do tend to hang around a site for awhile, exploring here
+  and there. It would seem only polite for a Web site to remember
+  the user who's been rattling around inside it for the past hour.
+  But the HTTP protocol is stateless. Each request for a document
+  is a new transaction; after the document is delivered the Web
+  server wipes its hands of the whole affair and starts fresh.</p>
+
+  <p>The HTTP protocol was designed that way because a stateless
+  model is appropriate for the bulk of a Web server's job: to
+  listen for requests for HTML documents and deliver them without
+  fuss, frills or idle chitchat. The fact that the implementors of
+  the protocol saw fit to build this stateless protocol on top of
+  the connection-oriented TCP network communications protocol,
+  thereby ensuring that the Web is hobbled by the performance
+  limitations of TCP without reaping any of its benefits, is a
+  small irony that we won't discuss further.</p>
+
+  <p>CGI scripts, however, often fit the stateless model poorly.
+  Many CGI scripts are search engines of some sort. People pose a
+  question, the CGI script does a search, and returns an answer.
+  The user looks at the results, refines or modifies his question,
+  and asks again. Unfortunately, by the time the user has refined
+  his query and wants to build on previous results, the original
+  CGI script has terminated, and the search has to start all over
+  again. Or consider the important class of CGI scripts called
+  "shopping carts." A user browses around an online catalog for a
+  while. Whenever something takes his fancy, he presses a button
+  that adds it to his shopping cart. When he's ready, he reviews
+  the contents of the cart and (the vendor hopes) presses a button
+  that performs an online order.</p>
+
+  <p>In the absence of any stateful behavior in HTTP itself, CGI
+  script writers have to keep track of state themselves. There are
+  several techniques for doing this: most of them rely on tricking
+  or cajoling the browser into keeping track of the state for
+  you.</p>
+
+  <ul>
+    <li>Maintain state variables in the CGI parameters. The
+    simplest trick is to store all the data you want to keep track
+    of in the query string passed from the browser to the CGI
+    script. You can store the data directly in the URL used in a
+    GET request, or as settings in a fill-out form. As the previous
+    column showed, this is relatively easy to do with CGI.pm,
+    because it was designed to create "sticky" state-maintaining
+    forms. This paradigm breaks down, however, when there's a lot
+    of data to keep track of or when it's important to maintain a
+    chronologically accurate record of the user's actions even when
+    the user hits the "back" and "forward" buttons.</li>
+
+    <li>Maintain the state on the server side with a
+    specially-spawned HTTP server. You can defeat the limitation on
+    HTTP by creating your own state-aware Web server. When a remote
+    user starts a session, you spawn a new HTTP server that's
+    dedicated to maintaining the state of that session, and you
+    redirect the user to the new server's URL. This is how the
+    state-maintaining miniserver module works and is the topic of
+    the next issue's column.</li>
+
+    <li>Save the session's state to a disk file and use a session
+    key to keep track of the files. This technique works even when
+    there's large amounts of state data, and requires minimal data
+    to be stored on the browser side of the connection. This is the
+    technique that I'll focus on in today's column.</li>
+  </ul>
+
+  <p>The listing on the next page is a sample state-maintaining CGI
+  script called remember.cgi. When invoked, it displays a form
+  containing a single text input field and two buttons labeled
+  "ADD" and "CLEAR" (see the figure for a screen shot). The user
+  may type a short phrase into the text field and press ADD. This
+  adds the phrase to the bottom of a growing list of phrases
+  displayed at the bottom of the page. When the user presses CLEAR,
+  the list is emptied. You can try it out for yourself at</p>
+
+  <p>
+  http://www.genome.wi.mit.edu/WWW/examples/ch9/remember.cgi.</p>
+  <pre>
+01 #!/usr/bin/perl
+02 # Collect the user's responses in a file and 
+   # echo them back to him when requested.
+03
+   # must be writable by 'nobody'
+04 $STATE_DIR = "./STATES";
+05
+06 use CGI;
+07
+08 $q = new CGI;
+09 $session_key = $q-&gt;path_info();
+   # get rid of the initial slash
+10 $session_key =~ s|^/||; 
+11
+   # If no valid session key has been provided,
+   # then we generate one, tack it on to the end of our URL
+   # as additional path information, and redirect the user
+   # to this new location.
+12 unless (&amp;valid($session_key)) {                        
+13     $session_key = &amp;generate_session_key($q);        
+14     print $q-&gt;redirect($q-&gt;url() . "/$session_key");  
+15     exit 0;                                          
+16 }
+17 
+18 $old_state = &amp;fetch_old_state($session_key);
+19
+   # Add the new item(s) to the old list of items
+20 if ($q-&gt;param('action') eq 'ADD') {                   
+21     @new_items = $q-&gt;param('item');
+22     @old_items = $old_state-&gt;param('item');
+23     $old_state-&gt;param('item',@old_items,@new_items);
+24 } elsif ($q-&gt;param('action') eq 'CLEAR') {
+25     $old_state-&gt;delete('item');
+26 }
+27 
+   # Save the new list to disk
+28 &amp;save_state($old_state,$session_key);                
+29 
+   # Now, at last, generate something for the user to look at.
+30 print $q-&gt;header;                                     
+31 print $q-&gt;start_html("The growing list");
+32 print &lt;&lt;END;
+33 &lt;h1&gt;The Growing List&lt;/h1&gt;
+34 Type a short phrase into the text field below. 
+   When you press &lt;i&gt;ADD&lt;/i&gt;, 
+   it will be added to a history of the phrases 
+35 that you've typed. The list is maintained on disk at 
+   the server end, so it won't get out of order if you  
+36 press the "back" button. Press &lt;i&gt;CLEAR&lt;/i&gt; to 
+   clear the list and start fresh.
+37 END
+38
+39 print $q-&gt;start_form;
+40 print $q-&gt;textfield(-name=&gt;'item',-default=&gt;'',
+           -size=&gt;50,-override=&gt;1),"&lt;p&gt;";
+41 print $q-&gt;submit(-name=&gt;'action',-value=&gt;'CLEAR');
+42 print $q-&gt;submit(-name=&gt;'action',-value=&gt;'ADD');
+43 print $q-&gt;end_form;
+44 print "&lt;hr&gt;&lt;h2&gt;Current list&lt;/h2&gt;";
+45 
+46 if ($old_state-&gt;param('item')) {
+47     print "&lt;ol&gt;";
+48     foreach $item ($old_state-&gt;param('item')) {
+49         print "&lt;li&gt;",$q-&gt;escapeHTML($item);
+50     }
+51     print "&lt;/ol&gt;";
+52 } else { print "&lt;i&gt;Empty&lt;/i&gt;" }
+53
+54 print &lt;&lt;END;
+55 &lt;hr&gt;&lt;address&gt;Lincoln D. Stein, 
+   lstein\@genome.wi.mit.edu&lt;br&gt;
+56 &lt;a href="/"&gt;Whitehead Institute/MIT Center 
+   for Genome Research&lt;/a&gt;&lt;/address&gt;
+57 END
+58 print $q-&gt;end_html;    
+59 
+   # Silly technique: we generate a session key from the
+   # remote IP address plus our PID. More sophisticated
+   # scripts should use a better technique.
+60 sub generate_session_key {                       
+61     my $q = shift;                                   
+62     my($remote) = $q-&gt;remote_addr;              
+63     return "$remote.$$";
+64 }
+65 
+   # Make sure the session ID passed to us is valid
+   # by looking for pattern ##.##.##.##.##
+66 sub valid {                                     
+67     my $key = shift;                            
+68     return $key=~/^\d+\.\d+\.\d+\.\d+.\d+$/;
+69 }
+70 
+   # Open the existing file, if any, and read the current state.
+   # We use the CGI object here, because it's straightforward to do.
+   # We don't check for success of the open(), because if there is
+   # no file yet, the new CGI(FILEHANDLE) call will return an empty
+   # parameter list, which is exactly what we want.
+71 sub fetch_old_state {                           
+72     my $session_key = shift;                     
+73     open(SAVEDSTATE,"$STATE_DIR/$session_key"); 
+74     my $state = new CGI(SAVEDSTATE);            
+75     close SAVEDSTATE;                           
+76     return $state;
+77 }
+78
+79 sub save_state {
+80     my($state,$session_key) = @_;
+81     open(SAVEDSTATE,"&gt;$STATE_DIR/$session_key") ||
+82     die "Failed opening session state file: $!";
+83     $state-&gt;save(SAVEDSTATE);
+84     close SAVEDSTATE;
+85 }
+
+</pre>
+
+  <p align="center"><a href="images/col2-fig1.gif"><img src=
+  "images/col2-fig1_small.gif" width="200" height="215" border="0"
+  alt="The Growing List"></a></p>
+
+  <p align="center"><font size="-1"><b>Figure 1:</b> The Growing
+  List</font></p>
+
+  <p>The script works by maintaining each session's state in a
+  separate file. The files are kept in a subdirectory that is
+  readable and writable by the Web server daemon. We keep track of
+  the correspondence between files and browser sessions by
+  generating a unique session key when the remote user first
+  accesses the script. After the session key is generated, we
+  arrange for the browser to pass the key back to us on each
+  subsequent access to the script.</p>
+
+  <p>The technique this script uses to maintain the session key is
+  to store it in the "additional path information" part of the URL.
+  This is the part of the URL between the name of the script and
+  the beginning of the query string. For example, in the URL</p>
+  <pre>
+http://toto.com/cgi-bin/remember.cgi/202.2.13.1.117?item=hi%20there
+</pre>
+
+  <p>the text "<tt>/202.2.13.1.117</tt>" is the additional path
+  information. Although the additional path information syntax was
+  designed for passing file information to CGI scripts, there's no
+  reason it can't be used for other purposes, and it's often easier
+  to keep the session key here than mixing it up with the other
+  script parameters.</p>
+
+  <p>Lines 8 to 16 are responsible for generating a unique session
+  key. After creating a new CGI object, the script fetches the
+  additional path information and strips off the initial slash
+  (lines 9-10). The session key is next passed to the subroutine
+  <tt>valid()</tt> (lines 66-69). This subroutine performs a
+  pattern match on the session key to ensure that it is a key
+  generated by our program rather than something that the user
+  happened to type in. Importantly, the <tt>valid()</tt> subroutine
+  also returns false if the session key is an empty string, which
+  happens the first time our script is called.</p>
+
+  <p>If the session key is blank or invalid we generate a new key
+  (lines 12-16) using the subroutine
+  <tt>generate_session_key()</tt>. This subroutine, located at
+  lines 60-64, is responsible for generating something that won't
+  conflict with other concurrent sessions. In this example we use
+  the simple but imperfect expedient of concatenating the remote
+  machine's IP address with the CGI script's process ID.</p>
+
+  <p>After creating a new session key we generate a redirect
+  directive to the browser, incorporating the session key into the
+  new URL. If our script's URL is
+  <tt>http://toto.com/cgi-bin/remember.cgi</tt> and the
+  newly-generated session key is 202.2.13.1.117, we redirect the
+  browser to</p>
+
+  <p>
+  <tt>http://toto.com/cgi-bin/remember.cgi/202.2.13.1.117</tt>.</p>
+
+  <p>The scripts exists after printing the redirect. It will be
+  reinvoked almost immediately by the browser when it retrieves the
+  new URL/session key combination.</p>
+
+  <p>The remainder of the script, from line 18 onward, contains the
+  code that is invoked when the browser provides a valid session
+  key. Line 18 calls <tt>fetch_old_state()</tt> to retrieve the
+  current list of text lines. This subroutine, defined in lines
+  71-77, opens up a file that contains the saved state by using the
+  session key directly as the name of the file. More sophisticated
+  scripts will want to use the session key in more clever ways,
+  such as the key to a record in a DBM file or a handle into a
+  relational database session.</p>
+
+  <p><tt>fetch_old_state()</tt> opens the file indicated by the
+  session key, ignoring any "file not found" errors, and passes the
+  filehandle to the CGI <tt>new()</tt> method. This creates a new
+  CGI object with parameters initialized from data stored in the
+  file. We create a new CGI object here solely because its
+  <tt>param()</tt> method offers a convenient way to store multiple
+  named parameters and because of its ability to save and restore
+  these named parameters to a file. We don't check first whether
+  the file exists. If the file doesn't exist already, the CGI
+  <tt>new()</tt> method returns an empty parameter list, which is
+  exactly what we want. We close the file and return the new CGI
+  object.</p>
+
+  <p>We now have two CGI objects. The first object, stored in the
+  variable <tt>$q</tt>, was initialized from the current query and
+  contains the contents of the text field and information about
+  which button the user pressed when he submitted the fill-out
+  form. The second object, stored in the variable
+  <tt>$old_state</tt>, is the CGI object initialized from the saved
+  file, and contains cumulative information about the user's
+  previous actions.</p>
+
+  <p>Lines 20 to 26 manipulate the saved state depending on the
+  user's request. We find out which button the user pressed by
+  examining the CGI query's "action" parameter (line 20). If equal
+  to "ADD", we recover the contents of the text field from the
+  query parameter "item" and add it to the cumulative list (line
+  23). If the "action" parameter is "CLEAR", then we clear the list
+  completely (line 25). Otherwise, no button was pressed and we
+  continue onward.</p>
+
+  <p>Next we save the updated list back to disk with
+  <tt>save_state()</tt>, which reverses the process by opening up
+  the file indicated by the session key and using the CGI
+  <tt>save()</tt> method to dump out the contents of
+  <tt>$old_state</tt>.</p>
+
+  <p>So far no text at all has been transmitted to the browser.
+  It's a good idea to do all the back end work first, because
+  network delays can make your CGI script hang during output. If
+  the user presses the "stop" button during this period your CGI
+  script will be terminated, potentially leaving things in an
+  inconsistent state.</p>
+
+  <p>Lines 30 through 58 generate the HTML document. The script
+  generates the HTTP header followed by the HTML preliminaries and
+  some explanatory text (lines 30-37). Next it creates the fill-out
+  form, using the <tt>start_form(), end_form()</tt>, and form
+  element generating subroutines discussed in the previous column.
+  The only trick in this section is the use of the
+  <tt>-override</tt> parameter in the call to <tt>textfield()</tt>.
+  We want the contents of this field to be blank each time the page
+  is displayed. For this purpose we set the contents to an empty
+  string and use <tt>-override</tt> to have CGI.pm suppress the
+  usual sticky behavior of fields.</p>
+
+  <p>After closing the form, we print out the current list of
+  phrases in lines 44-52. Because there's no control over what the
+  user types into the text field, it's important to escape any
+  special HTML characters (such as angle brackets and ampersands)
+  before incorporating it into our own document. Otherwise the
+  script might create a page that doesn't display properly. The
+  <tt>escapeHTML()</tt> method accomplishes this.</p>
+
+  <p>Last, we end the page with <tt>end_html()</tt> and exit. This
+  script doesn't save a vast amount of state information: only one
+  parameter, and a short one at that. However, the same techniques
+  can be used to store and manipulate the contents of hundreds of
+  parameters. In order to turn this from an example into a real
+  world script, you'll need to make a few refinements.</p>
+
+  <p>You might want to change the way session keys are chosen.
+  Although this script chooses its keys in a way that minimizes the
+  chances of conflict between two sessions, it isn't suitable for
+  security-sensitive applications. Such scripts should make sure
+  that the remote user is entitled to use the provided session key
+  in order to prevent one user from "stealing" another user's
+  state. Checking the IP address for consistency is a one way to do
+  this; password-protecting the script and incorporating the
+  encrypted password into the session key would be an even better
+  technique.</p>
+
+  <p>In order to make this script useful in the real world you'll
+  also need to remove state files when they've gone out of date.
+  Otherwise the scripts' PIDs will eventually roll over and start
+  using ancient state files that are no longer valid. (There's also
+  the risk of proliferating state files filling up your disk!) The
+  easiest way to handle this on a UNIX system is with a cron job
+  that runs at regular intervals looking for old state files and
+  deleting them.</p>
+
+  <p>Another thing you might want to change is the way the session
+  key is maintained. Netscape browsers support a "magic cookie"
+  field that is guaranteed to be maintained for the entire length
+  of a browser/server session. You can set the browser's magic
+  cookie when the script first accesses the script, using CGI.pm's
+  <tt>set_cookie()</tt>, method, and retrieve it on subsequent
+  invocations of the script using <tt>get_cookie()</tt>.
+  Unfortunately only Netscape browsers support the magic cookie
+  field, so it isn't useful for other browsers.</p>
+
+  <p>In the next column I discuss CGI:MiniSvr, a flexible and
+  powerful way of saving state information at the server's side of
+  the connection.</p>
+
+  <p>__END__ <!-- end of article -->
+   <!-- end of file --></p>
+</body>
+</html>

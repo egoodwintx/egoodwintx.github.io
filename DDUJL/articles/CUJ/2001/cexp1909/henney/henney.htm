@@ -1,0 +1,576 @@
+<HTML>   
+     <HEAD>
+<TITLE>September 2001 C++ Experts Forum/From Mechanism to Method</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.09/tocsep.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">From Mechanism to Method: Further Qualifications</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Kevlin Henney</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>Qualification is often used as a simple constraint on behavior. For instance, a non-<b>const</b> member function cannot be executed on a <b>const</b>-qualified object. In the general case, a <b>const</b>-qualified member function can be used with both <b>const</b>- and non-<b>const</b>-qualified objects; the exception is when the function is also overloaded privately as non-<b>const</b>. This exception highlights the other common use of qualification to distinguish between two functions and two different outcomes, although normally in a more substitutable fashion (i.e., so that the non-<b>const</b> version is effectively a subtype specialization of the <b>const</b> version <a href="#1">[1]</a>).</p>
+
+<H3><FONT COLOR="#000080">Qualification, Separation, and Unification</FONT></H3>
+
+<p>You can see this kind of substitutability in action with iterator access in the C++ Standard's container requirements: non-<b>const</b> container access yields <b>iterator</b>s whereas <b>const</b> container access yields <b>const_iterator</b>s, and, furthermore, an <b>iterator</b> may be used where a <b>const_iterator</b> is expected. In this case, qualification-based separation leads to <b>iterator</b> and <b>const_iterator</b> types.</p> 
+<p>Qualification can also be used as a means for unification. Consider an object that supports both reader locks and writer locks for safe multithreaded access: so long as there are no writers, multiple reader locks can be acquired and the owners can look at the object without changing it (i.e., only <b>const</b> operations); the owner of a writer lock has exclusive read-write access to an object (i.e., both <b>const</b> and non-<b>const</b> operations). Translating these concepts directly into code suggests the following:</p>
+
+<pre>
+class table
+{
+public:
+  void lock() const;   // acquire lock for reading
+  void lock();         // acquire lock for reading and writing
+  void unlock() const; // release reader lock
+  void unlock();       // release writer lock
+  ...
+};</pre>
+
+The acquisition and release of the lock now reflects the permissions of the calling context:</p>
+
+
+<pre>
+void reader_example(const table *target)
+{
+  target-&gt;lock();   // acquires lock for reading
+  ...
+  target-&gt;unlock(); // releases reader lock
+}
+
+void writer_example(table *target)
+{
+  target-&gt;lock();   // acquires lock for reading and writing
+  ...
+  target-&gt;unlock(); // releases writer lock
+}</pre>
+
+<p>Such access is made exception safe by introducing an acquisition-release object [<a href="#2">2</a>, <a href="#3">3</a>]:</p>
+
+<pre>
+template&lt;typename lockee_type&gt;
+class locker
+{
+public:
+  locker(lockee_type &amp;target)
+    : target(target)
+  {
+    target.lock();
+  }
+  ~locker()
+  {
+    target.unlock();
+  }
+private:
+  locker(const locker &amp;);
+  locker &amp;operator=(const locker &amp;);
+  lockee_type &amp;target;
+};</pre>
+
+<p>What's neat about this design is that only a single locker template is needed to cater for both <b>const</b> and non-<b>const</b> variants:</p>
+
+<pre>
+void reader_example(const table *target)
+{
+  locker&lt;const table&gt; guard(*target); // acquires reader lock
+  ...
+}
+
+void writer_example(table *target)
+{
+  locker&lt;table&gt; guard(*target);      // acquires writer lock
+  ...
+}</pre>
+
+<p>Code that is written to be both scope constrained and <b>const</b> correct will avoid pessimistic locking scenarios, where a lock is acquired for longer than is strictly necessary or the lock acquired is too strong for the required access.</p>
+
+<H3><FONT COLOR="#000080">Write-Back Proxies</FONT></H3>
+
+<p>Consider a slightly different scenario: objects that can be loaded on demand into memory and, when changed, written back. It is safe to assume that non-<b>const</b> operations will cause change and <b>const</b> operations will not, and that users will perform predominantly either <b>const</b> or non-<b>const</b> operations on a given object in a particular role:</p>
+
+<pre>
+class datapoint
+{
+public:
+  double upper_bound() const;
+  void upper_bound(double);
+  double lower_bound() const;
+  void lower_bound(double);
+  ...
+};</pre>
+
+<p>The only problem is that the objects are independent of your loading and saving framework. They do not contain convenient features that would make this problem trivial to resolve, such as a dirty flag to show when they've been modified. A simplistic, verbose, and error-prone approach would be to save or not in response to each call:</p>
+
+<pre>
+void view(const datapoint *target)
+{
+  double = target-&gt;upper_bound(); // no save required
+  ...
+}
+
+void manipulate(datapoint *target, double new_upper_bound)
+{
+  ...
+  target-&gt;upper_bound(new_upper_bound); // save required
+  save(target);                         // assume a non-member 
+                                        // save for target
+}</pre>
+
+
+<p>This code also assumes that the object has been preloaded into memory.</p>
+
+
+<H4><FONT COLOR="#000080">Custom Proxies</FONT></H4>
+
+<p>The standard solution to such problems is to manage the level of indirection with a proxy object [<a href="#4">4</a>, <a href="#5">5</a>]. A custom proxy, written to handle each of the member functions individually, can be written to encapsulate both the lazy loading and the save policy:</p> 
+
+<pre>
+class datapoint_view
+{
+public:
+  double upper_bound() const
+  {
+    if(!target)
+      load();
+    return target-&gt;upper_bound();
+  }
+  void upper_bound(double new_upper_bound)
+  {
+    if(!target)
+      load();
+    target-&gt;upper_bound(new_upper_bound);
+    save();
+  }
+  ...
+private:
+  void load() const;
+  void save();
+  mutable datapoint *target;  // null when not loaded
+  persistence_key target_key; // used by load
+};</pre>
+
+
+<p>Clients now work in terms of <b>datapoint_view</b> instead of <b>datapoint</b>. Although conventional, proxies and targets do not necessarily have to inherit from a common base class, in this case, unless the <b>datapoint</b> author included an interface class for another reason, it may not even be possible to perform such inheritance without further adaptation.</p>
+<p>However, although simple in many ways, this design is tediously repetitive. Each function follows a similar flow: load if not yet loaded, forward call, and then optionally a call to save state. It is also hardwired to a single target type. A generic solution would allow arbitrary data types to be managed in the same way. Smart pointers offer the most common idiom for such generic managed indirection.</p>
+
+<H4><FONT COLOR="#000080">Smart References</FONT></H4>
+
+<p>Consider first a simple case for a generic loading-and-saving smart pointer: working with built-in types or user-defined value types that, like built-ins, are manipulated only in terms of operators. The focus of operations is, therefore, on the dereferenced value. Another proxy variant, a smart reference, allows basic reads and writes to be distinguished:</p>
+
+<pre>
+template&lt;typename target_type&gt;
+class loading_ptr
+{
+public:
+  ...
+  class reference
+  {
+  public:
+    explicit reference(const loading_ptr *that)
+      : that(that)
+    {
+    }
+    operator target_type() const
+    {
+      return *that-&gt;target;
+    }
+    reference &amp;operator=(const target_type &amp;rhs)
+    {
+      *that-&gt;target = rhs;
+      that-&gt;save();
+      return *this;
+    }
+  private:
+    const loading_ptr *that;
+  };
+  reference operator*() const
+  {
+    if(!target)
+      load();
+    return reference(this);
+  }
+  ...
+private:
+  ...
+  friend class reference;
+  void load() const;
+  void save() const;
+  mutable target_type *target; // null when not loaded
+  persistence_key target_key;  // used by load
+};</pre>
+
+<p>A smart reference cannot be a perfect match for a real reference <a href="#6">[6]</a>, but such a limitation on transparency is true to a greater or lesser extent of any kind of proxy. For instance, the UDC (user-defined conversion) operator means that the result of dereferencing a <b>loading_ptr</b> is an <i>rvalue</i> rather than an <i>lvalue</i>. The disadvantage of the UDC as it stands is that it uses up the allotment of a single user-defined conversion. A little generic thinking gets around this problem:</p>
+
+<pre>
+template&lt;typename target_type&gt;
+class loading_ptr
+{
+public:
+  ...
+  class reference
+  {
+  public:
+    ...
+    template&lt;typename result_type&gt;
+    operator result_type() const
+    {
+      return *that-&gt;target;
+    }
+    ...
+  private:
+    loading_ptr *that;
+  };
+  ...
+};</pre>
+
+<p>The downside is that this permissive conversion can create some fresh new ambiguities: the templated UDC now eagerly matching all possibilities unless explicitly disambiguated. You have to choose between evils according to which least affects your code &#151; I guess that you probably don't need reminding that the world is not a perfect place.</p>
+<p>Almost all the overloadable operators can be overloaded to make working with the smart reference reflect the natural use of its target type more accurately. This is fine for built-in types and like-minded value classes, but not for targets with named members: for them, <b>operator-&gt;</b> must be overloaded.</p>
+
+<H4><FONT COLOR="#000080">Bracketing Smart Pointers</FONT></H4>
+
+<p>But over-eagerness to implement <b>operator-&gt;</b> will lead you straight into a brick wall:</p>
+
+
+<pre>template&lt;typename target_type&gt;
+class loading_ptr
+{
+public:
+  ...
+  target_type *operator-&gt;() const
+  {
+    if(!target)
+      load();
+    return target;
+  }
+  ...
+};</pre>
+
+<p>Sure, the object may have been successfully loaded into memory, but when and how will it be saved? The save needs to occur after the pointer has been returned and a member dereferenced through it &#151; in other words, outside the body of <b>operator-&gt;</b> over which you have control.</p> 
+<p>It would appear that you can never have too many proxies: the solution is to return a smart pointer from <b>loading_ptr</b>'s <b>operator-&gt;</b> and have its destructor perform the save:</p>
+
+<pre>
+template&lt;typename target_type&gt;
+class loading_ptr
+{
+public:
+  ...
+  class pointer
+  {
+  public:
+    explicit pointer(const loading_ptr *that)
+      : that(that), accessed(false)
+    {
+    }
+    target_type *operator-&gt;() const
+    {
+      accessed = true;
+      return that-&gt;target;
+    }
+    ~pointer()
+    {
+      if(accessed)
+        that-&gt;save();
+    }
+  private:
+    const loading_ptr *that;
+    bool accessed;
+  };
+  pointer operator-&gt;() const
+  {
+    if(!target)
+      load();
+    return pointer(this);
+  }
+  ...
+private:
+  friend class pointer;
+  ...
+};</pre>
+
+<p>What makes this idiom tick is that <b>operator-&gt;</b> chains: if the result of <b>operator-&gt;</b> also supports an <b>operator-&gt;</b>, this latter operator is called automatically, and so on until the result chain reaches a real pointer. What makes this idiom tock is the binding of a temporary object's lifetime to the end of the surrounding full expression. So, when used in a simple expression, the load is performed in the first <b>operator-&gt;</b>, which returns a temporary object used to access the members &#151; either function or data &#151; of the underlying target, and the save is performed by the destruction of the temporary object at the end of the expression:</p>
+
+<pre>
+void manipulate(
+   loading_ptr&lt;datapoint&gt; target, double new_upper_bound)
+{
+  ...
+  target-&gt;upper_bound(new_upper_bound);
+  //   ^load if necessary ^save
+}
+</pre>
+
+<p>As a point of implementation, note that you have to ensure that only one destructor execution performs the save because you are returning the <b>pointer</b> proxy by copy.</p>
+<p>This versatile bracketing technique has acquired various names over time: <i>locking pointer</i> in the context of thread synchronization <a href="#7">[7]</a>, <i>call wrappers</i> <a href="#8">[8]</a>, and <i>execute-around pointers</i> <a href="#9">[9]</a>.</p>
+
+<H4><FONT COLOR="#000080">The Depths of Qualification</FONT></H3>
+
+<p>But before you get too distracted or overwhelmed by the many levels and kinds of proxy you have at your disposal, remember that part of the design requirement was to distinguish between <b>const</b> and non-<b>const</b> usage. The code currently assumes the non-<b>const</b> case (i.e., always save). How can you distinguish a <b>const</b> target?</p>
+<p>A common, but alas incorrect, solution to this problem is to reflect the qualification of the smart pointer in the qualification of the result:</p>
+
+<pre>
+template&lt;typename target_type&gt;
+class loading_ptr
+{
+public:
+  ...
+  pointer operator-&gt;()
+  {
+    if(!target)
+      load();
+    return pointer(this);
+  }
+  const target_type *operator-&gt;() const
+  {
+    if(!target)
+      load();
+    return target; // return actual pointer as no save needed
+  }
+  ...
+};</pre>
+
+<p>There are certainly designs in which you would want such deep qualification, but this isn't one of them. For a composition relationship through a pointer, where an object pointed to by another is considered a part of a whole, qualification should run deeply, just as it does for a data member by value. For association, where the relationship represented is not whole-part, qualification should be shallow, which is the case for many indirection-based relationships. Making it deep arises from confusion &#151; albeit commonplace &#151; over levels of indirection: the qualification of your smart pointer relates to whether or not you can affect the smart pointer itself, not its referand.</p>
+
+<H3><FONT COLOR="#000080">Many Roads Lead to Rome</FONT></H3>
+
+<p>There are two user roles with respect to target usage for the write-back proxy: a <i>read-only</i> role, which we can equate to accessing a <b>const</b> target, and a <i>write-mostly</i> role, which we can equate to accessing a non-<b>const</b> target and typically accessing non-<b>const</b> members. If deep qualification were the only solution to this kind of problem, iterators to <b>const</b> containers would be stuck on the starting blocks. The good news is that not only is there a solution, there are many solutions, each with a different set of tradeoffs.</p>
+
+<H4><FONT COLOR="#000080">Separately Qualified Types</FONT></H3>
+
+<p>Taking a leaf straight out of the standard library, the iterator model can be used as the inspiration for a pair of class templates:</p>
+
+<pre>
+template&lt;typename target_type&gt;
+class loading_ptr
+{
+public:
+  ...
+  class pointer
+  {
+    ...
+  };
+  pointer operator-&gt;() const
+  {
+    if(!target)
+      load();
+    return pointer(this);
+  }
+  ...
+};
+
+template&lt;typename target_type&gt;
+class const_loading_ptr
+{
+public:
+  const_loading_ptr(const loading_ptr&lt;target_type&gt; &amp;);
+  ...
+  const target_type *operator-&gt;() const
+  {
+    if(!target)
+      load();
+    return target;
+  }
+  ...
+};</pre>
+
+<p>Note the converting constructor from a <b>loading_ptr</b> to a <b>const_loading_ptr</b>. This could also be supported by introducing a UDC to a <b>const_loading_ptr</b> in the <b>loading_ptr</b> template. Either way, a <b>loading_ptr</b> is substitutable for a <b>const_loading_ptr</b>. Note also that there is potentially a certain amount of duplicated code. A simple alternative that offers both substitutability and factoring of common code is to introduce an inheritance relationship:</p>
+
+<pre>template&lt;typename target_type&gt;
+class const_loading_ptr
+{
+  ...
+};
+
+template&lt;typename target_type&gt;
+class loading_ptr : public const_loading_ptr&lt;target_type&gt;
+{
+  ...
+};</pre>
+
+<p>Some members will be fully &quot;specialized&quot; and &quot;overridden&quot; in the derived class (i.e., <b>operator-&gt;</b> will be provided in <b>loading_ptr</b> and will block the one in <b>const_loading_ptr</b> from view). This is compile-time polymorphism rather than run-time polymorphism &#151; there are no <b>virtual</b> functions in sight, nor should there be.</p>
+
+<H4><FONT COLOR="#000080">Qualified Type Specialization</FONT></H4>
+
+<p>The <b>const_loading_ptr</b> solution is OK except that it leaves us with two different type names. This means that for an arbitrary type <b><i>T</i></b>, which may or may not be <b>const</b> qualified, you cannot simply write <b>loading_ptr&lt;<i>T</i>&gt;</b> and expect it to do the right thing (i.e., <b>loading_ptr&lt;const datapoint&gt;</b> is not equivalent to <b>const_loading_ptr&lt;datapoint&gt;</b>). Template specialization with respect to qualification offers a simplification <a href="#10">[10]</a>:</p>
+
+<pre>template&lt;typename target_type&gt;
+class loading_ptr // primary class template
+{
+public:
+  ...
+  class pointer
+  {
+    ...
+  };
+  pointer operator-&gt;() const
+  {
+    if(!target)
+      load();
+    return pointer(this);
+  }
+  ...
+};
+
+template&lt;typename target_type&gt;
+class loading_ptr&lt;const target_type&gt; // partial specialization
+{
+public:
+  loading_ptr(const loading_ptr&lt;target_type&gt; &amp;);
+  ...
+  const target_type *operator-&gt;() const
+  {
+    if(!target)
+      load();
+    return target;
+  }
+  ...
+};</pre>
+
+
+<p>This means that one template name, <b>loading_ptr</b>, covers both cases, with <b>loading_ptr&lt;datapoint&gt;</b> corresponding to the primary template definition and <b>loading_ptr&lt;const datapoint&gt;</b> corresponding to the partial specialization. Inheritance can again be used to provide substitutability and cure the common code:</p>
+
+<pre>template&lt;typename target_type&gt;
+class loading_ptr; // forward declare primary class template
+
+template&lt;typename target_type&gt;
+class loading_ptr&lt;const target_type&gt; // partial specialization
+{
+  ...
+};
+
+template&lt;typename target_type&gt;
+class loading_ptr : public loading_ptr&lt;const target_type&gt;
+{
+  ...
+};</pre>
+
+<p>It is worth pointing out that not all compilers support specialization with respect to qualification.</p>
+
+<H4><FONT COLOR="#000080">Explicit Qualification Check</FONT></H4>
+
+<p>There are only a few parts of the <b>loading_ptr</b> template that need to be different between the <b>const</b> and non-<b>const</b> variant. Instead of partially specializing the whole class template, why not just do so for the affected functions? This is an elegant and economic idea; unfortunately it also won't work: the C++ Standard currently disallows partial specialization of function templates. You can overload or fully specialize a function template, but alas neither of these options is directly suitable for the member functions in this particular problem.</p>
+<p>However, the effect of <b>const</b> partial specialization can, to a limited degree, be emulated. Instead of focusing on the <b>loading_ptr</b>, focus on the result of <b>operator-&gt;</b>. Return the <b>pointer</b> proxy in each case and determine only in the destructor whether or not a save is required.</p> 
+<p>Here is a brute force run-time type checked approach:</p>
+
+<pre>template&lt;typename target_type&gt;
+loading_ptr&lt;target_type&gt;::pointer::~pointer()
+{
+  if(accessed &amp;&amp;
+    typeid(target_type *) != typeid(const target_type *))
+    that-&gt;save();
+}</pre>
+ 
+<p>Because <b>typeid</b> ignores top-level qualifiers, the code is phrased in terms of pointers. The trick that allows the <b>const</b> discrimination to work is to recall that <b>const</b> qualifying something that is already <b>const</b> qualified has no effect. However, this approach lacks both elegance and economy. You can eliminate the run-time type check by introducing a predicate:</p> 
+
+<pre>
+template&lt;typename target_type&gt;
+loading_ptr&lt;target_type&gt;::pointer::~pointer()
+{
+  if(accessed &amp;&amp; !is_const(that-&gt;target))
+    that-&gt;save();
+}</pre>
+
+<p>Here, it is overloading with respect to <b>const</b> that allows the predicate approach to work:</p>
+
+<pre>
+template&lt;typename type&gt;
+bool is_const(type *)
+{
+  return false;
+}
+template&lt;typename type&gt;
+bool is_const(const type *)
+{
+  return true;
+}</pre>
+
+<p>If these functions are inlined &#151; and your compiler is doing at least a halfway decent job with inlining &#151; there will be no run-time overhead in this approach. Compile-time selection is the territory of traits &#151; a far more elegant approach:</p>
+
+<pre>
+template&lt;typename target_type&gt;
+loading_ptr&lt;target_type&gt;::pointer::~pointer()
+{
+  if(accessed &amp;&amp; !is_const&lt;target_type&gt;::value)
+    that-&gt;save();
+}</pre>
+
+<p>The following mono-trait class template uses <b>const</b> partial specialization to make the distinction:</p>
+
+<pre>template&lt;typename type&gt;
+struct is_const
+{
+  static const bool value = false;
+};
+
+template&lt;typename type&gt;
+struct is_const&lt;const type&gt;
+{
+  static const bool value = true;
+};</pre>
+
+<p>This approach can also be made to work using <b>const</b>-qualified pointers and partial specialization <a href="#11">[11]</a> if your compiler does not support direct <b>const</b> specialization.</p>
+
+<H4><FONT COLOR="#000080">Qualified Double Dispatch</FONT></H4>
+
+<p>There is a way to have selection without explicit control flow and to simulate the partial specialization of function templates. Double dispatch allows you to select an action on an object externally based on the type of the object. A family of functions performs the selection on your behalf calling back on the object you pass. This is normally described in terms of different classes in a hierarchy and forms the basis of the conventional form of the Visitor pattern <a href="#5">[5]</a>. We can also frame double dispatch in terms of qualification, which is simply a different, more constrained form of subtyping.</p>
+<p>Depending on the kind of extensibility you want in your design, you can define your dispatch functions either outside or inside the class. The following code uses class <b>static</b>s to retain some consistency with the previous solutions:</p>
+
+<pre>
+template&lt;typename target_type&gt;
+class loading_ptr
+{
+public:
+  ...
+  class pointer
+  {
+  public:
+    ...
+    ~pointer()
+    {
+      if(accessed)
+        save(that); // select appropriate save strategy
+    }
+  private:
+    template&lt;typename save_type&gt;
+    static void save(loading_ptr&lt;save_type&gt; *that)
+    {
+      that-&gt;save();
+    }
+    template&lt;typename save_type&gt;
+    static void save(loading_ptr&lt;const save_type&gt; *)
+    {
+       // do nothing as no save is needed
+    }
+    loading_ptr *that;
+    bool accessed;
+  };
+  ...
+};</pre>
+
+<p>If overloading with respect to the full <b>loading_ptr</b> type does not work for your compiler, restructure the code so that you overload with respect to the <b>target</b> pointer.</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+
+<p>Overloading with respect to qualification combines with templates to provide a valuable form of subtyping and specialization. Whilst not all of the techniques demonstrated are within reach of all compilers, there is enough overlap between their applicability to allow you some implementation wriggle room.</p>
+<p>The write-back proxy allows a number of issues to be explored, although it is not intended to demonstrate all that you would need in such a design. For instance, matters of object lifetime and thread synchronization have been glossed over. There is also an important assumption in the applicability of the core design: if the non-<b>const</b> access is not <i>write mostly</i> there will be a lot of wasted saves. However, as C++ is currently defined there is no way that a proxy can both be made generic and distinguish on the qualification of the actual target member accessed, so this is unfortunately a natural constraint.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1]  Kevlin Henney. &quot;From Mechanism to Method: Good Qualifications,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, January 2001, &lt;www.cuj.com/experts/1901/henney.htm&gt;.</p>
+<p><a name="2"></a>[2]  Bjarne Stroustrup. <i>C++ Programming Language</i>, 3rd Edition (Addison-Wesley, 1997).</p>
+<p><a name="3"></a>[3]  Kevlin Henney. &quot;C++ Patterns: Executing Around Sequences,&quot; <i>EuroPLoP 2000</i>, July 2000, also available from &lt;www.curbralan.com&gt;.</p>
+<p><a name="4"></a>[4]  Frank Buschmann, Regine Meunier, Hans Rohnert, Peter Sommerlad, and Michael Stal. <i>Pattern-Oriented Software Architecture: A System of Patterns</i> (Wiley, 1996).</p>
+<p><a name="5"></a>[5]  Erich Gamma, Richard Helm, Ralph Johnson, and John Vlissides. <i>Design Patterns: Elements of Reusable Object-Oriented Software</i> (Addison-Wesley, 1995).</p>
+<p><a name="6"></a>[6]  Scott Meyers. <i>More Effective C++: 35 New Ways to Improve Your Programs and Designs</i>, (Addison-Wesley, 1996).</p>
+<p><a name="7"></a>[7]  Kevlin Henney. &quot;C++ Advanced Design Issues: Asynchronous C++,&quot; <i>Visual Tools Developers' Academy</i> (Oxford, September 1996).</p>
+<p><a name="8"></a>[8]  Bjarne Stroustrup. &quot;Wrapping C++ Member Function Calls,&quot; <i>C++ Report</i>, June 2000.</p>
+<p><a name="9"></a>[9]  Kevlin Henney. &quot;From Mechanism to Method: Substitutability,&quot; <i>C++ Report</i>, May 2000, also available from &lt;www.curbralan.com&gt;.</p>
+<p><a name="10"></a>[10]  Kevlin Henney. &quot;From Mechanism to Method: Distinctly Qualified,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, May 2001, &lt;www.cuj.com/experts/1905/henney.htm&gt;.</p>
+<p><a name="11"></a>[11]  Boost library website, &lt;www.boost.org&gt;</p>
+
+<p><i><b>Kevlin Henney</b> is an independent consultant and trainer specializing in C++, Java, OO design, patterns, and software architecture.  He can be reached at <b>kevlin@curbralan.com</b>.</i></p>
+
+</BLOCKQUOTE></BODY></HTML>

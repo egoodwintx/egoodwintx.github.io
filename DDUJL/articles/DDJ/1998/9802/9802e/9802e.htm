@@ -1,0 +1,104 @@
+<html>
+<META NAME="year" CONTENT="1998">
+<head>
+<title>Dr. Dobb's Journal February 1998: Automatic File Conversions with Perl</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Automatic File Conversions with Perl</h1>
+
+<p><i>Dr. Dobb's Journal</i> February 1998
+</p>
+<h2>Make lpr easier to use</h2>
+
+<h3>By Tim Kientzle</h3>
+
+<I>Tim is a senior technical editor with DDJ. He can be reached at kientzle@ddj.com.</I>
+
+<hr>
+
+<p>The BSD printer-management system is actually fairly simple. The user program, lpr, accepts a user request and relays the file with control information to the printer daemon, lpd. The daemon program runs a print-filter program to convert the data for the desired output device and feeds the result to the printer. This simple system allows for a great deal of flexibility, but it's not always the easiest system to use.</p>
+
+<p>One problem, for instance, is that the daemon must select the correct print filter. It uses the control information from lpr to look up a program in a "printcap" file. This approach requires the user to specify the required conversion to lpr. However, inexperienced users may not know what kind of conversion is required; most simply memorize that certain options are required for certain extensions. It also restricts the kind of data that can be printed; both lpr and lpd must be recompiled to change the available options.</p>
+
+<p>One way around this problem is to make a "smart" print filter that recognizes the type of data it is being fed and invokes the appropriate conversion. A smart print filter makes lpr easier to use, since specifying the conversion is no longer necessary. It also removes the restriction on the number of file types; the formats that can be printed are restricted only by the print filter's ability to determine the format.</p>
+
+<p>Implementing a smart print filter involves three issues:</p>
+
+<p><b>Determining the type of the file.</b> Fortunately, most complex files have a "magic number" near the beginning of the file that can be used to identify the type. For example, PostScript files always begin with %! and TeX DVI files always begin with the two bytes 247, 2. This approach is used by the common <i>file</i> command, and you can refer to /etc/magic for a list of other magic numbers.</p>
+
+<p><b>Doing the actual conversion.</b> Fortunately, there are a variety of conversion programs freely available from many sources.</p>
+
+<p><b>Effectively dealing with multiple conversions.</b> For example, if you have an HP LaserJet printer, you might want to use DVIPS to convert TeX DVI files into PostScript, then use the free GhostScript program to convert PostScript into a printer file. Since this last step will be common to many different files, it would be nice to isolate it. That way, if you later replace your aging HP LaserJet with a PostScript-capable printer, you need only change one line.</p>
+
+<p>The nature and number of conversions may vary dramatically depending on the precise file format. For example, if you have a PostScript printer, then printing a PostScript file requires no conversion at all, while printing a compressed TeX DVI file will require two conversions: one to uncompress the data, and another to convert the DVI file to PostScript.</p>
+
+<p>My solution to this problem is the Perl program in <a name="rl1"><a href="9802e.htm#l1">Listing One</A> Perl is a good fit because it has sophisticated pattern-matching facilities that can be used to easily identify the file type based on the initial part of the file. I could have used the output of the <i>file </i>program instead of checking for magic numbers directly, but that would have meant hard coding the output strings from <i>file, </i>which seemed no better than hard coding the patterns to identify the file type directly.</p>
+
+<p>The innovative aspect of my program, which I call PrintConvert, is how it handles multiple conversions. Most conversions feed the data into a two-stage pipeline, consisting of a conversion program and another copy of PrintConvert. This allows PrintConvert to separately evaluate the output of each conversion stage, and makes it very easy to handle compressed input. For example, suppose you have a compressed text file, and type "<i>lpr textfile.Z</i>." The lpd daemon will invoke PrintConvert as the default print filter, which will then incrementally build the pipeline shown in <a name="rf1"><a href="9802ef1.htm">Figure 1</A>. At each step, a new copy of PrintConvert runs to classify the next step of the conversion.</p>
+
+<p>Of course, you'll probably want to add more data types. Adding a new data type will usually require adding a new <i>elsif </i>clause, similar to <a name="re1"><a href="9802ee1.htm">Example 1</A>. As you can see here, you need a regular expression to match the beginning of the file. In <a href="9802ee1.htm">Example 1</A>, the expression /^\037\213/ is a regular expression (/.../) that matches the two octal bytes 037, 213 that appear at the beginning (^) of the file. Note that the<i> $_ </i>variable (the default for a match like this) only holds the first part of the file; if you have a file that can only be recognized by inspecting the end of the file data, you'll need to do some additional work.</p>
+
+<p>PrintConvert also takes advantage of Perl's flexible file handling, which makes opening a program (precede the name with "|") or a standard I/O path ("&gt;-" is <i>stdout</i>) just as easy as opening a disk file.</p>
+
+<p>Since Perl is a complete and sophisticated programming language, you could add more complex processing to your conversions. For example, you might have a condition that recognizes PBM graphics files and either scales them or converts them, depending on whether or not that particular file fits on a page. This rule has a nice side effect: If you convert all other graphics files to PBM, they'll get scaled also.</p>
+
+<p>There are many other improvements you can make to this basic program. For example, it could generate burst pages or log printer usage. The final output could use GhostScript or a more sophisticated printer-management system. You could even integrate other printer-management functions, such as displaying the user name on the printer's LCD front-panel display.</p>
+
+<p><b>DDJ</b></p>
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>#!/usr/bin/perl# PrintConvert -- convert any file type into printer output
+<p></p>
+# Read the initial section of the file
+$blocksize=16384;
+sysread(STDIN,$_,$blocksize);
+$first_segment = $_;
+if (length($_) == 0) { exit(0); }
+<p></p>
+# Now, use those initial bytes to determine the file type and
+# appropriate handling.
+# Note that "$0 @ARGV" is the current program and options.  Most
+# formats are fed through some conversion program and then into
+# another copy of this program for further consideration.
+<p></p>
+if (/^\004?%!/) {                       # PostScript, possibly preceded by ^D
+    &amp;PrintTo("&gt;-");                     #   just dump it to STDOUT
+    print STDOUT "\004";                #   append Ctrl-D
+} elsif (/^\037\213/) {                 # GZIP
+    &amp;PrintTo("|gunzip | $0 @ARGV");
+} elsif (/^\037\235/) {                 # Unix Compress
+    &amp;PrintTo("|uncompress | $0 @ARGV");
+} elsif (/^\367\002/) {                 # TeX DVI format
+    &amp;PrintTo("&gt;/tmp/PrintConvert.tmp.$$");     # Save into temporary file
+    exec "dvips -q -f &lt;/tmp/PrintConvert.tmp.$$ | $0 @ARGV";
+} elsif (/^\115\115/) {                 # TIFF file
+    &amp;PrintTo("|fax2ps | $0 @ARGV");
+} elsif (/^\111\111/) {                 # TIFF file
+    &amp;PrintTo("|fax2ps | $0 @ARGV");
+} elsif (/^\314\000\206/) {             # FreeBSD executable (don't print)
+    print STDERR "Executable file not printed!\n";
+} else {                                # Unrecognized text file
+    &amp;PrintTo("|lptops -ntr | $0 @ARGV");              # Use lptops
+<p></p>
+}
+# `Print' data to the named destination
+sub PrintTo {
+    open(OUT,"@_");                     # Open the file or program
+    syswrite(OUT,$first_segment,length($first_segment)); # Write first segment
+    while(sysread(STDIN,$_,$blocksize)) {    # Now copy the rest
+          syswrite(OUT,$_,length($_));
+    }
+    close(OUT);
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1998, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

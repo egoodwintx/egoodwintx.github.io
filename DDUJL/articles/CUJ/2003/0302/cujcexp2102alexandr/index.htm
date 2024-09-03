@@ -1,0 +1,707 @@
+<HTML>   
+     <HEAD>
+<TITLE>February 2003/Generic&lt;Programming&gt;</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Generic&lt;Programming&gt;: Move Constructors</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Andrei Alexandrescu</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>As I'm sure you know very well, creating, copying around, and destroying temporary objects is the favorite indoor sport of your C++ compiler. Temporaries get created at the drop of a hat, and unfortunately that considerably impacts the performance of C++ programs. Indeed, temporaries are often credited as one of the top sources of inefficiency in C++ programs <a href="#1">[1]</a>.</p> 
+<p>It would be nice if you could write:</p>
+
+<pre>
+vector&lt;string&gt; ReadFile();
+vector&lt;string&gt; vec = ReadFile();
+</pre>
+
+<p>or:</p>
+
+<pre>
+string s1, s2, s3;
+...
+s1 = s2 + s3;
+</pre>
+
+<p>Alas, if you care about efficiency, you need to refrain from using such code. The temporaries created by <b>ReadFile()</b> and by <b>operator+</b>, respectively, will be copied to the destination and then thrown away ...  what a waste! </p>
+<p>To solve this, you need to rely on less elegant conventions. For example, you might pass the destination as an argument to the function:</p>
+
+<pre>
+void ReadFile(vector&lt;string&gt;&amp; dest);
+vector&lt;string&gt; dest; 
+ReadFile(dest);
+</pre>
+
+<p>Quite annoying. Worse, operators don't give you that option, so if you want to deal with large objects efficiently, you have to limit yourself to operators that don't create temporaries:</p>
+
+<pre>
+string s1, s2, s3;
+...
+s1 = s2;
+s1 += s3;
+</pre>
+
+<p>These awkward idioms often creep up within large teams working on large programs, imposing a continuous annoyance that curbs the joy of writing code and adds to the total number of lines. Wouldn't it be nice if we could return values from functions, use operators, and pass around temporaries, in confidence that time is not wasted on this create/copy/destroy spree?</p>
+<p>Wouldn't it?</p>
+<p>Actually it's not about &quot;would be nice&quot; only. There is huge community pressure to solve the unnecessary copying problem. The interest in the subject is staggering. A formal proposal for a language-based solution has already been submitted to the standardization committee <a href="#2">[2]</a>. Discussions are ravaging the Usenet, and the article you're now reading has been intensely reviewed. </p> 
+<p>This article shows you how you can address the problem of unnecessary copying in existing C++. There is no 100% satisfactory solution, but a remarkable degree of purity can be achieved. We will build together, step by step, a powerful framework that helps eliminate unnecessary copying of temporaries from your programs. The solution is not 100% transparent, but it does eliminate all unnecessary copies, and is encapsulated enough to serve as a reliable placeholder until years from now when a cleaner, language-based, approach will hopefully be standardized and implemented.</p>
+
+<H3><FONT COLOR="#000080">Temporaries and the &quot;Move Constructor&quot;</FONT></H3>
+
+<p>After fighting temporaries for a while, people have realized that eliminating the actual temporaries is not really the point in most cases. Most of the time, the point is to eliminate unnecessary <i>copying</i> of temporaries. Allow me to detail this issue a bit.</p>
+<p>Most &quot;expensive-to-copy&quot; data structures store their data in the form of pointers or handles. Typical examples are: a <b>String</b> type that holds a size and a <b>char*</b>, a <b>Matrix</b> type that holds a couple of integral dimensions and a <b>double*</b>, or a <b>File</b> type that stores a handle.</p>
+<p>As you see, the cost in copying <b>String</b>, <b>Matrix</b>, or <b>File</b> does not come from copying the actual data members; it comes from duplicating the data <i>referred to</i> by the pointer or the handle. </p>
+<p>So given that our purpose is to eliminate copying, a good way of doing that is to detect a temporary. In cynical terms &#151; given that an object is a goner anyway, we might just as well use it as an organ donor while it's still fresh.</p>
+<p>But what's a temporary, by the way? We'll come up with a heretic definition:</p>
+<UL><p>An object is considered temporary in a context if and only if the only operation executed on that object upon exiting that context is the destructor.</p></UL>
+<p>The context can be an expression or a lexical scope (such as a function body).</p>
+<p>The C++ Standard doesn't define temporaries, but it assumes that they are <i>anonymous</i> temporaries (such as the values returned by functions). By our (more general) definition, named stack-allocated variables defined inside a function are temporary all right. We'll later use this insight to our advantage.</p>
+<p>Consider this run-of-the-mill implementation of a <b>String</b> class:</p>
+
+<pre>
+class String 
+{
+  char* data_;
+  size_t length_;
+public:
+  ~String()
+  {
+    delete[] data_;
+  }
+  String(const String&amp; rhs)
+    : data_(new char[rhs.length_]), length_(rhs.length_)
+  {
+    std::copy(rhs.data_, rhs.data_ + length_, data_);
+  }
+  String&amp; operator=(const String&amp;);
+  ...
+};
+</pre>
+
+<p>Here the cost of copying consists largely of duplicating <b>data_</b>, that is, allocating new memory and copying it. It would be so nice if we could detect that <b>rhs</b> is actually a temporary. Consider the following pseudo-C++ code:</p>
+
+<pre>
+class String 
+{
+  ... as before ...
+  String(temporary String&amp; rhs)
+    : data_(rhs.data_), length_(rhs.length_)
+  {
+    // reset the source string so it can be destroyed
+    // don't forget that destructors are still executed
+    // on temporaries
+    rhs.data_ = 0;
+  }
+  ....
+};</pre>
+
+<p>The fictitious overloaded constructor <b>String(temporary String&amp;)</b> would enter in action when you create a <b>String</b> from an object that's temporary by our definition (such as the one returned by a function call). Then, the constructor performs a <i>move</i> of <b>rhs</b> to the object under construction, by simply copying the pointer (without duplicating the memory chunk it points to). Last but not least, the move constructor resets the source pointer <b>rhs.data_</b>. This way, when the temporary is destroyed, <b>delete[]</b> will be harmlessly applied to a null pointer.</p> 
+<p>An important detail is that <b>rhs.length_</b> is not set to zero after the move construction. This is incorrect from a pedantic viewpoint (we have a broken <b>String</b> with <b>data == 0</b> and <b>length_ != 0</b>), but is a good pretext to make a point. The state in which <b>rhs</b> must be left must not be <i>consistent</i>, just merely <i>destroyable</i>. This is because the one and only operation that will ever be applied to <b>rhs</b> is the destructor &#151; nothing else. So as long as <b>rhs</b> is safely destroyable, it does not have to look like a valid string at all.</p>
+<p>Move construction is a good solution for eliminating unnecessary copying of temporaries. We only have one little problem &#151; there's no <b>temporary</b> keyword within the C++ language.</p>
+<p>(It should be noted that detection of temporaries doesn't help all classes. Sometimes, <i>all</i> data is stored straight in the container. Consider:</p>
+
+<pre>
+class FixedMatrix
+{
+  double data_[256][256];
+public:
+  ... operations ...
+};
+</pre>
+
+<p>For such a class, actually copying the sheer <b>sizeof(FixedMatrix)</b> bytes is the costly operation, and detecting temporary objects doesn't help.)</p>
+
+<H3><FONT COLOR="#000080">Past Solutions</FONT></H3>
+
+<p>Unnecessary copying is a long-standing problem within the C++ community. There are two lines of attack, one from a coding/library writing direction, and the other from a language definition/compiler writing direction.</p>
+<p>From a language/compiler perspective, we have the &quot;return value optimization,&quot; in short, RVO. RVO is expressly allowed by the C++ language definition <a href="#3">[3]</a>. Basically, of all functions you could ever write, your C++ compiler can assume it knows what one of them does. That function is the copy constructor, and the compiler assumes that the copy constructor <i>copies</i>. </p>
+<p>Exactly because it assumes that, the compiler can eliminate unnecessary copies. For example, consider:</p>
+
+<pre>
+vector&lt;string&gt; ReadFile()
+{
+  vector&lt;string&gt; result;
+  ... fill result ...
+  return result;
+}
+vector&lt;string&gt; vec = ReadFile();
+</pre>
+
+<p>A smart compiler can pass <b>vec</b>'s address as a hidden argument to <b>ReadFile</b> and create <b>result</b> at exactly that address. So the code generated from the source above looks like this:</p>
+
+<pre>
+void ReadFile(void* __dest)
+{
+  // use placement new to build a vector 
+  // at the address dest
+  vector&lt;string&gt;&amp; result = 
+    *new(__dest) vector&lt;string&gt;;
+  ... fill result ...
+}
+// assume proper alignment
+char __buf[sizeof(vector&lt;string&gt;)]; 
+ReadFile(__buf);
+vector&lt;string&gt;&amp; vec = 
+  *reinterpret_cast&lt;vector&lt;string&gt;*&gt;(__buf); 
+</pre>
+
+<p>RVO has a couple of different flavors, but the gist is the same: the compiler eliminates a call to the copy constructor by simply constructing the function return value in the final destination.</p>
+<p>Unfortunately, implementing RVO is not as easy as it might seem. Consider a slightly modified version of <b>ReadFile</b>:</p>
+
+<pre>
+vector&lt;string&gt; ReadFile()
+{
+  if (error) return vector&lt;string&gt;();
+  if (anotherError) 
+  {
+    vector&lt;string&gt; dumb;
+    dumb.push_back(&quot;This file is in error.&quot;);
+    return dumb;
+  }
+  vector&lt;string&gt; result;
+  ... fill result ...
+  return result;
+}
+</pre>
+
+<p>Now there's not one local variable that needs to be mapped to the final result, there are several. Some are named (<b>dumb</b>, <b>result</b>) and some are unnamed temporaries. Needless to say, confronted with such a situation, many optimizers would give up and rely on the conservative and less efficient approach.</p>
+<p>Even if you want to write &quot;straight&quot; code that would not confuse RVO implementations, you'll be disappointed to hear that each compiler, and often each compiler <i>version</i>, has its own rules for detecting and applying RVO. Some apply RVO only to functions returning <i>unnamed temporaries</i> (the simplest form of RVO). The more sophisticated ones also apply RVO when there's a named result that the function returns (the so-called <i>Named RVO</i>, or NRVO). </p> 
+<p>In essence, when writing code, you can count on RVO being portably applied to your code depending on how you exactly write the code (under a very fluid definition of &quot;exactly&quot;), the phase of the moon, and the size of your shoes.</p>
+<p>But wait, there's less. Oftentimes the compiler cannot apply RVO even if it aches to. Consider this slightly changed call to <b>ReadFile()</b>:</p>
+
+
+<pre>
+vector&lt;string&gt; vec;
+vec = ReadFile();
+</pre>
+
+<p>As innocent as this change seems, it makes a huge difference. Now instead of the copy constructor, we're calling the assignment operator, which is a different beast. Unless your compiler's optimization skills border on pure magic, now you can surely kiss your RVO goodbye: <b>vector&lt;T&gt;::operator=(const vector&lt;T&gt;&amp;)</b> expects a <b>const</b> reference to a <b>vector</b>, so a temporary will be returned by <b>ReadFile()</b>, bound to the <b>const</b> reference, copied into <b>vec</b>, and thrown away. Unnecessary temporaries hit again!</p>
+<p>From a coding perspective, a technique that has been recommended for a long time is COW (copy-on-write) <a href="#4">[4]</a>, which is a technique based on reference counting. </p>
+<p>COW has several advantages, one of which is that it detects and eliminates unnecessary copies. For example, when a function returns, the returned object has a reference count of <b>1</b>. Then you copy it, which bumps its reference count to <b>2</b>. Finally, you destroy the temporary, and the reference count goes back to <b>1</b>, at which point the destination is the only owner of the data. No actual copy has been made.</p>
+<p>Unfortunately, reference counting also has many drawbacks in terms of threading safety, incurring its own overhead, and many hidden gotchas <a href="#4">[4]</a>. COW is so unwieldy, that, in spite of its advantages, recent STL implementations don't use reference counting for <b>std::string</b>, in spite of the fact that <b>std::string</b>'s interface was intently designed to support reference counting!</p>
+<p>Several idioms for &quot;non-duplicable&quot; objects have been developed, of which <b>auto_ptr</b> is the most refined one. <b>auto_ptr</b> is easy to use correctly, but, unfortunately, just as easy to use incorrectly. The solution discussed in this article extends the techniques used in defining <b>auto_ptr</b>.</p>
+
+<H3><FONT COLOR="#000080">Mojo</FONT></H3>
+
+<p>Mojo (Move of Joint Objects) is a coding technique and a small framework for eliminating unnecessary copying of temporary objects. Mojo works by discriminating between temporary objects and legitimate, &quot;non-temporary,&quot; objects.</p>
+
+<H3><FONT COLOR="#000080">Passing Arguments to Functions</FONT></H3>
+
+<p>An interesting analysis prompted by Mojo is a scrutiny of the conventions used for passing arguments to functions. The common advice of the pre-Mojo era goes:</p>
+<OL><LI>If the function intends to change the argument as a side effect, take it by reference/pointer to a non-<b>const</b> object. Example:</LI>
+
+<pre>
+void Transmogrify(Widget&amp; toChange);
+void Increment(int* pToBump);
+</pre>
+
+<LI>If the function doesn't modify its argument and the argument is of primitive type, take it by value. Example:</LI>
+
+<pre>
+double Cube(double value);
+</pre>
+
+<LI>Otherwise, the argument is (or could be, in case you define a template) a user-defined type and must not be mutated, so take it by reference to <b>const</b>. Example:</LI>
+
+<pre>
+String&amp; String::operator=(const String&amp; rhs);
+template&lt;class T&gt; vector&lt;T&gt;::push_back(const T&amp;);
+</pre>
+</OL>
+
+<p>The third rule's intent is to avoid accidental copying of large objects. However, sometimes this very rule <i>forces</i> an unnecessary copy instead of preventing it! Consider you have a function like <b>Connect</b> below:</p>
+
+<pre>
+void Canonicalize(String&amp; url);
+void ResolveRedirections(String&amp; url);
+
+void Connect(const String&amp; url)
+{
+  String finalUrl = url;
+  Canonicalize(finalUrl);
+  ResolveRedirections(finalUrl);
+  ... use finalUrl ...
+}
+</pre>
+
+<p><b>Connect</b> takes a reference to <b>const</b> as an argument and, <i>presto</i>, creates a copy of it. Then it further processes the copy. </p>
+<p>This function exhibits a <b>const</b> that stands in the way of efficiency. <b>Connect</b>'s declaration says: &quot;I don't need a copy; a reference to <b>const</b> would suffice&quot; &#151; while the body actually <i>does</i> create a copy. So if you now say:</p>
+
+<pre>
+String MakeUrl();
+...
+Connect(MakeUrl()); 
+</pre>
+
+<p>then you can count on <b>MakeUrl()</b> returning a temporary, which will be copied and then destroyed: the dreaded unnecessary copy pattern. For a compiler to optimize away the copy, it has to do the Herculean job of (1) getting access to <b>Connect</b>'s definition (hard with separately compiled modules), (2) parse <b>Connect</b>'s definition to develop an understanding of it, and (3) alter <b>Connect</b>'s behavior so that the temporary is fused with <b>finalUrl</b>. </p>
+<p>Say now you change <b>Connect</b> as follows:</p>
+
+<pre>
+void Connect(String url) // notice call by value
+{
+  Canonicalize(url);
+  ResolveRedirections(url);
+  ... use url ...
+}
+</pre>
+
+<p>From the viewpoint of <b>Connect</b>'s callers, there is absolutely no difference: although you changed the syntactic interface, the semantic interface stays the same. To the compiler, this syntactic change makes all the difference in the world. Now the compiler has more leeway for taking care of the <b>url</b> temporary. For example, in the example above:</p>
+
+<pre>
+Connect(MakeUrl());
+</pre>
+
+<p>the compiler doesn't have to be really smart to fuse the temporary returned by <b>MakeUrl</b> with the temporary needed by <b>Connect</b>. Indeed, it would be harder work to do otherwise! Ultimately, the very result of <b>MakeUrl</b> will be altered and used inside <b>Connect</b>. The former version was choking the compiler, preventing it from performing any optimizations. This version smoothly cooperates with the compiler.</p>
+<p>The downside of the new setting is that now calls to <b>Connect</b> might generate more machine code. Consider:</p>
+
+<pre>
+String someUrl = ...;
+Connect(someUrl);
+</pre>
+
+<p>In this case, the first version would simply pass a reference to <b>someUrl</b>. The second version would create a copy of <b>someUrl</b>, call <b>Connect</b>, and destroy that copy. This code-size overhead increases with the static number of calls to <b>Connect</b>. On the other hand, the calls involving a temporary such as <b>Connect(MakeUrl())</b> can just as well generate less code in the second version. At any rate, it is unlikely that the size difference would create a problem.</p>
+<p>So we identified a different set of recommendations:</p>
+
+<UL>
+<p>3.1. If the function <i>always</i> makes a copy of its argument inside, take it by value.<br>
+<p>3.2. If the function <i>never</i> makes a copy of its argument, take it by reference to <b>const</b>.<br>
+<p>3.3. If the function <i>sometimes</i> makes a copy of its argument and if you care about efficiency, follow the Mojo protocol.</p>
+</UL>
+
+<p>The only thing left to do is developing the &quot;Mojo protocol,&quot; whatever that is. </p>
+<p>The main idea is to overload the same function (such as <b>Connect</b>) with the intent of discriminating between temporary and non-temporary values. (The latter are also known as &quot;lvalues&quot; for historical reasons: colloquially, lvalues could appear on the left-hand side of an assignment.) </p>
+<p>Now in starting to overload <b>Connect</b>, an idea would be to define <b>Connect(const String&amp;)</b> to catch &quot;genuine&quot; constant objects. This, however, would be a mistake because this declaration will &quot;eat&quot; all <b>String</b> objects &#151; be they lvalues or temporaries. So the first good idea is to <i>not</i> declare a function that accepts a <b>const</b> reference, because it swallows all objects like a black hole.</p>
+<p>A second try is to define <b>Connect(String&amp;)</b> in an attempt to catch non-<b>const</b> lvalues. This works well, and in particular <b>const</b> values and unnamed temporaries can't be &quot;eaten&quot; by this overload &#151; a good start. Now we only have to differentiate between <b>const</b> objects and non-<b>const</b> temporaries.</p> 
+<p>To do this, the technique we apply is to define two &quot;type sugar&quot; classes <b>ConstantString</b> and <b>TemporaryString</b>, and to define conversion operators from <b>String</b> to those objects:</p>
+
+<pre>
+class String;
+
+// &quot;type sugar&quot; for constant Strings
+struct ConstantString 
+{
+  const String* obj_;
+};
+
+// &quot;type sugar&quot; for temporary Strings
+// (explanation coming)
+struct TemporaryString : public ConstantString {};
+
+class String
+{
+public:
+  ... constructors, destructors,
+  operations, you name it ... 
+  operator ConstantString() const
+  {
+    ConstantString result;
+    result.obj_ = this;
+    return result;
+  }
+  operator TemporaryString()
+  {
+    TemporaryString result;
+    result.obj_ = this;
+    return result;
+  }
+};
+</pre>
+
+<p>So now <b>String</b> defines two conversion operators. One notable difference between them is that <b>TemporaryString</b> doesn't apply to <b>const String</b> objects. </p>
+<p>Now say you define the following three overloads:</p>
+
+<pre>
+// binds to non-const temporaries
+void Connect(TemporaryString); 
+// binds to all const objects (lvalues AND temporaries)
+void Connect(ConstantString); 
+// binds to non-const lvalues
+void Connect(String&amp; str) 
+{
+  // just forward to the other overload
+  Connect(ConstantString(str)); 
+}
+</pre>
+
+<p>Here's how it all works. Constant <b>String</b> objects are &quot;attracted&quot; by <b>Connect(ConstantString)</b>. There is no other binding that could work; the other two work for non-<b>const</b> <b>String</b>s only.</p>
+<p>Temporary objects can't go to <b>Connect(String&amp;)</b>. They could, however, go to either <b>Connect(TemporaryString)</b> or <b>Connect(ConstantString)</b>, and the former overload must be chosen unambiguously. That's the reason for deriving <b>TemporaryString</b> from <b>ConstantString</b>, a trick that deserves some attention.</p> 
+<p>Consider for a moment that <b>ConstantString</b> and <b>TemporaryString</b> were totally independent types. Then, when prompted to copy a temporary object, the compiler would be equally motivated to go either:</p>
+
+<pre>
+operator TemporaryY() &#151;&gt; Y(TemporaryY)
+</pre>
+
+<p>or:</p>
+
+<pre>
+operator ConstantY() const &#151;&gt; Y(ConstantY)
+</pre>
+
+<p>Why the equal motivation? This is because the non-<b>const</b> to <b>const</b> conversion is &quot;frictionless&quot; as far as selecting member functions is concerned. </p>
+<p>The need, therefore, is to give the compiler more &quot;motivation&quot; to choose the first route than the second. That's where the inheritance kicks in. Now the compiler says: &quot;Ok, I guess I could go through <b>ConstantString</b> or <b>TemporaryString</b>... but wait, the <i>derived</i> class <b>TemporaryString</b> is a better match!&quot;</p>
+<p>The rule in action here is that matching a derived class is considered better than matching a base class when selecting a function from an overloaded set. </p>
+<p>Finally, an interesting twist &#151; the inheritance doesn't necessarily have to be <b>public</b>. Access rules are orthogonal onto overloading rules.</p>
+<p>Let's see how <b>Connect</b> works on an example:</p>
+
+
+<pre>
+String s1(&quot;http://moderncppdesign.com&quot;);
+// invoke Connect(String&amp;) 
+Connect(s1); 
+// invoke operator TemporaryString() 
+// followed by Connect(TemporaryString)
+Connect(String(&quot;http://moderncppdesign.com&quot;)); 
+const String s4(&quot;http://moderncppdesign.com&quot;);
+// invoke operator ConstantString() const 
+// followed by Connect(ConstantString)
+Connect(s4);
+</pre>
+
+<p>As you see, we achieved the main goal we wanted: we can make a difference between temporary objects and all other objects. This is the gist of Mojo.</p>
+<p>There are some less-than stellar aspects, most of which we'll set out to fix. First off, there's a minor code duplication: <b>Connect(String&amp;)</b> and <b>Connect(ConstantString)</b> must basically do the same thing. The code above solves the issue by forwarding from the first overload to the second.</p>
+<p>Second, let's face it, writing two little classes to give each type some Mojo doesn't sound very attractive, so let's start making things a little more generic so as to make them easier to use. We define a namespace <b>mojo</b> in which we put two generic <b>constant</b> and <b>temporary</b> classes:</p>
+
+<pre>
+namespace mojo
+{
+  template &lt;class T&gt;
+  class constant // type sugar for constants
+  {
+    const T* data_;
+  public:
+    explicit constant(const T&amp; obj) : data_(&amp;obj)
+    {
+    }
+    const T&amp; get() const
+    {
+      return *data_;
+    }
+  };<p></p>
+
+  template &lt;class T&gt;
+  // type sugar for temporaries
+  class temporary : private constant&lt;T&gt; 
+  {
+  public:
+    explicit temporary(T&amp; obj) : constant&lt;T&gt;( obj)
+    {
+    }
+    T&amp; get() const
+    {
+      return const_cast&lt;T&amp;&gt;(constant&lt;T&gt;::get());
+    }
+  };
+}
+</pre>
+
+<p>Let's also define a base class <b>mojo::enabled</b> that defines the two operators:</p>
+
+<pre>
+  template &lt;class T&gt; struct enabled // inside mojo
+  {
+    operator temporary&lt;T&gt;()
+    {
+      return temporary&lt;T&gt;(static_cast&lt;T&amp;&gt;(*this));
+    }
+    operator constant&lt;T&gt;() const
+    {
+      return constant&lt;T&gt;(static_cast&lt;const T&amp;&gt;(*this));
+    }
+  protected:
+    enabled() {} // intended to be derived from
+    ~enabled() {} // intended to be derived from
+  };
+</pre>
+
+<p>With this scaffolding in place, the task of &quot;mojoing&quot; a class becomes considerably simpler:</p>
+
+<pre>
+class String : public mojo::enabled&lt;String&gt;
+{
+  ... constructors, destructors, operations, you name it ... 
+public:
+  String(mojo::temporary&lt;String&gt; tmp)
+  {
+    String&amp; rhs = tmp.get();
+    ... perform a destructive copy of rhs into *this ...
+  }
+};
+</pre>
+
+<p>This is the Mojo protocol for passing arguments to functions.</p>
+
+<H3><FONT COLOR="#000080"></FONT></H3>
+
+<p>Sometimes, things seem to work together so nicely, you get a nice design artifact without having worked towards it. True, those perky situations are in short supply, which makes them all the more valuable.</p>
+<p>It just happens that with Mojo's design we can detect very easily whether a class supports Mojo or not. Simply write:</p>
+
+<pre>
+namespace mojo
+{
+  template &lt;class T&gt;
+  struct traits
+  {
+    enum { enabled = 
+      Loki::SuperSubclassStrict&lt; enabled&lt;T&gt;, T &gt;::value };
+  };
+}; 
+</pre>
+
+<p>Loki readily offers the mechanics for detecting whether a type is derived from another <a href="#5">[5]</a>.</p>
+<p>Now you can find out whether an arbitrary type <b>X</b> was designed for the Mojo protocol by saying <b>mojo::traits&lt;X&gt;::enabled</b>. This detection mechanism is very important in generic code, as we'll soon see.</p>
+
+<H3><FONT COLOR="#000080">Optimizing Returning Values from Functions</FONT></H3>
+
+<p>Now that we have passing arguments right, let's see how to extend Mojo to optimize returning values from functions. Again, the goal is portable efficiency &#151; 100% elimination of unnecessary copies, without dependence on one particular RVO implementation.</p>
+<p>Let's first see what the common advice says. For good reasons, some authors recommend <b>const</b>ifying return values as well <a href="#7">[7]</a>. Continuing the old rules:</p>
+
+<UL><p>4. When a function returns a user-defined object by value, return a <b>const</b> value. Example:</p>
+
+<pre>
+const String operator+(const String&amp; lhs, 
+  const String&amp; rhs);
+</pre>
+</UL>
+
+<p>The idea underlying rule 4 is to make user-defined operators behave much as built-in operators by forbidding wrong expressions such as <b>if (s1 + s2 = s3)</b>, when the intent is to say <b>if (s1 + s2 == s3)</b>. If <b>operator+</b> returns a <b>const</b> value, this particular bug will be detected at compile time. However, other authors <a href="#6">[6]</a> recommend against returning <b>const</b> values.</p>
+<p>On a philosophical note, any return value is transitory <i>par excellence</i>; it's an ephemerid that just was created and will disappear soon. Then, why force <b>operator+</b>'s client to get a constant value? What's constant about this butterfly? Seen from this perspective, <b>const</b> temporary looks like an oxymoron, a contradiction in terms. Seen from a practical perspective, <b>const</b> temporaries force copying at destination.</p> 
+  <p>Assuming we now agree it's best to keep <b>const</b> away from the return 
+    value if efficiency is important, how do we convince the compiler to move 
+    the result of a function to its destination instead of copying it?</p>
+<p>When copying an object of type <b>T</b>, the copy constructor is invoked. Given that the copy constructor is a function like any other, it would appear that we can just apply the same ideas as above, leading to the following setting:</p>
+
+<pre>
+class String : public mojo::enabled&lt;String&gt;
+{
+  ...
+public:
+  String(String&amp;);
+  String(mojo::temporary&lt;String&gt;);
+  String(mojo::constant&lt;String&gt;);
+};
+</pre>
+
+<p>This is a very nice setting, except for a little detail &#151; it doesn't work.</p>
+<p>Remember when I said: &quot;the copy constructor is a function like any other?&quot; Well, I lied. The copy constructor is a <i>special</i> function in annoying ways. In particular, if for a type <b>X</b> you define <b>X(X&amp;)</b> in lieu of <b>X(const X&amp;)</b>, then the following code doesn't work:</p>
+
+<pre>
+void FunctionTakingX(const X&amp;);
+FunctionTakingX(X()); // Error!
+  // Can't find X(const X&amp;)!
+</pre>
+
+<p>This badly disables <b>X</b>, so we are forced to include the <b>String(const String&amp;)</b> constructor. Now if you'll allow me to quote this very article, at a point I said: &quot;So the first good idea is to <i>not</i> declare a function that accepts a <b>const</b> reference, because it swallows all objects like a black hole.&quot; </p>
+<p>Can you say &quot;conflict of interest&quot;?</p>
+<p>Clearly, copy construction needs special treatment. The idea here is to create a new type, <b>fnresult</b>, which serves as a &quot;mover&quot; for <b>String</b> objects. Here are the steps we need to take: </p> 
+
+<OL><LI>Define <b>fnresult</b> such that a function that previously returned <b>T</b> will now return <b>fnresult&lt;T&gt;</b>. For this change to be transparent to callers, <b>fnresult&lt;T&gt;</b> must be convertible to <b>T</b>.</LI> 
+<LI>Establish move semantics for <b>fnresult</b>: whenever an <b>fnresult&lt;T&gt;</b> object is copied, the <b>T</b> contained inside is moved.</LI>
+<LI>Similarly to <b>operator constant</b> and <b>temporary</b>, provide a conversion operator to <b>fnresult</b> in class <b>mojo::enabled</b>.</LI>
+<LI>A mojoed class (such as <b>String</b> in our example) defines a constructor <b>String(mojo::fnresult&lt;String&gt;)</b> that completes the move.</LI>
+</OL>
+
+<p>The definition of <b>fnresult</b> looks like this:</p>
+
+<pre>
+namespace mojo
+{
+  template &lt;class T&gt; 
+  class fnresult : public T
+  {
+  public:
+    // The cast below is valid given that 
+    // nobody ever really creates a 
+    // const fnresult object
+    fnresult(const fnresult&amp; rhs) 
+      : T(temporary&lt;T&gt;(const_cast&lt;fnresult&amp;&gt;(rhs)))
+    {
+    }
+    explicit fnresult(T&amp; rhs) : T(temporary&lt;T&gt;(rhs))
+    {
+    }
+  };
+}</pre>
+
+<p>Because <b>fnresult&lt;T&gt;</b> inherits <b>T</b>, step 1 is taken care of: an <b>fnresult&lt;T&gt;</b> converts to a <b>T</b>. Then, copying an <b>fnresult&lt;T&gt;</b> object implies <i>moving</i> its <b>T</b> subobject by forcing a conversion to <b>temporary&lt;T&gt;</b>, thus taking care of step 2.</p> 
+<p>As mentioned, we add a conversion to <b>enabled</b> that returns an <b>fnresult</b>. The final version of <b>enabled</b> looks like this:</p>
+
+<pre>
+  template &lt;class T&gt; struct enabled
+  {
+    operator temporary&lt;T&gt;()
+    {
+      return temporary&lt;T&gt;(static_cast&lt;T&amp;&gt;(*this));
+    }
+    operator constant&lt;T&gt;() const
+    {
+      return constant&lt;T&gt;(static_cast&lt;const T&amp;&gt;(*this));
+    }
+    operator fnresult&lt;T&gt;()
+    {
+      return fnresult&lt;T&gt;(static_cast&lt;T&amp;&gt;(*this));
+    }
+  protected:
+    enabled() {} // intended to be derived from
+    ~enabled() {} // intended to be derived from
+  };
+</pre>
+
+<p>Finally, <b>String</b> defines the constructor mentioned in step 4. Here's <b>String</b> with all its constructors:</p>
+
+<pre> 
+class String : public mojo::enabled&lt;String&gt;
+{
+  ...
+public:
+  // COPY rhs
+  String(const String&amp; rhs); 
+  // MOVE tmp.get() into *this
+  String(mojo::temporary&lt;String&gt; tmp); 
+  // MOVE res into *this
+  String(mojo::fnresult&lt;String&gt; res); 
+};</pre>
+
+<p>Now consider the following function:</p>
+
+<pre>
+mojo::fnresult&lt;String&gt; MakeString()
+{
+  String result;
+  ...
+  return result;
+}
+...
+String dest(MakeString());
+</pre>
+<p>The route between <b>MakeString</b>'s <b>return</b> statement and <b>dest</b> is: <b>result</b> &#151;&gt; <b>String::operator fnresult&lt;String&gt;()</b> &#151;&gt; <b>fnresult&lt;String&gt;(const fnresult&lt;String&gt;&amp;)</b> &#151;&gt; <b>String::String(fnresult&lt;String&gt;)</b>.</p>
+<p>A compiler using RVO can eliminate the <b>fnresult&lt;String&gt;(const fnresult&lt;String&gt;&amp;)</b> call in the middle of the chain. What's most important, however, is that no function involved performs a true copy: they all are defined such that the actual content of <b>result</b> smoothly moves to <b>dest</b>. There is no memory allocation and no memory copying involved.</p>
+<p>Now, as you see, there are two, maximum three, move operations. It might be possible that for certain types and under certain conditions, you are better off (speed wise) with one copy than with three moves. There is an important difference, though: copying might fail (throw an exception), while the move never fails.</p>
+
+<H3><FONT COLOR="#000080">Scaling Up</FONT></H3>
+
+<p>Ok, we got Mojo working, and quite nicely, on individual classes. Now how about scaling Mojo up to compound objects that contain many other objects, some of which are mojoed as well?</p>
+<p>The task is to &quot;pass down&quot; a move constructor from a class to its members. Consider, for example, embedding class <b>String</b> above inside a class <b>Widget</b>:</p>
+
+<pre>
+class Widget : public mojo::enabled&lt;Widget&gt;
+{
+  String name_;
+public:
+  Widget(mojo::temporary&lt;Widget&gt; src) // source is a temporary
+    : name_(mojo::as_temporary(src.get().name_))
+  {
+    Widget&amp; rhs = src.get();
+    ... use rhs to perform a destructive copy ... 
+  }
+  Widget(mojo::fnresult&lt;Widget&gt; src) // source is a function result
+    : name_(mojo::as_temporary(src.name_))
+  {
+    Widget&amp; rhs = src;
+    ... use rhs to perform a destructive copy ... 
+  }
+};
+</pre>
+
+<p>The initialization of <b>name_</b> in the destructive constructor uses an important Mojo helper function:</p>
+
+<pre>
+namespace mojo
+{
+  template &lt;class T&gt;
+  struct traits
+  {
+    enum { enabled = 
+      Loki::SuperSubclassStrict&lt; enabled&lt;T&gt;, T &gt;::value };
+    typedef typename 
+       Loki::Select&lt;
+         enabled,
+         temporary&lt;T&gt;, 
+         T&amp;&gt;::Result
+       temporary;
+  };
+  template &lt;class T&gt;
+  inline typename traits&lt;T&gt;::temporary as_temporary(T&amp; src)
+  {
+    typedef typename traits&lt;T&gt;::temporary temp;
+    return temp(src);
+  }
+}
+</pre>
+
+<p>All <b>as_temporary</b> does is force creation of a temporary from an lvalue. This way, the move constructor of <b>member_</b> is invoked for the destination object.</p>
+<p>If <b>String</b> is mojoed, <b>Widget</b> takes advantage of that; if not, a straight copy is performed. In other words: if <b>String</b> is a superclass of <b>mojo::enabled&lt;String&gt;</b>, then <b>as_temporary</b> returns a <b>mojo::temporary&lt;String&gt;</b>. Otherwise, <b>as_temporary(String&amp; src)</b> is simply the identity function that takes a <b>String&amp;</b> and returns the same <b>String&amp;</b>.</p>
+<p>We availed ourselves of another Loki feature: <b>Select&lt;condition, T, U&gt;::Result</b> is either <b>T</b> or <b>U</b>, depending on whether the Boolean condition is true or false, respectively <a href="#5">[5]</a>.</p>
+
+<H3><FONT COLOR="#000080">Application: <b>auto_ptr</b>'s Cousin and Mojoed Containers</FONT></H3>
+
+<p>Consider a class <b>mojo_ptr</b> that disables a couple of constructors by making them private:</p>
+
+<pre>
+class mojo_ptr : public mojo::enable&lt;mojo_ptr&gt;
+{
+  mojo_ptr(const mojo_ptr&amp;); // const sources are NOT accepted
+public:
+  // source is a temporary
+  mojo_ptr(mojo::temporary&lt;mojo_ptr&gt; src) 
+  {
+    mojo_ptr&amp; rhs = src.get();
+    ... use rhs to perform a destructive copy ... 
+  }
+  // source is a function's result
+  mojo_ptr(mojo::fnresult&lt;mojo_ptr&gt; src) 
+  {
+    mojo_ptr&amp; rhs = src.get();
+    ... use rhs to perform a destructive copy ... 
+  } 
+  ...
+};
+</pre>
+
+<p>This class has an interesting behavior. You can't copy <b>const</b> objects of that class. You also can't copy lvalues of that class, ouch! But you can copy (with move semantics) temporary objects of that class, and you can explicitly move an object to another by writing:</p>
+
+<pre>
+mojo_ptr ptr1;
+mojo_ptr ptr2 = mojo::as_temporary(ptr1);
+</pre>
+
+<p>That's not too big a deal by itself; <b>auto_ptr</b> could have done that by simply making <b>auto_ptr(auto_ptr&amp;)</b> private. The interesting part is actually not about <b>mojo_ptr</b>, but rather how, by using <b>as_temporary</b>, you can build efficient containers storing &quot;classic&quot; types, general mojoed types, and <b>mojo_ptr</b> alike. All such a container has to do is to use <b>as_temporary</b> whenever it needs to shuffle elements around. For &quot;classic&quot; types, <b>as_temporary</b> is the identity function that does nothing; for <b>mojo_ptr</b>, <b>as_temporary</b> is the function that facilitates smooth moving. The <b>move</b> and <b>uninitialized_move</b> function templates (see the attached code) come in very handy, too.</p>
+<p>In standard terms, <b>mojo_ptr</b> is neither &quot;copyable&quot; nor &quot;assignable.&quot; However, <b>mojo_ptr</b> could be considered as part of a new category of types, called <i>&quot;moveable</i>.<i>&quot;</i> This is an important new category that also might include locks, files, and other non-duplicable handles. </p>
+<p>The result? If you ever wished for an &quot;owning container&quot; &agrave; la <b>vector&lt; auto_ptr&lt;Widget&gt; &gt;</b> with safe, clear semantics, you just got it with sugar on top. Also, mojoized vectors scale well when containing expensive-to-copy types, such as <b>vector&lt; vector&lt;string&gt; &gt;</b>.</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+<p>Mojo is a technique and a compact framework for eliminating unnecessary copying of temporaries. Mojo works by detecting temporaries and guiding them through a different function overload than lvalues. By doing so, the function taking a temporary can perform a destructive copy on it, confident that no other code is going to use that temporary.</p>
+<p>Mojo applies if client code follows a set of simple rules for passing arguments to, and returning values from, functions. </p>
+<p>Mojo defines a separate mechanism for eliminating copying in case of function returns.</p>
+<p>The extra machinery and type drudgery makes Mojo less that 100% transparent to client code; however, the degree of integration is pretty good for a library-based solution. In the best of all worlds, Mojo will stand as a robust placeholder until a more elegant, language-based feature will be standardized and implemented.</p>
+
+<H3><FONT COLOR="#000080">Acknowledgements</FONT></H3>
+
+<p>Mojo has been intensely scrutinized and has had a short, but intense childhood.</p>
+<p>David Abrahams made salient contributions to the implementation of move constructors. Rani Sharoni pointed out subtle bugs. Peter Dimov sent Mojo back to the whiteboard by figuring out a fatal problem in an earlier design. </p>
+<p>Gary Powell worked a lot to extend Mojo to work with inheritance, and Evgeny Karpov simplified code considerably in the presence of template functions. I hope we'll be able to discuss these improvements in a future article.</p>
+<p>Howard Hinnant, Peter Dimov, and Dave Abrahams deserve credit for the proposal to add move constructors to the language.</p>
+<p>Many, many enthusiastic volunteers all over the world reviewed this article. Thank you all! I would like to especially mention Walter E. Brown, David Brownell, Marshall Cline, Peter Dimov, Mirek Fidler, Daniel Frey, Dirk Gerrits, Fredrik Hedman, Craig Henderson, Howard Hinnant, Kevin S. Van Horn, Robin Hu, Grzegorz Jakacki, Sorin Jianu, Jozef Kosoru, Rich Liebling, Ray Lischner, Eric Niebler, Gary Powell, William Roeder, Maciej Sinilo, Dan Small, Alf P. Steinbach, Tommy Svensson, David Vandevoorde, Ivan Vecerina, Gerhard Wesp, and Yujie Wu.</p>
+
+<H3><FONT COLOR="#000080">Bibliography</FONT></H3>
+
+<p><a name="1"></a>[1] Dov Bulka and David Mayhew. <i>Efficient C++: Performance Programming Techniques</i>, (Addison-Wesley, 1999).</p>
+<p><a name="2"></a>[2] Howard E. Hinnant, Peter Dimov, and Dave Abrahams. &quot;A Proposal to Add Move Semantics Support to the C++ Language,&quot; ISO/IEC JTC1/SC22/WG21 &#151; C++, document number N1377=02-0035, September 2002, <a href="http://anubis.dkuug.dk/jtc1/sc22/wg21/docs/papers/2002/n1377.htm">&lt;http://anubis.dkuug.dk/jtc1/sc22/wg21/docs/papers/2002/n1377.htm&gt;</a>.</p>
+<p><a name="3"></a>[3] &quot;Programming Languages &#151; C++,&quot; International Standard ISO/IEC 14882, Section 12.2.</p>
+<p><a name="4"></a>[4] Herb Sutter. <i>More Exceptional C++</i> (Addison-Wesley, 2002).</p>
+<p><a name="5"></a>[5] Andrei Alexandrescu. <i>Modern C++ Design</i> (Addison-Wesley, 2001).</p>
+<p><a name="6"></a>[6] John Lakos. <i>Large-Scale C++ Software Design</i> (Addison-Wesley, 1996), Section 9.1.9.</p>
+<p><a name="7"></a>[7] Herb Sutter. <i>Exceptional C++</i> (Addison-Wesley, 2000).</p>
+
+<H3><FONT COLOR="#000080">Download the Code</FONT></H3>
+
+<p><a href="ftp://ftp.cuj.com/pub/2003/2102/alexandr.zip">alexandr.zip</a></p>
+
+<H3><FONT COLOR="#000080">About the Author</FONT></H3>
+
+<p><b>Andrei Alexandrescu</b> is a Ph.D. student at University of Washington in Seattle, and author of the acclaimed book <I>Modern C++ Design</I>. He may be contacted at <A HREF="mailto:andrei@metalanguage.com">andrei@metalanguage.com</a>. Andrei is also one of the featured instructors of The C++ Seminar (&lt;<a href="http://thecppseminar.com">http://thecppseminar.com</A>&gt;).</p>
+
+</BLOCKQUOTE></BODY></HTML>

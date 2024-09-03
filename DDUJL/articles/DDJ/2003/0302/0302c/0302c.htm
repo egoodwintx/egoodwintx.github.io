@@ -1,0 +1,172 @@
+<html>
+<head>
+<title>Feb03: C++ Stack Trace</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>C++ Stack Trace</h1>
+<p><i>Dr. Dobb's Journal</i> February 2003</p>
+<h2>Collecting the call stack in real time</h2>
+
+<h3>By Noam Cohen</h3>
+
+<I>
+Noam is chief technology officer at Vsoft. He can be contacted at noam@vsoft.com.</I>
+
+<hr>
+
+<p>During the development process, it is useful to know the context in which certain errors occur. For example, when error messages are displayed, it helps to know the tracks leading to the errors. Likewise, when applications crash, the postmortem data (available using Dr. Watson, for instance) in the stack can save the day.</p>
+<p>But collecting call stack data only when the application crashes has a limitation&#151;sometimes the call stack is corrupted and only the top of the stack is visible. This is how Dr. Watson works. Luckily, there is an alternative: You can collect the call stack while it's being created. This is what profilers do. As you might expect, this method also has a deficiency&#151;continuously collecting and storing call stack data consumes resources.</p>
+<DDJADVERTISEMENT INLINE>
+
+<p>When call stack information is available during the actual advancement of the program and not as a snapshot, the data can be used to identify patterns of calling functions. Normally, you would not want to see the very long trail of function calls leading to the current call&#151;except when this provides a solution to the bug.</p>
+
+<p>During the development of a C++ application, we needed more data than standard debugging tools provided, including:</p>
+
+
+<ul>
+  <li>Content of the call stack when error messages were logged. 
+  <li>Content of the call stack when fatal exceptions were thrown.
+
+  <li>Function call trees showing the history of function calls&#151;up to the current time. 
+
+</ul>
+
+
+<p>All these data were needed on a per-thread basis.</p>
+
+<p>Of course, the first two requirements can be satisfied in part with the Win32 API <i>StackWalk()</i> function. However, we decided not to use this API call because it is too complex,  not available on all platforms, and the results aren't detailed enough. (For more information on <i>StackWalk()</i>, see John Robbins's "Bugslayer" column <i>Microsoft Systems Journal</i>, February 1999; http://www.microsoft.com/msj/0299/bugslayer/bugslayer0299.htm).</p>
+
+<p>Consequently, we ended up building a tool that collects the information in real time, then displays the results. To collect the data, we needed to keep every function entry/exit. To do this, we used the constructor/distractor of auto variable to do all the hooking work; see <A NAME="rl1"><A HREF="#l1">Listing One</A>. This approach is easy to implement, platform independent, lets you easily decide which functions not to collect, and works correctly even when exceptions are thrown. On the downside, it requires that you manually insert code into the application under test.</p>
+
+<p>An alternative function hooking relies on the compiler to create a hook function for the entry/exit of each function. Microsoft's Visual C++ 6 enables the call to <i>_penter()</i> for every function call (using the /GH command line). In Visual C++ 7, the /GH flag also generates the <i>_pexit()</i> function call. This approach requires no changes to the application source code and works for C sources as well. However, it does rely on compiler-specific implementations and necessitates the use of a symbol engine.</p>
+
+<p>Every function entry/exit is reported to a singleton object. I implemented it as a COM (INPROC) server, though this isn't mandatory. During the first function entry report (<i>IStackTrace::Add()</i>), storage is allocated and a pointer to it is saved in the Thread Local Storage (TLS). <A NAME="rl2"><A HREF="#l2">Listing Two</A> is the pseudocode for <i>Add()</i>. The main body of code is in StackTrace.dll and contains the COM object that registers the function calls. Use of this COM object is done with the aid of classes and macros defined in stackTrace.h (available electronically; see "Resource Center," page 5).</p>
+
+<p>To use the stack trace, you need to:</p>
+
+
+<p>1. Register the stackTrace.dll.</p>
+
+<p>2. Set the registry flag to configure the stack tracer.</p>
+
+<p>3. Add <i>#include "stackTrace.h"</i> to the .cpp file(s).</p>
+
+<p>4. Add STACK_TRACE("function name") as the first line in every function to be monitored (<A NAME="rl1"><A HREF="#l1">Listing One</A>). I wrote a macro for VisualStudio 6 that eliminates manual typing; <A NAME="rl3"><A HREF="#l3">Listing Three</A> is sample code that uses the macro.</p>
+
+<p></p>
+
+<p>At any time during the run (that is, when an error is logged), the content of a stack trace can be dumped (for each thread, or for all threads). If dumping function call tree to file is enabled, a file for each thread is created. The file (which is in XML) shows the history of function calls. As <A NAME="rf1"><A HREF="0302cf1.htm">Figure 1</A> shows, I used XML to enable  XML tree viewers. This lets me easily collapse/expand large parts of the full call history. I then browsed the XML file using Frank Le's XmlTreeView (http://www.codeproject.com/soap/xmltreeview.asp). <A NAME="rf2"><A HREF="0302cf2.htm">Figure 2</A> is a sample logger output with StackTrace data (note the parameter value changing in the hex dump attached for each function call).</p>
+
+<p>Since C++ guarantees that destructors of automatic variables are called even if an exception is thrown, the registration of "exiting function" will not be skipped. Actually, it is so clean that no information on the exception is visible in the trace (unless you know to expect a certain function call order).</p>
+
+
+
+<h3>Performance Issues</h3>
+
+
+<p>Although this tool was developed for debugging&#151;not retail builds&#151;I still kept a close eye on performance. Writing the function data to the TLS requires copying about 30 bytes and an <i>STL::map::find()</i> operation. Since each thread has its own data structure, no synchronization objects are used, thereby avoiding nasty congestions.</p>
+
+
+<p>Writing function call history data to file is much slower (though most of the <i>WriteFile()</i> calls are done to the filesystem cache). To avoid slowing the application, a special worker thread in idle priority writes the function call trace to files. For each thread, a separate file is created, thus, the traces are not mixed. When <i>IStackTrace::Add()</i> is called, it checks if function trace is enabled. If so, it posts a message to the writer thread and returns immediately. The same is done in <i>IStackTrace::Remove()</i>. When the application terminates, the thread receives a TIME_TO_DIE message, closes the files, and terminates cleanly.</p>
+
+
+
+<h3>Hooking Entry and Exit</h3>
+
+
+<p>This version uses an explicit code to report the function name (as a string). An alternative, used by code profilers (such as Numega TrueTime), is to parse the binary code, and inject hooks to it. The best alternative is to use compiler supplied hooks. In this hook&#151;<i>_penter()</i> and <i>_pexit()</i>&#151;the function address is written to the registrar. A symbol engine can then convert the address to a well-formed function name. This requires compilation with debug symbols. The technique is thoroughly described by John Robbins in his article on creating the Smooth Working Set tool (<i>MSDN Magazine</i>, October and December 2000; http://msdn.microsoft.com/msdnmag/ issues/1000/bugslayer/bugslayer1000.asp). This technique seems to be the ideal solution, but since I use VC 6, the compiler supplies only the <i>_penter()</i>. I tried injecting my own <i>_pexit()</i> from it but failed. A full explanation is beyond the scope of this article.</p>
+
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>Admittedly, I do not use stack traces every day. For those sneaky bugs, however, I need the stack trace to be reliable and supply as much data as possible. The function call history was added at a later stage. At first we were skeptical of its usability&#151;after all, no one wants to browse through hundreds of thousands of lines. We learned quickly that it is quite easy to find the interesting portion and get to the usual "Hey, why is that call done here in the sequence?!" ritual. </p>
+
+
+
+
+<h3>Acknowledgment</h3>
+
+
+<p>Thanks to John Robbins for his help with the function hooks.</p>
+
+
+<p></p>
+
+
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1">Listing One </H4>
+
+
+<pre>#define DECLARE_STACKTRACE  StackTrace  g_StackTracer;
+// helper class for making life easier for the users of the StackTrace
+// When entering a function, simply construct an object of this class
+class AutoStackTrackEntry
+{
+public:
+    AutoStackTrackEntry(IN const char* message ,const char* _ebp)
+    {
+        g_StackTracer.Add(message,_ebp);
+    }
+    ~AutoStackTrackEntry()
+    {
+        g_StackTracer.Remove();
+    }
+};
+// macro to make life even easier using AutoStackTrackEntry.
+// You should have #define DECLARE_STACKTRACE  
+//                before any use of the STACK_TRACE() macro
+#define STACK_TRACE(msg)    \
+    unsigned int _ebp;      \
+    {__asm mov _ebp,ebp }   \
+    AutoStackTrackEntry  _stackEntry(msg, 
+                                reinterpret_cast&lt;char*&gt;(_ebp + 4))
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two</H4>
+
+
+<pre>Add( function_name, args_buffer)
+{
+    tls_index =  GetTlsForThread(GetCurrentThreadId()) ;
+    if(NOT_FOUND == tls_index)
+    {
+        allocate structure for the call stack, put it in  the TLS;
+        insert the mapping 'tid -&gt; tls' to the map.
+    }
+    StackTraceStruct  *pStruct = data_block_from(tls_index);
+    Update pstruct with function_name, args_buffer
+
+    If(should write function trace)
+        Notify worker thread with the current parameters.
+}
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+<H4><A NAME="l3">Listing Three</H4>
+
+
+<pre>int Tester::g(int k)
+{
+    STACK_TRACE("Tester::g");
+    ...
+}
+
+
+</pre>
+<P>
+<A HREF="#rl3">Back to Article</A>
+</P>
+
+
+</body>
+</html>
