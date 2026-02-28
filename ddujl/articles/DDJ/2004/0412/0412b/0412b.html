@@ -1,0 +1,384 @@
+
+<html>
+<head>
+<title>December, 2004: Databases &amp;  Dynamic Ruby Classes</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Databases &amp;  Dynamic Ruby Classes</h1>
+<p><i>Dr. Dobb's Journal</i> December, 2004</p>
+<h2>An elegant solution to thorny problems</h2>
+
+
+<h3>By David J. Berube</h3>
+
+
+<I>David is a consultant based in New Hampshire. He can be contacted at djberube@berubeconsulting.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Ruby, an open-source scripting language designed by Yukihiro Matsumoto, is an elegant language that follows the Principal of Least Surprise&#151;things are designed to work the way that you expect them to work. </p>
+
+<p>Despite this elegance&#151;or perhaps because of it&#151;Ruby is a flexible language. For example, class definitions are executable code; they are evaluated at run-time, not at compile time. Ruby uses this flexibility well. The language includes a shortcut for creating accessor methods that generates method definitions at runtime. The shortcut actually generates the code that defines these methods, and the Ruby interpreter executes it at runtime; it takes advantage of Ruby's ability to run any arbitrary string containing Ruby code.</p>
+
+<p>Ruby also lets you modify its behaviors to an uncommon degree; for example, you can define a method that handles when a nonexistent method is called on an object. Ruby also has a flexible mechanism for running code&#151;any string containing Ruby code&#151;in an arbitrary context. </p>
+
+<p>Ruby is a highly portable language that runs on Windows, Linux, UNIX, Mac OS, BeOS, and other platforms. For more information, see "Programming in Ruby," by Dave Thomas and Andy Hunt (<i>DDJ</i>, January 2001) and http://www.ruby-lang.org/. In this article, I use Ruby's features to run Ruby code from a MySQL database (although most of the major databases could have been used). In doing so, I first examine how to trap calls to missing methods and determine whether an object has a given property using a single table and one row per object. Next, I look at how to expand this methodology so that any given object property can evaluate to either a static value or can return the output of Ruby code, which is contained in the database and may be modified at runtime. After that, I detail how to create inheritance hierarchies so that if a property does not exist for a given object, its parents can be checked for a given property. </p>
+<h3>Setting and Retrieving Values</h3>
+
+<p><a name="rl1"></a><a href="#l1">Listing One</a> lets you set and and retrieve values from a database. (<a name="rl4"></a><a href="#l4">Listing Four</a> is the SQL script for creating a test database to run the Ruby examples I present here.) <a name="rl1"></a><a href="#l1">Listing One</a> defines a <i>Test_Object</i> class, along with two class-scope private members: </p>
+
+
+
+<ul>
+  <li><i>@@properties</i>, an array accessible to any member of the class.</li>
+  <li><i>MYTABLE</i>, a constant specifying the table the class represents. </li>
+</ul>
+
+
+
+<p>It also defines a method to read <i>object_id</i>, as well as an initialize method that lets you call <i>Test_Object.new()</i> with an <i>object_id</i> as a parameter. </p>
+
+<p>The <i>method_missing</i> method is executed when a nonexistent method is called. In Ruby, an assignment to a public member of a classic is simply a method whose name is the property name followed by an equals sign ("="). Because of this, the routine first checks if the rightmost character of the string is an equals sign. If it is, it's an assignment, so it calls the <i>set</i> method to set the field appropriately. The <i>set</i> method is a method of the class that uses an <i>UPDATE</i> statement to set the field equal to the new value. If the first character is not an equals sign, it checks if the method is in the list of the fields you are familiar with. If it is, then it retrieves the value and returns it. </p>
+
+<p>This technique has its downside. As implemented, it queries the database with a SQL <i>UPDATE</i> statement whenever an assignment is made. This can result in inefficiency when you make a large number of assignments. This may be an issue in situations where <i>UPDATE</i> statements are expensive or a large number of fields are modified at one time. You may wish to modify the technique so that the statements are stored until some update method is called that makes all the assignments at once. Of course, this reduces the intuitiveness and elegance of the solution, possibly inducing bugs. The other possibilities include a separate method for making updates to a number of properties at once, such as a separate method to set multiple properties, or perhaps a <i>begin_batch_update</i> and <i>end_batch update </i>method, which executes all the assignments inside the block once the block ends.</p>
+
+<p>To this point, this technique is not complicated, similar to how you might implement it in most object-oriented languages. However, the strength of the technique is that the code is very orthogonal, and there isn't duplication of code for each property you add. Instead, you can add additional properties just by adding new elements to <i>@@properties</i>. You can also add additional functionality&#151;type checking, auditing, compression, encryption, and the like&#151; easily and in a central place. The lack of code duplication, as well as the lack of special syntax, makes this technique stand out. Still, the really interesting part comes next.</p>
+<h3>Methods Stored In the Database</h3>
+
+<p><a name="rl2"></a><a href="#l2">Listing Two</a> defines a class that extends the technique. It contains the same functionality as the first class, with some additions. If a method is called that does not exist, and it is not part of the <i>@@properties</i> array, it is assumed that it is part of a second, dynamic table of properties for the object. The name of this table is defined as a class-scope constant, <i>EXTENDED_PROPERTIES_TABLE</i>. This table contains one property for one object per row, and each property can have either a static value or code associated with it. </p>
+
+<p>When a property is not part of the first table, then it is assumed to be an extended property, part of the extended properties table. These extended properties are different from the properties part of the first table; they may contain executable code instead of values. Because of that, they are more flexible; a static value may be changed to a dynamic value at runtime. Additionally, because there is one property per row, new properties may be added to an object at runtime without modifying the structure of the main object table. </p>
+
+<p>How are extended properties evaluated? First, the extended properties table is checked for a row with the appropriate object ID and property name. If it's not found&#151;in other words, if someone called a method that simply didn't exist&#151;then it returns <i>nil</i>, although in many situations it is preferable to raise an error. Next, it checks if there is code associated with that method. If there is, then it evaluates that code using Ruby's built-in evaluation faculty. </p>
+
+<p>Ruby runs the code in the current context so that the <i>self</i> object refers to the correct object, and the code can access private class members. Additionally, the code can access local variables from the calling method, the <i>get_property</i> function. One of those local variables is the <i>args</i> array&#151;the array containing the arguments passed to the method. Since the evaluated code has access to that array, it can simply take its arguments from the array. If so desired, you can check that the correct number of arguments is passed to the method, either inside the method itself or by adding an additional field to the extended properties table. No type checking is done for the arguments. Since Ruby itself does not perform argument type checking, that probably won't be a problem, although you could modify the <i>get_property</i> code to ensure that each argument was of the proper type.</p>
+
+<p>However, properties that do not need the capacity to contain code should be part of the objects table wherever possible. Why? To perform a query on extended properties, it requires at least one additional subquery for each property to be examined. This can be a severe performance problem if not used correctly. This is not an issue when updating or querying a single object, however, and so this can be an extremely powerful technique when the property is not frequently used as part of large queries.</p>
+<h3>Implementation Inheritance</h3>
+
+<p><a name="rl3"></a><a href="#l3">Listing Three</a> defines a third revision of the <i>Test_Object</i> class&#151;one that supports implementation inheritance entirely within the database, essentially by causing undefined method calls on an object to be handed to its parent object. An additional property, <i>parent</i>, is added to the <i>@@properties </i>array and to the <i>test_objects</i> table. The <i>parent</i> property specifies the ID of the parent <i>Test_Object</i>. The <i>get_property</i> method is modified so that if a property can't be found, it calls the <i>get_property</i> method of the <i>parent</i> object. This continues until a property is found or until the <i>parent</i> property is <i>nil</i> (which is how Ruby's MySQL interface represents SQL's <i>NULL</i>). </p>
+
+<p>If desired, multiple inheritance can be implemented in a similar manner&#151;Ruby's flexibility and this technique makes it relatively straightforward.</p>
+
+<p>However, as presented, the code does not check for infinite loops. If object 2 has object 1 as a parent, and object 1 has object 2 as a parent, and either object has an undefined method call, the code continues to search until a stack overflow. It's straightforward to implement this.</p>
+<h3>Debugging</h3>
+
+<p>There are a few considerations regarding debugging. First, what is going to happen when there is an error in code executed from the database? You may wish to raise the error so the calling method must handle it, as our example does, or deal with it otherwise: log the error, simply return a <i>nil</i>, print a message to the console, or some other action. This example raises the error and adds some additional information&#151;the fact that the error occurred in code inside the database, the method name, the object <i>id</i>, and the arguments passed to the method, if any. </p>
+
+<p>The other decision to be made is what to do in the event of a method call that isn't found even if the extended properties table is checked. The example I present (<a name="rl4"></a><a href="#l4">Listing Four</a>) simply returns <i>nil</i>; it may be preferable to raise an "undefined local variable or method" error instead.</p>
+<h3>Typical Use</h3>
+
+<p>These techniques are useful in a variety of applications. Of course, it is really only effective in situations where object-oriented design is effective&#151;which varies depending on who you ask. The three methods I've discussed here:</p>
+
+<ul>
+    <li>Using <i>method_missing</i> to seamlessly and intuitively access and update database records.</li>
+  <li>Using another table to dynamically add properties and methods.</li>
+  <li>Using recursion to add dynamic inheritance.</li>
+</ul>
+
+
+
+<p>are all appropriate in differing circumstances. </p>
+
+<p>Runtime modification of the code may not be useful in your project, in which case you may wish only to take advantage of the <i>method_missing</i> technique. Alternatively, you may wish to begin with a more traditional class, and then gradually move some methods from the file-bound Ruby source to the database&#151;the transition should be fairly smooth and relatively painless.</p>
+
+<p>Also note that while this example runs code from a database, other methods are available. It's also possible to read code or code fragments from a text file&#151;for example, a configuration file (see <a name="rl5"></a><a href="#l5">Listing Five</a>)&#151;and then use the <i>method_missing</i> technique to run that as part of the class. This can be extended, as well, to involve nonRuby code; for example, you may want to have properties that are defined as the result of a calculation involving other properties of the object. You can store the formulas in either a text file or a database, and then either parse them or convert them to Ruby code. In that way, for example, you can easily change business formulas without source changes&#151;and it's still elegant and orthogonal.</p>
+<h3>Conclusion</h3>
+
+<p>While Ruby certainly does not have the performance of C++, it has much of the power of Perl, and its orthogonality gives it better maintainability for larger projects. This is especially evident in the ability it gives you to extend the language. Such extensions must be done carefully&#151;in some cases, the performance problems can be significant. Even so, the techniques presented here can be a significant boon to a Ruby software project.</p>
+
+
+<p><b></b></p>
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>require 'config.rb'
+require 'mysql'
+$db = connect_db()
+class Test_Object
+    @@properties = ['property_one','property_two']
+    MYTABLE = 'test_objects'
+    attr_reader :object_id
+    def initialize(object_id)
+        @object_id=object_id
+    end
+    def method_missing( name, *args )
+        method_name = name.to_s
+          if (method_name.slice(-1,1) == '=')
+            field_name = method_name.chop
+            set field_name,args[0]
+          else
+            field_name=method_name
+            if @@properties.include?(field_name)
+            res= $db.query("SELECT #{field_name} FROM #{MYTABLE} 
+                                     where object_id='#{@object_id}';")
+            row = res.fetch_row
+            if (res.num_rows()==0) or row.nil?
+                nil
+            else    
+                row[0]
+            end
+             end
+          end
+    end
+    def set( name, value )
+        if @@properties.include?(field_name)
+          $db.query("UPDATE #{MYTABLE} set #{name}=
+            \"#{Mysql.escape_string(value)}\" where object_id=#{@object_id};")
+        end
+    end
+end
+#run some tests
+test_object = Test_Object.new(1)
+print "Testing property: #{test_object.property_one}\n"</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>require 'config.rb'
+require 'mysql'
+$db = connect_db()
+class Test_Object
+    @@properties = ['property_one','property_two']
+    MYTABLE = 'test_objects'
+    EXTENDED_PROPERTIES_TABLE = 'test_objects_props'
+    attr_reader :object_id
+    def initialize(object_id)
+        @object_id=object_id
+    end
+    def method_missing( name, *args )
+        method_name = name.to_s
+          if (method_name.slice(-1,1) == '=')
+            field_name = method_name.chop
+            set field_name,args[0]
+          else
+            field_name=method_name
+            if @@properties.include?(field_name)
+            res= $db.query("SELECT #{field_name} FROM #{MYTABLE} 
+                                     where object_id='#{@object_id}';")
+            row = res.fetch_row
+            if (res.num_rows()==0) or row.nil?
+                nil
+            else    
+                row[0]
+            end
+              else
+            get_property name   
+             end
+          end
+    end
+    def get_property(name)
+        res= $db.query("select `code`,`value` 
+             from #{EXTENDED_PROPERTIES_TABLE} 
+              where object_id='#{@object_id}' and `property_name`='#{name}';")
+        code,value = *res.fetch_row()
+        if res.num_rows()==0
+          nil
+        else 
+            if code.nil?
+                if value.nil?
+                    nil
+                else
+                    value
+                end
+            else
+                begin
+                    eval code
+                    rescue Exception
+                      if @args.nil?
+                          raise Exception.exception("Error in evaluating for 
+                            object ##{@object_id} in method #{name} 
+                             with no arguments. Error description: \"#$!\"")
+                      else
+                          raise Exception.exception("Error in evaluating for 
+                            object ##{@object_id} in method #{name} 
+                                with arguments #{@args.join(",")}. 
+                                    Error description: \"#$!\" ")
+                      end
+                end
+                
+                end
+        end
+    end
+    def set( name, value )
+        if @@properties.include?(field_name)
+          $db.query("UPDATE #{MYTABLE} set #{name}=\
+            "#{Mysql.escape_string(value)}\" where object_id=#{@object_id};")
+        end
+    end
+end
+#run some tests
+test_object = Test_Object.new(1)
+print "Extended property: #{test_object.test_extended_property}\n"
+print "Extended method: #{test_object.test_extended_method}\n"</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>require 'config.rb'
+require 'mysql'
+$db = connect_db()
+class Test_Object
+    @@properties = ['parent','property_one','property_two']
+    MYTABLE = 'test_objects'
+    EXTENDED_PROPERTIES_TABLE = 'test_objects_props'
+    attr_reader :object_id
+    def initialize(object_id)
+        @object_id=object_id
+    end
+    def method_missing( name, *args )
+        method_name = name.to_s
+          if (method_name.slice(-1,1) == '=')
+            field_name = method_name.chop
+            set field_name,args[0]
+          else
+            field_name=method_name
+            if @@properties.include?(field_name)
+            res= $db.query("SELECT #{field_name} FROM #{MYTABLE} 
+                               where object_id='#{@object_id}';")
+            row = res.fetch_row
+            if (res.num_rows()==0) or row.nil?
+                nil
+            else    
+                row[0]
+            end
+              else
+            get_property name   
+             end
+          end
+    end
+    def get_property(name)
+        res= $db.query("select `code`,`value` 
+             from #{EXTENDED_PROPERTIES_TABLE} 
+              where object_id='#{@object_id}' and `property_name`='#{name}';")
+        code,value = *res.fetch_row()
+        if res.num_rows()==0
+          if not parent.nil?
+            Test_Object.new(parent).get_property name
+          else
+            nil
+          end
+        else 
+            if code.nil?
+                if value.nil?
+                    nil
+                else
+                    value
+                end
+
+           else
+                    eval code 
+                end
+        end
+    end
+
+    def set( name, value )
+        if @@properties.include?(field_name)
+          $db.query("UPDATE #{MYTABLE} set #{name}=\
+            "#{Mysql.escape_string(value)}\" where object_id=#{@object_id};")
+        end
+    end
+end
+#run some tests
+test_object = Test_Object.new(1)
+print "Extended property: #{test_object.test_extended_property}\n"
+print "Extended method: #{test_object.test_extended_method}\n"
+print "Inherited property: #{test_object.test_inherited_property}\n"</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l4"></a>Listing Four</b><br>
+<pre># Use this SQL script to create a test database to run the examples. 
+# phpMyAdmin MySQL-Dump
+# version 2.2.7-pl1
+# http://phpwizard.net/phpMyAdmin/
+# http://www.phpmyadmin.net/ (download page)
+# Host: localhost
+# Generation Time: Apr 10, 2004 at 10:09 AM
+# Server version: 4.00.18
+# PHP Version: 4.3.1
+# Database : `test_database`
+# --------------------------------------------------------
+
+CREATE database test_database; 
+USE test_database;
+
+# Table structure for table `test_objects`
+CREATE TABLE test_objects (
+  object_id int(11) NOT NULL,
+  property_one text NOT NULL,
+  property_two text NOT NULL,
+  parent int(11) NULL,
+  PRIMARY KEY  (object_id)
+) TYPE=MyISAM;
+
+# Dumping data for table `test_objects`
+INSERT INTO test_objects (object_id, property_one, property_two, parent) 
+                                VALUES (0, 'parent of object 1', '', null);
+INSERT INTO test_objects (object_id, property_one, property_two, parent) 
+                             VALUES (1, 'property_one', 'property_two', 0);
+# --------------------------------------------------------
+# Table structure for table `test_props`
+
+CREATE TABLE test_objects_props (
+  property_name text NOT NULL,
+  object_id int(11) NOT NULL,
+  value text,
+  code text
+) TYPE=MyISAM;
+# Dumping data for table `test_objects_props`
+INSERT INTO test_objects_props (property_name, object_id, value, code) 
+                VALUES ('test_extended_property', 1, 'test suceeded', NULL);
+INSERT INTO test_objects_props (property_name, object_id, value, code) 
+                  VALUES ('test_extended_method', 1, NULL, 'Kernel.rand()');
+INSERT INTO test_objects_props (property_name, object_id, value, code) 
+                  VALUES ('test_inherited_property', 0, 
+                            'testing the inherited property suceeded', NULL);</pre>
+<a href="#rl4">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l5"></a>Listing Five</b><br>
+<pre>require 'mysql';
+
+$dbhost="localhost"
+$dbname="test_database"
+$dbuser="root"
+$dbpasswd=""
+$port = 7232
+
+def connect_db
+    Mysql.new($dbhost, $dbuser, $dbpasswd,$dbname)
+end</pre>
+<a href="#rl5">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

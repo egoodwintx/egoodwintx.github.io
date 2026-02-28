@@ -1,0 +1,920 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i12: Listing 1 backup.parent script</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a4.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a4_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink"><a href="a4_f2.htm">Figure 2</a></span></td>
+		<td><span class="navbarLink">Listing 1</span></td>
+		<td><span class="navbarLink"><a href="a4_l2.htm">Listing 2</a></span></td>
+	</tr>
+	<tr>
+		<td><span class="navbarLink"><a href="a4_s1.htm">Sidebar</a></span></td>
+		<td><a href="../../../../source/SA/2003/dec2003.tar"><b class=codeListing>dec2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b>Listing 1 </b><i>backup.parent script</i></h1>
+            <p> 
+            <pre>
+#!/bin/ksh 
+
+# Version 1.1.0
+#
+# 01/12/03 RCM    Tivoli Storage Manager Backup for an Oracle database whose
+#        files reside in a UFS filesystem
+#
+#        This "job" is made of two seperate scripts.  The "parent"
+#        that performs management and control operations (ie: get
+#        oracle file lists, db startup/shutdown, etc.) and the
+#        "child" that gets tasked to perform the "dsmc archive"
+#        tasks themselves.
+#
+#        This script will backup an Oracle database using a TSM
+#        server. The filenames are retreived from the Oracle
+#        database itself at runtime. A set of child processes
+#        perform the actual "dsmc archive" tasks to allow multi-
+#        streaming operations.
+#
+#        example syntax to run:
+#
+#        ./backup.parent database_sid HOT 2 ARC2WEEKS
+#
+#    Notes:    This script utilizes Solaris filesystem snapshots when
+#        backing up the files. thus minimizing the time that the
+#        database is down (for COLD) or in backup mode (for HOT)
+#        The database is taken down (altered, etc.) and when
+#        it is ready to be backed up, a "snapshot" of the filesystem
+#        is taken (see fssnap command.) Once the snapshot is done
+#        the database can be restarted (etc.)  A seperate filesystem
+#        is used to store the snapshot "backing store" files,
+#        and the snapshot (ie: /dev/fssnap/3) is mounted (in our case
+#        in the /tmp filesystem.)  When the "dsmc archive" task runs
+#        it is pointed at the snapshot.  Provided that the amount of
+#        changes to the snapshot'ed filesystems do not exceed the
+#        fssnap filesystem capacity the archive task should run
+#        normally. In the event that the snapshot filesystem is
+#        overloaded the snapshot being written to fails, and is deleted. 
+#        Please refer to the fssnap and fssnap_ufs manpages.
+#
+#        The default for a backup is COLD - if you do not want the 
+#        database shutdown make sure you specify HOT.
+#
+#                    -----
+#        The default snapshot filesystem will need to be modified
+#        see the "snapshot_fs" environment variable below.  You will
+#        get a warning message if it is not mounted.
+#                    -----
+#
+#        Since we are using filesystem snapshots and the /tmp filesystem
+#        becomes the mount point "holder", all the files (with the
+#        exception of the "archive logs" in the case of a HOT backup)
+#        will have been backed up from the /tmp filesystem from the 
+#        viewpoint of TSM.  Therefore you will often need to prefix
+#        pathnames with /tmp to get the proper pathname.
+#        
+#        A presumption of the "oracle" user environment exists.
+#        The user is "profiled/setup" by locally used routines, that
+#        may not exist in your environment. The ORACLE_SID, ORACLE_HOME,
+#        and PATH (appending $ORACLE_HOME/bin) environment variables 
+#        must be properly defined for the SQL*Plus commands to work
+#        correctly, if they are not defined in the oracle userid profile
+#        you can use the ${prep_script} variable to execute the commands
+#        or "source them in".  See your DBA if you have questions.
+#
+#        The use of "here is" documents (ie: some_cmd &lt;&lt; EOF) is 
+#        used to instream the connections to the database to perform
+#        queries etc. During the processing of this script several
+#        times oracle commands and info are handled by using the
+#        "su - oracle" command, feeding it the commands (typically
+#        "newdb", and "sqlplus" w/sql cmds) this way, often nesting
+#        some of them. Normally one can place a hyphen after the 
+#        redirection characters to strip out leading tabs and allow
+#        indentation for readability, I have deliberately not done so
+#        for the benifit of those that would end up copying the info
+#        and converting the tabs to blanks.
+#
+#        the scripts perform the following operations:
+#
+#        1) get the names of the files needing backup from the
+#           owning database.
+#        2) separate the files by filesystem into discrete "control"
+#           files (to be passed to the "archive" child processes.)
+#        3) create a "queue" of tasks for background (child) processes.
+#        4) ready the database for backups.
+#        5) snapshot the filesystems that hold backup targets.
+#        6) ready the database for users.
+#        7) run archive task for each filesystem.
+#            a) run up to $N tasks so as to utilize all cpus.
+#            b) cleanup/delete snapshots
+#        8) capture logs
+#
+#    Note2:
+#
+#    1) Snapshots (and their backing store files) are not deleted if 
+#       archive task fails - and must be manually deleted before the
+#       snapshot file system becomes full. (see Tip #1 below)
+#
+#    2) A "resourceutilization nn" staement may be required in the 
+#       dsm.sys (TSM system options) file, and may also require a 
+#       change to the TSM server (for the target node) for more
+#       "direct tape sessions" if you go direct to tape for large files
+#       if needed use "MaxNumMp" setting in the server config.
+#
+#
+# -----------------------------------------------------------------------
+#
+#    Archive maintenence:
+#
+#     To delete old copies use the "dsmc delete arch" command
+#    passing it each mountpoint that was backed up and the description
+#    field corresponding to the level at which you want the deletion 
+#    to occur (ie: database.day.time.process - note the time and pid
+#    should be unique.)
+#    ie:
+#        dsmc delete archive /tmp/shark01/ -desc="testdb.d030120.*"
+#
+#    meaning delete all files that were archived from the /tmp/shark01
+#    mount point on 01/20/03.  Note that you will have to do this for
+#    each mount point 
+
+# Tips/Notes/Warnings:
+#
+#    1) If the backup of a file fails during the running of the script
+#       you can attempt another archive of the file provided the snapshot
+#       still exists. (The child processes attempt to check the return
+#       codes from dsmc and not delete the snapshot if the archive 
+#       fails.)  Use the "dsmc archive" command manually to finish the
+#       failed backup. (see below)
+#
+#        1) find log of backup
+#        2) grep for "Unsuccessful"
+#        3) make sure the snapshot is still there and mounted
+#        4) do a manual archive(s)
+#        5) remove the backing store file
+#        6) unmount the snapshot
+#        7) delete the snapshot
+#
+#    find . -name "backup.parent.*.log1" -mtime -1 -print
+#    ./backup.parent.criisdb.COLD.d030127.t102713.p8242.log1
+#        .
+#        .
+#        .
+#    ./backup.parent.criisdb.COLD.d030128.t040000.p17556.log1
+#
+#    grep -i unsuccessful ./backup.parent.criisdb.COLD.d030128.t040000.p17556.log1
+#    Normal File--&gt;    20,971,536,384 /tmp/shark04/oradata/data_l05.dbf  ** Unsuccessful **
+#
+#    fssnap -i -o blockdevname | awk -F: '{print "df -k",$2}' | sh
+#    Filesystem            kbytes    used   avail capacity  Mounted on
+#    /dev/fssnap/2        64225208 52550912 11674296    82%    /tmp/shark04
+#
+#    dsmc archive /tmp/shark04/oradata/data_l05.dbf -filesonly \
+#        -desc="criisdb.COLD.d030128.t040000.p17556"
+#
+#    fssnap -i -o backing-store | awk -F: '{print "rm",$2}'
+#    rm  /fssnap/backup.parent.d030128.t040000.p17556._shark04.bs
+#
+#    umount /dev/fssnap/2
+#
+#    fssnap -d /dev/fssnap/2
+#    Deleted snapshot 2.
+#
+#    2) To get a list of files that have been archived (or backed up)
+#       may require them to be listed according to the mount point on
+#       which they were backed up.  This may be difficult for the
+#       snapshot'ed filesystems as they are transitory.  Try doing a
+#       "dsmc query filespace" and look for objects that were backed
+#       up in the /tmp/* filesystem names:
+#
+#     dsmc query filespace | grep "/tmp/"
+#        ...
+#     37   00/00/00   00:00:00   UFS     /tmp/shark01
+#        ...
+#
+#    dsmc query filespace | grep "/tmp/" | awk '{print "dsmc query archive \"" \
+#        $5 "/*\" -desc=\"criisdb.COLD.d030128.*\""}'
+#    dsmc query archive "/tmp/shark01/*" -desc="criisdb.COLD.d030128.*"
+#    dsmc query archive "/tmp/shark02/*" -desc="criisdb.COLD.d030128.*"
+#
+#    3) To restore a file, will require that you do a "dsmc RETrieve"
+#       of the files as they were backed up (ie: /tmp/shark01/...)
+#       using the rename option to put them in the proper location.
+#       ie:
+#
+#    dsmc retrieve  -desc="criisdb.COLD.d030128.*" \
+#        /tmp/shark04/oradata/temp02.dbf /shark04/oradata/temp02.dbf
+#
+#      Insure when you do this that there is ONLY ONE file that will be
+#      "retrieved" by doing a query first...
+
+#------------------------------------------------------------------------
+# Maintenance:
+#------------------------------------------------------------------------
+#
+# 02/11/03 RCM    Added dsmc "mgmtclas" option for specifing backup retention 
+#                 You can determine which classes are available for use by
+#                 doing a "dsmc query mgmtclas" command.
+#
+# 04/14/03 RCM    Utilizing "sudo" to run fssnap, mount, and umount commands.
+#        Normally these require root authority, and setting the uid
+#        bit on in the permissions is a) not good, and b) seems to 
+#        create a problem by which $0 becomes the shell name (ie: ksh)
+#        While not a crisis, it is not what was desired, therefore
+#        we will define $fssnap, $mount, $umount variables that have 
+#        the appropriate values. The /etc/sudoers file will need the
+#        following (uncommented) lines:
+#
+# maestro pill=NOPASSWD: /usr/sbin/fssnap, /usr/sbin/mount, /usr/sbin/umount
+# maestro pill=NOPASSWD: /usr/bin/su - oracle
+# maestro pill=NOPASSWD: /usr/bin/rm /tmp/backup*, /usr/bin/mv /tmp/backup*
+# maestro pill=NOPASSWD: /usr/bin/rm /fssnap/backup*
+# maestro pill=NOPASSWD: /usr/bin/dsmc query, /usr/bin/dsmc archive
+#
+
+#----------------- options passed 
+
+DB=$1
+hot_or_cold=$2
+children=$3
+retention_period=$4
+
+#----------------- verify options and/or set defaults
+if [ -z "$DB" ]; then 
+    echo "No database specified"
+    echo "Syntax is:"
+    echo
+    echo $0 "database_sid [ COLD | HOT ] [ num_streams ] [ retention_period ]"
+    echo
+    exit 4
+fi
+
+# type of backup COLD or HOT
+hot_or_cold=${hot_or_cold:="COLD"}
+if [[ $hot_or_cold != "COLD" &amp;&amp; $hot_or_cold != "HOT" ]]; then
+    echo "Error \"$hot_or_cold\" not valid"
+    echo "specify COLD or HOT"
+    exit 4
+fi
+
+# default number of tasks, when not specified. psrinfo and word counting the
+# number of lines returned is used to determine the number of cpus. if this 
+# does not work specify the default manually.
+#
+children=${children:=$(psrinfo | wc -l)}
+
+# MGMTCLAS option for retention information, you can determine available
+# classes by doing a "dsmc query mgmtclas" command
+retention_period=${retention_period:="ARC5WEEKS"}
+
+export DSM_DIR=/opt/tivoli/tsm/client/ba/bin
+export DSM_CONFIG=${DSM_DIR}/dsm.opt
+
+export PATH=/usr/sbin:${PATH}:${DSM_DIR}
+
+#----------------- functions  
+function keep_going {
+# request permission from operator to continue
+echo "reply \"yes\" to continue"
+read RESP
+if [ "${RESP}" != "yes" ]; then exit; fi
+}
+
+#----------------- variables (filenames, etc.)  
+# the child script that performs the actual "dsmc archive" task
+# (this script should reside in the same directory as this parent script)
+child=$(dirname $0)/backup.child
+
+# a set of unique names for temporary files is generated by using the /tmp
+# filesystem, name of the script, date &amp; time, and finally process id (pid)
+
+timestamp=d$(date +%y%m%d).t$(date +%H%M%S)
+tmpname=/tmp/$(basename $0).$DB.$hot_or_cold.$timestamp.p$$
+
+child_prefix=/tmp/$(basename $child).$DB.$hot_or_cold.$timestamp
+# (the child's pid will be appended in the $child script)
+
+# description is the "description" option (field) that is passed to the
+# tsm server when the file is archived.  This field can be used as a 
+# "keyword" field when listing and/or deleting old backups.
+description=$DB.$hot_or_cold.$timestamp.p$$
+
+# Files used by the script
+tmpfile1=$tmpname.tmpfile1
+tmpfile2=$tmpname.tmpfile2
+tmpfile3=$tmpname.tmpfile3
+tmpfile4=$tmpname.tmpfile4
+log1=$tmpname.log1
+log2=$tmpname.log2
+filesystems=$tmpname.filesystems
+begin_bkup=$tmpname.begin_bkup
+end_bkup=$tmpname.end_bkup
+
+# log directory, if it doesn't exist create it
+logdir=$(dirname $0)/../logs
+if [ ! -d ${logdir} ]; then
+    mkdir ${logdir}
+fi
+
+# 04/14/03 RCM    Command variables, used for using "sudo" with the following
+#        commands: (sudo,) fssnap, mount, umount, su - export them so
+#        that child processes, will see them properly (su need not)
+export sudo="/usr/local/bin/sudo "
+if [ ! -x ${sudo} ]; then
+    export sudo=""
+fi
+export fssnap="${sudo}/usr/sbin/fssnap"
+export mount="${sudo}/usr/sbin/mount"
+export umount="${sudo}/usr/sbin/umount"
+su="${sudo}/usr/bin/su"
+rm="${sudo}/usr/bin/rm"
+mv="${sudo}/usr/bin/mv"
+export dsmc="${sudo}/usr/bin/dsmc"
+
+# Oracle admin id and prep script (profile the environment)
+# Note that you will have to decide which approach for profiling the oracle
+#      userid works best for your environment.  You may decide to imbed the
+#      commands for exporting the database ORACLE_SID, ORACLE_HOME, and PATH
+#      environment variables in a .profile, .khrc, etc. file or "source" them
+#      in via the prep script if you have multiple databases. (Our "newdb"
+#      profiling script/function is much more complex than what is needed for
+#      doing just a backup.
+oracle="oracle"
+prep_script="newdb $DB"
+
+# Make sure we can talk to the server.
+${dsmc} query session &gt;&gt; $log1
+if [ $? -ne 0 ]; then
+    logger -ip local1.notice $0": Error, Can not establish session with server properly"
+    logger -ip local1.notice $0": exiting"
+
+    echo "Error, Can not establish session with server properly"
+    exit
+fi
+
+# Check to make sure we can use the management class specified
+${dsmc} query mgmtclas | grep ${retention_period}
+rc=$?
+if [ $rc -ne 0 ]; then
+    logger  -ip local1.notice $0": Error, Storage MGMTCLAS ${retention_period} invalid"
+    logger  -ip local1.notice $0": exiting."
+
+    echo "Error, Storage MGMTCLAS ${retention_period} invalid"
+    exit
+fi
+
+# filesystem where the filesystems of the target files to be backed up, can
+# be snapshot'ed (ie: the "backing store" filesystem)
+snapshot_fs=/fssnap
+snapshot_fs_line=$(expr ${LINENO} - 1)
+# Check to make sure that our "snapshot_fs" is mounted.
+host_fs=$(df ${snapshot_fs} | cut -f1 -d'(' | tr -d ' ')
+rc=$?
+if [[ $rc -ne 0 || ${host_fs} != ${snapshot_fs} ]]; then
+    echo ""
+    echo "Error, the snapshot filesys (${snapshot_fs}) is not mounted."
+    echo ""
+    echo "       insure that this is the correct file system, and it is mounted"
+    echo "       or change the "snapshot_fs" environment variable in the $0"
+    echo "       script at line number ${snapshot_fs_line}"
+    echo ""
+    logger  -ip local1.notice $0": The snapshot filesys: ${snapshot_fs} not mounted."
+    logger  -ip local1.notice $0": backup canceled."
+    exit
+fi
+
+# since the backing store files are stored in a different filesystem,
+# they need a different naming convention.
+bstmpname=$snapshot_fs/$(basename $0).$timestamp.p$$
+
+# we export these so that awk process (below) can see it.
+export tmpfile3 tmpfile4
+
+export CTLFILE_BKUP=$tmpname.ctlfile_bkup
+export CTLFILE_BKUP_NAME=\'$CTLFILE_BKUP\'
+
+#----------------- main routines  
+
+logger  -ip local1.notice $0": Oracle database ($DB) backup started"
+
+# "View" names that we will use to gather info from/about the database
+# We will need the datafiles for starters, and depending on the type
+# of backup (cold/hot) we will need the controlfiles, logfiles, and
+# archive logs.
+
+# Note: on processing/passing view names...
+# Insure that you escape the dollar sign that oracle needs for the "sysadmin"
+# views, by imeadiately prefixing it with a back slash, or the shell will
+# think that it is a variable to process. 
+
+CONTROLFILE='v\$controlfile'
+LOGFILE='v\$logfile'
+DATAFILE='v\$datafile'
+TEMPFILE='v\$tempfile'
+ARCHIVED_LOG='v\$archived_log'
+
+# To obtain the "critical" database files, we run SQL*Plus and run selects
+# to query the database system views (or in the case of the datafiles, at 
+# the request of one of our DBAs the sys.dba_data_files table... - feel free
+# to set it back to the view.)
+
+# the select statements format the output for later use by using colons for
+# field delimiters, and other text for describing the record types.
+# the format is:
+#
+# column
+#   1    filetype identifier (ie: CONTROLFILE, TABLESPACE, etc.)
+#   2    "tablespace name" if any (only used for tablespaces)
+#   3    os filesystem pathname of the data (our backup target files)
+
+${su} - ${oracle} &lt;&lt; EOF &gt;&gt; $log1 2&gt;&amp;1
+${prep_script}
+sqlplus -SILENT "/ as sysdba" &lt;&lt; EON &gt;&gt;  $log2
+whenever sqlerror exit 1
+set pagesize 0
+set heading off
+set timing off
+spool $tmpfile1
+select 'CONTROLFILE::'|| name      from $CONTROLFILE;
+select 'TABLESPACE:'||tablespace_name||':'||file_name from sys.dba_data_files;
+select 'LOGFILE::'||member    from $LOGFILE;
+select 'TEMPFILE::'||NAME      from $TEMPFILE;
+spool off
+set echo off
+spool $tmpfile2
+SHOW parameter db_block_size
+spool off
+exit 0
+EON
+EOF
+if [ $? -ne 0 ]; then
+    echo "Error getting tablespace info (from "$DB")"
+    logger  -ip local1.notice $0": Error getting tablespace info (from "$DB")"
+    exit
+fi
+cat $log2 &gt;&gt; $log1
+${rm} $log2
+
+# read in the datafile (logical) block size
+read name datatype blksize &lt; $tmpfile2
+echo "db_block_size=" $blksize
+${rm} $tmpfile2
+
+# go through the path lists, and generate input for the child
+# dsmc backup jobs. the pathname is the last field in our temp file - awk's 
+# $NF "variable" ("NF" is the "Number of Fields" on the input record, and
+# thus if NF=3 then $NF=$3)
+#
+# the arguments the child tasks will receive are: filesystem name, pathname
+# of a file that contains the pathnames within that filesystem of the backup
+# targets, and the fssnap "snapshot" device name (ie: /dev/fssnap/3)
+# assigned to the filesystem.
+
+# we seperate the list of pathnames to be backed up into seperate files 
+# by filesystem name, then pass those file names to each child process child
+# started. thus each child process backs up only those files within it's
+# designated filesystem.
+
+# we determine the filesystem name by doing a "df" on each file then write
+# the "target" pathname to a file named after the "target filesystem", also
+# writing the name of the filesystem and it's associated "file lists"
+# pathname to a seperate file.  we sort/de-dup that file, and use it to
+# schedule the child processes by filesystem.
+
+# Note: we generate discrete files for each filesystem by "echoing" the 
+# the pathname of each target file (those being backed up) to a file whose
+# name incorporates the filesystem of the target file. thus each time the
+# filesystem changes, the pathname of the target file is written to a "new"
+# file.
+# 
+#           +----------&gt;--------------&gt;----------+
+#           |                                     \
+#       +---+---+                                  \
+#      /         \                                  \ 
+# ie:     /shark01/oradata/data_l01.dbf                +     
+#                                                    |
+#               is written to a file named:      +---+---+
+#                                         /         \
+#    /tmp/backup.parent.d030114.t093015.p1920._shark01
+#
+# thus when the above files are created all the backup targets in "/shark01"
+# filesystem will be in the "*._shark01" file, the targets for "/shark02"
+# will be in "*._shark02", etc.  these files then become the file lists for
+# the "dsmc archive" child processes.
+#
+# the underscores ("_") are used to replace the slashes ("/") in the file
+# names to create "valid" pathnames.  ie: /opt/oracle becomes _opt_oracle
+# this simplifies things considerably.
+#
+# since we do this for each pathname to be backed up, we wind up with a 
+# "control" file (one that we will use for queuing up multiple streams)
+# that contains duplicate entries ie: five files being backed up, existing
+# in three different filesystems will produce a five line file, with two 
+# lines repeated. (see example below)
+#
+# /shark01/oradata/init_load_01e.dbf
+# /shark01/oradata/init_load_02.dbf
+# /shark02/oradata/indx_s01.dbf
+# /shark02/oradata/init_load_01g.dbf
+# /shark03/oradata/data_l03.dbf
+#
+# would generated the file:
+#
+# /shark01 /tmp/backup.parent.d030114.t105520.p1920._shark01
+# /shark01 /tmp/backup.parent.d030114.t105520.p1920._shark01
+# /shark02 /tmp/backup.parent.d030114.t105520.p1920._shark02
+# /shark02 /tmp/backup.parent.d030114.t105520.p1920._shark02
+# /shark03 /tmp/backup.parent.d030114.t105520.p1920._shark03
+#
+# sorting/de-duping produces: 
+#
+# /shark01 /tmp/backup.parent.d030114.t105520.p1920._shark01
+# /shark02 /tmp/backup.parent.d030114.t105520.p1920._shark02
+# /shark03 /tmp/backup.parent.d030114.t105520.p1920._shark03
+#
+# now we can spawn one child "dsmc archive" task for each line in the above
+# file, thus giving us the ability to multi-stream the archive tasks.
+
+# we use "grep" to get only the desired data, and pipe it to awk to print
+# the last field of the output from the oracle selects for filenames.  (ie:
+# this is the pathname of the file to be backed up.)  thus pathlist becomes
+# a list of the backup targets.
+
+# Note: LOGFILES (redo/archive) have a different structure.  These files
+#       must not be backed up using snapshots, and redo logs should not
+#       be backed up during a HOT backup. 
+#
+#       Also TEMP files should not be backed up either.  Prior to Oracle 8
+#       the tempfiles were needed to bring up the database. Also they can
+#       be "sparse files" that can cause problems with backup products.
+
+if [ $hot_or_cold == "HOT" ]; then
+# 07/30/03 RCM  grep'ing out Only the tablespace files (archive logs and
+#               control files must be processed differently.)  Temporary
+#        files are not to be backed up in any case, but we keep 
+#        the names here for documenting the fact they exist.
+        pathlist=$(grep ^"TABLESPACE:" $tmpfile1 | nawk -F: '{print $NF}')
+else    pathlist=$(grep -v ^"TEMPFILE:" $tmpfile1 | nawk -F: '{print $NF}')
+fi
+for path in $pathlist; do
+    filesys=$(df $path|cut -f1 -d'('|tr -d ' ')
+    outfile=$(echo $filesys|tr / _)
+    echo $path &gt;&gt; $tmpname.$outfile
+    echo $filesys $tmpname.$outfile &gt;&gt; $tmpfile2
+done
+
+# sort and de-dup the temp file
+sort -u -o $filesystems $tmpfile2
+${rm} $tmpfile2
+
+#keep_going
+
+# for COLD backup:
+# connect to the database and shut it down
+if [ $hot_or_cold = "COLD" ]; then 
+    ${su} - oracle &lt;&lt; EOF &gt;&gt; $log1 2&gt;&amp;1
+    ${prep_script}
+    sqlplus "/ as sysdba" &lt;&lt; EON &gt;&gt;  $log2
+    whenever sqlerror exit 1
+    set timing off
+    shutdown immediate
+    exit 0
+EON
+EOF
+    if [ $? -ne 0 ]; then
+        logger  -ip local1.notice $0": Error shutting down database:" $DB
+        echo "Error shutting down database:" $DB
+        exit
+    else     echo "Database shutdown, Ok"
+        logger  -ip local1.notice $0": Database ("$DB") shutdown, Ok"
+    fi
+    cat $log2 &gt;&gt; $log1
+    ${rm} $log2
+fi
+
+# for HOT backup:
+# put the database in backup mode
+if [ $hot_or_cold = "HOT" ]; then
+    # set up two files, one with the commands to place the database in
+    # backup mode, the other to take it out of backup mode
+    # Note that where tablespaces occupy multiple files, the duplicate
+    # tablespace names need to be removed.
+    grep ^TABLESPACE $tmpfile1 | cut -f2 -d: | sort -u -o $tmpfile2 
+
+    # generate BEGIN BACKUP mode commands
+    nawk -F: \
+    'BEGIN {
+        print "whenever sqlerror exit 1"
+        print "set timing off"
+        print "spool", ENVIRON["tmpfile3"]
+        print "show parameter log_archive_dest"
+        print "archive log list"
+        print "spool off"
+    } {
+        print "alter tablespace",$1,"begin backup;"
+    } END {
+        print "exit 0" 
+    }' $tmpfile2 &gt; $begin_bkup
+
+    # generate END BACKUP mode commands
+    nawk -F: \
+    'BEGIN {
+        print "whenever sqlerror exit 1"
+        print "set timing off"
+    } {
+        print "alter tablespace",$1,"end backup;"
+    } END {
+        print "spool", ENVIRON["tmpfile4"]
+        print "archive log list"
+        print "spool off"
+        print "alter system switch logfile;"
+        print "alter database backup controlfile to " ENVIRON["CTLFILE_BKUP_NAME"] ";"
+        print "exit 0"
+    }' $tmpfile2 &gt; $end_bkup
+    ${rm} $tmpfile2
+
+    ${su} - ${oracle} &lt;&lt; EOF &gt;&gt; $log1 2&gt;&amp;1
+    ${prep_script}
+    sqlplus "/ as sysdba" &lt; $begin_bkup &gt;&gt;  $log2
+EOF
+    if [ $? -ne 0 ]; then
+        logger  -ip local1.notice $0": Error putting database in backup mode:" $DB
+        echo "Error putting database in backup mode:" $DB
+        exit
+    else     echo "Database placed in backup mode, Ok"
+        logger  -ip local1.notice $0": Database ("$DB") placed in backup mode, Ok"
+    fi
+    # go through the "spool" file that contains the "archive log list" output
+    # and determine the archive directory and the sequence number of the 
+    # "oldest" archive log file.
+    arch_dir=$(grep -i ^"log_archive_dest " $tmpfile3 | awk '{print $NF}')
+    echo "archive dir is:" $arch_dir
+    oldest=$(grep -i ^"Oldest " $tmpfile3 | awk '{print $NF}')
+    echo "oldest sequence number is:" $oldest
+    cat $log2 &gt;&gt; $log1
+    ${rm} $log2 $begin_bkup
+fi
+
+#keep_going
+
+# read the filesystem names and snapshot each one re-writing the $filesystems
+# control file with the snapshot device name included to each record.
+#
+# Note: If doing a HOT backup, the archive logs can not be snapshot'ed and 
+#    then backed up, we will add them to the list below with /dev/null as 
+#    the name of the snapshot so the child process handling it knows.
+
+# Use db_block_size for chunksize
+chunksize=$(expr $blksize / 1024)k
+while read filesystem pathnames
+do
+    outfile=$(echo $filesystem|tr / _)
+    snapshot=$(${fssnap} -F ufs \
+        -o backing-store=$bstmpname.$outfile.bs,chunksize=$chunksize $filesystem)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        logger  -ip local1.notice $0": Error" $rc "doing snapshot for:" $filesystem
+        echo "Error" $rc "doing snapshot for:" $filesystem
+        # error? don't exit here (database status?) see below
+        break
+    else     echo $filesystem "snapshot taken, Ok"
+        logger  -ip local1.notice $0":" $filesystem "snapshot taken, Ok"
+    fi
+    echo $filesystem $pathnames $snapshot &gt;&gt; $tmpfile2
+done &lt; $filesystems
+${rm} $filesystems
+${mv} $tmpfile2 $filesystems
+
+if [ $rc -ne 0 ]; then
+    # some snapshot problem must occurred, delete the ones that we
+    # have created so far and bring the database back up before exit
+    # while read filesystem pathnames snapshot
+    echo "Snapshot error seems to have occured, deleting snapshots"
+    df -k &gt;&gt; $log1
+    if [ -f $filesystems ]; then
+        while read filesystem pathnames snapshot
+        do
+            logger  -ip local1.notice $0": Removing snapshot" $snapshot
+            echo "Removing snapshot" $snapshot
+            if [ ! -z "$snapshot" ]; then
+                ${fssnap} -i -o mountpoint,backing-store,backing-store-len \
+                    $filesystem &gt;&gt; $log1
+# 07/24/03 snapshot device name not working so well under Sol8
+#                               $snapshot &gt;&gt; $log1
+#            ${fssnap} -d $snapshot    
+            ${fssnap} -d $filesystem    
+            fi
+        done &lt; $filesystems
+    fi    
+fi
+
+#keep_going
+
+# for COLD backup:
+# connect to the database and start it back up
+if [ $hot_or_cold = "COLD" ]; then 
+    ${su} - ${oracle} &lt;&lt; EOF &gt;&gt; $log1 2&gt;&amp;1
+    ${prep_script}
+    sqlplus "/ as sysdba" &lt;&lt; EON &gt;&gt;  $log2
+    whenever sqlerror exit 1
+    set timing off
+    startup 
+    exit 0
+EON
+EOF
+    if [ $? -ne 0 ]; then
+        logger  -ip local1.notice $0": Error restarting database:" $DB
+        echo "Error restarting database:" $DB
+        exit
+    else     echo "Database restarted - users may go back to work"
+        logger  -ip local1.notice $0": Database ("$DB") restarted, Ok"
+    fi
+    cat $log2 &gt;&gt; $log1
+    ${rm} $log2
+fi
+
+# for HOT backup:
+# take the database out of backup/archivelog mode
+if [ $hot_or_cold = "HOT" ]; then 
+    ${su} - ${oracle} &lt;&lt; EOF &gt;&gt; $log1 2&gt;&amp;1
+    ${prep_script}
+    sqlplus "/ as sysdba" &lt; $end_bkup &gt;&gt;  $log2
+EOF
+    if [ $? -ne 0 ]; then
+        logger  -ip local1.notice $0": Error taking database out of backup mode:" $DB
+        echo "Error taking database out of backup mode:" $DB
+        exit
+    else     echo "Database taken out of backup mode"
+        logger  -ip local1.notice $0": Database ("$DB") taken out of backup mode, Ok"
+    fi
+    # go through the "spool" file that contains the "archive log list" 
+    # output and get the "current" archive log file.
+
+    cat $log2 &gt;&gt; $log1
+    ${rm} $log2 $end_bkup
+
+    # aurguably we might want to wait for a moment or two in this step to
+    # allow time for the the archive log switch command to take effect...
+    # I've not seen any problems but if so add a sleep below - like...
+    # sleep 10
+
+    # To backup the archive logs according to the Oracle B&amp;R Handbook
+    # you need to get all the archive logs that were in use between the
+    # the "backup start" and "backup end" commands. We got the "oldest"
+    # earlier when we put the database in backup mode by spooling the 
+    # "console log" and then doing an archive log list and grep'ing for 
+    # "oldest".  Then (just above) after snapshots were taken, we did 
+    # another "archive log list" (before switching the logs, but after
+    # taking the database out of backup mode), and got the "current" log.
+    # (See example of "list" below.)
+
+    # SQL&gt; archive log list
+    # Database log mode              Archive Mode
+    # Automatic archival             Enabled
+    # Archive destination            /oraarch/testdb/
+    # Oldest online log sequence     267
+    # Next log sequence to archive   269
+    # Current log sequence           269
+
+    # ls -lt /oraarch/testdb/ | head
+    # total 566912
+    # -rw-rw----   1 oracle   dba     10485248 May 16 12:35 0000000268_0001.arch
+    # -rw-rw----   1 oracle   dba     10485248 May 15 22:22 0000000267_0001.arch
+    # -rw-rw----   1 oracle   dba     10485248 May 15 07:55 0000000266_0001.arch
+    # -rw-rw----   1 oracle   dba     10485248 May 14 17:44 0000000265_0001.arch
+    # ...
+
+    # get "Current log sequence"
+    current=$(grep -i ^"Current " $tmpfile4 | awk '{print $NF}')
+    echo "current achive log is:" $current
+
+    # We have the "oldest" sequence number above, now having obtained the 
+    # current sequence number and having done the log switch we can query 
+    # the database for all the logs between the two sequence numbers.  These 
+    # will be the ones that need to be backed up with the datafiles for the 
+    # "recover" command to work properly.
+
+    ${su} - ${oracle} &lt;&lt; EOF &gt;&gt; $log1 2&gt;&amp;1
+    ${prep_script}
+    sqlplus -SILENT "/ as sysdba" &lt;&lt; EON &gt;&gt;  $log2
+    whenever sqlerror exit 1
+    set linesize 100 trimspool on feedback off echo off term off heading off pagesize 0
+    spool $tmpname.archive_logs
+    select name from $ARCHIVED_LOG where sequence# &gt;= ${oldest} and  sequence# &lt;= ${current};
+    spool off
+    exit 0
+EON
+EOF
+
+    filesys=$(df $(dirname $arch_dir)|cut -f1 -d'(')
+    echo $filesys $tmpname.archive_logs "/dev/null" &gt;&gt; $filesystems
+
+    # now build the backup cards for the controlfile we told oracle to "backup"
+    pathlist=$CTLFILE_BKUP
+    filesys=$(df $(dirname $CTLFILE_BKUP)|cut -f1 -d'(')
+    for path in $pathlist; do
+        echo $path &gt;&gt; $tmpname.control_file
+    done
+    echo $filesys $tmpname.control_file "/dev/null" &gt;&gt; $filesystems
+    
+fi
+
+if [ $rc -ne 0 ]; then
+    # one of the snapshots attempt above failed, in theory we will have
+    # deleted the others, and resumed user operations with the database
+    # and we can now exit.
+    echo "Snapshot error must have occured, exiting"
+    logger  -ip local1.notice $0": job terminating."
+    exit
+fi
+
+#keep_going
+
+# read the file back in and run a background job for
+# each filesystem.
+while read filesystem pathnames snapshot
+do
+    # if there are max background jobs running, sleep
+    # until one ends - before starting any more
+    while [ $(jobs -p | wc -l) -ge $children ]
+    do
+        sleep 5
+    done
+    # start a background task and tell it which
+    # files to process. then add it to the pid_history list
+    $child $filesystem $pathnames $child_prefix $snapshot $description $retention_period &amp;
+    pid_history=$pid_history" "$!
+
+    # wait a few moments for it to start up, then do an iostat to get
+    # some numbers regarding the i/o throughput (feel free to change or 
+    # remove the echo and iostat commands below.
+    sleep 5
+    echo "---------------------------------------------------" &gt;&gt; $log1
+    iostat -xtnTd 3 3 &gt;&gt; $log1
+done &lt; $filesystems
+#${rm} $filesystems
+# for now save the filesystems list... (We might need it for other stuff)
+${mv} $filesystems $logdir/$(basename $filesystems)
+
+#keep_going
+
+# wait for all jobs to end, and then collect all logs
+wait
+for pid in $pid_history
+do
+    cat $child_prefix.$pid.log &gt;&gt; $log1
+    ${rm} $child_prefix.$pid.log
+done
+echo "files archived via adsm:"
+grep -i normal $log1
+echo "\nDescription field used:" $description
+echo "\n to list files use the mountpoint name (ie: /tmp/shark01/)"
+echo "and the -desc=... option to list them, ie:"
+echo "\n"
+echo "dsmc query archive \"/tmp/shark01/*\" -desc=\""$description"\"\n"
+# finally move the logfile to a permanant location, in this case the
+# /usr/local/logs directory for example.
+${mv} $log1 $logdir/.
+logger  -ip local1.notice $0": Oracle database ("$DB") backup complete"
+echo "Parent ending"
+rm $tmpname.*
+exit
+</pre>
+        </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

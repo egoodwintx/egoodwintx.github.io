@@ -1,0 +1,692 @@
+<HTML>
+<META NAME="year" CONTENT="1989">
+<HEAD>
+
+<TITLE>APR89: MORE MEMORY FOR DOS EXEC</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>MORE MEMORY FOR DOS EXEC<a name="00af_0003"><a name="00af_0003"></h1><P>
+<h2><a name="00af_0001"><a name="00af_0000">Swapping calling programs in and out of expanded memory is useful when programs invoke each other</h2><P>
+<h3>Kim Kokkonen</h3><P>
+<p><i><a name="00af_0002"><a name="00af_0000">Kim Kokkonen is the president of TurboPower Software and the author of many public domain Turbo Pascal tools.  He can be reached at P.O. Box 66747, Scotts Valley, CA 95066.</i></p><hr><P>
+As many have lamented, the 640K of memory available to DOS programs is looking smaller every year.  With TSRs gobbling up memory on one end, and applications growing larger on the other, it is easy to use up all the space.  Of course, necessity is the mother of invention, so desperate DOS programmers have devised a number of ad hoc methods --using expanded and extended memory, overlays, and so on --to cram more functions into the same space.<P>
+This article describes another such method.  I've enhanced the DOS Exec function by swapping most of the calling program into expanded memory or to disk, and giving all that free memory to the child process.  When the subprocess is complete, the calling program is swapped back into place and continues normally.  This technique is especially valuable for menuing environments that must Execute other large programs, or modern programming editors that are expected to spawn huge compilations at the touch of a key.  In fact, it's useful for any program that must invoke another.<P>
+The swapping Exec function is implemented in a Turbo Pascal 5.0 unit called ExecSwap.  The meat of the code is written in assembly language, however, and with some changes could be linked into other languages.<P>
+<h3><a name="00af_0004">Turbo Pascal Program Organization<a name="00af_0004"></h3><P>
+In order for me to explain how ExecSwap works, we'll need to delve into the organization of a Turbo Pascal program.  Let's examine this program called X, shown in <a href="8904a.htm#00af_0005"> Example 1</A>.<P>
+<h4><a name="00af_0005"><a name="00af_0005"><B>Example 1:</B> An examination of program X</h4><P>
+<pre>
+  program X;
+  uses {System,} Dos, Crt;
+  begin
+         ClrScr;
+         Exec('C:\COMMAND.COM',&quot;);
+  end.</pre><P>
+<P>
+What this program does isn't important.  I'll use it just to show the arrangement of memory.  X uses two of Turbo's standard units, Crt and Dos.  It also implicitly uses the System unit, as does every Turbo Pascal program.  <a href="8904a.htm#00af_0006">Table 1</A> maps out the various segments.  (You can see a similar map of a real program by having the compiler create a MAP file and inspecting the segment map at the beginning of that file.)  It's important to note that each Pascal unit has its own code segment (denoted by CS_CRT, etc. in <a href="8904a.htm#00af_0006">Table 1</A>), and that the code segments are arranged in what might seem like reverse order.  That is, the unit appearing first in the USES statement is linked at the highest memory address, and the main program has the lowest code segment.  Also, if the program doesn't need to use the heap, the memory above the heap base may not be allocated.<P>
+<h4><a name="00af_0006"><a name="00af_0006"><B>Table 1:</B> Memory map of example program</h4><P>
+<pre>
+
+  PSP:               program segment prefix        lower addresses
+  CS_X:              X code                                |
+  CS_Crt:            Crt code                              |
+  CS_Dos:            Dos code                              v
+  CS_System:         System code                   higher addresses
+  DS:                initialized data                      |
+                     uninitialized data                    |
+  SS:                stack                                 v
+  HeapOrg:           heap base
+  HeapPtr:           heap high water mark
+                     available heap space
+  FreePtr:           free list
+  FreePtr+1000h:  top of program
+                     available DOS memory
+  xxxx:              top of memory</pre><P>
+<P>
+ExecSwap's goal is to copy most of the memory used by the program to secondary storage and then to deallocate that memory.  ExecSwap needs to leave only enough of itself behind to call DOS Exec and restore the image when the child process returns.<P>
+By this criterion the best place for ExecSwap's code would be in the main body of the program.  This way it could start swapping memory at the lowest possible code segment and free the most memory for the child process.  In <a href="8904a.htm#00af_0006">Table 1's</A> terms it would start swapping at code segment CS_X and continue to the top of the program.  After deallocating memory, the only overhead would be the program segment prefix (256 bytes) plus the portion of segment CS_X required to undo the swap.  <a href="8904a.htm#00af_0007">Example 2</A>  shows what memory might look like while the child process was active.  The rest of program X would have been stored in EMS memory if available, or in a disk file if not.<P>
+<h4><a name="00af_0007"><a name="00af_0007"><B>Example 2:</B> Memory map while child process is active</h4><P>
+<pre>
+  PSP:           program segment prefix      | ExecSwap
+  CS_X:          X code (partial)            | overhead
+    .---------------------------------------------------
+    |  child program  program  segment  prefix
+    |  ...
+    |  xxxx:         top of memory</pre><P>
+<P>
+There's another factor to consider, though.  ExecSwap should be convenient to use in more than just one program.  Hence, I've made it a self-contained unit which is available just by adding it to the main program's USES statement.  Considering <a href="8904a.htm#00af_0006">Table 1</A>  again, it's clear that when you USE ExecSwap you want to add it at the end of the list.  In that case, the memory map will look like <a href="8904a.htm#00af_0008">Example 3</A>.  The memory that remains allocated during the Exec is the PSP, the code in the main program X, and whatever part of ExecSwap must remain resident.<P>
+<h4><a name="00af_0008"><a name="00af_0008"><B>Example 3:</B> Memory map after using ExecSwap</h4><P>
+<pre>
+  PSP:                program segment prefix
+  CS_X:               X code
+  CS_ExecSwap:        ExecSwap code            &lt;------
+  CS_Crt:             Crt code
+  CS_Dos:             Dos code
+  CS_System:          System code
+  ...
+  xxxx:               top of memory</pre><P>
+<P>
+The main program's code segment need not be large, of course.  In the extreme case, the main program would consist of nothing but a USES statement and a single procedure call to another unit.  This reduces the overhead of the Exec call to essentially just the PSP plus ExecSwap itself.  And that's not much: ExecSwap's resident portion consumes less than 2,000 bytes.<P>
+<h3><a name="00af_0009">Using ExecSwap<a name="00af_0009"></h3><P>
+Before we plunge into the mechanics of ExecSwap, I'll describe how it is used by an application.  The unit interfaces three routines, shown in <a href="8904a.htm#00af_000a">Example 4</A> .  Before performing an Exec call, the program must call InitExecSwap.  This routine computes how many bytes to swap and allocates space to store the swapped region.<P>
+<h4><a name="00af_000a"><a name="00af_000a"><B>Example 4:</B> ExecSwap routines</h4><P>
+<pre>
+  function InitExecSwap (LastToSave : Pointer; SwapFileName:
+  String) : Boolean;
+    {-Initialize for swapping, returning TRUE if successful}
+
+  function ExecWithSwap (Path, CmdLine : String) : Word;
+    {-DOS Exec supporting swap to EMS or disk}
+
+  procedure ShutdownExecSwap;
+    {-Deallocate swap area}</pre><P>
+<P>
+The swapped region of memory starts just beyond the resident portion of ExecSwap.  The programmer must specify the end of the region with the parameter LastToSave because the choice depends on how the program uses the heap.  What you choose for LastToSave affects only the size of the swap file or the amount of EMS memory needed; it has no effect on resident overhead during the Exec call.<P>
+There are three reasonable values for LastToSave.  Passing the System variable HeapOrg tells ExecSwap not to save any part of the heap; this is the correct option for programs that make no use of the heap.  Passing the system variable HeapPtr causes ExecSwap to save all allocated portions of the heap.  Only the free list is ignored, so this is a good choice for programs that don't fragment the heap.  Passing the expression Ptr(Seg (FreePtr^)+$1000, 0) tells ExecSwap to save the entire heap, including the free list.  This is the most conservative option, but it may lead to swap files approaching 640K bytes in size.<P>
+InitExecSwap's second parameter, SwapFileName, specifies the name and location of the swap file.  If EMS memory is available, this name won't be used; otherwise InitExecSwap will create a new file.  InitExecSwap assures that sufficient EMS or disk space exists for the swap; if not, it returns FALSE.  To minimize swap times, it's a good idea to put the swap file on the fastest drive that will hold it.  It's also prudent to avoid a floppy drive because the user may change disks while the child process is active.  The swap file remains open, using a file handle, until ShutdownExecSwap is called or the program ends.  InitExecSwap marks the file with the Hidden and System attributes so that the user of the child process won't be tempted to delete it.<P>
+ExecWithSwap is analogous to the standard Exec procedure in Turbo's Dos unit.  Its first parameter is the path name of the program to Execute, and its second is the command line to pass to it.  The only difference from Exec is that ExecWithSwap is a function, returning the status of the call in a Word.  The function returns DOS error codes, with one exception.  The most common error codes are:<P>
+<pre>   0    success
+   1    swap error (no swap storage, disk error, EMS error)
+   2    file not found
+   3    path not found
+   8    insufficient memory</pre><P>
+You may never need to call ShutdownExecSwap, since ExecSwap sets up an exit handler that automatically calls it when the program ends.  In some cases, however, you may want to close and erase the swap file or regain EMS space before continuing.<P>
+There's a conundrum here.  ExecSwap should be last in the USES list, but the main program should do as little as possible.  So where do you place calls to the ExecSwap routines?  It's easiest to call them from the main program and take the hit in overhead.  Turbo Pascal provides a better key to the puzzle, though.  Version 5 supports procedure variables, and Version 4 makes it easy to fake them.  So do this: In the main program, assign the address of each ExecSwap procedure to a procedure variable declared in a unit used early in the USES list.  Then call ExecSwap's routines in any later unit by referring to the procedure variables.<P>
+One caution about using ExecSwap: Because most of your program's code isn't in memory while the child process runs, it's essential that the program's interrupt handlers be deactivated first.  Turbo Pascal 5 provides a handy procedure called SwapVectors that does this for all the System interrupt handlers.  Call SwapVectors just before and after ExecWithSwap, and treat any of your own handlers in a similar fashion.<P>
+<a href="8904a.htm#00af_000e">Listing One</A>, page 66, offers a simple example of using ExecSwap. You can assemble ExecSwap.ASM (<a href="8904a.htm#00af_0012">Listing Three</A>, page 66) using MASM 4.0 or later, or any compatible assembler.  Then compile the test program to an EXE file and run it, and you'll enter a DOS shell.  If you have a DOS memory mapping utility, you'll see that the TEST program is using less than 3K of memory.  The swap file uses about 20K, most of that for the 16K stack, which is Turbo's default.  If the swap goes to EMS, the EMS block will be 32K bytes, because EMS is allocated in 16K chunks.  Type Exit to leave the shell, and the test program will regain control.<P>
+A real program provides more impressive results.  We developed ExecSwap for use in our Turbo Analyst product, which offers an integrated environment where the programmer can edit source files, then Exec the compiler, debugger, or any of many other programming utilities.  Without benefit of ExecSwap, the environment keeps about 25OK of memory during the Exec.  With ExecSwap, the overhead is only about 4K.  That 246K makes a difference!<P>
+<h3><a name="00af_000b">How It's Done<a name="00af_000b"></h3><P>
+ExecSwap's Pascal source file, ExecSwap.PAS, is given in <a href="8904a.htm#00af_0010">Listing Two</A>, page 66.  It's little more than a shell for the assembly language routines in ExecSwap.ASM, <a href="8904a.htm#00af_0012">Listing Three</A>.<P>
+Looking at InitExecSwap in <a href="8904a.htm#00af_0010">Listing Two</A>, you'll see that it checks first for EMS memory (any version of EMS will do).  If that is available, it is used in preference to disk storage.  If not, InitExecSwap goes on to assure that there's enough space on the specified drive to hold the swap area.  The production version of ExecSwap (trimmed here for the sake of brevity), checks that the drive doesn't hold removable media. InitExecSwap also stores several items in global variables, where they're easily accessible by the assembly language routines, and installs an exit handler to clean up after itself in case the program halts unexpectedly.<P>
+The tricky stuff is in ExecSwap.ASM.  The file starts with the standard boilerplate needed for linking to Turbo Pascal.  A number of temporary variables in the code segment are declared; these are essential because the entire data segment is gone during critical portions of ExecWithSwap.  One of these variables is a temporary stack.  It's a small one, only 128 bytes, but it is required because the normal Turbo Pascal stack is also swapped out.  Macro definitions follow; more than the usual number of macros are used to keep the Listing to a reasonable length.<P>
+ExecWithSwap starts by copying a number of variables into the code segment.  Then it checks to see whether swapping will go to EMS or disk.  If neither has been activated, ExecWithSwap exits immediately, returning error code 1. Otherwise, ExecWithSwap processes one of four similar loops: one each to swap to or from disk or EMS storage.  Let's trace the &quot;swap to EMS&quot; loop in detail, at label WriteE.  The sequence for swapping to disk is so similar that I won't need to describe it here.<P>
+First map EMS memory, making the first 16K page of the EMS swap area accessible through the page window at FrameSeg:0.  (Note that ExecSwap doesn't save the EMS context; if your application uses EMS for other storage, be sure to remap EMS after returning from ExecWithSwap.)  The macro SetSwapCount then computes how many bytes to copy into the first page, returning a full 16K bytes unless it's also the last page.  The first location to save is at label FirstToSave, which immediately follows the ExecWithSwap routine.  The MoveFast macro copies the first swap block into the EMS window.  BX is then incremented to select the next logical EMS page, and the DS register is adjusted to point to the next swap block, 16K bytes higher in memory.  The loop continues until all the bytes have been copied.<P>
+Next, modify the DOS memory allocation, so that the space just swapped out is available to the child process.  First, save the current allocated size so you can restore it later.  Then switch to the small temporary stack, which is safely nestled in the code segment.  Finally, call the DOS SetBlock function to shrink the memory to just beyond the end of the ExecWithSwap routine.<P>
+The actual DOS Exec call follows.  The implementation here is similar to the one in Borland's Dos unit.  It validates and formats the program path and command line, parses file control blocks (FCBs) from the command line in case the child expects them, and calls the DOS Exec function.  The error code returned by Exec is stored unit the reverse swap is complete.<P>
+The reverse swap is just that: It reallocates memory from DOS and copies the parent program back into place.  There is, however, one critical difference from the fist swap.  Errors that occur during the reverse swap are fatal.  Because the program to return to no longer exists, the only recourse is to halt.  The most likely reason for such an error is the inability to reallocate the initial memory block.  This occurs whenever the Exec call (or the user) has installed a memory resident program while in the shell.  Be sure to warn your users not to do this!  ExecSwap could write an error message before halting; to save space here, it just sets the ErrorLevel, which can be checked within a batch file:<P>
+<pre>     0FFh can't reallocate memory   0FEh disk error   0FDh EMS error</pre><P>
+ExecWithSwap is done after it switches back to the original stack, restores the DS register, and returns the status code.<P>
+The remainder of ExecSwap.ASM is a collection of small utility routines, some of which may find for general use.<P>
+<h3><a name="00af_000c">In Summary<a name="00af_000c"></h3><P>
+ExecSwap seems quite reliable.  It doesn't depend on any newly discovered undocumented features of DOS, and has been tested by thousands of users.<P>
+There are a few additional features it might have.  The production version writes status messages while swapping, so nervous users don't think their hard disks are being formatted.  It might also support direct swapping to extended memory; this hasn't been attempted because experience indicates that using extended memory in a DOS application is a compatibility nightmare, and RAM disks seem quite adequate for swapping.  If the remainder of ExecSwap were converted to assembly language, Turbo Pascal's link order conventions (within a unit) could be circumvented, and another 500 bytes or so of Exec overhead would be saved.  With a few more DOS memory management calls, it would be possible for the parent and child processes to share a common data area.  An extension of the ExecSwap concept allows TSR programs to leave just a core of interrupt handlers in memory, and swap the application code in when they pop up (SideKick Plus apparently does this).<P>
+The ExecSwap unit has become a very useful item in my bag of tricks.  With an ExecSwap-based DOS shell in the programming editor I use, I can achieve the kind of multitasking I need (&quot;interruption-based&quot; multitasking).  ExecSwap should make it easier for you to squeeze more functionality into that 640K box as well.<P>
+<h3><a name="00af_000d">Acknowledgment<a name="00af_000d"></h3><P>
+Special thanks to Chris Franzen of West Germany, who added disk swapping capability to the original unit, which had supported only EMS.<P>
+
+<a name="00af_000e"><a name="00af_000e">
+<a name="00af_000f"></pre><B>[LISTING ONE]</B><pre><a name="00af_000f">
+
+program TestExecSwap;
+uses
+  Dos,ExecSwap; {Keep ExecSwap last}
+const
+  SwapLoc : array[Boolean] of String[7] = ('on disk', 'in EMS');
+var
+  Status : Word;
+begin
+  if not InitExecSwap(HeapPtr, 'SWAP.$$$') then
+    WriteLn('Unable to allocate swap space')
+  else begin
+    WriteLn('Allocated ', BytesSwapped, ' bytes ', SwapLoc[EmsAllocated]);
+    SwapVectors;
+    Status := ExecWithSwap(GetEnv('COMSPEC'), '');
+    SwapVectors;
+    WriteLn('Execu status; ', Status);
+  end;
+end.
+
+
+
+
+<a name="00af_0010"><a name="00af_0010">
+<a name="00af_0011"></pre><B>[LISTING TWO]</B><pre><a name="00af_0011">
+
+{Copyright (c) 1988 TurboPower Software}
+{May be used freely as long as due credit is given}
+{$R-,S-}
+unit ExecSwap;
+  {-Memory-efficient DOS EXEC call}
+interface
+
+const
+  BytesSwapped : LongInt = 0;             {Bytes to swap to EMS/disk}
+  EmsAllocated : Boolean = False;         {True when EMS allocated for swap}
+  FileAllocated : Boolean = False;        {True when file allocated for swap}
+
+function ExecWithSwap(Path, CmdLine : String) : Word;
+  {-DOS EXEC supporting swap to EMS or disk}
+
+function InitExecSwap(LastToSave : Pointer; SwapFileName : String) : Boolean;
+  {-Initialize for swapping, returning TRUE if successful}
+
+procedure ShutdownExecSwap;
+  {-Deallocate swap area}
+
+implementation
+
+var
+  EmsHandle : Word;               {Handle of EMS allocation block}
+  FrameSeg : Word;                {Segment of EMS page frame}
+  FileHandle : Word;              {DOS handle of swap file}
+  SwapName : String[80];          {ASCIIZ name of swap file}
+  SaveExit : Pointer;             {Exit chain pointer}
+
+  {$L EXECSWAP}
+  function ExecWithSwap(Path, CmdLine : String) : Word; external;
+  procedure FirstToSave; external;
+  function AllocateSwapFile : Boolean; external;
+  procedure DeallocateSwapFile; external;
+
+  {$F+}     {These routines could be interfaced for general use}
+  function EmsInstalled : Boolean; external;
+  function EmsPageFrame : Word; external;
+  function AllocateEmsPages(NumPages : Word) : Word; external;
+  procedure DeallocateEmsHandle(Handle : Word); external;
+  function DefaultDrive : Char; external;
+  function DiskFree(Drive : Byte) : LongInt; external;
+
+  procedure ExecSwapExit;
+  begin
+    ExitProc := SaveExit;
+    ShutdownExecSwap;
+  end;
+  {$F-}
+
+  procedure ShutdownExecSwap;
+  begin
+    if EmsAllocated then begin
+      DeallocateEmsHandle(EmsHandle);
+      EmsAllocated := False;
+    end else if FileAllocated then begin
+      DeallocateSwapFile;
+      FileAllocated := False;
+    end;
+  end;
+
+  function PtrDiff(H, L : Pointer) : LongInt;
+  type
+    OS = record O, S : Word; end;   {Convenient typecast}
+  begin
+    PtrDiff := (LongInt(OS(H).S) shl 4+OS(H).O)-
+               (LongInt(OS(L).S) shl 4+OS(L).O);
+  end;
+
+  function InitExecSwap(LastToSave : Pointer;
+                        SwapFileName : String) : Boolean;
+  const
+    EmsPageSize = 16384;            {Bytes in a standard EMS page}
+  var
+    PagesInEms : Word;              {Pages needed in EMS}
+    BytesFree : LongInt;            {Bytes free on swap file drive}
+    DriveChar : Char;               {Drive letter for swap file}
+  begin
+    InitExecSwap := False;
+
+    if EmsAllocated or FileAllocated then
+      Exit;
+    BytesSwapped := PtrDiff(LastToSave, @FirstToSave);
+    if BytesSwapped &lt;= 0 then
+      Exit;
+    SaveExit := ExitProc;
+    ExitProc := @ExecSwapExit;
+
+    if EmsInstalled then begin
+      PagesInEms := (BytesSwapped+EmsPageSize-1) div EmsPageSize;
+      EmsHandle := AllocateEmsPages(PagesInEms);
+      if EmsHandle &lt;&gt; $FFFF then begin
+        EmsAllocated := True;
+        FrameSeg := EmsPageFrame;
+        if FrameSeg &lt;&gt; 0 then begin
+          InitExecSwap := True;
+          Exit;
+        end;
+      end;
+    end;
+    if Length(SwapFileName) &lt;&gt; 0 then begin
+      SwapName := SwapFileName+#0;
+      if Pos(':', SwapFileName) = 2 then
+        DriveChar := Upcase(SwapFileName[1])
+      else
+        DriveChar := DefaultDrive;
+      BytesFree := DiskFree(Byte(DriveChar)-$40);
+      FileAllocated := (BytesFree &gt; BytesSwapped) and AllocateSwapFile;
+      if FileAllocated then
+        InitExecSwap := True;
+    end;
+  end;
+end.
+
+
+
+
+<a name="00af_0012"><a name="00af_0012">
+<a name="00af_0013"></pre><B>[LISTING THREE]</B><pre><a name="00af_0013">
+
+;EXECSWAP.ASM
+;  Swap memory and exec another program
+;  Copyright (c) 1988 TurboPower Software
+;  May be used freely as long as due credit is given
+;---------------------------------------------------------------------------
+DATA    SEGMENT BYTE PUBLIC
+        EXTRN   BytesSwapped:DWORD      ;Bytes to swap to EMS/disk
+        EXTRN   EmsAllocated:BYTE       ;True when EMS allocated for swap
+        EXTRN   FileAllocated:BYTE      ;True when file allocated for swap
+        EXTRN   EmsHandle:WORD          ;Handle of EMS allocation block
+        EXTRN   FrameSeg:WORD           ;Segment of EMS page frame
+        EXTRN   FileHandle:WORD         ;Handle of DOS swap file
+        EXTRN   SwapName:BYTE           ;ASCIIZ name of swap file
+        EXTRN   PrefixSeg:WORD          ;Base segment of program
+DATA    ENDS
+;---------------------------------------------------------------------------
+CODE    SEGMENT BYTE PUBLIC
+        ASSUME  CS:CODE,DS:DATA
+        PUBLIC  ExecWithSwap,FirstToSave
+        PUBLIC  AllocateSwapFile,DeallocateSwapFile
+        PUBLIC  DefaultDrive,DiskFree
+        PUBLIC  EmsInstalled,EmsPageFrame
+        PUBLIC  AllocateEmsPages,DeallocateEmsHandle
+;---------------------------------------------------------------------------
+FileAttr        EQU     6               ;Swap file attribute (hidden+system)
+EmsPageSize     EQU     16384           ;Size of EMS page
+FileBlockSize   EQU     32768           ;Size of a file block
+StkSize         EQU     128             ;Bytes in temporary stack
+lo              EQU     (WORD PTR 0)    ;Convenient typecasts
+hi              EQU     (WORD PTR 2)
+ofst            EQU     (WORD PTR 0)
+segm            EQU     (WORD PTR 2)
+;---------------------------------------------------------------------------
+;Variables in CS
+EmsDevice       DB      'EMMXXXX0',0    ;Name of EMS device driver
+UsedEms         DB      0               ;1 if swapping to EMS, 0 if to file
+BytesSwappedCS  DD      0               ;Bytes to move during a swap
+EmsHandleCS     DW      0               ;EMS handle
+FrameSegCS      DW      0               ;Segment of EMS page window
+FileHandleCS    DW      0               ;DOS file handle
+PrefixSegCS     DW      0               ;Segment of base of program
+Status          DW      0               ;ExecSwap status code
+LeftToSwap      DD      0               ;Bytes left to move
+SaveSP          DW      0               ;Original stack pointer
+SaveSS          DW      0               ;Original stack segment
+PathPtr         DD      0               ;Pointer to program to execute
+CmdPtr          DD      0               ;Pointer to command line to execute
+ParasWeHave     DW      0               ;Paragraphs allocated to process
+CmdLine         DB      128 DUP(0)      ;Terminated command line passed to DOS
+Path            DB      64 DUP(0)       ;Terminated path name passed to DOS
+FileBlock1      DB      16 DUP(0)       ;FCB passed to DOS
+FileBlock2      DB      16 DUP(0)       ;FCB passed to DOS
+EnvironSeg      DW      0               ;Segment of environment for child
+CmdLinePtr      DD      0               ;Pointer to terminated command line
+FilePtr1        DD      0               ;Pointer to FCB file
+FilePtr2        DD      0               ;Pointer to FCB file
+TempStack       DB      StkSize DUP(0)  ;Temporary stack
+StackTop        LABEL   WORD            ;Initial top of stack
+;---------------------------------------------------------------------------
+;Macros
+MovSeg          MACRO Dest,Src          ;Set one segment register to another
+        PUSH    Src
+        POP     Dest
+                ENDM
+
+MovMem          MACRO Dest,Src          ;Move from memory to memory via AX
+        MOV     AX,Src
+        MOV     Dest,AX
+                ENDM
+
+InitSwapCount   MACRO                   ;Initialize counter for bytes to swap
+        MovMem  LeftToSwap.lo,BytesSwappedCS.lo
+        MovMem  LeftToSwap.hi,BytesSwappedCS.hi
+                ENDM
+
+SetSwapCount    MACRO BlkSize           ;Return CX = bytes to move this block
+        LOCAL   FullBlk                 ;...and reduce total bytes left to move
+        MOV     CX,BlkSize              ;Assume we'll write a full block
+        CMP     LeftToSwap.hi,0         ;Is high word still non-zero?
+        JNZ     FullBlk                 ;Jump if so
+        CMP     LeftToSwap.lo,BlkSize   ;Low word still a block or more?
+        JAE     FullBlk                 ;Jump if so
+        MOV     CX,LeftToSwap.lo        ;Otherwise, move what's left
+FullBlk:SUB     LeftToSwap.lo,CX        ;Reduce number left to move
+        SBB     LeftToSwap.hi,0
+                ENDM
+
+NextBlock       MACRO SegReg, BlkSize   ;Point SegReg to next block to move
+        MOV     AX,SegReg
+        ADD     AX,BlkSize/16           ;Add paragraphs to next segment
+        MOV     SegReg,AX               ;Next block to move
+        MOV     AX,LeftToSwap.lo
+        OR      AX,LeftToSwap.hi        ;Bytes left to move?
+                ENDM
+
+EmsCall         MACRO FuncAH            ;Call EMM and prepare to check result
+        MOV     AH,FuncAH               ;Set up function
+        INT     67h
+        OR      AH,AH                   ;Error code in AH
+                ENDM
+
+DosCallAH       MACRO FuncAH            ;Call DOS subfunction AH
+        MOV     AH,FuncAH
+        INT     21h
+                ENDM
+
+DosCallAX       MACRO FuncAX            ;Call DOS subfunction AX
+        MOV     AX,FuncAX
+        INT     21h
+                ENDM
+
+InitSwapFile    MACRO
+        MOV     BX,FileHandleCS         ;BX = handle of swap file
+        XOR     CX,CX
+        XOR     DX,DX                   ;Start of file
+        DosCallAX 4200h                 ;DOS file seek
+                ENDM
+
+HaltWithError   MACRO Level             ;Halt if non-recoverable error occurs
+        MOV     AL,Level                ;Set errorlevel
+        DosCallAH 4Ch
+                ENDM
+
+MoveFast        MACRO                   ;Move CX bytes from DS:SI to ES:DI
+        CLD                             ;Forward
+        RCR     CX,1                    ;Convert to words
+        REP     MOVSW                   ;Move the words
+        RCL     CX,1                    ;Get the odd byte, if any
+        REP     MOVSB                   ;Move it
+                ENDM
+
+SetTempStack    MACRO                   ;Switch to temporary stack
+        MOV     AX,OFFSET StackTop      ;Point to top of stack
+        MOV     BX,CS                   ;Temporary stack in this code segment
+        CLI                             ;Interrupts off
+        MOV     SS,BX                   ;Change stack
+        MOV     SP,AX
+        STI                             ;Interrupts on
+                ENDM
+;--------------------------------------------------------------------------
+;function ExecWithSwap(Path, CmdLine : string) : Word;
+ExecWithSwap    PROC FAR
+        PUSH    BP
+        MOV     BP,SP                   ;Set up stack frame
+
+;Move variables to CS where we can easily access them later
+        MOV     Status,1                ;Assume failure
+        LES     DI,[BP+6]               ;ES:DI -&gt; CmdLine
+        MOV     CmdPtr.ofst,DI
+        MOV     CmdPtr.segm,ES          ;CmdPtr -&gt; command line string
+        LES     DI,[BP+10]              ;ES:DI -&gt; Path
+        MOV     PathPtr.ofst,DI
+        MOV     PathPtr.segm,ES         ;PathPtr -&gt; path to execute
+        MOV     SaveSP,SP               ;Save stack position
+        MOV     SaveSS,SS
+        MovMem  BytesSwappedCS.lo,BytesSwapped.lo
+        MovMem  BytesSwappedCS.hi,BytesSwapped.hi
+        MovMem  EmsHandleCS,EmsHandle
+        MovMem  FrameSegCS,FrameSeg
+        MovMem  FileHandleCS,FileHandle
+        MovMem  PrefixSegCS,PrefixSeg
+        InitSwapCount                   ;Initialize bytes LeftToSwap
+
+;Check for swapping to EMS or file
+        CMP     EmsAllocated,0          ;Check flag for EMS method
+        JZ      NotEms                  ;Jump if EMS not used
+        JMP     WriteE                  ;Swap to EMS
+NotEms: CMP     FileAllocated,0         ;Check flag for swap file method
+        JNZ     WriteF                  ;Swap to file
+        JMP     ESDone                  ;Exit if no swapping method set
+
+;Write to swap file
+WriteF: MovSeg  DS,CS                   ;DS = CS
+        InitSwapFile                    ;Seek to start of swap file
+        JNC     EF0                     ;Jump if success
+        JMP     ESDone                  ;Exit if error
+EF0:    SetSwapCount FileBlockSize      ;CX = bytes to write
+        MOV     DX,OFFSET FirstToSave   ;DS:DX -&gt; start of region to save
+        DosCallAH 40h                   ;File write
+        JC      EF1                     ;Jump if write error
+        CMP     AX,CX                   ;All bytes written?
+        JZ      EF2                     ;Jump if so
+EF1:    JMP     ESDone                  ;Exit if error
+EF2:    NextBlock DS,FileBlockSize      ;Point DS to next block to write
+        JNZ     EF0                     ;Loop if bytes left to write
+        MOV     UsedEms,0               ;Flag we used swap file for swapping
+        JMP     SwapDone                ;Done swapping out
+
+;Write to EMS
+WriteE: MOV     ES,FrameSeg             ;ES -&gt; page window
+        MOV     DX,EmsHandle            ;DX = handle of our EMS block
+        XOR     BX,BX                   ;BX = initial logical page
+        MovSeg  DS,CS                   ;DS = CS
+EE0:    XOR     AL,AL                   ;Physical page 0
+        EmsCall 44h                     ;Map physical page
+        JZ      EE1                     ;Jump if success
+        JMP     ESDone                  ;Exit if error
+EE1:    SetSwapCount EmsPageSize        ;CX = Bytes to move
+        XOR     DI,DI                   ;ES:DI -&gt; base of EMS page
+        MOV     SI,OFFSET FirstToSave   ;DS:SI -&gt; region to save
+        MoveFast                        ;Move CX bytes from DS:SI to ES:DI
+        INC     BX                      ;Next logical page
+        NextBlock DS,EmsPageSize        ;Point DS to next page to move
+        JNZ     EE0                     ;Loop if bytes left to move
+        MOV     UsedEms,1               ;Flag we used EMS for swapping
+
+;Shrink memory allocated to this process
+SwapDone:MOV    AX,PrefixSegCS
+        MOV     ES,AX                   ;ES = segment of our memory block
+        DEC     AX
+        MOV     DS,AX                   ;DS = segment of memory control block
+        MOV     CX,DS:[0003h]           ;CX = current paragraphs owned
+        MOV     ParasWeHave,CX          ;Save current paragraphs owned
+        SetTempStack                    ;Switch to temporary stack
+        MOV     AX,OFFSET FirstToSave+15
+        MOV     CL,4
+        SHR     AX,CL                   ;Convert offset to paragraphs
+        ADD     BX,AX
+        SUB     BX,PrefixSegCS          ;BX = new paragraphs to keep
+        DosCallAH 4Ah                   ;SetBlock
+        JNC     EX0                     ;Jump if successful
+        JMP     EX5                     ;Swap back and exit
+
+;Set up parameters and call DOS Exec
+EX0:    MOV     AX,ES:[002Ch]           ;Get environment segment
+        MOV     EnvironSeg,AX
+        MovSeg  ES,CS                   ;ES = CS
+        LDS     SI,PathPtr              ;DS:SI -&gt; path to execute
+        MOV     DI,OFFSET Path          ;ES:DI -&gt; local ASCIIZ copy
+        CLD
+        LODSB                           ;Read current length
+        CMP     AL,63                   ;Truncate if exceeds space set aside
+        JB      EX1
+        MOV     AL,63
+EX1:    MOV     CL,AL
+        XOR     CH,CH                   ;CX = bytes to copy
+        REP     MOVSB
+        XOR     AL,AL
+        STOSB                           ;ASCIIZ terminate
+        LDS     SI,CmdPtr               ;DS:SI -&gt; Command line to pass
+        MOV     DI,OFFSET CmdLine       ;ES:DI -&gt; Local terminated copy
+        LODSB
+        CMP     AL,126                  ;Truncate command if exceeds space
+        JB      EX2
+        MOV     AL,126
+EX2:    STOSB
+        MOV     CL,AL
+        XOR     CH,CH                   ;CX = bytes to copy
+        REP     MOVSB
+        MOV     AL,0DH                  ;Terminate with ^M
+        STOSB
+        MovSeg  DS,CS                   ;DS = CS
+        MOV     SI,OFFSET CmdLine
+        MOV     CmdLinePtr.ofst,SI
+        MOV     CmdLinePtr.segm,DS      ;Store pointer to command line
+        INC     SI
+        MOV     DI,OFFSET FileBlock1
+        MOV     FilePtr1.ofst,DI
+        MOV     FilePtr1.segm,ES        ;Store pointer to filename 1, if any
+        DosCallAX 2901h                 ;Parse FCB
+        MOV     DI,OFFSET FileBlock2
+        MOV     FilePtr2.ofst,DI
+        MOV     FilePtr2.segm,ES        ;Store pointer to filename 2, if any
+        DosCallAX 2901h                 ;Parse FCB
+        MOV     DX,OFFSET Path
+        MOV     BX,OFFSET EnvironSeg
+        DosCallAX 4B00h                 ;Exec
+        JC      EX3                     ;Jump if error in DOS call
+        XOR     AX,AX                   ;Return zero for success
+EX3:    MOV     Status,AX               ;Save DOS error code
+
+;Set up temporary stack and reallocate original memory block
+        SetTempStack                    ;Set up temporary stack
+        MOV     ES,PrefixSegCS
+        MOV     BX,ParasWeHave
+        DosCallAH 4Ah                   ;SetBlock
+        JNC     EX4                     ;Jump if no error
+        HaltWithError 0FFh              ;Must halt if failure here
+EX4:    InitSwapCount                   ;Initialize LeftToSwap
+
+;Check which swap method is in use
+EX5:    CMP     UsedEms,0
+        JZ      ReadF                   ;Jump to read back from file
+        JMP     ReadE                   ;Read back from EMS
+
+;Read back from swap file
+ReadF:  MovSeg  DS,CS                   ;DS = CS
+        InitSwapFile                    ;Seek to start of swap file
+        JNC     EF3                     ;Jump if we succeeded
+        HaltWithError 0FEh              ;Must halt if failure here
+EF3:    SetSwapCount FileBlockSize      ;CX = bytes to read
+        MOV     DX,OFFSET FirstToSave   ;DS:DX -&gt; start of region to restore
+        DosCallAH 3Fh                   ;Read file
+        JNC     EF4                     ;Jump if no error
+        HaltWithError 0FEh              ;Must halt if failure here
+EF4:    CMP     AX,CX
+        JZ      EF5                     ;Jump if full block read
+        HaltWithError 0FEh              ;Must halt if failure here
+EF5:    NextBlock DS,FileBlockSize      ;Point DS to next page to read
+        JNZ     EF3                     ;Jump if bytes left to read
+        JMP     ESDone                  ;We're done
+
+;Copy back from EMS
+ReadE:  MOV     DS,FrameSegCS           ;DS -&gt; page window
+        MOV     DX,EmsHandleCS          ;DX = handle of our EMS block
+        XOR     BX,BX                   ;BX = initial logical page
+        MovSeg  ES,CS                   ;ES = CS
+EE3:    XOR     AL,AL                   ;Physical page 0
+        EmsCall 44h                     ;Map physical page
+        JZ      EE4                     ;Jump if success
+        HaltWithError 0FDh              ;Must halt if failure here
+EE4:    SetSwapCount EmsPageSize        ;CX = Bytes to move
+        XOR     SI,SI                   ;DS:SI -&gt; base of EMS page
+        MOV     DI,OFFSET FirstToSave   ;ES:DI -&gt; region to restore
+        MoveFast                        ;Move CX bytes from DS:SI to ES:DI
+        INC     BX                      ;Next logical page
+        NextBlock ES,EmsPageSize        ;Point ES to next page to move
+        JNZ     EE3                     ;Jump if so
+
+ESDone: CLI                             ;Switch back to original stack
+        MOV     SS,SaveSS
+        MOV     SP,SaveSP
+        STI
+        MOV     AX,SEG DATA
+        MOV     DS,AX                   ;Restore DS
+        MOV     AX,Status               ;Return status
+        POP     BP
+        RET     8                       ;Remove parameters and return
+ExecWithSwap    ENDP
+;---------------------------------------------------------------------------
+;Label marks first location to swap
+FirstToSave:
+;---------------------------------------------------------------------------
+;function AllocateSwapFile : Boolean;
+AllocateSwapFile PROC NEAR
+        MOV     CX,FileAttr             ;Attribute for swap file
+        MOV     DX,OFFSET SwapName+1    ;DS:DX -&gt; ASCIIZ swap name
+        DosCallAH 3Ch                   ;Create file
+        MOV     FileHandle,AX           ;Save handle assuming success
+        MOV     AL,0                    ;Assume failure
+        JC      ASDone                  ;Failed if carry set
+        INC     AL                      ;Return true for success
+ASDone: RET
+AllocateSwapFile ENDP
+;---------------------------------------------------------------------------
+;procedure DeallocateSwapFile;
+DeallocateSwapFile PROC NEAR
+        MOV     BX,FileHandle           ;Handle of swap file
+        DosCallAH 3Eh                   ;Close file
+        XOR     CX,CX                   ;Normal attribute
+        MOV     DX,OFFSET SwapName+1    ;DS:DX -&gt; ASCIIZ swap name
+        DosCallAX 4301h                 ;Set file attribute
+        DosCallAH 41h                   ;Delete file
+        RET
+DeallocateSwapFile ENDP
+;---------------------------------------------------------------------------
+;function EmsInstalled : Boolean;
+EmsInstalled    PROC FAR
+        PUSH    DS
+        MovSeg  DS,CS                   ;DS = CS
+        MOV     DX,OFFSET EmsDevice     ;DS:DX -&gt; EMS driver name
+        DosCallAX 3D02h                 ;Open for read/write
+        POP     DS
+        MOV     BX,AX                   ;Save handle in case one returned
+        MOV     AL,0                    ;Assume FALSE
+        JC      EIDone
+        DosCallAH 3Eh                   ;Close file
+        MOV     AL,1                    ;Return TRUE
+EIDone: RET
+EmsInstalled    ENDP
+;---------------------------------------------------------------------------
+;function EmsPageFrame : Word;
+EmsPageFrame    PROC FAR
+        EmsCall 41h                     ;Get page frame
+        MOV     AX,BX                   ;AX = segment
+        JZ      EPDone                  ;Done if Error = 0
+        XOR     AX,AX                   ;Else segment = 0
+EPDone: RET
+EmsPageFrame    ENDP
+;---------------------------------------------------------------------------
+;function AllocateEmsPages(NumPages : Word) : Word;
+AllocateEmsPages PROC FAR
+        MOV     BX,SP                   ;Set up stack frame
+        MOV     BX,SS:[BX+4]            ;BX = NumPages
+        EmsCall 43h                     ;Allocate EMS
+        MOV     AX,DX                   ;Assume success
+        JZ      APDone                  ;Done if not 0
+        MOV     AX,0FFFFh               ;$FFFF for failure
+APDone: RET     2                       ;Remove parameter and return
+AllocateEmsPages ENDP
+;---------------------------------------------------------------------------
+;procedure DeallocateEmsHandle(Handle : Word);
+DeallocateEmsHandle PROC FAR
+        MOV     BX,SP                   ;Set up stack frame
+        MOV     DX,SS:[BX+4]            ;DX = Handle
+        EmsCall 45h                     ;Deallocate EMS
+        RET     2                       ;Remove parameter and return
+DeallocateEmsHandle ENDP
+;---------------------------------------------------------------------------
+;function DefaultDrive : Char;
+DefaultDrive    PROC FAR
+        DosCallAH 19h                   ;Get default drive
+        ADD     AL,'A'                  ;Convert to character
+        RET
+DefaultDrive    ENDP
+;---------------------------------------------------------------------------
+;function DiskFree(Drive : Byte) : LongInt;
+DiskFree        PROC FAR
+        MOV     BX,SP                   ;Set up stack frame
+        MOV     DL,SS:[BX+4]            ;DL = Drive to check
+        DosCallAH 36h                   ;Get disk space
+        MOV     DX,AX                   ;Return 0FFFFFFFFh for failure
+        CMP     AX,0FFFFh               ;Bad drive number?
+        JZ      DFDone                  ;Jump if so
+        MUL     CX                      ;AX = bytes/cluster
+        MUL     BX                      ;DX:AX = bytes free
+DFDone: RET     2                       ;Remove parameter and return
+DiskFree        ENDP
+;---------------------------------------------------------------------------
+CODE    ENDS
+        END
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1989, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

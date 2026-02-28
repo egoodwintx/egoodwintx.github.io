@@ -1,0 +1,524 @@
+<HTML>
+<META NAME="year" CONTENT="1989">
+<HEAD>
+
+<TITLE>SP 89: C CUSTOMIZED MEMORY ALLOCATORS</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>C CUSTOMIZED MEMORY ALLOCATORS<a name="02b1_0003"><a name="02b1_0003"></h1><P>
+<h2><a name="02b1_0001"><a name="02b1_0000">When malloc( ) et al won't do</h2><P>
+<h3>Paul Anderson</h3><P>
+<p><i><a name="02b1_0002"><a name="02b1_0000">Paul is a consultant and coauthor of Advanced C Tips and Techniques, published by Howard W. Sams, from which this article was adapted.  Paul can be reached at 1212 Eolus Ave., Leucadia, CA 92024.</i></p><hr><P>
+C programs often need to allocate storage at run time.  The C library routines malloc( ), calloc( ), realloc( ), and free( ) use pointers to heap memory for run-time storage. Although these routines are easy to use, there's no error checking if you call them incorrectly.  Subtle bugs can make you lose valuable development time.<P>
+In this article, I'll show you how to customize the memory allocator routines to help you during the development cycle.  Along the way I'll introduce several techniques that help pinpoint memory allocator errors as they occur.  The approach is to provide front ends to the standard allocators for debugging.  After the system is running and becomes stable, you can then replace the customized allocators with the standard ones.  You may, however, want to continue to use the custom allocators in your system, depending upon the overhead imposed on your system.  This article should at least give you some ideas on how to better C's run-time management routines for your own applications.<P>
+<h3><a name="02b1_0004">Negative Subscripts<a name="02b1_0004"></h3><P>
+The basic rule for arrays that the compiler uses for a pointer offset is:<P>
+<pre>     &amp;a[n] = a + n = (char *)a + n* sizeof(object)</pre><P>
+Substituting 0 for n, you have<P>
+<pre>     &amp;a[0] = a = (char *)a</pre><P>
+This explains why C array subscripts start at zero.  The compiler always uses the base address for the start of the array.  What happens when n is negative?  The formula for a negative pointer offset is only slightly different:<P>
+<pre>     &amp;a[-n] = a - n = (char *)a - n * sizeof(object)</pre><P>
+The pointer offset is below the base address of the array.  Negative subscripts are legal in C because the index is converted to a pointer offset.<P>
+<a href="8914i.htm#02b1_0005">Example 1</A> is a program that demonstrates out-of-bounds array references in C.  The program uses a negative subscript and also references an array element beyond its last member.  On the Xenix system I use, this program produces a core dump, but I've seen it run fine under DOS and other Unix systems.  Note that this program would not compile if rewritten in Pascal or Algol.  These languages include compile-time checks that complain if an array subscript is out-of-bounds.  In C, however, array references simply convert to pointer offsets.  This allows programs with negative subscripts to compile and sometimes to run.<P>
+<h4><a name="02b1_0005"><a name="02b1_0005"><B>Example 1:</B> Out-of-bounds references</h4><P>
+<pre>
+  /* twzone.c = array out of bounds */
+
+  main()
+  {
+      int buf[10];
+
+      buf[-4] = 1;            /* negative subscript */
+      buf[10] = 2;            /* one step beyond */
+
+      printf(&quot;%d %d\n&quot;, *(buf - 4), *((buf + 10));
+  }</pre><P>
+<P>
+Negative subscripts can be put to work in a useful way.  Here, I'll use them in a custom version of the C library routine calloc( ).  The routine, called xcalloc( ), provides heap memory for data storage at run time, and provides features that calloc( ) does not.  For example, xcalloc( ) checks for errors instead of leaving this job to the calling routine. This makes it easier to use, and it helps centralize error messages.  xcalloc( ) also stores an integer that indicates the number of elements you request in heap storage along with the data.<P>
+Programs call xcalloc( ) with the same protocols as calloc( ).  xcalloc( ), however, allocates memory for an integer value in addition to space for the data.  The routine stores the number of elements allocated from the heap and returns a pointer to the space allocated for the data.  Programs use a negative offset from the heap pointer to access the number of elements.<P>
+Suppose, for example, you call xcalloc( ) to allocate heap storage for ten integers and assign the heap address to p (a pointer to an integer).<P>
+int *p;    . . . .    p = (int *) xcalloc(10, sizeof(int));    . . . .<P>
+xcalloc( )'s first argument is the number of elements and the second argument is the size of each element.  sizeof(int) is used for portability.  <a href="198902b3.htm">Figure 1</A>  shows a modified heap configuration for a machine with 16-bit integers and addresses.  p points to ten integers (with initial values of zero) on the heap.  The number of elements (ten) is stored at address 8612, in front of the data.  p, however, points to address 8614, assuming that integers are 2 bytes.  Programs use a negative offset from p to access the number of elements (ten).<P>
+<a href="8914i.htm#02b1_0006">Example 2</A> is a program called neg.c that demonstrates xcalloc( ). neg.c calls xcalloc( ) twice for heap storage.  The first call allocates storage for ten integers and the second for fifteen integers.  You can assume the heap pointers p and q are valid because xcalloc( ) checks for heap errors.  The program calls routines to assign integers to the heap and display their values.  The first call to fill( ) stores ten integer numbers on the heap, and the second call stores fifteen integers.  display( ) prints the data from the heap area pointed to by its argument.  Neither of these routines requires the number of elements as a function parameter -- this is available from the heap pointer.<P>
+<h4><a name="02b1_0006"><a name="02b1_0006"><B>Example 2:</B> Program that demonstrates xcalloc( )</h4><P>
+<pre>
+  /* neg.c - negative subscripts with xcalloc */
+
+  #include &lt;stdio.h&gt;
+
+  main()
+  {
+
+     char *xcalloc();
+     int *p, *q;
+
+     p - (int *) xcalloc(10, sizeof(int));
+     q = (int *) xcalloc(15, sizeof(int));
+
+     fill(p);                  /* fill with 10 numbers */
+     display(p);               /* print 10 numbers */
+
+     fill(q);                  /* fill with 15 numbers */
+     display(q);               /* print 15 numbers */
+
+  }
+
+  $ neg
+    1  2  3  4  5  6  7  8  9  10
+    1  2  3  4  5  6  7  8  9  10  11  12  13  14  15</pre><P>
+<P>
+<a href="8914i.htm#02b1_0007">Example 3</A> shows the code for xcalloc( ).  The variable blksize contains the amount of memory you request from the heap.  The function calls malloc( ) from the standard C library to allocate blksize bytes plus one integer (sizeof-(int) bytes) from the heap.  Note that xcalloc( ) displays an error message and terminates the program if heap space is not available.  The statement<P>
+<pre>
+     *(int *)pheap = nitems;
+              /* store no. of items in heap */</pre><P>
+stores the number of elements in the heap by casting the heap pointer to an integer pointer before the size is stored.  memset( ) zeros the heap area to make xcalloc( ) compatible with calloc( ).  The statement<P>
+<pre>
+     return pheap + sizeof(int);
+                               /* pointer to data */</pre><P>
+returns the heap pointer to the calling routine, which is offset by the integer containing the number of elements.  sizeof( ) makes xcalloc( ) portable.<P>
+<h4><a name="02b1_0007"><a name="02b1_0007"><B>Example 3:</B> xcalloc( ) routine</h4><P>
+<pre>
+  #include &lt;stdio.h&gt;
+  #include &lt;malloc.h&gt;
+  #include &lt;memory.h&gt;
+
+  char *xcalloc(nitems, size)          /* custom calloc()   */
+  unsigned nitems, size;
+  {
+
+     char *pheap;
+     unsigned blksize;
+
+     blksize = nitems * size;              /* size of chunk */
+
+     if ((pheap = malloc(blksize + sizeof(int))) == NULL) {
+       fprintf(stderr, &quot;Can't malloc on heap\n&quot;);
+       exit (1);
+
+     }
+     *(int *)pheap = nitems;               /* store no. of items in heap */
+
+     memset(pheap + sizeof(int),
+     0, blksize);                         /* zero the area */
+
+     return pheap + sizeof(int);          /* pointer to data */
+  }</pre><P>
+<P>
+Now for the rest of the routines.  <a href="8914i.htm#02b1_0007">Example 4</A> shows fill( ) and display( ), which use negative subscripts.  Both routines access the heap to determine the number of elements before they loop through the data.  The statement p[-1] uses a negative subscript.  From the basic rule for C arrays, it's as if you typed *(p - 1).  This evaluates to an integer, which is the number of elements at the heap address.<P>
+<h4><a name="02b1_0008"><a name="02b1_0008"><B>Example 4:</B> fill( ) and display( ) routines</h4><P>
+<pre>
+  fill(p)                                  /* fill heap with integers */
+  int *p;
+  {
+
+     int i;
+     int nints = p[-1];                /* number of items from heap */
+
+     for (i = 0; i &lt;nints; i++)
+         p[i] = i + i;
+
+  }
+
+  display(p)                           /* display integers from heap */
+  int *p;
+  {
+     int i;
+     int nints = p[-1];                /* number of items from heap */
+
+     for (i = 0; i &lt; nints; i++)
+         printf(&quot;%3d&quot;, p[i]);
+     putchar('\n');
+  }</pre><P>
+<P>
+neg.c demonstrates only integer pointers.  Programs may use xcalloc( ) to allocate heap pointers to any C data type.  Suppose, for example, you want to allocate space for 20 structures of type something.  You may call xcalloc( ) as follows:<P>
+<pre>     struct something *ps;
+    . . . .
+    ps = (struct something *) xcalloc(20, sizeof(struct something));</pre><P>
+This shows that xcalloc( ) is independent of the allocated pointer's data type.  The routine still stores the number of elements as an integer, however, which means you have to cast the pointer appropriately to access it.  I'll elaborate.<P>
+Suppose sfill( ) and sdisplay( ) store data into heap structures and display data, respectively.  A call to sfill( ), for example, looks like<P>
+<pre>     sfill(ps); /* fill 20 structures */</pre><P>
+Inside sfill( ), you access the number of elements with the following statements:<P>
+<pre>     sfill(p)
+          /* fill structures from heap */
+    struct something *p;
+    {
+    int nitems = ((int *)p)[-1];
+          /* number of items from heap */
+    . . . .
+    }</pre><P>
+You must cast p before you apply the negative subscript.  The parentheses are necessary in order to make the statement compile.  Without them, the compiler tries to cast an array reference.  The same changes would apply to sdisplay( ).<P>
+<h3><a name="02b1_0009">Customized Memory Allocators<a name="02b1_0009"></h3><P>
+Many of the standard C library routines have no error checking.  When you use these routines and errors occur, you may want to report error information that the standard routines can't (or won't) provide.  One way to get this extra level of error checking is to write front ends to the standard library routines.  These custom routines check for errors and handle system specifics, then call the standard routines if they don't discover problems.<P>
+The dynamic storage allocators from the standard C library are good candidates for custom front ends.  I've found that software systems that make heavy use of dynamic storage allocation are harder to debug.  Calls to malloc( ), calloc( ), and realloc( ), for example, provide some information about errors, but you rarely get enough to find the cause of the problem.  What's worse, free( ) may destroy the integrity of the heap if its argument is not a heap address from a previous call to the allocator.<P>
+With a little effort and some overhead, you can improve this situation.  In this section, I'll present front ends for malloc( ), realloc( ), and free( ).  A front end for calloc( ) follows from the same approach.<P>
+<h3><a name="02b1_000a">Front Ends<a name="02b1_000a"></h3><P>
+Programs include a file called xalloc.h for using the front end routines.  The statement #include &quot;xalloc.h&quot; provides the interface.  I'll examine this file shortly.<P>
+I'll start with xmalloc( ), a front end for malloc( ).  The use of xmalloc( ) allocates storage dynamically in the same way as malloc( ).  Suppose, for example, a file called pgm.c contains the following statements.<P>
+<pre>     #include &quot;xalloc.h&quot;
+    . . . .
+    char *pheap;
+    . . . .
+    pheap = xmalloc(100);
+          /* 100 bytes */
+    . . . .</pre><P>
+xmalloc( ) allocates 100 bytes of memory from the heap.  If all is well, it's as if you called malloc( ).  If there is an error, however, the program terminates and displays the following message on standard error:<P>
+<pre>     file pgm.c - line 56: malloc error for 100 bytes</pre><P>
+The error message displays the file name and the line number where malloc( ) fails.  This helps you locate the exact spot in your source file where the problem occurred.<P>
+The front ends xrealloc( ) and xfree( ) work in a similar way.  Programs use these front ends with the same parameters as their C library counterparts.  Note that none of the front ends require you to test the return value from an allocator call.<P>
+<a href="8914i.htm#02b1_000b">Example 5</A> shows what's inside the include file xalloc.h.  The header file reveals that the front ends are actually macros that call separate functions.  The use of the special names _FILE_ and _LINE_ makes the C preprocessor substitute a filename and line number each time the macro is called.  This allows each function to display an error message with a file name and a line number when a C library allocator routine fails.<P>
+<h4><a name="02b1_000b"><a name="02b1_000b"><B>Example 5:</B> xalloc.h header file</h4><P>
+<pre>
+  /* xalloc.h = header file for customized memory allocators */
+
+  #define xmalloc(N)          ymalloc(_FILE_, _LINE_, N)
+  #define xcalloc(N, S)       ycalloc(_FILE_, _LINE_, N, S)
+  #define xrealloc(P, N)      yrealloc(_FILE_, _LINE_, P, N)
+  #define xfree(P)            yfree(_FILE_, _LINE_, P)
+
+  char *ymalloc(), *ycalloc(), *yrealloc();
+  void yfree();</pre><P>
+<P>
+Note that xmalloc( ) (a macro) calls ymalloc( ) (a function).  <a href="8914i.htm#02b1_000c">Example 6</A> shows the first version of ymalloc( ).  It's not very fancy yet, but there's more to come.  At this point, ymalloc( ) calls malloc and checks the return pointer value.  If there's an error, an error message appears on standard error and the program terminates.<P>
+<h4><a name="02b1_000c"><a name="02b1_000c"><B>Example 6:</B> First version of ymalloc.c</h4><P>
+<pre>
+  /* ymallocl.c - front end for malloc()
+                  Version 1
+
+  */
+
+  #include &lt;stdio.h&gt;
+  #include &lt;malloc.h&gt;
+
+  char *ymalloc(file, lineno, nbytes)
+  char *file;
+  int lineno;
+  unsigned int nbytes;
+  {
+
+     char * pheap;
+
+     pheap = malloc(nbytes);
+     if (pheap == (char *) NULL) {
+       fprintf(stderr, &quot;file %s - line %d: malloc error for %u bytes\n&quot;,
+                        file, lineno, nbytes);
+
+       exit(1);
+
+     }
+     return pheap;
+  }</pre><P>
+<P>
+Now put xmalloc( ) to use.  Suppose you want to maintain a symbol table of different data types.  For simplicity, limit data types to only strings and doubles.  One way to handle different data types is with a union of pointers to the data.  <a href="8914i.htm#02b1_000d">Example 7</A> contains a header file called defs.h which defines a node, called &quot;Symbol,&quot; for a symbol table linked list.  The pointer pnext links each symbol in the table to the next one.  Suppose you declare<P>
+<pre>     Symbol *p;          /* pointer to symbol table */</pre><P>
+in a program.  If p points to a symbol and p-&gt;dtype is equal to STRING, then p-&gt;val.pstring is a pointer to a string.  Otherwise, p-&gt;val.pdouble points to a double.<P>
+<h4><a name="02b1_000d"><a name="02b1_000d"><B>Example 7:</B> Symbol table example</h4><P>
+<pre>
+  /* defs.h - symbol table definitions */
+
+  #define STRING 1
+  #define DOUBLE 2
+
+  typedef struct Symbol {
+         int dtype;
+         union {
+            char *pstring;
+            double *pdouble;
+         } val;
+         struct Symbol *pnext;
+  } Symbol;</pre><P>
+<P>
+<a href="8914i.htm#02b1_0012">Listing One</A>, page 94, is a program that calls xmalloc( ) and creates storage for a string symbol, a double symbol, and a large number of integers.  For the symbols, the first call to xmalloc( ) allocates storage for a symbol, and the second call reserves storage for the data.  I'll omit the details of linking the two symbols together. The last call to xmalloc( ) doesn't have anything to do with the symbol table, but it shows what happens if you try to allocate heap storage for too many objects.<P>
+The header file defs.h contains the definition of Symbol.  The first xmalloc( ) allocates storage for a string symbol and assigns a heap address to pointer p1.  The second xmalloc() allocates storage for the string member pointed to by p1.  The program sets p1's data type to STRING and copies the constant string &quot;test string&quot; pointed to by ps to the heap.<P>
+The third xmalloc( ) allocates storage on the heap for a double symbol, and the fourth xmalloc( ) creates storage for a double.  The program assigns a double precision constant (6.7e - 13) to p2, whose data type is DOUBLE.  The last xmalloc( ) attempts to allocate 30,000 integers on the heap.  The program fails on the Xenix machine I use because there's not enough room.  The error message indicates which xmalloc( ) fails.<P>
+Before I move on to the front ends for realloc( ) and free( ), let's include another level of error checking.  This time I'll have the calls to xmalloc( ) and realloc( ) save heap pointers, so that xfree( ) can check them before it calls free( ).  With this arrangement, the front ends flag an error if a program tries to free an invalid heap pointer.<P>
+This requires a data structure to hold heap pointers.  For simplicity, I use an array that holds a maximum of 256 pointers.  <a href="8914i.htm#02b1_0014">Listing Two</A>, page 94, contains the C source code for this arrangement.  Note that I modified ymalloc to install the heap pointer in the array of pointers called dbuf.  All that's different from the first version is a call to install( ) to save the heap pointers.<P>
+The install( ) routine searches the dbuf array for an empty spot (NULL).  If none is found, the program exits with an error message that says the debug buffer is full.  Otherwise, the heap pointer is stored in a vacant slot.  For simplicity, I make a linear search through the dbuf array and terminate the program if it's full, but other approaches are possible (see the bibliography at the end of this article).<P>
+Recall that the macro xrealloc( ) calls the function yrealloc( ), which is a front end to realloc( ).  yrealloc( ) verifies that the pointer that's passed to it has been previously allocated on the heap, however.  It checks the debug buffer for the pointer, and if it's there, calls the standard realloc( ) to replace it with a new pointer.<P>
+Now let's look closer at the yrealloc( ) routine.  First, yrealloc( ) checks oldp to make sure that it's not NULL and in the buffer.  Otherwise, the program displays an error message along with the illegal address, and exits.  If all is well, yrealloc( ) calls realloc( ) and verifies that the new heap pointer is not NULL.  Before yrealloc( ) returns the heap pointer, the function installs the pointer in the same debug buffer slot as the old pointer.<P>
+The last front end is xfree( ), which calls yfree( ) and verifies that a pointer has heap storage associated with it.  This is the important level of error checking that's missing from the free( ) library routine.<P>
+The yfree( ) routine displays an error message and exits if the heap pointer is not stored in dbuf or if it is NULL.  The error message displays the bad address.  If the pointer contains a valid heap address, the routine makes the pointer's location in the dbuf array available (NULL), before it calls free( ).  This arrangement guarantees that you never free storage on the heap that hasn't been previously allocated.<P>
+I tested these new routines by modifying the symbol table example.  <a href="8914i.htm#02b1_0016"> Listing Three</A>, page 94, is a program called &quot;sym2.c,&quot; which reallocates the heap to hold a longer string for the string symbol and calls xfree( ) to free heap storage.  The first part of the program is the same as the previous version.  However, sym2.c calls xrealloc( ) with the old pointer, p1-&gt;val.pstring, to allocate enough storage to accommodate a longer string, ps2.  The program copies the longer string to symbol p1 on the heap and displays the new string.<P>
+Note that sym2.c calls xfree( ) twice.  The first call works fine because the pointer contains a valid heap address.  The second call, however, displays an error message because ps2 is not a heap pointer.<P>
+<h3><a name="02b1_000e">Performance Issues<a name="02b1_000e"></h3><P>
+How about performance?  Although the front ends provide error checking, be aware that these routines introduce additional overhead and may cause problems with time-critical software, for several reasons.  First of all, you're passing more parameters to the front end routines than the C library modules require.  Secondly, it takes time to save heap pointers and search for them.  What you have, therefore, is a trade-off between error checking and performance.<P>
+In the early stages of development, the front ends can help considerably during debugging. After the software becomes stable, you can always remove the front ends and return to the standard allocators.  One way to do this is by modifying xalloc.h, as shown in <a href="8914i.htm#02b1_000f">Example 8</A>.  This makes your code execute the C library calls instead of their front end counterparts.  Bear in mind, however, that this approach does not check return values.<P>
+<h4><a name="02b1_000f"><a name="02b1_000f"><B>Example 8:</B> Header file for standard allocators</h4><P>
+<pre>
+  /* xalloc.h - header file for standard memory allocators
+                (No error checking)
+
+  */
+
+  #define xmalloc(N)         malloc(N)
+  #define xcalloc(N, S)      calloc(N, S)
+  #define xrealloc(P, N)     realloc(P, N)
+  #define xfree(P)           free(P)
+
+  char *malloc(), *calloc(), *realloc();
+  void free();</pre><P>
+<P>
+<h3><a name="02b1_0010">Bibliography<a name="02b1_0010"></h3><P>
+Anderson, Paul and Anderson, Gail; Advanced C: Tips and Techniques.  Indianapolis, Ind.: Howard W. Sams &amp; Company, 1988.<P>
+<h3><a name="02b1_0011">Acknowledgments<a name="02b1_0011"></h3><P>
+Id like to thank Gail Anderson, Marty Gray, and Tim Dowty for their assistance.<P>
+
+_C CUSTOMIZED MEMORY ALLOCATORS_
+by Paul Anderson
+
+<a name="02b1_0012"><a name="02b1_0012">
+<a name="02b1_0013"></pre><B>[LISTING ONE]</B><pre><a name="02b1_0013">
+
+
+/* sym1.c - symbol table data types */
+
+#include &lt;stdio.h&gt;
+#include &quot;xalloc.h&quot;
+#include &quot;defs.h&quot;
+
+main()
+{
+   Symbol *p1, *p2;
+   char *ps = &quot;test string&quot;;
+   int *p5;
+
+   p1 = (Symbol *) xmalloc(sizeof(struct Symbol));
+   p1-&gt;dtype = STRING;
+   p1-&gt;val.pstring = xmalloc(strlen(ps) + 1);
+   strcpy(p1-&gt;val.pstring, ps);
+
+   p2 = (Symbol *) xmalloc(sizeof(struct Symbol));
+   p2-&gt;dtype = DOUBLE;
+   p2-&gt;val.pdouble = (double *) xmalloc(sizeof(double));
+   *p2-&gt;val.pdouble = 6.7e-13;
+
+   printf(&quot;%s\n&quot;, p1-&gt;val.pstring);
+   printf(&quot;%g\n&quot;, *p2-&gt;val.pdouble);
+
+   p5 = (int *) xmalloc(30000 * sizeof(int));
+}
+
+$ sym1
+test string
+6.7e-13
+file sym1.c - line 26:  malloc error for 60000 bytes
+
+
+
+
+
+<a name="02b1_0014"><a name="02b1_0014">
+<a name="02b1_0015"></pre><B>[LISTING TWO]</B><pre><a name="02b1_0015">
+
+#include &lt;stdio.h&gt;
+#include &lt;malloc.h&gt;
+
+#define MAXBUF 256                /* size of debug buffer */
+static char *dbuf[MAXBUF];        /* debug buffer */
+
+/* ymalloc2.c - front end for malloc()
+                Version 2
+*/
+
+char *ymalloc(file, lineno, nbytes)
+char *file;
+int lineno;
+unsigned int nbytes;
+{
+   char *pheap;
+   void install();
+
+   pheap = malloc(nbytes);
+   if (pheap == (char *) NULL) {
+     fprintf(stderr,&quot;file %s - line %d:  malloc error for %u bytes\n&quot;,
+                     file, lineno, nbytes);
+     exit(1);
+   }
+   install(pheap);                  /* place in debug buffer */
+   return pheap;
+}
+
+void install(pheap)               /* store heap pointer in debug buffer */
+char *pheap;
+{
+   register char **pbuf;
+
+   for (pbuf = dbuf; pbuf &lt; dbuf + MAXBUF; pbuf++)
+       if (*pbuf == (char *) NULL) {
+          *pbuf = pheap;
+          return;
+       }
+   fprintf(stderr, &quot;No room left in debug buffer\n&quot;);
+   exit(1);
+}
+
+char *yrealloc(file, lineno, oldp, nbytes)
+char *file, *oldp;
+int lineno;
+unsigned int nbytes;
+{
+   char *newp;
+   register char **pbuf;
+   short found = 0;
+
+   if (oldp != (char *) NULL)
+      for (pbuf = dbuf; pbuf &lt; dbuf + MAXBUF; pbuf++)
+          if (*pbuf == oldp) {      /* find oldp's slot */
+             found = 1;
+             break;
+          }
+   if (!found) {
+      fprintf(stderr,&quot;file %s - line %d:  realloc error for address %x\n&quot;,
+                     file, lineno, oldp);
+      exit(1);
+   }
+   newp = realloc(oldp, nbytes);
+   if (newp == (char *) NULL) {
+      fprintf(stderr,&quot;file %s - line %d:  realloc error for %u bytes\n&quot;,
+                     file, lineno, nbytes);
+      exit(1);
+   }
+   *pbuf = newp;         /* replace in debug buffer's old slot */
+   return newp;
+}
+
+void yfree(file, lineno, pheap)
+char *file, *pheap;
+int lineno;
+{
+   register char **pbuf;
+
+   if (pheap != (char *) NULL)
+      for (pbuf = dbuf; pbuf &lt; dbuf + MAXBUF; pbuf++)
+          if (*pbuf == pheap) {
+             *pbuf = NULL;
+             free(pheap);
+             return;
+          }
+   fprintf(stderr,&quot;file %s - line %d:  free error for address %x\n&quot;,
+                     file, lineno, pheap);
+   exit(1);
+}
+
+
+
+
+
+<a name="02b1_0016"><a name="02b1_0016">
+<a name="02b1_0017"></pre><B>[LISTING THREE]</B><pre><a name="02b1_0017">
+
+
+/* sym2.c - more symbol table data types */
+
+#include &lt;stdio.h&gt;
+#include &quot;xalloc.h&quot;
+#include &quot;defs.h&quot;
+
+main()
+{
+   Symbol *p1, *p2;
+   char *ps = &quot;test string&quot;;
+   char *ps2 = &quot;much longer test string&quot;;
+
+   p1 = (Symbol *) xmalloc(sizeof(struct Symbol));
+   p1-&gt;dtype = STRING;
+   p1-&gt;val.pstring = xmalloc(strlen(ps) + 1);
+   strcpy(p1-&gt;val.pstring, ps);
+
+   p2 = (Symbol *) xmalloc(sizeof(struct Symbol));
+   p2-&gt;dtype = DOUBLE;
+   p2-&gt;val.pdouble = (double *) xmalloc(sizeof(double));
+   *p2-&gt;val.pdouble = 6.7e-13;
+
+   printf(&quot;%s\n&quot;, p1-&gt;val.pstring);
+   printf(&quot;%g\n&quot;, *p2-&gt;val.pdouble);
+
+   p1-&gt;val.pstring = xrealloc(p1-&gt;val.pstring, strlen(ps2) + 1);
+   strcpy(p1-&gt;val.pstring, ps2);
+   printf(&quot;%s\n&quot;, p1-&gt;val.pstring);
+
+   xfree((char *) p2-&gt;val.pdouble);
+   xfree(ps2);                      /* free a bad pointer */
+}
+
+$ sym2
+test string
+6.7e-13
+much longer test string
+file sym2.c - line 31:  free error for address 2634
+
+
+
+Example 1: Out of bounds references
+
+/* twzone.c - array out of bounds */
+
+main()
+{
+    int buf[10];
+
+    buf[-4] = 1;             /* negative subscript */
+    buf[10] = 2;             /* one step beyond */
+
+    printf(&quot;%d %d\n&quot;, *(buf - 4), *(buf + 10));
+}
+
+
+Example 2: Program that demonstartes xcalloc()
+
+
+/* neg.c - negative subscripts with xcalloc */
+
+#include &lt;stdio.h&gt;
+
+main()
+{
+   char *xcalloc();
+   int *p, *q;
+
+   p = (int *) xcalloc(10, sizeof(int));
+   q = (int *) xcalloc(15, sizeof(int));
+
+   fill(p);                            /* fill with 10 numbers */
+   display(p);                         /* print 10 numbers */
+
+   fill(q);                            /* fill with 15 numbers */
+   display(q);                         /* print 15 numbers */
+}
+
+$ neg
+  1  2  3  4  5  6  7  8  9 10
+  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+
+
+ Example 3: xcalloc() routine
+
+
+
+#include &lt;stdio.h&gt;
+#include &lt;malloc.h&gt;
+#include &lt;memory.h&gt;
+
+char *xcalloc(nitems, size)            /* custom calloc() */
+unsigned nitems, size;
+{
+   char *pheap;
+   unsigned blksize;
+
+   blksize = nitems * size;                    /* size of chunk */
+
+   if ((pheap = malloc(blksize + sizeof(int))) == NULL) {
+      fprintf(stderr, &quot;Can't malloc on heap\n&quot;);
+      exit(1);
+   }
+   *(int *)pheap = nitems;                     /* store no. of items in heap */
+
+   memset(pheap + sizeof(int), 0, blksize);    /* zero the area */
+
+   return pheap + sizeof(int);                 /* pointer to data */
+}
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1989, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

@@ -1,0 +1,313 @@
+
+<html>
+<head>
+<title>May, 2004: Eight Million Ways to die</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; The Perl Journal-->
+
+<h1>Eight Million Ways to <i>die</i></h1>
+<p><i>The Perl Journal</i> May, 2004</p>
+<h3>By Randal L. Schwartz</h3>
+<h2></h2>
+
+
+
+<I>Randal is a coauthor of Programming Perl, Learning Perl, Learning Perl for Win32 Systems, and Effective Perl Programming, as well as a founding board member of the Perl Mongers (perl.org). Randal can be reached at merlyn@stonehenge.com.</I>
+
+<hr>
+
+
+
+
+
+<p>What is that old saying? "The best-laid plans of mice and men..." And like that old saying, sometimes your programs don't go the way you expect.</p>
+
+<p>For example, a user might not enter a number between one and five, even though your prompt carefully suggests that they do. Or maybe the file you expected to create in that directory can't be created. Or the database connection fails to connect (and was it because the system was down or because you were given a bad password?). Or the module you needed for a particular part of the application failed to load (maybe because it was never installed).</p>
+
+<p>Usually, when things go wrong, you want to know about it and do something in your program in response. For example, consider a program that updates a data file, incrementing a value:</p>
+
+<blockquote>
+<pre>
+open OLD, "counter";
+open NEW, "&gt;counter.tmp";
+print NEW &lt;OLD&gt; + 1;
+close OLD;
+close NEW;
+rename "counter.tmp", "counter";
+
+</pre>
+</blockquote>
+
+<p>Note that we have six lines of code, any of which could fail. Let's take the simplest ones first. If the first <i>open</i> fails, we'll be using a closed filehandle in the third line, which will look like a 0 to the <i>add 1</i> operation, and we'll get a "1" value in the final file.</p>
+
+<p>Now, this might actually make sense for this application: The first invocation of the program yields a 1 value. But, if we have warnings enabled, we'll get a warning when we attempt to read from a closed filehandle on the third line because that's generally considered bad style, if not a more serious error. We could notice the return value from that <i>open</i> and rewrite the code like this:</p>
+
+<blockquote>
+<pre>
+my $old_value = 0;
+if (open OLD, "counter") {
+$old_value = &lt;OLD&gt;;
+close OLD;
+}
+open NEW, "&gt;counter.tmp";
+print NEW $old + 1;
+close NEW;
+rename "counter.tmp", "counter";
+
+</pre>
+</blockquote>
+
+<p>and this does solve the extraneous warning. We now take an alternate execution path if the file is not initially present, thus, nicely sidestepping the warning.</p>
+
+<p>But what if the <i>open </i>failure is from something more serious than "file not found"? My UNIX <i>open(2)</i> manpage lists about a dozen different reasons for a failure, including esoteric things such as "a symbolic link loops back onto itself." How do we distinguish those?</p>
+
+<p>The error variable <i>$!</i> starts to look pretty interesting. For example, we can distinguish between <i>good</i>, <i>file not found</i>, and <i>everything else</i> with a three-way branch:</p>
+
+<blockquote>
+<pre>
+if (open OLD, "counter") {
+  # good
+} elsif ($! =~ /file.*not found/) {
+  # not found, default to 0
+} else {
+  # everything else
+}
+
+</pre>
+</blockquote>
+
+<p>Because I'm using <i>$!</i> in a string context, I get to see the string-ish error message. This is fairly operating-system specific, but if you're not trying to be portable across a wide variety of systems, you can get away with such matches.</p>
+
+<p>Note that I'm testing <i>$!</i> only when I've had a failure and immediately afterward. This is the only time I can be sure that there's really an error in there because, although an operating-system request failure sets <i>$!</i>, nothing normally resets it. Thus, this code is broken:</p>
+
+<blockquote>
+<pre>
+## BAD CODE DO NOT USE
+open OLD, "counter";
+if ($! =~ /file.*not found/) { # file not found
+  ..
+} elsif ($!) { # other error
+  ..
+} else { # everything OK
+  ..
+}
+
+</pre>
+</blockquote>
+
+<p>We're not necessarily testing the failed <i>open</i> call here&#151;any prior failed call might give us a false positive.</p>
+
+<p>But now, we need to decide what to do if we get that unexpected error. There's an old joke among programmers: "Don't test for anything you aren't willing to handle," but we can no longer plead ignorance here. The most common solution is to abort the entire program and let the sysadmin on duty watch take care of it, and that's easy with <i>die</i>. Let's redesign our program so that a missing counter file is considered a bad, bad thing, and abort the program if that first <i>open</i> fails:</p>
+
+<blockquote>
+<pre>
+unless (open OLD, "counter") {
+  die "Cannot open counter";
+}
+
+</pre>
+</blockquote>
+
+<p>In this case, a false return value (for any reason) from <i>open</i> triggers the <i>die</i>, which aborts our program immediately. The error message is sent to STDERR (rather than STDOUT) to ensure that the message is not lost in a typical redirection to a file or pipe. In addition, the filename and the line number are automatically appended to the message, unless the message string ends in a newline. This helps us find the source of the <i>die</i> among many modules and files.</p>
+
+<p>Note that the error message contains the attempted operation as well. Again, this helps the debugging a bit, other than the cryptic "died at line 14" from the default message. This is especially handy when the filename for the operation might have come from another source:</p>
+
+<blockquote>
+<pre>
+chomp(my $filename = &lt;SOMEOTHERFILE&gt;);
+unless (open OLD, $filename) {
+  die "Cannot open $filename";
+}
+
+</pre>
+</blockquote>
+
+<p>Before making it a habit to include such information in my <i>die</i> messages, I was occasionally confused about why my program was failing because I had presumed that a variable contained something other than what it did. Always echo the input parameters in the error message!</p>
+
+<p>Another thing to include is the <i>$!</i> I mentioned earlier. That can help us figure out the kind of failure:</p>
+
+<blockquote>
+<pre>
+unless (open OLD, "counter") {
+  die "Cannot open counter: $!";
+}
+
+</pre>
+</blockquote>
+
+<p>And finally, this is too much typing. The <i>or</i> operator executes its right operand only when the left operand is False, so we can shorten this to the traditional:</p>
+
+<blockquote>
+<pre>
+open OLD, "counter"
+  or die "Cannot open counter; $!";
+
+</pre>
+</blockquote>
+
+<p>So, to fully instrument my original program, I could add <i>or die </i> to each of the steps that might fail:</p>
+
+<blockquote>
+<pre>
+open OLD, "counter" or die;
+open NEW, "&gt;counter.tmp" or die;
+print NEW &lt;OLD&gt; + 1 or die;
+close OLD or die;
+close NEW or die;
+rename "counter.tmp", "counter" or die;
+
+</pre>
+</blockquote>
+
+<p>Wait a second? Why am I checking the return value from <i>print</i>? And from <i>close</i>? Those can't fail, can they? Certainly they can, although this is probably one of the few times you'll see any program that tests for them. The <i>print</i> can fail if the filehandle is closed or if there's an I/O error, such as a disk being full. And the <i>close</i> can fail if the filehandle is closed or if the final buffer being flushed at the time of the close couldn't be written (again, typically from a full disk).</p>
+
+<p>This seems like a lot of typing. Can we reduce this? Sure, with the <i>Fatal</i> module, part of the Perl core for recent versions of Perl. We simply list the subroutines that should have an automatic <i>or die</i> added, and away we go:</p>
+
+<blockquote>
+<pre>
+use Fatal qw(open close rename);
+open OLD, "counter";
+open NEW, "&gt;counter.tmp";
+print NEW &lt;OLD&gt; + 1;
+close OLD;
+close NEW;
+rename "counter.tmp", "counter";
+
+</pre>
+</blockquote>
+
+
+
+<p>Now we have (nearly) the same program with a lot less typing. The downside to this approach is that we don't really get to say what the error message is, other than the default <i>Died</i>. To get a bit more control, I could add <i>:void</i> to that argument list, and then any of those calls that have explicit testing for the return value will no longer be fatal:</p>
+
+<blockquote>
+<pre>
+use Fatal qw(:void open close rename);
+open OLD, "counter" or warn "old value unavailable, presuming 0\n";
+open NEW, "&gt;counter.tmp";
+print NEW &lt;OLD&gt; + 1;
+close OLD or "ignore";
+close NEW;
+rename "counter.tmp", "counter";
+
+</pre>
+</blockquote>
+
+<p>Why didn't I list <i>print</i> here? Well, <i>Fatal</i> uses some magic behind the scenes, and <i>print</i> resists this magic. Oops. We'll have to do that one by hand.</p>
+
+<p>The <i>die</i> operator is fatal to the program unless it is enclosed within an <i>eval</i> block (or by a __DIE__ handler, but I digress). Once safely within the <i>eval</i> block, any <i>die</i> aborts the block, not the program. Immediately following the block, we check the <i>$@</i> variable, which is guaranteed to be empty if the block executed to completion (or the text message that would have been sent to STDERR if we would have otherwise aborted). Time for an example:</p>
+
+<blockquote>
+<pre>
+use Fatal qw(:void open close rename);
+for my $file (qw(counter1 counter2 counter3)) {
+  eval {
+    open OLD, "$file" or warn "old value unavailable, presuming 0\n";
+    open NEW, "&gt;$file.tmp";
+    print NEW &lt;OLD&gt; + 1;
+    close OLD or "ignore";
+    close NEW;
+    rename "$file.tmp", "$file";
+  };
+  if ($@) {
+    print "ignored error on $file (continuing): $@";
+  }
+}
+
+</pre>
+</blockquote>
+
+<p>Here, I've put the previous code inside the <i>eval</i> block, using <i>$file</i> in place of the literal filenames. If any of the steps within the <i>eval</i> block fail, we skip immediately to the end of the block. The message ends up in <i>$@</i>. If the message is present, we note it on STDOUT. Whether there was an error or not, we're continuing the loop.</p>
+
+<p>Now, suppose we conclude that any permission-denied message inside the eval block is likely to mean we're not going to get much further on the rest of the program. We can take different actions based on the value within <i>$@</i>. For example:</p>
+
+<blockquote>
+<pre>
+use Fatal qw(:void open close rename);
+for my $file (qw(counter1 counter2 counter3)) {
+  eval {
+    open OLD, "$file" or warn "old value unavailable, presuming 0\n";
+    open NEW, "&gt;$file.tmp";
+    print NEW &lt;OLD&gt; + 1;
+    close OLD or "ignore";
+    close NEW;
+    rename "$file.tmp", "$file";
+  };
+  if ($@ =~ /permission denied/i) {
+    die $@; # rethrow $@
+  } elsif ($@) {
+    print "ignored error on $file (continuing): $@";
+  }
+}
+
+</pre>
+</blockquote>
+
+<p>If the message in <i>$@</i> after the loop matches permission denied, we <i>rethrow</i> the error. In this case, there's no outer <i>eval</i> block, so the program aborts. However, had there been an outer <i>eval</i> block, we'd simply pop out one more level. In turn, that outer block could handle the error or <i>rethrow</i> it again to the next level (if any), and so on.</p>
+
+<p>Matching the specific text of error messages can be a bit problematic, especially when you have to change the text for internationalization of your program. Fortunately, modern versions of Perl permit the <i>die</i> parameter to be an object, not just a text message. When an object value is thrown with <i>die</i>, the <i>$@</i> value contains that object as well. Not only does this let us pass structured data up the exception-handling logic, we can also create hierarchies of error classifications to quickly sort entire groups of errors apart.</p>
+
+<p>The best framework I've seen for creating such error categories is <i>Exception::Class</i> found in CPAN. Let's restructure our program to use exception objects rather than text testing (see <a name="rl1"></a><a href="#l1">Listing 1</a>).</p>
+
+<p>The first lines (invoking <i>Exception::Class</i> with parameters) create a hierarchy of classes, starting with my <i>E</i> class (selected because the name is short). From <i>E</i>, I break errors into two categories: user-related errors and file-related errors. File-related errors are further categorized into various file operations. The <i>isa</i> parameter defines the base class for each derived class, permitting the use of normal <i>isa</i> tests for quick categorization.</p>
+
+<p>Now, inside the <i>eval</i>, instead of a simple <i>die</i>, I use the <i>throw</i> method of an appropriate error class, with a specific error message. I won't need to include <i>$!</i> here because I'll know that every error in the <i>E::File</i> category was system-call related, and I can put that just once in the error handler.</p>
+
+<p>Finally, the error-handling logic just past the end of the <i>eval</i> block is also changed. If <i>$@</i> is an object derived from my <i>E</i>, then I sort out what kind of error it might be. Note that I've chosen to handle all <i>E::Create</i> errors as relatively "fatal" to my loop (although they might in turn be caught by some outer <i>eval</i> block not shown here). User errors are distinguished from <i>E::File</i> errors, with the latter displaying the <i>$!</i> value automatically. Also note that any legacy errors (from an ordinary <i>die</i> or maybe a reference or object not within my hierarchy of classes) simply get <i>rethrown</i> as well.</p>
+
+<p>This framework is actually quite flexible, permitting additional structured attributes to be carried along in the error object, as well as having objects inherit from multiple class hierarchies to distinguish multiple traits (file versus database, fatal versus recoverable, and so on). If you're building a complex application, you should definitely look into using <i>Exception::Class</i> or something similar. Until next time, enjoy!</p>
+<p><b></b></p>
+<p><b></b></p>
+<p><b></b></p>
+<p><b>TPJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing 1</b><br>
+<pre>use Exception::Class (
+  E =&gt; { description =&gt; "my base error class" },
+  E::User =&gt; { description =&gt; "user-related errors", isa =&gt; qw(E) },
+  E::File =&gt; { description =&gt; "file-related errors", isa =&gt; qw(E) },
+  E::Open =&gt; { description =&gt; "cannot open", isa =&gt; qw(E::File) },
+  E::Create =&gt; { description =&gt; "cannot create", isa =&gt; qw(E::File) },
+  E::Rename =&gt; { description =&gt; "cannot rename", isa =&gt; qw(E::File) },
+  E::IO =&gt; { description =&gt; "other IO", isa =&gt; qw(E::File) },
+);
+for my $name (@ARGV) {
+  eval {
+    $name =~ /^\w+$/ or E::User-&gt;throw("bad file name for $name");
+    open IN, $name or E::Open-&gt;throw("reading $name");
+    open OUT, "&gt;$name.tmp" or E::Create-&gt;throw("creating $name.tmp");
+    print OUT &lt;IN&gt; + 1 or E::IO-&gt;throw("writing $name.tmp");
+    close IN or E::IO-&gt;throw("closing $name");
+    close OUT or E::IO-&gt;throw("closing $name.tmp");
+    rename "$name.tmp", $name or E::Rename-&gt;throw("renaming $name.tmp to $name");
+  };
+  if (UNIVERSAL::isa($@, "E")) { # an object error from my tree
+    if ($@-&gt;isa("E::User")) {
+      warn "Pilot error: $@"; # warn and continue
+    } elsif ($@-&gt;isa("E::Create")) {
+      $@-&gt;rethrow; # same as die $@
+    } elsif ($@-&gt;isa("E::File")) { # other IO errors
+      warn "File error: $@: $!";
+    } else {
+      warn "Uncategorized error: $@"; # warn and continue
+    }
+  } elsif ($@) { # a legacy die error
+    die $@; # abort (possibly caught by outer eval
+  } # else everything went ok
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

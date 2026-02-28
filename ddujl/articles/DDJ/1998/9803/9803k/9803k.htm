@@ -1,0 +1,241 @@
+<html>
+<META NAME="year" CONTENT="1998">
+<head>
+<title>Dr. Dobb's Journal March 1998: Windows NT Device Driver Toolkits</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Windows NT Device Driver Toolkits</h1>
+
+<p><i>Dr. Dobb's Journal</i> March 1998
+</p>
+<h2>Writing a simulator device driver</h2>
+
+<h3>By Patrick Tennberg</h3>
+
+<I>Patrick received his B.S. in computer science from the University of Umea, Sweden.  He can be contacted at tennberg@canit.se.</I>
+
+<hr>
+
+<p>Writing a device driver in C using the Windows NT Device Driver Kit (DDK) can be scary. Luckily, there are alternatives, such as BlueWater Systems' WinDK and Vireo Software's Driver::Works. In this article, I'll examine these class libraries and develop a hardware-device simulator driver to illustrate their use. But first, let's take a look at the inner workings of Windows NT device drivers.</p>
+
+<h3>Windows NT Device-Driver Backgrounder</h3>
+
+<p>There are two groups of Windows NT device drivers -- monolithic and layered. A monolithic device driver represents one piece of hardware (a data-acquisition board, for instance), while a layered driver sits on top of another driver (or between two drivers) forming a hierarchy. SCSI and network drivers are examples of layered drivers.</p>
+
+<p>Device drivers run in NT's kernel mode, while applications run in user mode. The method of communication between an application and a device driver is an I/O-request packet (IRP). An application uses <i>CreateFile</i> to receive a handle to a device driver (or more precisely, to the device object exposed by the device driver). The application can then use standard Win32 API functions, such as <i>ReadFile</i>, <i>WriteFile</i>, and <i>DeviceIoControl,</i> to communicate with the device. </p>
+
+<p>A device driver exports one function, <i>DriverEntry,</i> which is called when the driver is first loaded and is responsible for claiming hardware resources and initializing the hardware. One single hardware adapter can contain several different devices (a soundboard can also contain a joystick port, for instance). <i>DriverEntry</i> is responsible for creating one or more device objects. Each device object can represent a physical device on the hardware; a device object can also represent a logical device.</p>
+
+<p>Applications residing in user mode are not interested in communicating with the driver, but rather, with the device itself. <i>DriverEntry,</i> therefore, creates a symbolic link for each device object it creates. <i>DriverEntry</i> also registers dispatch routines. Dispatch routines (for a highest-level driver) live within the context of the calling application; this is called "passive level." A dispatch routine corresponds to a driver request; examples of driver requests are <i>ReadFile</i>, <i>WriteFile</i>, and <i>CloseHandle</i>. When an application in user mode calls <i>ReadFile</i>, the I/O manager assembles the request to an IRP, and dispatches it to the callback registered with the driver to handle read requests.</p>
+
+<p>A dispatch routine is responsible for completing the IRP (that is, performing the action requested by an application), and returning a status code. A read request reads data from the device, while a close request cleans up and closes it. The dispatch routine cannot always complete the IRP immediately; in some cases, the device may need to be started before data can be read or written. The device object contains a queue. A dispatch function can choose to insert the IRP into this queue and return STATUS_IO_PENDING. This instructs the I/O manager to put the calling application on hold until the request can be fulfilled. Before inserting the IRP into the queue, the dispatch function attaches a cancel routine with the IRP. The cancel routine is called by the I/O manager if the application or the operation system closes the connection before the driver has completed all IRPs. </p>
+
+<p>Another routine that a driver can register is <i>StartIO</i>. Because it operates in an arbitrary context, it is limited in what DDK APIs it can call and it must use nonpaged memory. This rule is true for all parts of the driver not running at passive level. A dispatch routine stores an IRP in the device queue by calling <i>IoStartPacket</i>. The I/O manager will, at this stage, see if the device object is already busy processing an IRP. If the device object is busy, the IRP is stored in the associated queue for later processing. If the device object is not busy, the I/O manager calls <i>StartIO</i> directly. <i>StartIO</i> is responsible for starting the device (that is, making it ready for a read or a write). Before doing anything else, the <i>StartIO</i> routine should check if the IRP has been cancelled; if so, it should return immediately. When the driver is sure the IRP can be completed, it should remove the cancel routine attached to the IRP.</p>
+
+<p>When the device is finished, the driver needs to be notified. The physical device can notify the driver by generating an interrupt. The interrupt service routine (ISR) then acknowledges the interrupt and generates a deferred procedure call (DPC), which completes the IRP and starts the next package by calling <i>IoStartNextPacket</i>. The I/O manager then dequeues an IRP from the queue and calls <i>StartIO</i> again (if the queue is not empty). The <i>StartIO</i> routine lets a driver serialize the communication with the physical device. An ISR should do as little work as possible to keep the interrupt latency down. The real work should be done by a DPC. </p>
+
+<h3>A Simulator Device Driver</h3>
+
+<p>The company I work for contracted to write device drivers for a manufacturer of hardware and software for real-time data acquisition and analysis in the medical field. Each device driver is represented in user mode by a number of components that plug into the rest of the system. When I received new hardware that needed a driver, I started by writing a simulator driver. The simulator driver correctly handled all requests from the various components in user mode. It also implemented the scheme we had selected to transport data effectively from kernel mode to user mode. </p>
+
+<p>When the simulator driver was ready, I continued by writing the user-mode component. The testing group could test the system with the simulator driver without worrying about the actual hardware. This scheme also allowed other developers to test their components with the simulator driver. The big gain is that I don't need to worry about the state of the hardware and eventual bugs. While the testing group and the other developers used the new components and simulator driver, I focused on writing the real driver and resolved problems without holding up the rest of the team. </p>
+
+<p>The driver I developed (available electronically; see "Resource Center," page 3) simulates a simple data-acquisition board. The driver supports three I/O control requests (configure, start, and stop) and a read request. IOCTL_DATADRIVER_SETUP takes a structure as a parameter. This structure contains the sampling frequency and a channel mask. The channel mask determines which data channels to sample. IOCTL_DATADRIVER_START starts the sampling of all channels and IOCTL_DATADRIVER_STOP stops the sampling. The sampling is done using a repetitive timer. A new feature of Windows NT 4.0, the repetitive timer restricts the use of the drivers to this platform. The output of the driver is either a square wave or data from a file (if a filename is specified in the registry). The transport of data between user mode and kernel mode uses buffered I/O; this is inefficient, but it doesn't matter much because the size of the data is small and the sampling rate low. The buffered I/O means the I/O manager copies the data from a buffer allocated in kernel mode to the buffer provided by users in the call to <i>ReadFile</i>. I have included a test program that works with both drivers and prints the data to a console window.</p>
+
+<h3>WinDK 2.5</h3>
+
+<p>Bluewater Systems' WinDK Device Driver Development Kit Version 2.5 supports Windows NT device-driver development in C and C++. The toolkit provides Wizard technology, Windows Driver Model (WDM) support for both Universal Serial Bus (USB) and IEEE 1394 (Firewire) devices, device-driver profiling, and sample code (source to the library has to be purchased separately). System requirements for WinDK 2.5 are Windows NT 3.51/4.0 (Intel or Alpha), Visual C++ 4.x/5.0, and the Windows NT or WDM DDK.</p>
+
+<p>The WinDK class library is delivered on CD-ROM, along with manuals that introduce the NT driver model and hard-to-find information such as how to set up WinDBG (the debugger delivered with the DDK). The reference manual describes all classes and member functions, and includes documentation on the C library. Because the reference manual is too brief to be useful, you are often forced to look up the underlying function in the DDK to get the information you need. The online help consists of a copy of the reference manual.</p>
+
+<p>The WinDK Device Driver Wizard is powerful and easy to use. However, I have some minor complaints about the Wizard. You cannot specify the types of the registry keys: You must manually change them in the code. The same is true for IOCTL. Also, when defining new registry keys and IOCTL, you can only remove the last in the list. The Wizard only lets you select between the two available dispatch functions (<i>Read</i> and <i>Write</i>). The code generated is heavily commented and sprinkled with "To Do" phrases where you can add your own code.</p>
+
+<p>The Wizard is able to generate much more complicated skeletons than the one used for the simulator driver I present here. Multiple devices, multiple device queues, and DMA and PCI setup are only a few of the more-advanced options for which the Wizard will generate code.</p>
+
+<p>The Wizard generates three source files and two header files. One source file contains the DriverEntry and all dispatch functions. Another contains the device class definition (derived from CDevice and/or other classes, depending on the selection you made in the Wizard) and device class body. The file defining the body contains only the code for the constructor and the destructor. The third source file contains dispatch member functions; these member functions are defined in the first header file: the device-class header file. The separation of constructor and dispatch functions makes the code easier to navigate. The second header file, which contains the IOCTL, can be shared between the device driver and a user-mode application.</p>
+
+<p>For <i>DriverEntry</i>, the Wizard generated code for setting up the dispatch routines and creating a device object. The only thing I needed to do was add a registration dispatch routine for a <i>Close</i> request. </p>
+
+<p>The WinDK class <i>CDevice</i> encapsulates the functionality of a device object, including functions for queuing and completing IRPs. The work of setting up the physical device is done in the constructor of the device class. My constructor needed to do three things. First, I used a WinDK function to create a symbolic link name. The Wizard has generated all code necessary to read the registry values I specified when defining my driver. If the registry key "DataFile" exists and points to a valid file, then the constructor allocates memory and reads the file into memory. The code for reading the file was straightforward to write. The library contains the class <i>CFileIo</i>, which hides all details of creating, reading, and writing files. If the DataFile entry is missing, the constructor allocates memory for two data entries and sets a flag instructing the device to output a square wave.</p>
+
+<p>The next step was to include functionality for my dispatch functions. A dispatch callback in WinDK is an ordinary C function. The library provides a macro that takes a device object as a parameter and gives you a pointer to the corresponding device class. You can then use this pointer to call member functions or to manually manipulate data contained in your device class. The Wizard has generated a dispatch function for handling <i>DeviceIoControl</i> requests (<i>DataDriverDeviceIoctlDispatch</i>). The Wizard has also generated member functions (<i>DataDriverDevice</i>) for handling each of the IOCTLs our driver supports. The actual IOCTL that caused the dispatch is stored with the IRP, and the dispatch function <i>DataDriverDeviceIoctlDispatch</i> contains a switch statement that calls the correct member function. </p>
+
+<p>The member function <i>DataDriverDeviceIoctlSetupDevice</i> will check the parameters and copy the frequency and the channel map from the structure used as a parameter to the <i>DeviceIoControl</i> call in user mode. The <i>DataDriverDevice</i> class uses the WinDK class <i>CRepetitiveTimer</i> to simulate data sampling. This class lets you connect a dispatch function that will be called repetitively when a certain period of time has expired. <i>DataDriverDeviceIoctlSetupDevice</i> registers a callback routine with the timer.</p>
+
+<p>DataDriverDeviceIoctlStartDevice converts the frequency from "Hertz" to "millisecond" and starts the timer. <i>DataDriverDeviceIoctlStopDevice</i> will stop the timer and print a message if you missed any samples. This can happen if the test program fails to feed the driver with IRPs.</p>
+
+<p>Processing a <i>ReadFile</i> request is performed by the function <i>DataDriverDeviceReadDispatch</i>. It does a sanity check on the data and, if everything is correct, queues the IRP and attaches the default WinDK cancel routine to it. In our case, the <i>StartIO</i> function does nothing -- all work is done in the timer callback.</p>
+
+<p>The timer callback registered with the timer object, <i>TimerCallback</i>, first checks if there is an IRP available. You can get the current IRP by calling the member function <i>GetCurrentIrp</i> (defined by <i>CDevice</i>). This function returns the current IRP, which is assigned to a field in the device object by the I/O manager before the system calls <i>StartIO</i>. It then checks if the IRP has been canceled. Because we are in the process of completing the IRP, we also remove the cancel routine. This entire operation is performed by the single WinDK function <i>CheckIrpCanceled</i>. If this function returns True, you know the IRP was canceled and returned from the <i>TimerCallback</i>. You then call the <i>TimerCallback</i> member function defined in the <i>DataDriverDevice</i> class. The member <i>TimerCallback</i> fills in the structure passed as parameter in the call to <i>ReadFile,</i> and completes the IRP.</p>
+
+<p>The WinDK has a pragmatic design. BlueWater Systems used it internally before releasing it as a product. The design goal was to have a library that imposes no overhead and helps the developer in following the NT device-driver design rules. Classes are only used to encapsulate common functionality and are not designed for inheritance that would change the behavior of a class.</p>
+
+<p>Bluewater Systems put in a lot of effort to make programmers follow the design rules laid down by the NT kernel designers. For example, all classes override operators <i>new</i> and <i>delete</i>. This allows the library to allocate the correct type of memory (paged or nonpaged) for a class. Classes that encapsulate functionality that is only available on the passive level will always allocate paged memory, and vice versa.</p>
+
+<p>WinDK contains a number of useful tools, such as debugger extensions, a profiling tool, and performance-counter support. The profiling tool can be used to profile any device driver you have the source for. The profiling tool comes complete with a user-mode application that displays profiling graphs. The samples are well commented and follow the NT device-driver design rules. All samples supporting hardware have the same standard as commercial drivers. The full duplex serial driver, for example, can be used instead of the one provided with Windows NT (and it is up to 20 percent faster).</p>
+
+<h3>Driver::Works 1.2</h3>
+
+<p>Vireo Software's Driver::Works is a C++ class library device-driver development toolkit that includes the Driver::Wizard code-generation wizard and Driver::Monitor (which lets programmers monitor driver activity without a debugger). The package supports NT/WDM driver development and comes with full source code for both the library and sample drivers. Driver::Works requires Visual C++ 4.2 or later, as well as the NT or Windows 98 DDK. </p>
+
+<p>Driver::Works is delivered on two diskettes, along with a manual that covers installation, the Wizard, and the library's object model. The main part of the manual is a cookbook of examples. The manual doesn't provide a complete picture of the NT driver model. Still, the online help is excellent and contains most of the information needed to use classes and members correctly.</p>
+
+<p>The Driver::Works Wizard lets you specify all dispatch functions. You can also specify the type of registry keys and IOCTL. The Wizard generates advanced skeletons that use multiple devices, multiple device queues, DMA, and PCI hardware.</p>
+
+<p>For my simulator driver, the Wizard generated four source files and a file containing the IOCTLs. The source file DataDriver (and its corresponding header file) defines the class <i>DataDriver</i> that inherits from <i>KDriver</i>. The Wizard generates code that searches the registry for devices and creates a <i>DataDriverDevice</i> class for each device found. The Wizard will also provide similar code for searching after devices on a bus. All this work is done by the <i>KConfigurationQuery</i> class. The real workhorse is the <i>DataDriverDevice</i> class, derived from <i>KDevice</i>. The constructor contains the code that reads from the registry and loads a data file -- if the "DataFile" key exists. All code for reading from the registry is created by the Wizard. If the key exists, you use the <i>KFile</i> class to read the data file from disk. Otherwise, you set up the simulator device to output a square wave. This code is almost identical to the WinDK code, but one difference is that the base class creates the symbolic link. The constructor for <i>KDevice</i> takes a device name as one of its parameters. </p>
+
+<p>Driver::Works creates all dispatch callbacks as member functions. The library creates stub functions that redirect the call to the correct member function. The scheme involves the same magic as MFC and OWL use to map window messages to member functions. All this behind-the-scenes work can look like a waste of processor time, but the overhead is only around 300 microseconds on a 100-MHz Pentium. The library lets you use ordinary C functions as dispatch callbacks, so the redirection is more of a convenience (because you will usually call member functions yourself in the dispatch callbacks). Driver::Works lets you use member functions for a wide variety of callbacks such as ISR, DPC, controller objects, and so on. However, ISR and DPC should be fast, so the code generated by the Wizard uses ordinary C functions as callbacks by default. This technique is used by the callback for the repetitive timer, handled by the class <i>KTimedCallback</i>. </p>
+
+<p>The code for handling <i>Read</i>, <i>Close</i>, <i>StartIO</i>, and <i>DeviceIoControl</i> are identical to the WinDK version. The only thing to note about the Driver::Works version is the cumbersome way of handling canceling of IRPs. The Wizard generates all the code necessary, but WinDK handles this much more elegantly by providing library code that can be used transparently. I would like to see a function similar to <i>CheckIrpCanceled</i>. Also, the default cancel function really belongs in the base class.</p>
+
+<p>Driver::Works does an excellent job of encapsulating the complete DDK (at least the kernel part). The design is flexible and unobtrusive. The classes are designed to be extendible, and can be used as building blocks for reusable components. They also provide template-based classes for handling different types of containers.</p>
+
+<p>Driver::Works is only delivered with one tool -- Driver::Monitor -- that lets you see trace outputs from your driver without any debugger. However, this tool requires that you use the <i>KTrace</i> class for output. </p>
+
+<h3>Conclusion</h3>
+
+<p>Both toolkits greatly simplify the development of device drivers. They both support Windows Driver Model (WDM) and Windows NT driver development. The main difference between WinDK and Driver::Works is in the design. Vireo has chosen to design an academic object-oriented framework, while BlueWater provides you with utility classes and a C-style approach. These differences are illustrated in <a name="rl1"><a href="9803k.htm#l1">Listings One</A> and <a name="rl2"><a href="9803k.htm#l2">Two</A>. <a href="9803k.htm#l1">Listing One</A> is code for claiming and using I/O ports and interrupts with DPC using WinDK, while <a href="9803k.htm#l2">Listing Two</A> is code for doing the same thing with Driver::Works. C programmers experienced with NT driver development might prefer Bluewater's library. C++ developers and developers first exposed to device drivers, on the other hand, will probably prefer Vireo's Driver::Works.</p>
+
+<p>Whichever library you choose, compared to developing your driver in C, you will save a tremendous amount of time compared to using just the Windows NT DDK. The ideal solution for me is to use both -- Driver::Works for its design, and WinDK for its samples and great tools.</p>
+
+<H4>For More Information<BR>
+<BR>
+Vireo Software Inc. <BR>
+21 Half Moon Hill <BR>
+Acton, MA 01720<BR>
+508-264-9200 <BR>
+http://www.vireo.com/<BR>
+<BR>
+BlueWater Systems Inc. <BR>
+P.O. Box 776<BR>
+Edmonds, WA 98020<BR>
+425-771-3610 <BR>
+http://www.bluewatersystems.com/</H4>
+
+<p><b>DDJ</b></p>
+
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>// Getting, claiming, and using resources with WinDK.<p></p>
+// Get the resources from the registry
+CRegistry *pRegistry = new CRegistry(m_DriverRegPath);
+<p></p>
+pRegistry-&gt;SetRelativePath(Concatenate(pDeviceName,L"\\Parameters"));
+pRegistry-&gt;GetKey(L"PortBase",&amp;m_PortBase);
+pRegistry-&gt;GetKey(L"PortRange",&amp;m_PortRange);
+pRegistry-&gt;GetKey(L"Irq",&amp;m_Irq);
+delete pRegistry;
+<p></p>
+BOOLEAN fConflict;
+<p></p>
+CResource *pResources = new CResource(ISA,0,this,2);
+pResources-&gt;AddPortResource(m_MappedAddress);
+pResources-&gt;AddInterruptResource(m_Interrupt);
+pResources-&gt;AssignCardsResources(m_DriverRegPath,&amp;conflict);
+delete pResources;
+<p></p>
+// Accessing the I/O ports using WinDK
+WINDK_MAPPED_ADDRESS m_MappedAddress
+<p></p>
+// map the device ports
+m_MappedAddress.Length                      = m_PortRange;
+m_MappedAddress.PortType                    = PORT_MAPPED;
+m_MappedAddress.UnmappedAddress.LowPart     = m_PortBase;
+m_MappedAddress.UnmappedAddress.HighPart    = 0;
+m_MappedAddress.Flags                       = CmResourceShareDeviceExclusive;
+<p></p>
+// map I/O address
+status = MapIoAddress(Isa, busNumber, m_MappedAddress);
+<p></p>
+// Write to port
+WRITE_PORT_UCHAR((PUCHAR)(m_MappedAddress.pAddress + RESET_ALL),0);
+<p></p>
+// Map an interrupt
+WINDK_INTERRUPT_RESOURCE m_Interrupt;
+<p></p>
+// Setup an interrupt with WinDK
+m_Interrupt.Level       = m_Irq;
+m_Interrupt.Vector      = m_Irq;
+m_Interrupt.Affinity    = 0;
+m_Interrupt.Flags       = CmResourceShareDeviceExclusive;
+m_Interrupt.Mode        = Latched;
+<p></p>
+// DpcForIsr and Isr is static functions they can however use member functions
+InitializeInterrupt(
+    ISA,
+    0,
+    reinterpret_cast&lt;PIO_DPC_ROUTINE&gt;(DpcForIsr),
+    reinterpret_cast&lt;PIO_DPC_ROUTINE&gt;(Isr),
+    this,
+    m_Interrupt    
+    );// Claming resources with WinDK
+// The resources are automatically released in the destructor
+<p></p>
+// Unmap the I/O address
+UnmapIoAddress(m_MappedAddress);
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>// Getting, claiming, and using resources with DriverWorks. Using the registry // with Driver::Works. Driver::Works has it's own way of defining devices in
+// the registry. The advantage of using there model is that
+// you can use the KConfigurationQuery class and CreateRegistryPath
+m_RegPath = KDevice::CreateRegistryPath(L"MyDevice",m_Unit);
+<p></p>
+KRegistryKey unitKey(*m_RegPath); 
+    
+if (NT_SUCCESS(unitKey.LastError()))
+{   
+    unitKey.QueryValue(L"PortBase", &amp;m_PortBase);
+    unitKey.QueryValue(L"PortRange", &amp;m_PortRange);        
+    unitKey.QueryValue(L"Irq", &amp;m_Irq);
+}
+// Claming resources with Driver::Works
+KResourceRequest resReq(Isa,0,0);
+<p></p>
+resReq.AddPort(m_PortBase, m_PortBase, m_PortRange, 2, 0,
+                              CmResourceShareDeviceExclusive);
+resReq.AddIrq(m_Irq,m_Irq);   
+resReq.Submit(this,m_DriverRegPath);
+<p></p>
+// Accessing the I/O ports using Driver::Works
+KIoRange m_Ports;
+<p></p>
+// BusType, Offset, I/O port base, I/O port range
+fStatus = m_Ports.Initialize(Isa,0,m_PortBase,m_PortRange);
+// Write to the port
+m_Ports.outb(RESET_ALL,0);
+<p></p>
+// Map an interrupt with Driver::Works
+KInterrupt m_Interrupt;
+<p></p>
+// Setup the interrupt
+m_Interrupt.Initialize(Isa,0,m_Irq,m_Irq,Latched,FALSE,FALSE);
+    
+// The Isr can be a member of the device class, it can also be an static
+// member function to avoid the overhead of an extra function call.
+m_Interrupt.Connect(LinkTo(Isr),this);
+<p></p>
+// Initialize a DPC object which may be queued by interrupt service routine
+InitializeDpcForIsr(LinkTo(DpcForIsr));
+<p></p>
+// Release claimed resources
+KResourceRequest resReq(Isa,0,0);
+        
+resReq.Release(this,m_DriverRegPath);
+<p></p>
+// The destructor unmaps the memory automatically
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1998, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

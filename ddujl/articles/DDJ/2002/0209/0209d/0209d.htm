@@ -1,0 +1,312 @@
+<html>
+<head>
+<title>Sep02: Writing Apache Modules</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Writing Apache Modules</h1>
+<p><i>Dr. Dobb's Journal</i> September 2002</p>
+
+<h3>By L. Blunt Jackson</h3>
+
+<I>
+Blunt is a freelance programmer and writer in Seattle. He can be reached at mail@bluejack.com.</I>
+
+<hr>
+
+<a name="rs1"><a href="0209ds1.htm">Lifecycle of Apache Servers</a><hr>
+
+<p>A recent survey revealed that Apache web servers power 56 percent of all web sites. Although known for robustness, performance, and security, one reason for this remarkable success is a modular architecture that enables easy extension with optional functionality, third party add-ons, and custom modifications.</p>
+<p>So how do you go about writing an Apache module? In this article, I'll present a module for Apache 1.3 (the most commonly used flavor), illustrating key points of Apache design along the way. I'll then upgrade the module to Apache 2.0, recently released as the current production version. There are, of course, numerous freely available third-party modules; http://modules .Apache .org/ has an inventory of modules ranging from specialized logging to on-the-fly compression.</p>
+<DDJADVERTISEMENT INLINE>
+
+<p>For purposes of illustration, I'll present here a module named "mod_hw" (short for "Hello World"), which picks up a greeting phrase from Apache's config file, identifies the browser type, and streams HTML, incorporating both elements back to the browser. Rather than compiling the module into Apache itself, I'll build and configure the module as a shared object. From a configuration perspective, there isn't much difference. Although compiling into Apache can provide a small performance boost, there are advantages to working with shared objects. For instance, a rapid compile-debug cycle benefits from the shared-object approach. Also, multiple developers can share a single version of the web server&#151;controlled by different config files&#151;to work on their own modules. Moreover, it is generally easier to deploy and maintain versions when the modules are distinct objects on disk.</p>
+
+
+
+<h3>The Module <i>struct</i></h3>
+
+
+<p>For this project, I'm using only the file mod_hw.c. The full module is contained in this file, although I can link in as many additional libraries as I like. While Apache is written strictly in C, C++ programmers can work with Apache by using <i>extern "C"</i> around the functions registered with Apache.</p>
+
+
+<p>A module is simply a library of callback functions. The heart of the library is the <i>struct</i> of type <i>module</i> (see <A NAME="re1"><A HREF="0209de1.htm">Example 1</A>), which Apache uses to register the callback functions. Apache's http_config.h defines this type. </p>
+
+<p>The name of the module <i>struct</i> is not arbitrary. For Apache to load the module, configuration directives are inserted into the config file like this:</p>
+
+<blockquote><p>
+LoadModule hw_module /usr/local/lib/ 				mod_hw.so </p>
+
+<p>
+AddModule mod_hw.c</p>
+
+</blockquote>
+
+<p>These entries should go at the end of the existing module list. The <i>LoadModule </i>directive provides Apache with the name of the <i>struct</i> and the location of the shared object on disk. </p>
+
+
+
+<h3>Command Processing</h3>
+
+
+<p>In the lifecycle of an Apache process (for more lifecycle information, see the accompanying text box entitled "Lifecycle of Apache Servers"), the first calls to the module come from configuration directives, if Apache encounters any while digesting httpd.conf.</p>
+
+
+<p>Since I want to be able to configure the greeting from the Apache config file, I need to register code to act on config directives. I do so by setting up a <i>command_rec</i> structure (also defined in http_config.h), as in <A NAME="re2"><A HREF="0209de2.htm">Example 2</A>. <i>hw_cmds </i>is a table of <i>command_rec</i> structures that maps the directive to the function that handles it, as well as setting flags that indicate how and when it should be called. In this instance, you map to the <i>set_greeting</i> function. The third element is a <i>void </i>pointer to data, which I could specify here and which would be passed to the function, but which I don't need for this implementation. The fourth element specifies how this configuration directive is to be used. Because Apache uses server-wide configuration directives&#151;as well as directives for virtual servers and specific locations, and additional config files on a per directory basis (.htaccess files)&#151;there are a number of merging and override rules possible here. I am going with the simplest: RSRC_CONF indicates a server-wide directive. Other options can be found in http_config.h. The fifth element specifies how many arguments will be processed by the directive. In this case, I am only passing in one. Again, options exist here, from taking the unparsed line to iterating over a list of parameters. The final parameter is a descriptive string used for error reporting.</p>
+
+<p>The <i>set_greeting</i> function is clearly of the simplest sort. The only parameter you need to use is the third&#151;the single value provided from the config file. Because of the flag TAKE1 in <i>command_rec</i>, Apache requires the config file to provide one parameter, and guarantees that this third parameter is not NULL. Were the config file misconfigured, Apache would error and abort on startup. If, in processing the command, you hit an unrecoverable error, you could return a string instead of NULL, again causing an abort.</p>
+
+<p>In the config file, I access this command with the <i>SetGreeting "Yo Yo Yo!" </i>directive. Since Apache acts on config files top to bottom, this directive must be inserted after the <i>LoadModule</i> directive. Because I specified RSRC_CONF, it should not be within a virtual server, location, or directory block&#151;the scope of this <i>SetGreeting</i> is the whole server.</p>
+
+
+
+<h3>Module Initialization</h3>
+
+
+<p>Once Apache has processed all config files, each module is initialized. My initialization routine simply checks if the greeting was set; if not, it is set with the default text:</p>
+
+
+<blockquote><p>
+static void</p>
+
+<p>
+hw_init (server_rec *s, pool *p)</p>
+
+<p>{</p>
+
+<p>if (! greeting) set_greeting(NULL, NULL, 			          "Init Greeting");</p>
+
+<p>
+}</p>
+
+</blockquote>
+
+<h3>Response Handling (1.3)</h3>
+
+
+<p>Response handlers cause the most confusion for newcomers to Apache modules. It probably doesn't help that Apache 1.3 and 2.0 treat response handlers differently. Nor does it help that the documentation for 2.0 on Apache.org is inaccurate, and that no document I've stumbled across covers both configuring the web server to dispatch to response handlers and writing response handlers (much less the connection between the two). Furthermore, unlike the other callbacks appropriate to the lifespan of a request, only one response handler is possible for any given request.</p>
+
+
+<p>First, the handler. The module has registered a table of type <i>handler_rec </i>named <i>hw_handlers</i>. <A NAME="re3"><A HREF="0209de3.htm">Example 3</A> shows both this table and the response handler. The table is a simple mapping. This is the glue that binds directives from the config file to the correct response handler.</p>
+
+<p>While the handler appears simple, it illustrates several important points. First, there are all kinds of data available to a handler about both the browser making the request and the connection itself. Examine Apache's httpd.h for the structures <i>request_rec</i> and <i>conn_rec</i> to find out what you have access to, as well as alloc.h for the various ways of accessing tables (important for the various bits of information available from the HTTP headers). In this example, I simply request the <i>User-Agent </i>(if any) to incorporate in the response stream.</p>
+
+<p>Second, I set the content type and send the headers. The default content type is text/plain and some finicky browsers decline to render this (Opera, for example). If you don't tell Apache 1.3 to send the headers, it won't. Again, some browsers object to this.</p>
+
+<p>Third, note how data is sent to the client. Check out Apache's http_protocol.h for many more options, including sending a file direct from disk.</p>
+
+<p>Finally, there is the return code. OK signals that the response is complete. Other options include DECLINED, indicating that this handler can't generate the response, and Apache should dispatch to another appropriate handler, if possible. Alternatively, the function may return an HTTP error code, such as HTTP_INTERNAL_ERROR, which forces that response to the browser. A full list of return codes is in httpd.h.</p>
+
+<p><A NAME="rl1"><A HREF="#l1">Listing One</A> is the complete application. Still, the question remains: How will Apache correctly dispatch to the response handler? Of course, this being Apache, there are a number of alternatives.</p>
+
+<p>First, it can dispatch based on content type, as determined simply by the file suffix in the URI. For example, if I wanted <i>hw_handle_req</i> to generate the response for any file named "*.hw," I would add the directive <i>AddHandler hw-app .hw</i> to the config file. Here, the circle is complete, mapping the file suffix to the string in the <i>hw_handlers</i> table, which maps to the function. This mechanism is particularly useful for something like .cgi, in which, instead of streaming the .cgi file, you want it to execute the CGI file, and stream the output of that process. Other examples include .php and .shtml.</p>
+
+<p>A better alternative, for many purposes, is to name a location that maps to the handler. For example:</p>
+
+<blockquote><p>
+&lt;Location /hw&gt;</p>
+
+<p>
+SetHandler hw-app</p>
+
+<p>
+&lt;/Location&gt;</p>
+
+</blockquote>
+
+<p>This dispatches any URI with a path beginning with "/hw/" to my handler. This is more intuitive for functional applications. A good example in the standard distribution is <i>mod_status</i>, which typically maps the location <i>/server-status</i> to a dynamically generated output of all kinds of interesting status information about the web server. You can then apply additional directives to this location, such as user authentication, domain restriction, and the like.</p>
+
+<p>Newcomers sometimes don't realize that when Apache dispatches to a response handler, the URI no longer needs to reference a file on disk at all. Once control is handed to the response handler, the handler is free to use or ignore the URI. If you are developing a custom file-parsing engine, perhaps the URI will be meaningful to your handler in that it specifies the file to parse. On the other hand, if you are generating content out of a database, or connecting to some further network for content, perhaps the URI is more information to dispatch on.</p>
+
+
+
+<h3>Debugging</h3>
+
+
+<p>Typical Apache configurations run several child processes, each listening for incoming requests. For debugging purposes, you want to reduce <i>MinServers</i> and <i>MaxServers</i> to 1, so that there is only one process available for debugging. There will still be two processes&#151;parent and child. Everything interesting happens in the child, so use your debugger to attach to that running process. (gdb &lt;executable&gt; &lt;pid&gt; works nicely for basic UNIX debugging.) </p>
+
+
+
+
+<h3>Apache 2.0</h3>
+
+
+<p>Five years in development, Apache 2.0 was released to the public in April this year. One hindrance to general adoption is the dearth of available modules. A second is the absence of accurate documentation, which often lags in open-source development. Here, I'll upgrade the module in <A NAME="rl1"><A HREF="#l1">Listing One</A> for Apache 2.0.</p>
+
+
+<p>A word of caution: Don't be too hasty to upgrade. Apache 2.0  achieves the stability and security currently found in 1.3, but for most UNIX platforms, there is not much new functionality; and without careful tuning of the thread control knobs, you can expect some performance degradation. Where 2.0 delivers the goods is for Windows implementations, in which the new hybrid multiprocess, multithreading model makes better use of the OS than 1.3. Also, 2.0 does introduce some powerful new flexibility for server administration and custom module design beyond the scope of this article.</p>
+
+
+
+<h3>Module Design Changes</h3>
+
+
+<p>Version 1.3 modules will not compile for Apache 2.0 without modification. The Apache team changed the fundamental framework that registers callback functions, the core API that you might use to interact with the web server, and to a small degree, the way the config file is utilized (the only change in configuration is that the <i>AddModule</i> directive is no longer needed). One of the important changes that further extends Apache's flexibility is the ability for modules to call into one another.</p>
+
+
+<p><A NAME="rl2"><A HREF="#l2">Listing Two</A> is the whole module. The module <i>struct</i> is much simpler than in 1.3 because Apache 2.0 defines a great number of additional steps in the lifecycle of a request. Rather than clubbing them all into a monstrous module <i>struct</i> with each function signature different than the last, it requests that you register all hooks (new terminology) from the "register hooks" function (which I have inventively named <i>hw_register_hooks</i>). For other possible hooks, see <A NAME="rt1"><A HREF="0209dt1.htm">Table 1</A>. In the upgraded module, I register the same functions used in 1.3 by this new mechanism.</p>
+
+<p>The processing of config file directives and the command structure are unchanged.</p>
+
+<p><A NAME="re4"><A HREF="0209de4.htm">Example 4</A> is the new response handler. I have abandoned the <i>request_rec</i> table that mapped a handler name to a particular function. Apache no longer dispatches based on that. Instead, just like every other hook, Apache calls each response handler in each module until some handler accepts the job.</p>
+
+<p>Accordingly, the first thing the handler must do is determine whether it ought to run. The config file directives are the same, but instead of triggering a dispatch system, they simply stamp the appropriate handler on the <i>request_rec struct</i>. So, the response handler evaluates that particular character array to see if it is the right hook for the job.</p>
+
+<p>This is the primary reason for the additional parameters used in the hook registration calls. The first parameter sends a pointer to the appropriate function. The remaining parameters are used for either finely grained function ordering, or the more rough-and-ready flag-based system used in this example. Because there may be cases where multiple handlers could take on a response, you want to make sure that the correct handler will be the first to get it. For other types of hooks, the order in which modules act on the request may be critical.</p>
+
+<p>Other changes include minor name changes in the API calls, and the fact that you no longer ask Apache to send the headers. To support HTTP 1.1 specifications, Apache now provides content length for all responses or else provides a chunked stream. Accordingly, Apache must generate and stream the HTTP headers after receiving some or all of the response stream.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>The Apache web server exemplifies much of what is best about the open-source software development paradigm. Not only has the extent of peer review ensured a rock solid product, but nearly every flexible use of the web server has been imagined and accounted for.</p>
+
+
+<p>Writing a new module may not be the right solution for every problem, but when it is the right solution, the mechanics of actually hooking into Apache's architecture should not be a daunting task.</p>
+
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>
+#include "httpd.h"
+#include "http_config.h"
+#include "http_protocol.h"
+
+static const char* greeting;
+
+/* command processing happens at startup, before all else */
+static const char*
+set_greeting(cmd_parms *cmd, void* empty, char* text)
+{
+    /* TAKE1 guarantees that text will not be null */
+    greeting = text;
+    /* If we wanted to return an error code, we would return a string.
+       This would prevent Apache from running. */
+    return NULL;
+}
+/* initialization is called at startup, after command processing
+   we use this to set the greeting if no directives were placed
+   in the config file. */
+static void
+hw_init (server_rec *s, pool *p)
+{
+    if (! greeting) set_greeting(NULL, NULL, "Init Greeting");
+}
+static int hw_handle_req ( request_rec *r )
+{
+    const char* ua = ap_table_get(r-&gt;headers_in, "User-Agent" );
+    if (!ua || !*ua) ua = "No User-Agent.";
+
+    /* set and send headers */
+    r-&gt;content_type = "text/html";
+    ap_send_http_header( r );
+
+    /* send the content body */
+    ap_rputs( "&lt;HTML&gt;&lt;HEAD&gt;&lt;TITLE&gt;Hello World&lt;/TITLE&gt;&lt;/HEAD&gt;&lt;BODY&gt;\n" , r );
+    ap_rprintf( r, "&lt;P&gt;%s &lt;br&gt;Using Browser: %s&lt;/P&gt;\n", greeting, ua );
+    ap_rputs( "&lt;/BODY&gt;&lt;/HTML&gt;\n", r );
+    return OK;
+}
+command_rec hw_cmds[] = {
+    { "SetGreeting", set_greeting, NULL, RSRC_CONF, TAKE1, "Set Greeting" },
+    { NULL }
+};
+static const handler_rec hw_handlers[] = {
+    { "hw-app", hw_handle_req },
+    { NULL }
+};
+module MODULE_VAR_EXPORT hw_module = {
+    STANDARD_MODULE_STUFF,
+    hw_init,       /* initializer */
+    NULL,          /* dir config creator */
+    NULL,          /* dir merger --- default is to override */
+    NULL,          /* server config */
+    NULL,          /* merge server config */
+    hw_cmds,       /* command table */
+    hw_handlers,   /* response handlers */
+    NULL,          /* filename translation */
+    NULL,          /* check_user_id */
+    NULL,          /* check auth */
+    NULL,          /* check access */
+    NULL,          /* type_checker */
+    NULL,          /* fixups */
+    NULL,          /* logger */
+    NULL,          /* header parser */
+    NULL,          /* child_init */
+    NULL,          /* child_exit */
+    NULL           /* post read-request */
+};
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two</H4>
+
+
+<pre>
+#include "httpd.h"
+#include "http_config.h"
+#include "http_protocol.h"
+
+static const char* greeting;
+static const char* set_greeting(cmd_parms* cmd, void* empty, char* text)
+{
+    greeting = text;
+    return NULL;
+}
+static int
+hw_init(apr_pool_t* p, apr_pool_t* plog, apr_pool_t* ptemp, server_rec* s)
+{
+    if (!greeting) set_greeting(NULL, NULL, "No Greeting at Init");
+    return OK;
+}
+static int hw_handle_req(request_rec* r)
+{
+    const char* ua;
+    /* note, we have to check to see if this handler is
+       the one that has actually been requested */
+    if(strcmp(r-&gt;handler, "hw") != 0)
+        return DECLINED;
+    ua = apr_table_get (r-&gt;headers_in, "User-Agent");
+    if (!ua || !*ua) ua = "No User Agent.";
+    /* note, we do not _send_ headers anymore */
+    r-&gt;content_type = "text/html";
+    ap_rputs  (    "&lt;HTML&gt;&lt;HEAD&gt;&lt;TITLE&gt;Hi!&lt;/TITLE&gt;&lt;/HEAD&gt;&lt;BODY&gt;\n" , r );
+    ap_rprintf( r, "&lt;P&gt;%s &lt;br&gt;Using Browser: %s&lt;/P&gt;\n", greeting, ua );
+    ap_rputs  (    "&lt;/BODY&gt;&lt;/HTML&gt;\n", r );
+    return OK;
+}
+command_rec hw_cmds[] = {
+    { "SetGreeting", set_greeting, NULL, RSRC_CONF, TAKE1, "Set Greeting" },
+    { NULL }
+};
+static void hw_register_hooks(apr_pool_t* p)
+{
+    ap_hook_post_config (hw_init,       NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_handler     (hw_handle_req, NULL, NULL, APR_HOOK_FIRST );
+}
+module AP_MODULE_DECLARE_DATA hw_module =
+{
+    STANDARD20_MODULE_STUFF,
+    NULL,    /* create per-directory config structures */
+    NULL,    /* merge per-directory config structures  */
+    NULL,    /* create per-server config structures    */
+    NULL,    /* merge per-server config structures     */
+    hw_cmds,            /* command handlers */
+    hw_register_hooks   /* register hooks   */
+};
+
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+
+
+</body>
+</html>

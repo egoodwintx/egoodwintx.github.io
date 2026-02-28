@@ -1,0 +1,652 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v11, i10: Listing 4 CSV2db::Update</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a4.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a4_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink"><a href="a4_l2.htm">Listing 2</a></span></td>
+		<td><span class="navbarLink"><a href="a4_l3.htm">Listing 3</a></span></td>
+		<td><span class="navbarLink">Listing 4</span></td>
+		<td><a href="../../../../source/SA/2002/oct2002.tar"><b class=codeListing>oct2002.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b>Listing 4 </b><i>CSV2db::Update</i></h1>
+            <p> 
+            <pre>
+package CSV2db::Update;
+
+use strict;
+use vars qw($VERSION);
+use Class::Struct;
+use IO::File;
+use Text::CSV_XS;
+use DBI;
+
+$VERSION = substr q$Revision: 1.0 $, 10;
+
+# attributes, with their default values (if any)
+my %default =
+    (configfile          =&gt; '',
+     dbhost         =&gt; 'localhost',
+     dbname         =&gt; undef,
+     dbid         =&gt; undef,
+     dbpw         =&gt; undef,
+     dbdname             =&gt; 'mysql',
+     csvquotechar     =&gt; '"',
+     csvfieldsep     =&gt; ',',
+     verbose         =&gt; 0,
+     fake         =&gt; 0,
+     stdinpw         =&gt; 0,
+     alarmt         =&gt; 10,
+     _conf               =&gt; undef,
+    );
+
+# Use Class::Struct's struct() to create our standard accessor methods
+# as well as the "new" method.  (Note - this loop depends on all
+# attributes being scalars.)
+struct(map { ($_, '$') } keys %default);
+
+# Regular expression to recognize numeric SQL types.  These are types
+# that should have NULL stored (represented as undef in DBI) instead
+# of an empty string.
+my($sqlnumberre) = '^(tinyint|smallint|mediumint|integer|int|bigint|' .
+    'float|double|real|decimal|numeric|datetime|date|timestamp|time|year)';
+
+# Suffixes for renaming database tables
+my($tempsuffix) = '_temp';
+my($oldsuffix)  = '_old';
+
+# workhorse method
+sub table {
+    my ($self, $table, $fh) = @_;
+
+    ###
+    ### Check arguments and assign defaults to any items still undefined
+    ###
+    die("Require 'tablename' and 'filehandle' arguments to \"table\"")
+    unless (defined $table  &amp;&amp;  defined $fh);
+    die("Second arg to \"table\" method must be an IO::File filehandle")
+    unless (ref $fh eq 'IO::File');
+    for (keys %default) {
+    $self-&gt;$_($default{$_}) unless defined $self-&gt;$_;
+    }
+
+    ###
+    ### Read the configuration file
+    ###
+    $self-&gt;_readconfig();
+
+    ###
+    ### Assign options and pre-/post-process calls from the config file
+    ###
+    # for convenience, grab them directly into a hash
+    my(%options) = %{$self-&gt;_conf-&gt;{options}}
+    if exists $self-&gt;_conf-&gt;{options};
+    # propagate the options
+    for (keys %options) {
+    print "Configuration file option '$_': $options{$_}\n"
+        if $self-&gt;verbose();
+    if ($self-&gt;can($_)) {
+        $self-&gt;$_($options{$_});
+    } else {
+        print "Bad configuration file option '$_' ignored\n";
+    }
+    }
+    # get and check lists of the pre- and post-process routine calls
+    my @preprocess = @{$self-&gt;_conf-&gt;{preprocess}}
+    if exists $self-&gt;_conf-&gt;{preprocess};
+    my @postprocess = @{$self-&gt;_conf-&gt;{postprocess}}
+    if exists $self-&gt;_conf-&gt;{postprocess};
+    for (@preprocess, @postprocess) {
+    die("Option file '" . $self-&gt;configfile() . "' preprocess and " .
+        "postprocess entries must\n\t" .
+        "all be code references (either 'sub {...},' or '\&amp;function,')\n")
+        unless ref $_ eq 'CODE';
+    }
+
+    ###
+    ### Now, set up the table definitions from the config file
+    ###
+    # Data structure from config file:
+    #   tablename =&gt; [[fieldname, fieldtype, index, fulltextindex, sub]...]
+    #                      0          1        2          3         4
+    #   ignore field if fieldtype is empty;
+    #   create index if index is true;
+    #   use field in fulltextindex if fulltextindex is true;
+    #   field #4 is _optional_ subroutine reference to run on this field.
+    #   Note: to define primary key, do it as part of the fieldtype;
+    #   use index only for regular indices.
+    # for convenience, grab the structure into a hash
+    my(%tables) = %{$self-&gt;_conf-&gt;{tables}};
+    die("Found no table definitions in the configuration file '" .
+    $self-&gt;configfile() . "'!\n")
+    unless (scalar keys %tables &gt; 0);
+    # check for legal field names, force types to uppercase, check
+    # that field-specific subs are coderefs, and see if there are any
+    # "SET"-type definitions in the selected table
+    my $anysets = 0;
+    for my $thistable (keys %tables) {
+    for (@{$tables{$thistable}}) {
+        die("No field name can be longer than 64 characters!\n\t[$_]\n")
+        if length $_-&gt;[0] &gt; 64;
+        die("Field names cannot contain '.' or '/'!\n\t[$_]\n")
+        if $_-&gt;[0] =~ m#\.|/#;
+        die("Field-specific processing routines must be coderefs\n" .
+            "(there's a '" . (ref $_-&gt;[4]) . "' instead)\n")
+        if (($_-&gt;[4])  &amp;&amp;  (ref $_-&gt;[4] ne 'CODE'));
+        $_-&gt;[1] = uc $_-&gt;[1];  # uppercase the type
+        ++$anysets if (($_-&gt;[1] =~ /^SET$/i)  &amp;&amp;  ($thistable eq $table));
+    }
+    }
+    # is our table name present in the configuration file?
+    die("No table '$table' is defined in config file '",
+    $self-&gt;configfile(), "'\n")
+    unless exists $tables{$table};
+
+    ###
+    ### Get our database pw from stdin, if needed, then hook us up
+    ###
+    if ($self-&gt;stdinpw()) {
+    my $s;
+    eval {
+        local $SIG{ALRM} = sub {die "alarm\n" };
+        alarm $self-&gt;alarmt() if ($self-&gt;alarmt() &gt; 0);
+        $s = &lt;STDIN&gt;;
+        alarm 0 if ($self-&gt;alarmt() &gt; 0);
+    };
+    die($@ eq "alarm\n"  ?  "Timed out"  :  "Unknown cause") if ($@);
+    chomp $s;
+    $self-&gt;dbpw($s);
+    }
+    # hook up to the database
+    my $dbstring = "DBI"  . ":" .
+    $self-&gt;dbdname()  . ":" .
+    $self-&gt;dbname()   . ":" .
+    $self-&gt;dbhost();
+    print "connect to '$dbstring'\n" if $self-&gt;verbose();
+    my $dbh;
+    die("Failed database connect.\n")
+    unless $dbh = DBI-&gt;connect("$dbstring", $self-&gt;dbid(), $self-&gt;dbpw(),
+                   {AutoCommit =&gt; 1, RaiseError =&gt; 1});
+
+    ###
+    ### Perform preprocessing on the entire input data stream (if requested)
+    ###
+    # For each preprocessing routine in order, we create a tmpfile,
+    # preprocess into it, then adopt that as our current data source,
+    # thus walking us through a series of tmpfiles.
+    # Each preprocess routine expects source and target IO filehandles.
+    for (@preprocess) {
+    my $temp = IO::File-&gt;new_tmpfile()
+        or die("Failed opening tempfile for preprocessing: $!\n");
+    $_-&gt;($fh, $temp);
+    $fh-&gt;close()
+        or die("Failed closing a preprocessed filehandle: $!\n");
+    $fh = $temp;
+    $fh-&gt;seek(0,0);
+    }
+
+    ###
+    ### Search for any MySQL SET-type values within the entire
+    ### datafile.  To get the list of items for each field, we
+    ### exhaustively examine the entire input stream (rewinding it at
+    ### the end).  Then the SET definition(s) are rewritten to include
+    ### their values.
+    ###
+    if ($anysets) {
+    my(%setbits);
+    my @fields;
+    # examine all SET-type fields for their values
+    while ($self-&gt;_nextcsvline($fh, scalar @{$tables{$table}}, \@fields)) {
+        next if (scalar @fields  !=  scalar @{$tables{$table}});
+        for my $tableconf (@{$tables{$table}}) {
+        my($field) = shift @fields;
+        # look only at fields with SET types from configuration file
+        if ($tableconf-&gt;[1] =~ /^SET$/i) {
+            # field-specific function for this field
+            $field = $tableconf-&gt;[4]-&gt;($field)
+            if exists $tableconf-&gt;[4];
+            # generic postprocess functions
+            for (@postprocess) {
+            $field = $_-&gt;($field);
+            }
+            # memorize each of the set content items
+            for (split(/,/, $field)) {
+            ++$setbits{$tableconf-&gt;[0]}{$_};
+            }
+        }
+        }
+    }
+    $fh-&gt;seek(0,0);   # rewind the input file
+    # rewrite field definition clauses to include the set items
+    for (@{$tables{$table}}) {
+        if ($_-&gt;[1] =~ /^SET$/i) {
+        $_-&gt;[1] = 'SET(';
+        $_-&gt;[1] .= "'" .
+            join("','", sort keys %{$setbits{$_-&gt;[0]}}) . "'"
+            if (scalar keys %{$setbits{$_-&gt;[0]}});
+        $_-&gt;[1] .= ')';
+        print "Rewrote set definition to $_-&gt;[1]\n"
+            if $self-&gt;verbose();
+        }
+    }
+    }
+
+    ###
+    ### Set up our SQL statements to create fields and indices
+    ###
+    # create a name for the temporary table we will create
+    my $temptable = $table . $tempsuffix;
+    my $sql = "CREATE TABLE `$temptable` ( ";
+    # first, the field names and their types
+    for (@{$tables{$table}}) {
+    # if $_-&gt;[1] isn't defined, we ignore the incoming datafield
+    $sql .= "`$_-&gt;[0]` $_-&gt;[1], " if $_-&gt;[1];
+    }
+    $sql =~ s/,\s*$//; # kill trailing comma from list
+    # accumulate list of indexes to create
+    for (@{$tables{$table}}) {
+    $sql .= ", INDEX ( `$_-&gt;[0]` )" if $_-&gt;[2];
+    }
+    # create fulltext indexing, if requested
+    my($fullindexes) = '';
+    for (@{$tables{$table}}) {
+    if ($_-&gt;[3]) {
+        if ($_-&gt;[1] =~ /text|varchar/i) {
+        $fullindexes .= "`$_-&gt;[0]`, ";
+        } else {
+        print "'$_-&gt;[0]': no fulltext index (only text or varchar)\n";
+        }
+    }
+    }
+    $fullindexes =~ s/,\s*$//; # kill trailing comma from list
+    if ($fullindexes) {
+    $sql .= ", FULLTEXT `fulltext` ($fullindexes)";
+    }
+    # cap off the clause
+    $sql .= " )";
+
+    ###
+    ### Create the new table, and prepare to populate it
+    ###
+    if (grep(/^$temptable$/, $dbh-&gt;tables())) {
+    print "do: DROP TABLE `$temptable`\n" if $self-&gt;verbose();
+    $dbh-&gt;do("DROP TABLE `$temptable`") unless $self-&gt;fake();
+    } else {
+    print "no temptable drop - it did not exist in the database\n";
+    }
+    print "do: $sql\n" if $self-&gt;verbose();
+    $dbh-&gt;do($sql) unless ($self-&gt;fake());
+    print "finished create\n" if $self-&gt;verbose();
+    $sql = "INSERT INTO `$temptable` ( ";
+    for (@{$tables{$table}}) {
+    $sql .= "`$_-&gt;[0]`, " if $_-&gt;[1];
+    }
+    $sql =~ s/,\s*$//;  # trim trailing comma
+    $sql .= " ) VALUES ( ";
+    for (@{$tables{$table}}) {
+    $sql .= "?, "  if $_-&gt;[1];
+    }
+    $sql =~ s/,\s*$//;  # trim trailing comma
+    $sql .= " )";
+    print "prepare: $sql\n" if $self-&gt;verbose();
+    my $sth = $dbh-&gt;prepare($sql) unless ($self-&gt;fake());
+
+    ###
+    ### Step through each input CSV line, populating the new database.
+    ### Do the field-specific and postprocessing functions along the way.
+    ###
+    my @fields;
+    while ($self-&gt;_nextcsvline($fh, scalar @{$tables{$table}}, \@fields)) {
+    if (scalar @fields  !=  scalar @{$tables{$table}}) {
+        # this was checked during parsing already, but what the hell
+        print "This record should have ", scalar @{$tables{$table}},
+        "but has ", scalar @fields,
+        ". Skipped...\n\t", join("|", @fields), "\n";
+        next;
+    }
+    my(@out);
+    for (@{$tables{$table}}) {
+        my($field) = shift @fields;
+        # use only fields with non-null types from configuration file
+        if ($_-&gt;[1]) {
+        # field-specific function for this field
+        $field = $_-&gt;[4]-&gt;($field) if (exists $_-&gt;[4]);
+        # generic postprocess functions
+        for (@postprocess) {
+            $field = $_-&gt;($field);
+        }
+        # in DBI-ville, null numbers are set with undef, not ""
+        $field = undef
+            if ($field eq ""  &amp;&amp;  $_-&gt;[1] =~ /$sqlnumberre/io);
+        push(@out, $field);
+        }
+    }
+    print scalar @out, " " if $self-&gt;verbose();
+    $sth-&gt;execute(@out) unless $self-&gt;fake();
+    }
+    print "\n" if $self-&gt;verbose();
+    $sth-&gt;finish unless $self-&gt;fake();
+
+    ###
+    ### We're done, so drop the old backup table, back up the existing
+    ### table, and swap in the new one.  Then quit the db connection.
+    ###
+    if (grep(/^$table$oldsuffix$/, $dbh-&gt;tables())) {
+    print "do: DROP TABLE `$table$oldsuffix`\n" if $self-&gt;verbose();
+    $dbh-&gt;do("DROP TABLE `$table$oldsuffix`") unless $self-&gt;fake();
+    } else {
+    print "no backup table drop - it did not exist in the database\n";
+    }
+    if (grep(/^$table$/, $dbh-&gt;tables())) {
+    print "do: RENAME TABLE `$table` TO `$table$oldsuffix`\n"
+        if $self-&gt;verbose();
+    $dbh-&gt;do("RENAME TABLE `$table` TO `$table$oldsuffix`")
+        unless $self-&gt;fake();
+    } else {
+    print "no backup table created - it did not exist in the database\n";
+    }
+    print "do: RENAME TABLE `$temptable` TO `$table`\n" if $self-&gt;verbose();
+    $dbh-&gt;do("RENAME TABLE `$temptable` TO `$table`") unless $self-&gt;fake();
+    $dbh-&gt;disconnect;
+
+    print "Done\n" if $self-&gt;verbose();
+
+    1;
+}
+
+
+###
+### Read the configuration file
+###
+sub _readconfig {
+    my($self) = shift @_;
+
+    # see if it really exists
+    die("Missing config file '", $self-&gt;configfile(), "'!\n")
+    if ( ! -e $self-&gt;configfile());
+    # make sure it's a real file
+    die("Config file '", $self-&gt;configfile(), "' must be regular file.\n")
+    unless (-f $self-&gt;configfile());
+    # mild permission checks
+    my($mode, $uid) = (stat($self-&gt;configfile()))[2,4];
+    die("Could not get file status on '", $self-&gt;configfile(), "': $!\n")
+    if ( ! defined $mode  ||  ! defined $uid);
+    die("Config file must not be writable by world (only by owner/group)\n")
+    if ($mode &amp; 002);
+    # read and parse the sucker
+    $self-&gt;_conf(do $self-&gt;configfile());
+    unless ($self-&gt;_conf) {
+    die("Failed parsing '", $self-&gt;configfile(), "': $@\n")
+        if $@;
+    die("Failed running '", $self-&gt;configfile(), "': $!\n")
+        unless defined $self-&gt;_conf;
+    die("Failure in configuration file '", $self-&gt;configfile(), "'\n");
+    }
+}
+
+###
+### Return a lexically sorted list of the names of the tables
+### from the object (i.e. that are in the config file).
+###
+sub tablenames {
+    my($self) = shift @_;
+    $self-&gt;_readconfig;
+    sort keys %{$self-&gt;_conf-&gt;{tables}};
+}
+
+###
+### Suck data from the filehandle and render it into a single
+### CSV-interpreted set of fields returned in @{$fieldsep}.
+###
+sub _nextcsvline {
+    my($self, $fh, $nfields, $fieldsp) = @_;
+
+    # start up a csv object, ready for parsing incoming text
+    my($csv) = Text::CSV_XS-&gt;new({binary     =&gt; 1,
+                  sep_char   =&gt; $self-&gt;csvfieldsep(),
+                  quote_char =&gt; $self-&gt;csvquotechar(),
+                 });
+
+    # Here's the deal: some formats (notably tab-separated from
+    # Endnote) cheerily let linebreak characters exist within fields,
+    # as well as using them as record separators.  Hence we read
+    # lines, gluing the first field of the subsequent line onto the
+    # last field of the preceeding line (if the field was split),
+    # until we get a whole record-full of fields.  If, at that point,
+    # there are missing fields or spare fields left over, we assume we
+    # have an out-of-sync error and we're screwed.  Along the way, we
+    # also deal with the possibility that records are simply split
+    # between lines (avoiding gluing fields in that case and just
+    # continuing to accumulate fields).
+    #
+    # But it gets worse.  In the case where there is no quote
+    # character (thank you Endnote tab-separated) there is no possible
+    # way to distinguish a split field from a split record.  So in
+    # that case, we always assume that a split record was split in the
+    # middle of a field and glue things together.  Best we can do, I'm
+    # afraid.
+    #
+    # Sigh.
+
+    my(@fields) = ();
+    my($brokenfield) = 0;
+
+    return 0 if $fh-&gt;eof();
+    my $line = &lt;$fh&gt;;
+    unless ($csv-&gt;parse($line)) {
+    # if field was split, appending a quote will rescue us
+    print "line " . $fh-&gt;input_line_number .
+        ": Rereading on possible split field error\n" if $self-&gt;verbose();
+    $csv-&gt;parse($line . $self-&gt;csvquotechar());
+    $brokenfield = 1;
+    }
+    if ($csv-&gt;status()) {
+    @fields = $csv-&gt;fields();
+    my @more = ();
+    while ((scalar @fields &lt; $nfields  ||  $brokenfield)  &amp;&amp;
+           ($line = &lt;$fh&gt;)) {
+        if ($brokenfield  ||  $self-&gt;csvquotechar() eq '') {
+        # we're in the midst of a "\n"-broken single field
+        print "line " . $fh-&gt;input_line_number .
+            ": Broken field - reading another line\n"
+            if $self-&gt;verbose();
+        if ($csv-&gt;parse($self-&gt;csvquotechar() . $line)) {
+            $brokenfield = 0; # field split once, and we cured it
+        } else {
+            # field split twice, we'll need to keep gluing
+            $csv-&gt;parse($self-&gt;csvquotechar() .
+                $line . $self-&gt;csvquotechar());
+        }
+        if ($csv-&gt;status()) {
+            @more = $csv-&gt;fields();
+            print "Got ", scalar @more, " more fields\n"
+            if $self-&gt;verbose();
+            $fields[$#fields] .= "\n" . shift @more;
+        } else {
+            die("line " . $fh-&gt;input_line_number .
+            ": Failed reading broken field: $line\n");
+        }
+        } else {
+        # simply too few fields, try adding from next line
+        print "line " . $fh-&gt;input_line_number .
+            ": Split record - reading another line ",
+            "(have ", scalar @fields, " of $nfields)\n"
+            if $self-&gt;verbose();
+        unless ($csv-&gt;parse($line)) {
+            # if field was split, appending a quote will rescue us
+            print "line " . $fh-&gt;input_line_number .
+            ": Rerereading on a possible split field\n"
+                if $self-&gt;verbose();
+            $csv-&gt;parse($line . $self-&gt;csvquotechar());
+            $brokenfield = 1;
+        }
+        if ($csv-&gt;status()) {
+            @more = $csv-&gt;fields();
+            print "Got ", scalar @more, " more fields\n"
+            if $self-&gt;verbose();
+        } else {
+            die("line " . $fh-&gt;input_line_number .
+            ": Failed trying to add fields to record: $line\n");
+        }
+        }
+        while (scalar @fields &lt; $nfields  &amp;&amp;  scalar @more &gt; 0) {
+        push(@fields, shift @more);
+        }
+    }
+    # by now we should have a perfect record with no dangly bits
+    if (scalar @more  &gt;  0          || # unused bonus fields
+        scalar @fields != $nfields  || # too few fields at the end
+        $brokenfield) {    # unterminated very last field
+        die("Error on line " , $fh-&gt;input_line_number,
+        ": Out-of-sync data.  ",
+        scalar @more, " extra fields; have ",
+        scalar @fields, " of $nfields; ",
+        $brokenfield ? "broken field" : "not a broken field.\n",
+        "It happened around data line: ",
+        defined $line ? $line : "[last line of the file, I think]",
+        "\n");
+    }
+    } else {
+    die("Error on line " . $fh-&gt;input_line_number . ":\n\t" .
+        $csv-&gt;error_input . "\n");
+    }
+    @{$fieldsp} = @fields;
+    return 1;
+}
+
+
+1;
+
+__END__
+
+=pod
+Following is a sample CGI program that can act as a file upload wrapper:
+
+ #!/usr/bin/perl -w
+ use strict;
+ use lib qw(/home/dean2/programs/CSV2db);
+ use CSV2db::Update;
+ use CSV2db::Util;
+ use CGI;
+ use CGI::Carp qw(fatalsToBrowser warningsToBrowser);
+
+ # start the proper protocol for outputting a web page
+ my $q = new CGI;
+ print $q-&gt;header(), $q-&gt;start_html(-title   =&gt; 'Glossary Update',
+                    -bgcolor =&gt; 'white',
+                   );
+
+ # initialize our Update object and get the list of tables
+ my $update = CSV2db::Update-&gt;new(
+                  configfile =&gt; 'glossary.config',
+                  dbhost     =&gt; 'localhost',
+                  dbname     =&gt; 'glossary',
+                  dbid       =&gt; 'glossarist',
+                  dbpw       =&gt; 'Murray',
+                  dbdname    =&gt; 'mysql',
+                  verbose    =&gt; 1,
+                  fake        =&gt; 0,
+                  stdinpw    =&gt; 0,
+                 );
+ my @tables = $update-&gt;tablenames();
+
+ #
+ # either present the file-upload page or process uploaded files
+ #
+ if ( ! $q-&gt;param('button')) {
+     # no files uploaded yet, this is the first (print-form) call
+     print "&lt;center&gt;",
+     $q-&gt;start_multipart_form('POST', $ENV{SCRIPT_NAME} ?
+                  $ENV{SCRIPT_NAME} : $q-&gt;url()),
+         "&lt;table cellspacing=1 cellpadding=1 border=1&gt;",
+     "&lt;tr&gt;&lt;td colspan='2'&gt;",
+     "&lt;center&gt;Prepare comma-separated-value (CSV) files. ",
+     "&lt;br&gt;Enter one or more CSV file names into the appropriate ",
+     "blanks in the &lt;b&gt;File Name&lt;/b&gt; column below, &lt;br&gt;then click ",
+     "the &lt;b&gt;Upload&lt;/b&gt; button.&lt;/center&gt;",
+     "&lt;/td&gt;&lt;/tr&gt;",
+     "&lt;tr&gt;&lt;th&gt;Table Name&lt;/th&gt;",
+     "&lt;th&gt;File Name&lt;/th&gt;&lt;/tr&gt;";
+     for (@tables) {
+     print "&lt;tr&gt;&lt;td align='right'&gt;$_&lt;/td&gt;&lt;td&gt;",
+         $q-&gt;filefield(-name =&gt; 'file_' . $_,
+               -size =&gt; 40,
+              ),
+         "&lt;/td&gt;&lt;/tr&gt;\n";
+     }
+     print "&lt;tr&gt;&lt;td colspan=2 align='center'&gt;",
+     $q-&gt;submit(-name =&gt; 'button',
+            -value =&gt; 'Upload CSV File(s)',
+           ),
+     "&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;", $q-&gt;endform(), "&lt;/center&gt;";
+
+ } else {
+
+     # files have (allegedly) been uploaded, so let's process them
+     print "&lt;pre&gt;\n";
+     for my $table (@tables) {
+     my $fh = $q-&gt;upload('file_' . $table);
+     if (defined $fh) {
+         print "Processing table $table...&lt;br&gt;";
+         # this file copy is terribly lame, but it works until I
+         # can figure out how to convert an Fh object from
+         # CGI::upload into an IO::File handle.
+         my $iofh;
+         if ( ! ($iofh = IO::File-&gt;new_tmpfile())) {
+         print "Failed opening tempfile: $!\n";
+         } else {
+         $iofh-&gt;print($_) while (&lt;$fh&gt;);
+         $iofh-&gt;seek(0,0);
+         $update-&gt;table($table, $iofh);
+         }
+     } else {
+         print "Skipping table $table...\n";
+     }
+     }
+     print "Done&lt;/pre&gt;\n";
+ }
+
+ print $q-&gt;end_html();
+
+=cut
+</pre>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

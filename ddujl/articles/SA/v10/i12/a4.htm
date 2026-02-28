@@ -1,0 +1,800 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v10, i12: Implementing Kerberos</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a4_s1.htm">Sidebar</a></span></td>
+		<td><a href="../../../../source/SA/2001/dec2001.tar"><b class=codeListing>dec2001.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <H1><img src="a4.gif" width="200" height="174" align="right">Implementing 
+              Kerberos </h1>
+            <p> <i>David Smith</i>
+            <p> Kerberos is the mythical three-headed dog guarding the gates of 
+              the underworld. It has long been a symbol of unceasing vigilance 
+              and was therefore selected as the name of the authentication service 
+              for MIT's Project Athena (a collaboration among IBM, DEC, and MIT 
+              to develop a ubiquitous networking service for undergraduates at 
+              MIT). Project Athena included such innovations as the X Window system, 
+              a Directory service named Hesiod, and a messaging service named 
+              Zephyr, but only X and Kerberos have become prevalent outside MIT.
+            <p> Kerberos was designed for an environment with insecure workstations, 
+              an insecure network, and moderately secure servers. These assumptions 
+              are paralleled in the current Internet, making Kerberos an effective 
+              authentication service in modern distributed environments. It is 
+              not, however, a complete security service: Kerberos provides for 
+              authentication, not authorization or accounting, and is not easily 
+              extensible to multi-domain environments. The latter issue is being 
+              addressed by current work incorporating PKI support into Kerberos, 
+              but at present cross-realm authentication needs to be performed 
+              by explicitly extending trust between two Key Distribution Centers 
+              (KDC).
+            <p> Enhancements in Kerberos V allow hierarchical cross-realm trust 
+              using transitive trust between different domains. With this architecture, 
+              a KDC in realm PLEAIDES.TAURUS.TEST can have a cross-realm trust 
+              extended to TAURUS.TEST and will inherit trust to other subdomains 
+              of TAURUS.TEST.
+            <p> In this article, I will demonstrate how to implement Kerberos 
+              on multiple operating systems and discuss some of the issues that 
+              arise when using "kerberized" applications. I will begin with a 
+              discussion of the terminology and roles involved in a Kerberos system, 
+              following with the network design for the test domain and the actual 
+              implementation steps. For this article, I am using the Kerberos 
+              Version 5 distribution obtained from MIT:
+            <p> 
+            <pre>
+http://web.mit.edu/network/kerberos-form.html
+</pre>
+            This site provides binaries and sources for destinations in the United 
+            States and Canada; exportable versions for use by individuals in other 
+            countries are available at: 
+            <p> 
+            <pre>
+http://www.crypto-publish.org
+</pre>
+            <b>Protocol</b>
+            <p> Kerberos is a method to distribute session keys for use in encrypting 
+              traffic between two entities in a network. These session keys include 
+              a timestamp so that they are valid for a limited duration (preventing 
+              replay attacks), and are provided by a Key Distribution Center (KDC). 
+              The KDC must be implemented on a secure platform, because it holds 
+              the identities of all parties involved in the Kerberos system. The 
+              KDC contains two services: an Authentication Service that handles 
+              the initial request and a Ticket Granting Service that makes use 
+              of an encrypted channel for requests to other services. It should 
+              not be used for other services because of the danger that those 
+              services might compromise the Kerberos database. If we use the example 
+              of one party, Alice attempting to access a service on the system 
+              named Bob, the protocol takes the following steps:
+            <p> 
+            <p> 1 Alice requests access to the Ticket Granting Server (TGS) from 
+              the KDC in plaintext.
+            <p> 2 The KDC sends a session key for the TGS (encrypted in Alice's 
+              secret key).
+            <p> 3. Alice uses the session key to get a Ticket Granting Ticket 
+              (TGT) from the TGS and subsequently uses that session key and the 
+              TGT to obtain tickets for new services. This prevents her from having 
+              to continually send traffic encrypted in her secret key (which gives 
+              more data to brute-force decoding attack).
+            <p> 4. When Alice requests a service on Bob, she sends a request to 
+              the TGS encrypted with her session key that contains her TGT, a 
+              newly constructed Authenticator to identify her, and the service 
+              identifier for Bob.
+            <p> 5. The TGS returns a ticket valid for use with Bob and also a 
+              new session key to use when communicating with Bob, encrypted in 
+              the session key for the TGS.
+            <p> 6. Alice sends the Ticket (which includes the specific service 
+              requested) and her Authenticator for that ticket to Bob.
+            <p> 7. Bob decrypts the ticket (which is encrypted with Bob's secret 
+              key), and extracts the session key for the session with Alice. Bob 
+              uses the session key to decrypt the authenticator received from 
+              Alice. 
+            <p> 
+            <p> The Kerberos protocol ends at this point, with Alice and Bob mutually 
+              authenticated (since only the true Bob could decrypt the Ticket), 
+              and with a randomly generated session key they can use to encrypt 
+              further traffic for the service. Each service needs to have its 
+              own session key, although different applications might use the same 
+              principals to create their unique session keys.
+            <p> This protocol design has several implications. First, the KDC 
+              must be kept secure and highly available. Kerberos includes the 
+              concept of master/slave KDCs so that there is no single point of 
+              failure. Each service that uses Kerberos must be "kerberized" so 
+              that the initial connection makes use of the TGT to authenticate 
+              and provide the session keys to encrypt traffic. Thus, Kerberos 
+              cannot be used transparently to a non-kerberized application (such 
+              as can be done with SSH). As a growing number of applications are 
+              kerberized, however, this issue is becoming less important.
+            <p> <b>Implementation Steps</b>
+            <p> Kerberos implementation involves several steps. Before installing 
+              the software it is necessary to design the Kerberos realm, the server 
+              locations, and ancillary services to keep the KDC functional. Then, 
+              the applications to be kerberized must be identified and integrated 
+              with the Kerberos system. Finally, the principals must be named 
+              and registered in the Kerberos database.
+            <p> For Kerberos to prevent replay attacks, each ticket and authenticator 
+              is timestamped. Therefore, all principals in a Kerberos realm must 
+              have a consistent value for the current time. This requires a time 
+              service available to all hosts in the realm (and consistent with 
+              the time used in other realms). I have used NTP for this purpose 
+              and installed NTP clients on all the systems with a local NTP server 
+              synchronized with the NTP network.
+            <p> <b>Realm Design</b>
+            <p> Kerberos is divided into realms, each a self-contained implementation 
+              of a KDC (including an Authentication service and a TGS on the same 
+              system) with a set of registered principals. Originally, realm lookup 
+              was performed by defining the realm/DNS domain correspondence in 
+              a configuration file. But in Kerberos V, it is possible to use new 
+              DNS SRV records to locate Kerberos realms and principles using DNS. 
+              Kerberos V defaults to looking up KDCs through DNS, but requires 
+              explicit configuration to look up realms from DNS names. MIT states 
+              that the latter is more prone to spoofing and does not recommend 
+              it for sites accessible from the Internet. However, both realm and 
+              KDC lookups through DNS were used by Microsoft in their implementation 
+              for Windows 2000. Therefore, both will be used in this article to 
+              transparently integrate Windows 2000 clients into a Kerberos realm.
+            <p> Each realm is named with a unique name, by convention an uppercase 
+              version of the DNS domain. For example, in the domain taurus.test, 
+              the Kerberos realm should be named TAURUS.TEST. If multiple realms 
+              are required in an organization, use descriptive names ending with 
+              the domain name, such as PLEAIDES.TAURUS.TEST. The names of realms 
+              and the KDCs for each realm can be defined in a configuration file 
+              on each system, or provided by special DNS records. Although realms 
+              are not hierarchical (where a realm named PLEAIDES.TAURUS.TEST would 
+              be a subsidiary of the TAURUS.TEST realm), the integration with 
+              DNS allows for realm lookups to be made through the DNS hierarchy. 
+              Kerberos V also allows transitive trust to be created between subdomains 
+              and their parent zones, extending trust to other subdomains of a 
+              common parent.
+            <p> Each client will look for a TXT record in the DNS records for 
+              a target host. If there is a record in the host name or in any zone 
+              containing that host with the first component of "_kerberos", then 
+              the rest of the TXT record is taken as the name of the realm. This 
+              allows multiple domains to be managed as a single realm, or separate 
+              hosts within a domain to be managed in separate realms.
+            <p> Each realm then has a DNS style name; and, in the zone records 
+              for that domain, special SRV records identify the master and slave 
+              KDCs and the Kerberos admin server. These services are defined as 
+              follows:
+            <p> 
+            <p> 
+            <ul>
+              <li> <b>_kerberos._udp</b> -- This identifies the Kerberos service 
+                on any KDC, both master and slave servers. Only active servers 
+                should be included in this list; if the Kerberos daemon is not 
+                running, the server name should be removed. 
+              <li> <b>_kerberos-master._udp</b> -- This identifies Kerberos service 
+                on the master KDC, so that a client can make a final decision 
+                on authenticating a user where they may have changed their password 
+                but not had enough time for the change to propagate. 
+              <li> <b>_kerberos-adm._tcp</b> -- This identifies a server running 
+                the kadmind program. Only the master KDC runs this program, which 
+                is used to modify the Kerberos database. At present, the kadmin 
+                program still needs to look up the admin server using the <b>krb5.conf</b> 
+                file, but other applications such as Windows 2000 expect to use 
+                the DNS records. 
+              <li> <b>_kpasswd._udp</b> -- This identifies the KDC where password 
+                changes can be recorded.
+            </ul>
+            <p> MIT recommends that the KDCs be named with aliases that can be 
+              used in the <b>krb5.conf</b> files as well. These aliases should 
+              be kerberos for the master KDC and kerberos-1, kerberos-2 for all 
+              slave KDCs. These aliases are <i>not</i> used in the DNS implementation, 
+              which must use the true name of the host in the SRV record. Therefore, 
+              while the use of "kerberos" aliases should be continued to support 
+              transparent failover for Kerberos IV clients, both the aliases and 
+              the canonical names must be registered as principals in the Kerberos 
+              realm.
+            <p> For this project, I configured a realm named TAURUS.TEST with 
+              the master KDC named aldebaran.taurus.test, a slave KDC (also supporting 
+              SMB) named ain.taurus.test, and several clients in the domain pleaides.taurus.test. 
+              Aldebaran is a 100-MHz Pentium running BSD/OS Version 3.0, ain is 
+              an 350-MHz Intel Pentium III, while the client systems range from 
+              a Motorola StarMax 3000 running Mac OS 9.1 to a 500-MHz Pentium 
+              III running Windows 2000.
+            <p> The DNS zone for taurus.test therefore includes the following 
+              records:
+            <p> 
+            <pre>
+$TTL 86400
+@    SOA   ain.taurus.test.   root.ain.taurus.test. (
+                2001080805 ; serial
+                10800      ; refresh
+                3600       ; retry
+                3600000    ; expire
+                86400 )    ; minimum
+
+
+     NS   ain.taurus.test.
+
+
+
+ain  A    192.168.1.1
+kerberos-1 CNAME ain
+
+
+hyadum    A    192.168.1.2
+alcyone   A    192.168.1.10
+taygeta   A    192.168.1.41
+aldebaran A    192.168.1.25
+kerberos CNAME aldebaran
+
+
+electra.pleaides A  192.168.1.30
+merope.pleaides     A    192.168.1.35
+
+
+_kerberos      TXT  "TAURUS.TEST"
+_kerberos._udp      SRV  0 0 88 aldebaran
+_kerberos-master._udp    SRV  0 0 88 aldebaran
+_kerberos-adm._tcp  SRV  0 0 749 aldebaran
+_kpasswd._udp       SRV  0 0 464 aldebaran
+</pre>
+            <b>Source Configuration and Installation</b>
+            <p> I downloaded the Kerberos V 1.2.2 source from MIT into <b>/usr/local/src</b> 
+              on aldebaran. The source for 1.2.2 comes in one gzipped tar file 
+              that unpacks into the krb5-1.2.2 directory tree. This tree includes 
+              the doc and src subtrees.
+            <p> For cross-platform builds, Kerberos supports an object tree so 
+              that one source tree can be used by multiple systems. The Kerberos 
+              source includes the client utilities required to communicate to 
+              the KDC and the libraries needed by kerberized applications. Support 
+              for Kerberos IV clients is normally provided (except by Windows 
+              2000) so that older clients can use a Kerberos V server for authentication. 
+              Because of the number of different operating systems in this test 
+              network, I exported the Kerberos source tree so that executables 
+              for each system could be built from a centralized resource.
+            <p> Most operating systems (including OpenBSD) ship with Kerberos 
+              IV, not Kerberos V. Kerberos IV has known buffer overflow vulnerabilities 
+              and is no longer supported by MIT. Therefore, I obtained the latest 
+              source from MIT. Even with a current version of the operating system, 
+              I recommend obtaining the source from MIT to stay up to date with 
+              patches and bug fixes. Kerberos requires a working C compiler, GNU 
+              make, GNU bison, and, for testing, Perl and Tcl.
+            <p> Kerberos uses the GNU configure script to tailor the source for 
+              each platform. By default, DNS resolution of Kerberos realms is 
+              not enabled (because of concern for spoofing), so it will need to 
+              be enabled. Also, different operating systems have specific requirements 
+              that are identified in the Installation guide (unpacked into the 
+              doc directory and available on the MIT site). The default destination 
+              prefix is <b>/usr/local</b>, and the default KDC database directory 
+              is <b>$PREFIX/var/krb5kdc</b>.
+            <p> The makefiles include a target for testing the software, so it 
+              is important to run "make check" to verify that the code works before 
+              installing it. The default tests merely check that the components 
+              are built correctly, but support for the DejaGNU test suite is integrated 
+              and if present, will test Kerberos client/server interaction. I 
+              built Kerberos on BSD/OS with the following commands (when mounted 
+              from the appropriate operating system:
+            <p> 
+            <pre>
+% PWD=/usr/local/obj
+% /usr/local/src/krb5-1.2.2/src/configure --enable-dns
+% make
+% make check
+% make install
+</pre>
+            <b>KDC Configuration</b>
+            <p> Once the software is built and installed, the KDC must be configured. 
+              This is done by initializing the database, adding administrators 
+              and configuring master and slave KDCs. The configuration files on 
+              the KDC servers define the location for the realm databases and 
+              the default lifetimes for tickets. The configuration files are text 
+              files structured similar to Microsoft .INI files. The kdc.conf file 
+              is found on all KDCs in a Kerberos realm (usually located in the 
+              Kerberos directory /var/krb5kdc/ and in this implementation contains 
+              the following information:
+            <p> 
+            <pre>
+[kdcdefaults]
+  kdc_ports = 88,750 # this supports the V5 (88) and V4 (750) clients
+[realms]
+  TAURUS.TEST = {
+     database_name = /usr/local/var/krb5kdc/principal
+     admin_keytab = /usr/local/var/krb5kdc/kadm5.keytab
+     acl_file = /usr/local/var/krb5kdc/kadm5.acl
+     dict_file = /usr/local/var/krb5kdc/kadm5.dict
+     key_stash_file = /usr/local/var/krb5kdc/.k5.TAURUS.TEST
+     kadmind_port = 749
+     max_life = 10h 0m 0s
+     max_renewable_life = 7d 0h 0m 0s
+     master_key_type = des3-hmac-sha1
+     supported_enctypes = des3-hmac-sha1:normal \
+       des-cbc-crc:normal des-cbc-crc:v4
+   kdc_supported_enctypes = des3-hmac-sha1:normal \
+       des3-cbc-crc:normal des-\cbc-crc:normal
+   }
+</pre>
+            The <b>krb5.conf</b> file is located in <b>/etc</b> for all Kerberos 
+            V systems. Although DNS support has reduced the need for some sections 
+            of the <b>krb5.conf</b> file, that file is used to define defaults 
+            for Kerberos applications and is therefore a requirement for every 
+            host in a Kerberos realm. For most Kerberos hosts it is only necessary 
+            to keep the <b>[libdefaults]</b> stanza, adding the <b>[realms]</b> 
+            stanza with the <b>admin_server</b> option if access to the Kerberos 
+            admin tool is required from that host. For the KDC (master and slave), 
+            it contains the following:
+            <p> 
+            <pre>
+[libdefaults]
+    ticket_lifetime = 600
+    default_realm = TAURUS.TEST
+    default_tkt_enctypes = des3-hmac-sha1 des-cbc-crc
+    default_tgs_enctypes = des3-hmac-sha1 des-cbc-crc
+[realms]
+    TAURUS.TEST = {
+       admin_server = kerberos.taurus.test:749
+}
+
+[logging]
+    kdc = FILE:/var/log/krb5kdc.log
+    admin_server = FILE:/var/log/kadmin.log
+    default = FILE:/var/log/krb5lib.log
+</pre>
+            Once these two files are created, the database must be initialized. 
+            That is performed with the command <b>kdb5_util</b>:
+            <p> 
+            <pre>
+% /usr/local/sbin/kdb5_util create -r TAURUS.TEST -s
+Initializing database '/usr/local/var/krb5kdc/principal' for =&gt; \ 
+   realm 'TAURUS.TEST', master key name 'K/M@TAURUS.TEST'
+You will be prompted for the database Master Password.
+It is important that you NOT FORGET this password.
+Enter KDC database master key: &lt;type the master password&gt;
+Re-enter KDC database master key to verify: &lt;again&gt;
+%
+</pre>
+            This creates the principal database. Because all the credentials are 
+            stored in this database, it is imperative to keep the password for 
+            this database secure. By default, the files created by this command 
+            are kept in <b>/usr/local/var/krb5kdc</b> and include the database 
+            itself (principal and principal.ok), the administrative files (principal.kadm5.*), 
+            and the stash file (.k5.&lt;&lt;REALM&gt;&gt;). The stash file is 
+            used to provide the master password to the Kerberos daemon at system 
+            startup. It is not necessary if the startup procedure is designed 
+            to prompt for the password at system initialization. Although the 
+            password is encrypted and the file is protected, truly paranoid sites 
+            may want to not use it at all. It is created with the <b>-s</b> switch 
+            to the <b>kdb5_util create</b> command.
+            <p> The next step is to create an administrator and add it to the 
+              ACL file. The ACL file is defined in krb.conf and is named by default 
+              "kadm5.acl". The format is:
+            <p> 
+            <pre>
+Kerberos principal  permissions    optional target principal
+</pre>
+            The only entry required at this time is for an administrator. This 
+            file controls access to the Kerberos database so ordinary users do 
+            not need to be mentioned in it. Because the file syntax allows wildcard 
+            entries, I prepared an initial file allowing all administrators in 
+            the realm to have complete access to the database:
+            <p> 
+            <pre>
+*/admin@TAURUS.TEST *
+</pre>
+            Now we can create the initial administrator on the master KDC using 
+            the kadmin.local program. Both kadmin and kadmin.local perform the 
+            same functions, but kadmin.local is only available on the master KDC. 
+            Kadmin is available on any Kerberos system and allows for remote management. 
+            We need to create the first administrator locally so that we can use 
+            that principal to create slave servers.
+            <p> 
+            <pre>
+% /usr/local/sbin/kadmin.local
+kadmin.local: addprinc admin/admin@TAURUS.TEST
+WARNING: no policy specified for "admin/admin@TAURUS.TEST"; \
+   defaulting to no policy
+Enter password for principal admin/admin@TAURUS.TEST: &lt;password&gt;
+Re-enter password for principal admin/admin@TAURUS.TEST: &lt;again&gt;
+Principal "admin/admin@TAURUS.TEST" created.
+kadmin.local:
+</pre>
+            Before exiting from kadmin.local, it is necessary to create the keytab 
+            files for the special principals "kadmin/admin" and "kadmin/changepw". 
+            This is done with the following commands (a backslash shows where 
+            two lines should be typed as one):
+            <p> 
+            <pre>
+kadmin.local: ktadd -k /usr/local/var/krb5kdc/kadm5.keytab \
+        kadmin/admin kadmin/changepw
+Entry for principal kadmin/admin with kvno 3, encryption type
+        Triple DES cbc mode with HMAC/sha1 added to keytab
+        WRFILE:/usr/local/var/krb5kdc/kadm5.keytab.
+Entry for principal kadmin/admin with kvno 3, encryption type
+        DES cbc mode with CRC-32 added to keytab
+        WRFILE:/usr/local/var/krb5kdc/kadm5.keytab.
+Entry for principal kadmin/changepw with kvno 3, encryption type
+        Triple DES cbc mode with HMAC/sha1 added to keytab
+        WRFILE:/usr/local/var/krb5kdc/kadm5.keytab.
+Entry for principal kadmin/changepw with kvno 3, encryption type
+        DES cbc mode with CRC-32 added to keytab
+        WRFILE:/usr/local/var/krb5kdc/kadm5.keytab.
+</pre>
+            Now, the KDC and Kerberos admin server can be started:
+            <p> 
+            <pre>
+% /usr/local/sbin/krb5kdc
+% /usr/local/sbin/kadmind
+</pre>
+            Each program will run as a daemon. These commands should be added 
+            to the appropriate startup file for the system (<b>/etc/init.d/krb5</b> 
+            for Red Hat, <b>/etc/rc.local</b> for BSD systems). Starting automatically 
+            will require a stash file. After starting, the log files should be 
+            checked to verify that they started correctly. The file krb5kdc.log 
+            showed "commencing operation" as the last line, while the file kadmind.log 
+            showed "starting".
+            <p> <b>Adding Slave Servers</b>
+            <p> The slave servers now need to be configured. Assuming that the 
+              Kerberos software has been compiled and installed on the slave server, 
+              the slaves must be created as Kerberos principals. They must also 
+              have their keytabs extracted, installed locally, and configured 
+              for database propagation.
+            <p> Each host in a Kerberos system needs to be defined as a principal 
+              in the Kerberos database and have its secret key extracted to a 
+              keytab file stored locally. The keytab file holds an encrypted copy 
+              of the host's password, but it must be protected from unauthorized 
+              access by making it unreadable by anyone but root and excluded from 
+              all backups. Both the canonical name and the Kerberos alias must 
+              be added as principals for the master and slave servers, and keytabs 
+              for both names must be stored locally. Additionally, the host's 
+              idea of its own name must match the principal name as a fully qualified 
+              domain name. On Linux systems, this is done making FQDN the first 
+              entry in the <b>/etc/hosts file</b> (where the hostname is picked 
+              up). Other operating systems will have different techniques.
+            <p> On aldebaran.taurus.test (Kerberos), run the following as root:
+            <p> 
+            <pre>
+% /usr/local/sbin/kadmin -p admin/admin
+Password: &lt;enter admin password&gt;
+kadmin: addprinc -randkey host/aldebaran.taurus.test
+WARNING: no policy specified for "host/aldebaran.taurus.test@TAURUS.TEST"; \
+   defaulting to no policy.
+kadmin: ktadd host/aldebaran.taurus.test
+kadmin: Entry for principal host/aldebaran.taurus.test@TAURUS.TEST with kvno
+3, encryption type Triple DES cbc mode with HMAC/sha1 added to keytab WRFILE:
+/etc/krb5.keytab.
+kadmin: Entry for principal host/aldebaran.taurus.test@TAURUS.TEST with kvno
+3, encryption type DES cbc mode with CRC-32 added to keytab WRFILE:
+/etc/krb5.keytab.
+kadmin: addprinc -randkey host/kerberos.taurus.test
+WARNING: no policy specified for "host/kerberos.taurus.test@TAURUS.TEST"; \
+   defaulting to no policy.
+kadmin: ktadd host/kerberos.taurus.test
+kadmin: Entry for principal host/kerberos.taurus.test@TAURUS.TEST with kvno
+3, encryption type Triple DES cbc mode with HMAC/sha1 added to keytab WRFILE:
+/etc/krb5.keytab.
+kadmin: Entry for principal host/kerberos.taurus.test@TAURUS.TEST with kvno
+3, encryption type DES cbc mode with CRC-32 added to keytab WRFILE:
+/etc/krb5.keytab.
+kadmin:
+</pre>
+            Do the same on the slave server, ain.taurus.test (kerberos-1):
+            <p> 
+            <pre>
+% /usr/local/sbin/kadmin -p admin/admin
+Password: &lt;enter admin password&gt;
+kadmin: addprinc -randkey host/ain.taurus.test
+WARNING: no policy specified for "host/ain.taurus.test@TAURUS.TEST"; \
+   defaulting to no policy.
+kadmin: ktadd host/ain.taurus.test
+kadmin: Entry for principal host/ain.taurus.test@TAURUS.TEST with kvno 3, \
+   encryption type Triple DES cbc mode with HMAC/sha1 added to keytab WRFILE: /etc/krb5.keytab.
+kadmin: Entry for principal host/ain.taurus.test@TAURUS.TEST with kvno 3, \
+   encryption type DES cbc mode with CRC-32 added to keytab WRFILE: /etc/krb5.keytab.
+kadmin: addprinc -randkey host/kerberos-1.taurus.test
+WARNING: no policy specified for "host/kerberos-1.taurus.test@TAURUS.TEST"; \
+   defaulting to no policy.
+kadmin: ktadd host/kerberos-1.taurus.test
+kadmin: Entry for principal host/kerberos-1.taurus.test@TAURUS.TEST with \
+   kvno 3, encryption type Triple DES cbc mode with HMAC/sha1 added to \
+   keytab WRFILE: /etc/krb5.keytab.
+kadmin: Entry for principal host/kerberos-1.taurus.test@TAURUS.TEST with \
+   kvno 3, encryption type DES cbc mode with CRC-32 added to keytab \
+   WRFILE: /etc/krb5.keytab.
+kadmin:
+</pre>
+            Now we can enable propagation of the database from the master to the 
+            slave KDCs. This process will eventually need to be performed as a 
+            cron job, but the initial stage will perform it manually. First, each 
+            KDC needs an acl file for propagation (by default named <b>/usr/local/var/krb5kdc/kpropd.acl</b>, 
+            containing the principals for each of the KDCs:
+            <p> 
+            <pre>
+host/kerberos.taurus.test@TAURUS.TEST
+host/kerberos-1.taurus.test@TAURUS.TEST
+</pre>
+            The propagation daemon needs to be added to <b>/etc/inetd.conf</b> 
+            as follows:
+            <p> 
+            <pre>
+krb5_prop stream tcp nowait root /usr/local/sbin/kpropd kpropd
+eklogin     stream tcp nowait root /usr/local/sbin/klogind \
+     klogind -k -c -e
+</pre>
+            The following services must also be defined in the <b>/etc/services</b> 
+            file:
+            <p> 
+            <pre>
+kerberos       88/udp
+kerberos       88/tcp
+krb5_prop     754/tcp
+kerberos-adm  749/tcp
+kerberos-adm  749/udp
+eklogin      2105/tcp
+</pre>
+            The dump propagation is done on the master KDC with the following 
+            commands:
+            <p> 
+            <pre>
+% /usr/local/sbin/kdb5_util dump /usr/local/var/krb5kdc/slave_datatrans
+% /usr/local/sbin/kprop -f/usr/local/var/krb5kdc/ \
+   slave_datatrans kerberos-1.taurus.test
+</pre>
+            If successful, the kprop command will print "Database propagation 
+            to kerberos-1.taurus.test: SUCCEEDED", and the slave will have a current 
+            copy of the <b>/usr/local/var/krb5kdc/principal</b> databases. Some 
+            common causes for failure are the inclusion of hosts in the _kerberos._udp 
+            SRV records that are not running the krb5kdc program, or a hostname 
+            on the slave that is not listed in the known Kerberos principals. 
+            The Kerberos distribution includes a shell script, krb5-1.2.2/src/slave/kslave_update, 
+            that can be started as a cron job to automatically propagate the database 
+            to a named slave KDCs.
+            <p> It is now possible to create a stash file for the slave KDC and 
+              to start the krb5kdc daemon. The kadmind daemon is only started 
+              on the master server.
+            <p> 
+            <pre>
+% /usr/local/sbin/kdb5_util stash
+kdb5_util: Cannot read/find stored master key while reading master key
+kdb5_util: Warning: proceeding without master key
+Enter KDC database master key: &lt;Enter database password&gt;
+%/usr/local/sbin/krb5kdc
+%
+</pre>
+            Once the Kerberos daemon is restarted, the slave server can be added 
+            to the _kerberos._udp SRV record in the DNS, and the DNS can be restarted.
+            <p> <b>Adding Principals</b>
+            <p> A Kerberos principal is a person or host known to the Kerberos 
+              system. A principal's name is typically divided into three parts: 
+              PRIMARY/INSTANCE@REALM, although the instance portion is optional. 
+              For example, a host would use the format host/hostname.domain@REALM 
+              (although the REALM can be implied), while an individual would typically 
+              leave off the instance, simply using person@REALM. Microsoft, however, 
+              does not support this structure and requires a different format 
+              for cross-platform integration.
+            <p> In Kerberos, only hosts that supply services need to be registered 
+              as principals. Since services include telnet, ftp, and the Berkeley 
+              r* commands (as well as ssh). In practice, most UNIX hosts will 
+              need to be registered. However, Windows and Macintosh hosts do not 
+              need to be registered unless they are providing file services. As 
+              described above, a host is typically registered by running the kadmin 
+              program on it, creating the principal and exporting its host key 
+              to the local keytab file. In this process, we rely on Kerberos to 
+              generate a random key for the host password:
+            <p> 
+            <pre>
+myhost % /usr/local/sbin/kadmin -p admin/admin
+Password: &lt;enter admin password&gt;
+kadmin: addprinc -randkey host/myhost.taurus.test
+WARNING: no policy specified for "host/myhost.taurus.test@TAURUS.TEST";
+defaulting to no policy.
+kadmin: ktadd host/myhost.taurus.test
+kadmin: Entry for principal host/myhost.taurus.test@TAURUS.TEST with kvno 3,
+encryption type Triple DES cbc mode with HMAC/sha1 added to keytab WRFILE:
+/etc/krb5.keytab.
+kadmin: Entry for principal host/myhost.taurus.test@TAURUS.TEST with kvno 3,
+encryption type DES cbc mode with CRC-32 added to keytab WRFILE:
+/etc/krb5.keytab.
+kadmin: exit
+myhost %
+</pre>
+            Windows 2000 servers do not support the ktadd command, so they are 
+            created differently. According to Microsoft, the process for integrating 
+            a Windows 2000 workstation in an existing Kerberos realm requires 
+            the following steps:
+            <p> 
+            <p> 1. Add the Windows 2000 workstation as a principal in the realm.
+            <p> 2. Identify the realm and KDC to the workstation. 
+            <p> 3. Map the usernames to principals in the realm for single sign-on.
+            <p> 
+            <p> The first step is performed in the Kerberos realm using kadmin:
+            <p> 
+            <pre>
+% kadmin
+kadmin: ank -pw &lt;password&gt; host/merope.pleaides.taurus.test
+WARNING: no policy specified for \
+   host/merope.pleaides.taurus.test@TAURUS.TEST; \
+   defaulting to no policy
+Principal "host/merope.pleaides.taurus.test@TAURUS.TEST" created
+kadmin:
+</pre>
+            The next two steps are performed on the Windows 2000 workstation. 
+            Microsoft supplies the commands <b>ksetup</b> and <b>ktpass</b> for 
+            this purpose. Although they are not installed by default, they can 
+            be added from the Windows 2000 distribution media by running SETUP 
+            from the \support\tools\ directory on the CD. The tools are placed 
+            in the directory \Program Files\Support Tools\, which is added to 
+            the path after rebooting.
+            <p> 
+            <pre>
+C:&gt; ksetup /setdomain TAURUS.TEST
+C:&gt; ksetup /addkdc TAURUS.TEST kerberos.taurus.test
+C:&gt; ksetup /setmachpassword &lt;password&gt; #use the same one as above
+</pre>
+            It is now necessary to restart the Windows 2000 workstation. After 
+            it reboots, the command to map users can be issued and Windows will 
+            use the Kerberos V KDC for authentication. Multiple maps can be provided, 
+            including wildcards. In this example, we map the Kerberos admin user 
+            to Administrator and all others to corresponding local users. Note 
+            that the use of instances in a principal name for users is not supported 
+            by Windows (the slash is interpreted as an NT domain).
+            <p> 
+            <pre>
+C:&gt; ksetup /mapuser admin@TAURUS.TEST Administrator
+C:&gt; ksetup /mapuser * *
+</pre>
+            Microsoft does not have a kadmin client and, therefore, does not provide 
+            an encrypted channel over which to transmit host keys. Thus, it is 
+            necessary to explicitly specify the machine password when adding it 
+            to the Kerberos V database.
+            <p> <b>Users</b>
+            <p> Each user in a Kerberos system must be defined as a principal. 
+              Most individual users would be created without an instance, but 
+              it is useful to include instances where a user performs multiple 
+              roles. For example, an individual might have a principal record 
+              of joe@taurus.test, but also have a principal for administrative 
+              use stored as joe/admin@taurus.test. This latter record would match 
+              the administrative ACL file, kadmin.acl, as defined above that allowed 
+              all "*/admin@taurus.net" users full administrative access to the 
+              system.
+            <p> <b>Kerberized Applications</b>
+            <p> Kerberos would not be much use without a way to integrate it into 
+              applications. The standard distribution includes the following applications, 
+              which would replace the non-kerberized versions in <b>/etc/inetd.conf</b> 
+              on Kerberos hosts:
+            <p> 
+            <pre>
+ftpd
+klogind
+kshd
+telnetd
+</pre>
+            These programs are in <b>/usr/local/sbin</b>, and the corresponding 
+            client applications are in <b>/usr/local/bin</b>. Those directories 
+            should be placed ahead of the <b>/usr/bin</b> and <b>/usr/sbin</b> 
+            directories in standard PATH variables. Besides these applications, 
+            Kerberos clients also include the following programs:
+            <p> 
+            <p> 
+            <ul>
+              <li> login.krb5 -- A login program to allow single sign-on. 
+              <li> kinit -- Obtains tickets for you. 
+              <li> klist -- Lists currently held tickets. 
+              <li> kdestroy -- Destroys your tickets (should be run automatically 
+                on logout). 
+              <li> kpasswd -- Changes your password on the KDC. 
+              <li> ksu -- Changes your default principal (like su but referring 
+                to the KDC). 
+            </ul>
+            <p> <b>Kerberos IV Integration</b>
+            <p> Since many platforms have Kerberos IV clients and it may be impossible 
+              to upgrade them to Kerberos V, I will show how to configure a Kerberos 
+              IV client to communicate with the Kerberos V server. The client 
+              configuration files are stored in <b>/etc/kerberosIV</b> and named 
+              krb.conf and krb.realms. They must have entries that define the 
+              default realm and identify the KDCs for that realm. Krb.conf should 
+              define the local realm in the first line and follow that by any 
+              number of lines defining realm/host entries. In TAURUS.TEST, a Kerberos 
+              IV krb.conf file will look like this:
+            <p> 
+            <pre>
+TAURUS.TEST
+TAURUS.TEST   kerberos.taurus.test server admin
+TAURUS.TEST   kerberos-1.taurus.test server
+</pre>
+            The krb.realms file provides a way to translate from a host name to 
+            a realm name without implicitly matching them to the DNS domain. It 
+            contains lines of the form:
+            <p> 
+            <pre>
+host_name    kerberos_realm
+domain_name  kerberos_realm
+</pre>
+            where a domain name is identified by an initial dot (.) before the 
+            domain. A krb.realm file for TAURUS.TEST would therefore be:
+            <p> 
+            <pre>
+taurus.test  TAURUS.TEST
+.taurus.test TAURUS.TEST
+</pre>
+            This will cover both the domain name and any hosts listed within that 
+            domain. With this configuration, a user can run the Kerberos IV client 
+            packages available under operating systems such as OpenBSD. To run 
+            kerberized services it is still necessary to upgrade to Kerberos V.
+            <p> <b>Server Management</b>
+            <p> Because the KDC is a critical component of a Kerberos system, 
+              it must be closely protected. MIT recommends that <b>/etc/inetd.conf</b> 
+              be limited to the following services to control access to the KDC:
+            <p> 
+            <pre>
+time   stream tcp nowait root internal
+time   dgram    udp nowait root internal
+krb5_prop stream tcp nowait root /usr/local/sbin/kpropd kpropd
+eklogin     stream tcp nowait root /usr/local/sbin/klogind \
+     klogind -k -c -e
+</pre>
+            The eklogin service requires an encrypted session and will reject 
+            a non-encrypted rlogin attempt. To connect to the KDC, it is necessary 
+            to issue the following commands:
+            <p> 
+            <pre>
+% kinit
+Password for dsmith@TAURUS.TEST: &lt;enter password&gt;
+% rlogin -x aldebaran.taurus.test
+</pre>
+            <b>Kerberos Resources</b>
+            <p> MIT has an extensive Kerberos Web site at:
+            <p> 
+            <pre>
+http://web.mit.edu/kerberos/www
+</pre>
+            The FAQ from that site provides additional information including some 
+            information about connections to Windows 2000. Microsoft also has 
+            an extensive set of pages on Kerberos under Windows 2000, including 
+            step-by-step instructions for interoperability:
+            <p> 
+            <pre>
+http://www.microsoft.com/windows2000/techinfo/planning/security/kerbsteps.asp
+</pre>
+            They do not provide any information about configuring NT 4.0 clients 
+            to support Kerberos.
+            <p> Cygnus developed a Kerberos implementation (based in Kerberos 
+              IV) for Windows NT that integrated the login screen to a KDC, but 
+              it required the Cygwin libraries and is no longer available from 
+              Cygnus. It has been mirrored in several locations and can now be 
+              obtained from the site <b>crypto.radius.net</b>. The Kerberos protocol 
+              is defined in RFC 1510.
+            <p> <i>David Smith has been programming for more than 30 years and 
+              has worked as a consultant for the last 10. He has designed access 
+              control systems and data transfer protocols for several applications 
+              on multiple platforms. He is currently an independent consultant 
+              and can be contacted at: <b>David.Smith@acm.org</b>.</i>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

@@ -1,0 +1,107 @@
+<HTML>   
+     <HEAD>
+<TITLE>July 2001 C++ Experts Forum/The (B)Leading Edge</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.07/tocjul.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">The (B)Leading Edge:  Using IOStreams &#151; Creating a Whole New Stream Class</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Jack W. Reeves</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>In this installment, I am going to continue my exploration of the Standard C++ library IOStreams class, only I am going to get a little further out in left field. (In fact, this is far enough out that it requires a very good version of the standard library &#151; I have had trouble making this work on more than one platform.)  First let me take a slight sidetrack. When I was first learning the new standard library, it rapidly became apparent that just about everything is a template. (You have probably noticed this also.) This made perfectly good sense for the containers, the algorithms, and by extension the iterators. After all, these were the components of the original Standard Template Library. It even seemed to make sense that the <b>string</b> class was a template that had to be specialized by its actual character type. After all, Standard C++ includes several character types.</p>
+<p>But originally I could not really understand the value of having the IOStreams library be template based. It seemed to me that ultimately you were going to generate a byte stream, so what was the point. Obviously, it made sense to have output operations for both regular character strings and wide character strings, but that could be accomplished with member template functions without parameterizing the entire library.</p> 
+<p>When I thought about it a little more, I realized that I was thinking at too low a level. I was also forgetting some details about how templates work. IOStreams are not really about generating or reading a byte stream, but instead are an abstraction that handles formatting data to/from character representations. Since C++ has different types of characters, it makes perfectly good sense that there should be I/O mechanisms that can read/write a <b>wchar_t</b> stream, as well as one that can handle ordinary characters. Templates in C++ provide a way of expressing this characteristic at the abstract level.</p> 
+<p>Once I got use to the idea of an IOStream being a parameterized type, I started wondering what other character types might make sense. One of the things I have been interested in from the first time I learned IOStreams was the possibility of using the same abstraction to handle network connections. This is obviously nothing new. Lots of different programmers and different libraries have created things like SocketStreams, PipeStreams, etc. Unfortunately, there are a couple of problems with using the IOStreams abstraction for network programming. The first is that the IOStreams abstraction works pretty well for the client side of a connection, but it is missing some fundamental operations necessary for the server side. This can be handled by adding the operations to the derived IOStreams class, but most designers quickly find that it makes more sense to have something like a Socket, Listener, or Acceptor class that handles the details of receiving a connection request. Once a connection is established, then it can be associated with some related type of IOStream in any of several different ways.</p>
+<p>There is a more fundamental problem with using IOStreams as an abstraction for network communications however. As I noted above, the basic abstraction of IOStreams is that of formatting data to/from a character stream. Unfortunately, most of the network programming I have done has involved some type of application-level protocol layered on top of the connection. Few of these protocols have been as simple as the formatting provided by IOStreams. In fact, many of the protocols that I have used have been binary protocols. As a result, I have usually found myself using a network stream basically in unformatted mode. This pretty much defeats the purpose of having an IOStream tied to a connection &#151; if I just want to do reads and writes, an ordinary Socket class can usually handle that just fine.</p> 
+<p>One of the binary protocols that I have used is the XDR protocol. If you are not familiar with this protocol, it is the presentation layer used by the RPC mechanism. One of the characteristics of this protocol is that all data types are represented by multiples of four-byte &quot;words.&quot; It occurred to me that these four-byte chunks of data could be thought of as the &quot;characters&quot; of the XDR protocol. From there I wondered if it would be possible to use the template mechanisms in the IOStreams library to create an IOStream abstraction that could handle reading and writing the XDR stream. This column describes what I have come up with so far. I have to note that I am still tweaking the code as I try this out on different platforms, and with different possible applications.</p> 
+
+<H3><FONT COLOR="#000080">XDR Basics</FONT></H3>
+
+<p>The XDR protocol is defined by RFC 1832 <a href="#4">[4]</a> and is really pretty simple. All data comes in four-byte chunks. XDR defines encoding schemes for the following basic types:</p> 
+
+<pre>int          &#151; encoded in 32 bit twos complement, big endian
+hyper int    &#151; encoded in 64 bit
+unsigned int
+unsigned hyper int
+float        &#151; encode in 32 bit, IEEE format, big endian
+double       &#151; encoded in 64 bit, IEEE format
+quadruple &#151; encoded in 128 bit
+enum         &#151; encoded same as int
+bool         &#151; encoded as 1 or 0 in int format
+opaque data (fixed length) &#151; encoded as stream of octets
+                             padded with nulls
+opaque data (variable length) &#151; encoded as &lt;length&gt;&lt;data&gt;
+array (fixed length)
+array (variable length) &#151; has &lt;length&gt; preceding data
+string       &#151; encoded as &lt;length&gt; followed by ASCII data
+</pre>
+
+<p>XDR also defines a discriminated union, which is encoded as you would expect</p>
+
+<pre>
+&lt;discriminate&gt;&lt;appropriate data&gt;
+</pre>
+
+<p>Note that XDR does not contain a <b>char</b> type. I will have more to say about this below.</p>
+
+<H3><FONT COLOR="#000080">XDR_Stream</FONT></H3>
+
+<p><a href="list1.htm">Listing 1</a> is the header file <b>XdrStream.h</b>. <b>XdrStream.cpp</b> is the implementation of the basic data types. <b>XdrStream_reader.cpp</b> contains the implementation of the <b>iXDR_Stream</b> class. <b>XdrStream_writer.cpp</b> is the implementation of the <b>oXDR_Stream</b> class, and the bi-directional <b>XDR_Stream</b> class.  <b>XdrStream.cpp</b>, <b>XdrStream_reader.cpp</b>, and <b>XdrStream_writer.cpp</b> are available for download from <a href="../../../source/2001/jul01/reeves.zip">reeves.zip</a>.</p> 
+<p>First let me describe the interfaces. The first thing I needed was a class to represent an XDR character.</p>
+
+<pre>struct XDR_Char {
+    unsigned char _data[4];
+    void swap_bytes();
+    void pad(int)
+};
+</pre>
+
+<p>Since <b>char</b>s on my platform are eight-bits long, this <b>struct</b> has the correct size for an XDR character. If your platform uses something other than eight-bit characters, you will have to adjust the definition of an <b>XDR_Char</b> accordingly.</p>
+
+<p>In order to use this class to specialize any of the templates in the IOStreams library, it should meet certain requirements. The Standard requires that it be a POD (Plain Old Data) class. What I have shown here is a POD <b>struct</b>. While the actual definition of a POD <b>struct</b> in the C++ Standard is pretty formal, the basic idea is that it has to act like a built-in type when it comes to construction, copying, and destruction. That means no private or protected data members; no user-defined constructors, destructor, or copy assignment operator; no data members or base classes that are not POD types; and no virtual functions. It is still possible to have member functions however.  Note: while the Standard requires a POD class, it may not work, depending upon how your version of the standard library is implemented. My implementation requires a way to construct an <b>XDR_Char</b> from a regular <b>char</b>. To do this, I had to add a default constructor (<b>XDR_Char()</b>), and a converting constructor (<b>XDR_Char(char x)</b>) to my class. While this technically means that it is no longer a POD class, (I call it a light weight class <a href="#5">[5]</a>), it should behave like a POD for all practical purposes.</p>
+<p>I have defined the <b>XDR_Char</b> class inside of namespace <b>Util</b>. This is my general-purpose utilities namespace. I may move this later.</p>
+<p>The other characteristic of a type used to specialize an IOStreams template is the requirement that a traits class exists for that type. I decided to just specialize the <b>char_traits</b> class in the standard library. This way, I don't have to keep specifying the traits class all the time. Since I am providing a definition of a specialization of a template defined in namespace <b>std</b>, I have to put that definition in namespace <b>std</b> also.</p> 
+<p>Once I had my character type and its corresponding traits type, I could then use it to create some new IOStreams types. First, I created an <b>XDR_Streambuf</b> class by specializing the <b>std::basic_streambuf </b>template. This creates a base <b>streambuf</b> class that can manage writing to and reading from a buffer of <b>XDR_Char</b>s. As with the regular <b>streambuf</b>s, a concrete derived <b>XDR_Streambuf</b> class will have to be created to actually connect an <b>XDR_Streambuf</b> to a source/sink of <b>XDR_Char</b>s.</p>
+<p>Next, I had a decision to make. I needed <b>iXDR_Stream</b>/<b>oXDR_Stream</b>/<b>XDR_Stream</b> classes to act as base classes for any derived concrete XDR stream classes. In the IOStreams model, these classes provide the formatting necessary to insert or extract data objects from the stream. Unfortunately, the type of formatting needed by an XDR stream is totally different from that provided by the other IOStream classes. I could create my own specialization for <b>basic_istream&lt;XDR_Char&gt;,</b> <b>basic_ostream&lt;XDR_Char&gt;,</b> and <b>basic_iostream&lt;XDR_Char&gt;,</b> but in the end I decided it wasn't worth the effort. Users were going to work with an <b>iXDR_Stream</b> class, etc., and not care whether it was a <b>typedef</b> of a template specialization or a class in its own right. So I decided to just define my own <b>XDR_Stream</b> classes from scratch. Note, they still derive from <b>basic_ios&lt;&gt;</b>, which in turn derives from <b>ios_base</b>. This way I still get a lot of the functionality of an IOStream class without having to write it myself. I also get some stuff that I cannot use &#151; such as a lot of field formatting options that don't apply &#151; but that is of minor importance. If I was concerned about the latter, I might be tempted to make <b>basic_ios&lt;XDR_Char&gt;</b> a protected base class instead of a public one. (As I said, I am still tweaking this code.)</p> 
+<p>As you can see, the interface for <b>iXDR_Stream</b>, <b>oXDR_Stream</b>, and <b>XDR_Stream</b> looks pretty conventional. I will use <b>oXDR_Stream</b> as my example, but most of what I say applies equally well to <b>iXDR_Stream</b>.</p>
+<p>There are inserter (<b>operator&lt;&lt;)</b> functions for all the basic types in C++. I noted above that XDR does not define a <b>char</b> type (or a <b>wchar_t</b>). Therefore, the inserters for these types actually are implemented using the inserter for <b>int</b>. Note: C++ leaves it up to the implementation whether the built-in type <b>char</b> is signed or unsigned.  XDR will move the bit pattern correctly from one machine to another, but if you interpret that bit pattern as an integer, you might get some unexpected results if one platform treats a <b>char</b> as signed and the other doesn't.  </p>
+<p>Since my platform is an Intel-based one, my <b>int</b>s are already in two's-complement form, but they are encoded internally as little endian. The implementation of the <b>int</b> inserters have to swap the bytes into big-endian format before the <b>XDR_Char</b> can be written to the <b>XDR_Streambuf</b>. Since my platform does not provide a <b>long long int</b>, I do not have an inserter that will directly encode an XDR <b>hyper</b> integer type.</p>
+<p>The inserters for the real types are similar. Again, my platform already stores floating data in IEEE format, so it was just a matter of getting the endians correct in order to encode them. On my platform, a <b>long double</b> is actually implemented as a <b>double</b> (boo, hiss, Microsoft). Because of this, I did not bother to implement the <b>long double</b> inserter, which should encode as an XDR <b>quadruple</b> type.</p> 
+<p>The implementation of the opaque data functions is also straightforward. The only requirement is to make sure that the final <b>XDR_Char</b> in the encoding is padded with nulls as necessary. The function names indicate the type of underlying XDR encoding that is to be accomplished: <b>put</b> does a fixed-length encoding, while <b>vput</b> does a variable-length encoding. In the latter, the length of the data is encoded before the actual data. Note that on the input side, the corresponding functions exist: <b>get</b> and <b>vget</b>. The <b>vget</b> function expects to extract the length of data from the XDR stream. For this function, the second argument is the maximum length data that can be extracted. If the actual length in the stream exceeds the specified maximum, the read fails and the stream is marked as "bad." To make things easier to use, I have included both <b>vput</b> and <b>vget</b> functions that take an argument of a <b>vector<unsigned char></b>. This is primarily of importance on the input side: the <b>vector</b> will grow dynamically to hold the actual amount of data extracted from the stream.</p>
+<p>There are template functions that handle the encoding of arrays of data. I probably should have named these <b>put</b> and <b>vput</b> also, but decided not to hassle with compilers that don't like this type of overloading. The <b>vget_arr</b> extractor is overloaded with another one that takes an argument of a <b>std::vector&lt;T&gt;</b>. This can be used when the user does not want to allocate an array of the maximum possible size. Alternately, the user can simply extract the length separately and then allocate the correct size array and read it directly with a <b>get_arr</b> call. Using the <b>vget_arr</b> call with a vector is simpler &#151; that is why it is there.</p> 
+<p>The last thing to note are the free operators that handle strings. XDR has no provision for a fixed-length character string, so strings are always encoded with a length followed by the data. The data itself has to be in ASCII format &#151; people on EBCDIC machines will have to convert. Lastly, the final <b>XDR_Char</b> of a string encoding has to be padded with nulls. On the input side of things, an attempt to extract to a <b>char*</b> will assume that there is enough space to hold the actual data. The maximum allowed size can be specified by setting the field width. (This is one of those things that gets added for free because an <b>iXDR_Stream</b> is derived from <b>basic_ios&lt;&gt;</b>). Since the actual data length is always encoded in the stream, setting the field width is equivalent to specifying the maximum length when using a <b>vget</b> function &#151; if the length is greater than the maximum, an error occurs.</p> 
+<p>For those users who are familiar with the low-level <b>xdr_foo</b> functions, you will note that there is no provision to pass in a null <b>char*</b> and let the <b>iXDR_Stream</b> library allocate the required amount of buffer. If you need a dynamically sized buffer, read the data into a <b>string</b> instead. That is why it is part of the interface.</p> 
+<p>That is all there is to it. Naturally, in actual practice that is just the beginning. Any class type <b>T</b> that needs to be encoded in XDR format will have to provide its own versions of :</p>
+
+<pre>
+oXDR_Stream&amp; operator&lt;&lt;(oXDR_Stream&amp;, const T&amp; obj);
+iXDR_Stream&amp; operator&gt;&gt;(iXDR_Stream&amp;, T&amp; obj);
+</pre>
+
+<p>Naturally, these will be implemented using the existing inserters and extractors.</p>
+
+<H3><FONT COLOR="#000080">Wrapping Up</FONT></H3>
+
+<p>At this point you might be wondering &quot;What is the point?&quot; After all, the existing library of <b>xdr_foo</b> functions exists, it works, it is pretty much standard, and XDR encoding/decoding is a pretty low-level activity that very few programmers ever get involved with. Those that do usually don't have any problem working with the low-level API. (I was probably one of a very few that hated working with that API.) As one friend asked me &#151; &quot;Where's the payback?&quot;</p> 
+<p>The simple answer is that now things are easier, so those people that have to do this sort of encoding/decoding should be able to do it quicker and with fewer errors. Unfortunately, while that argument works for me, I have found that it doesn't seem to work for most people.</p> 
+<p>So how about this argument: once I had this code in place, I realized that I had the beginning of a pretty basic, but nevertheless real, object persistence mechanism. Think about it. I think XDR makes a very nice standard for use along those lines. Once we start talking about that instead of network data programming, then obviously a lot more people are going to be involved in writing XDR encode/decode functions than otherwise would have been. And now the benefit of <b>XDR_Stream</b> abstraction becomes apparent. By making it easy enough, it enables possibilities that most people would ordinarily dismiss as being not worth the time and effort.</p> 
+<p>Next time, I will show you what I am doing along the lines of building a persistent object store using XDR streams.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1] Jack Reeves. &quot;The (B)Leading Edge: Using IOStreams &#151; Part I,&quot; <i>C/C++ User's Journal C++ Experts Forum</i>, January 2001, <b>www.cuj.com/experts/1901/reeves.htm</b>.</p>
+<p><a name="2"></a>[2] Jack Reeves. &quot;The (B)Leading Edge: Using IOStreams &#151; Part II,&quot; <i>C/C++ User's Journal C++ Experts Forum</i>, March 2001, <b>www.cuj.com/experts/1903/reeves.htm</b>.</p>
+<p><a name="3"></a>[3] Jack Reeves. &quot;The (B)Leading Edge: Using IOStreams &#151; Locales and Facets,&quot; <i>C/C++ User's Journal C++ Experts Forum</i>, May 2001, <b>www.cuj.com/experts/1905/reeves.htm</b>.</p>
+<p><a name="4"></a>[4] RFC 1832 &#151; eXternal Data Representation, <b>http://www.cis.ohio-state.edu/cgi-bin/rfc/rfc1832.html</b>.</p>
+<p><a name="5"></a>[5] Jack Reeves. "The (B)Leading Edge: Low Overhead Class Design," <i>The C++ Report</i>, February 1998.
+
+
+<p><i><b>Jack W. Reeves</b> is an engineer and consultant specializing in object-oriented software design and implementation. His background includes Space Shuttle simulators, military CCCI systems, medical imaging systems, financial data systems, and numerous middleware and low-level libraries. He currently is living and working in Europe and can be contacted via <b>jack_reeves@bleading-edge.com</b>.</i></p>
+
+<h4><a href="../../../source/2001/jul01/reeves.zip"></a></h4>
+
+</BLOCKQUOTE></BODY></HTML>

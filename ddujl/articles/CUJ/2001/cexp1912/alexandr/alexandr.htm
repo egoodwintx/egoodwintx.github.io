@@ -1,0 +1,344 @@
+<HTML>   
+     <HEAD>
+<TITLE>December 2001 C++ Experts Forum/Generic&lt;Programming&gt;</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.12/tocdec.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Generic&lt;Programming&gt;: Typed Buffers (III)</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Andrei Alexandrescu</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>This is the last installment treating typed buffers, lightweight and flexible contiguous arrays of objects of arbitrary types. Lying somewhere in between the primitive built-in arrays and the sophisticated <b>std::vector</b>, typed buffers are useful structures when efficiency is paramount, and, more important, handy building blocks for more elaborate structures &#151; such as strings, vectors, queues, and more.</p>
+<p>The previous installment <a href="#1">[1]</a> focused on efficient implementations of basic buffer-related operations, such as filling and copying memory. The article you are about to read takes a broader view &#151; we will talk about copying and moving objects, as opposed to raw data.</p>
+
+<H3><FONT COLOR="#000080">Mor(e)on Allocators</FONT></H3>
+
+<p>When trying to stun people at parties by talking about policy-based design <a href="#2">[2]</a>, I usually remark sardonically that STL allocators are a well-known experiment with a policy, an experiment that failed miserably. </p>
+<p>Like those Freudian reports that link the mid-life angst to some little event in childhood, memory allocation in C++ has quite an interesting story that harkens back to C.</p>
+<p>Since its inception, C has offered three memory management primitives: <b>malloc</b>, <b>free</b>, and <b>realloc</b>:</p>
+
+<pre>
+void* malloc(size_t size);
+void free(void* p);
+void* realloc(void* p, size_t newSize);
+</pre>
+
+<p>Three might be a magic number, but three memory management primitives are just not enough. Even more so when you consider the annoying overlap &#151; <b>realloc</b> does it <i>all</i>:</p>
+
+<UL><LI>If you pass it a null pointer, <b>realloc</b> does what <b>malloc</b> does.</LI>
+<LI>If you pass it a zero size, <b>realloc</b> does what <b>free</b> does.</LI></UL>
+
+<p>So <b>realloc</b> is a do-it-all function that takes care of all your memory management needs. (This is a bad sign, by the way.) Let's see what a typical <b>realloc</b> implementation looks like.</p>
+
+<pre>
+void* realloc(void* p, size_t newSize)
+{
+     // Get rid of degenerate cases
+    if (p == 0) return malloc(newSize);
+    if (newSize == 0) return free(p), 0;
+
+    // Attempt in-place expansion
+    if (p == _expand(p, newSize) &amp;&amp; _msize(p) &gt;= newSize) 
+    {
+        return p;
+    }
+ 
+    // Need to move memory &#151; acquire new chunk 
+    void* pNew = malloc(newSize);
+    if (!pNew) return 0;</p>
+
+    // Move data to the new location
+    memcpy(pNew, p, std::min(_msize(p), newSize));
+    free(p);
+    return pNew;
+}</pre>
+
+<p>Guess the <b>realloc</b> implementation above is quite easy to read, especially because it doesn't obey the SESE (Single Entry, Single Exit) tyranny <a href="#3">[3]</a>. Some details are unclear, though &#151; what do <b>_expand</b> and <b>_msize</b> do?</p>
+<p>These two primitives are instrumental to <b>realloc</b>'s functioning:</p>
+
+<pre>
+void* _expand(void* p, size_t newSize);
+size_t _msize(void* p);</pre>
+
+<p><b>_expand</b> attempts to expand in place the memory block pointed to by its first argument. It is possible that when you try to reallocate a block of memory, the block just next to it is available. In that case, the memory allocator can just quickly adjust its bookkeeping structures to accommodate the reallocation at the expense of that next block. This is much faster than copying the whole chunk to a larger location. In case of success, <b>_expand</b> returns the pointer passed to it.</p> 
+<p><b>_msize</b> simply returns the size of the chunk pointed to by its argument. (Any memory manager must keep track of the size of each chunk.)</p>
+<p><b>_expand</b> and <b>_msize</b> are not standard, so you only can use them indirectly via <b>realloc</b>.</p>
+<p>Getting back to <b>realloc</b>, if in-place expansion fails, then <b>realloc</b> allocates a whole new block, copies the old block to the new block using <b>memcpy</b>, and <b>free</b>s the old block. Very simple. Maybe <i>too</i> simple.</p>
+<p>When C++ was born, it relied heavily on C's library and infrastructure. In particular, it would have been awkward if C++ developed its own, separate, memory allocator from scratch &#151; it made much more sense to build a new, strongly typed allocation mechanism onto Standard C's allocation primitives.</p> 
+<p>And here lies the problem. </p>
+<p>While <b>memcpy</b> is so loyal to C, it is C++'s well-intended but clumsy servant. For C, moving things around with <b>memcpy</b> works just fine, but C++ needs more. Objects with constructors and destructors cannot be moved in memory just like that. They might encapsulate pointers to their own internals or compiler-managed data (such as pointers to base in virtual inheritance). This means that a C++ object might not be valid anymore if <b>memcpy</b>'d from one location to another &#151; and righteously, the C++ Standard explicitly prohibits <b>memcpy</b>ing objects that are not POD (Plain Old Data). </p>
+<p>If <b>memcpy</b> is not good, then <b>realloc</b> is not good &#151; and so C++ forewent any reallocation opportunities since day one. C++ has <b>new</b> and <b>delete</b>, but not &quot;<b>renew</b>&quot; or anything similar to <b>realloc</b>.</p>
+<p>It comes as no surprise that <b>std::allocator</b> (that is, yet another allocation thingie whose only purpose is to annoy everybody) does not provide an interface for reallocation, either. And so in the dusk of the second millennium, the most modern C++ library does not have a means to support optimal memory allocation.</p>
+<p>Because C++ lacks efficient reallocation, by definition a C++ program uses more memory and/or is slower than it could be. To add insult to injury, neither C nor C++ expose <b>_msize</b>, so in practice the size of a dynamically allocated block must usually be stored twice &#151; in the bowels of the allocator and in the program itself.</p> 
+<p>Now close your eyes for a moment. Close your eyes and imagine the multitude of C++ applications humming (and some crashing) out there right now &#151; all those desktop apps, business apps, servers, middle-tiers, embedded systems, you name it. Now open your eyes and face the truth. They are sub-optimal: they copy memory when they shouldn't, and they manage information that they shouldn't. All this because C's original allocator design didn't provide client access to two primitives <a href="#4">[4]</a>.</p> 
+<p>Let's now see how we can optimize buffer memory allocation. Because typed buffers use allocators, we need a solution that plays well with the <b>std::allocator</b> interface.</p>
+
+<H3><FONT COLOR="#000080">The Mallocator</FONT></H3>
+
+<p>No, it's not the title of a Hollywood movie &#151; it's just an <b>std</b>-like allocator based on <b>malloc</b>.</p>
+<p>Let's start by making an observation: <b>realloc</b> is not entirely unusable to C++; it's just unusable with a subset of C++'s types. So even within the confines of the scarce Standard C API, you can safely use <b>realloc</b> with any POD, including all primitive types. Thus, in order to reap fast reallocation for our <b>buffer</b> class, we need to do the following:</p>
+<UL><p>A) Figure out whether an arbitrary type <b>T</b> is a POD or not.</p>
+<p>B) Define a <b>malloc</b>-based allocator that has the same interface as <b>std::allocator</b> and adds a reallocate function. For PODs, the new allocator uses <b>realloc</b> directly; for non-PODs, it returns &quot;uh-uh,&quot; in which case the caller must proceed with the classic allocate-copy-discard sequence.</p> 
+<p>C) Provide a method to interrogate an allocator: &quot;Are you able to reallocate?&quot; To that question, <b>std::allocator</b> must answer &quot;No.&quot; Rub: you <i>cannot</i> touch <b>std::allocator</b>.</p> 
+<p>D) If available, exploit that <b>reallocate</b> function within <b>buffer</b>. That is, if you instantiate <b>buffer&lt;char, std::allocator&lt;char&gt; &gt;</b>, nothing special happens, but if you say <b>buffer&lt;char, mallocator&lt;char&gt; &gt;</b>, then <b>buffer</b> uses efficient reallocation wherever possible.</p></UL>
+
+<p>Each of the issues above has a unique best solution in modern C++, and it is a good exercise to think of that before continuing to read. Deal?</p>
+<p>Ok, here goes.</p>
+<UL><p>A) If you've read <a href="#5">[5]</a>, you know that <b>TypeTraits</b> is the solution. Adding to <a href="#5">[5]</a>'s code base, you can now write:</p>
+
+<pre>namespace TypeTraits
+{
+    template &lt;typename T&gt; struct IsPOD
+    {
+        enum { value = IsPrimitive&lt;T&gt;::value };
+    };
+}</pre>
+
+<p>By default, only primitive types are POD. As shown in <a href="#5">[5]</a>, you can specialize <b>TypeTraits::IsPOD</b> for types that you know are PODs.</p>
+<p>B) Herb and Jim would write, &quot;Prophet Austern has explained to the masses how to write a Standard-blessed allocator.&quot; Indeed, Matt Austern did it in <a href="#6">[6]</a>, which you can find on the holy Internet.</p>
+
+<pre>template &lt;typename T&gt;        
+struct Mallocator        
+{        
+    ... allocator implementation using malloc/free, see <a href="#6">[6]</a> ...
+
+    T* reallocate(T* p, size_type newSize)        
+    {        
+        return TypeTraits::IsPOD&lt;T&gt;::value        
+        ? static_cast&lt;T*&gt;(realloc(p, newSize))        
+        : static_cast&lt;T*&gt;(0);        
+    }        
+};</pre>
+
+<p>C) How to query a type's capabilities non-intrusively? Of course &#151; traits <a href="#7">[7]</a>! Without further ado:</p>
+
+<pre>
+template &lt;typename A&gt;        
+struct AllocatorSupportsReallocation        
+{        
+    enum { value = false };        
+};
+
+template &lt;typename T&gt;        
+struct AllocatorSupportsReallocation&lt; Mallocator&lt;T&gt; &gt;        
+{        
+    enum { value = true };        
+};</pre>
+
+<p>D) Writing two versions of a function depending on a Boolean condition is easy accomplished by using <b>Int2Type</b> [<a href="#2">2</a>, <a href="#8">8</a>]. The reallocation is best handled by an overloaded function:</p>
+
+<pre>template &lt;typename A&gt;        
+typename A::pointer Reallocate(        
+    A&amp; alloc,        
+    typename A::pointer p,         
+    typename A::size_type oldObjectCount,        
+    typename A::size_type newObjectCount,        
+    Int2Type&lt;false&gt;)        
+{        
+    ...implement reallocation for allocators         
+        that DON'T support <b>reallocate</b>...        
+}
+
+template &lt;typename A&gt;        
+typename A::pointer Reallocate(        
+    A&amp; alloc,        
+    typename A::pointer p,         
+    typename A::size_type oldObjectCount,        
+    typename A::size_type newObjectCount,        
+    Int2Type&lt;true&gt;)        
+{        
+    ...implement reallocation for allocators         
+        that DO support <b>reallocate</b>...        
+}</pre>
+</UL>
+<p>Why do you need the <b>oldObjectCount</b> parameter? It's simple: when <b>A::realloc</b> returns zero and you need to allocate a new chunk and then copy objects, you need to know how many objects you had. That's why the two <b>Reallocate</b> implementations deal with object counts, not byte counts. <b>Reallocate</b> is a tad higher-level than allocators' member functions.</p>
+<p>Now when invoking <b>Reallocate</b>, all <b>buffer&lt;T, A&gt;</b> has to do is to pass <b>Int2Type&lt;TypeTraits::IsPOD&lt;T&gt;::value&gt;</b> as the last argument, and, voil&agrave;! Fast reallocation kicks in!</p> 
+<p>Sometimes, you <i>do</i> have access to library extensions, such as <b>_expand</b> and <b>_msize</b>. This is the case with Microsoft's C library implementation. That means, you can implement efficient reallocation for all types, not just PODs. Of course, if you do that and you want your code to have some cross-platform dignity, you must do the usual <b>#ifdef</b> sorcery.</p>
+
+<H3><FONT COLOR="#000080">Moving Objects</FONT></H3>
+
+<p>Let's now move on to another topic. Even if you could reallocate memory optimally by exploiting whatever in-place expansion opportunities there are, things are still far from optimal. Consider this:</p>
+
+<pre>
+buffer&lt;std::string&gt; buf(1000000);        
+for (size_t i = 0; i != buf.size(); ++i)        
+{        
+    buf[i] = GetSomeString(i);        
+}        
+...        
+buf.reserve(buf.size() + 1000);</pre>
+
+<p>Now regardless of whether or not you use the <b>Mallocator</b>, sometimes you do need to go through the allocate-copy-destroy cycle. Assuming that happens in the example above, the <b>reserve </b>call involves moving around 1,000,000 string objects. In C++, moving objects is done similar to those primitive teleporting methods: clone the object at a distance and then kill the original.</p>
+<p>Cloning all those strings can be costly &#151; much more costly than just copying the memory they sit on. If the strings are not reference counted &#151; which is quite likely <a href="#9">[9]</a> &#151; then <b>reserve</b> incurs <i>a lot</i> of unnecessary work. <b>reserve</b> allocates a new memory chunk, copies each string to the new chunk, and finally, destroys the strings in the old chunk.</p>
+<p>But why all these copies when we actually only need to smoothly <i>reseat</i> objects? We just need to tell a string, &quot;Hey, here's a new place for you in memory, please reseat yourself.&quot; Because the old location of the string is irrelevant (will be discarded anyway), the string can only efficiently copy its internal pointers to the destination memory block. </p>
+<p>It doesn't take long to figure out that to model what we're trying to do requires the concept of <i>moving</i> as a primitive operation, distinct from copying. Copying is duplicating the object. Moving is not duplication, the total number of objects stays the same. Absent the concept of moving, we implement it in C++ by cloning and then butchering the original. We need to be more human.</p> 
+<p>There are many ways of implementing moving. The simplest one can think of is via a function:</p>
+
+<pre>
+template &lt;class T&gt; void Move(T* src, void* dest);</pre>
+
+<p>That's not that easy, however. Consider you are implementing a string class:</p>
+
+<pre>class UltimateString        
+{        
+    char* start_;        
+    char* end_;        
+    char* endOfStorage_; // because there's no <b>_msize</b>, sigh        
+public:        
+    ... functions ...        
+};</pre>
+
+<p>Now you'd think you specialize <b>Move</b> for <b>UltimateString</b> as follows:</p>
+
+<pre>template &lt;&gt;        
+void Move(UltimateString* src, void* dest)        
+{        
+    UltimateString* typedDest = static_cast&lt;UltimateString*&gt;(dest);        
+    typedDest-&gt;start_ = src-&gt;start_;        
+    typedDest-&gt;end_ = src-&gt;end_;        
+    typedDest-&gt;endOfStorage_ = src-&gt;endOfStorage_;        
+}</pre>
+
+<p>If you think that's it, you're wrong. That's not it, because the Standard leaves compilers the latitude to add their own data to your classes (except when they're POD). That means, the compiler might add an <b>int __coolnessFactor_</b> member variable to your string class, a variable that you don't know about, which makes it impossible for you to copy all of <b>src</b> into <b>dest</b>. The effect of <b>Move</b> is undefined.</p> 
+<p>C++ insists that every object that has constructors is built through a call to one of those constructors. Any other way of creating an object is prohibited. So a solution to moving objects must go through some constructor.</p>
+<p>Let's then define a stub class like this:</p>
+
+<pre>template &lt;typename T&gt;        
+struct Takeover        
+{        
+    explicit Takeover(T&amp; obj) : obj_(obj) {}        
+    T&amp; Get() { return obj_; }        
+private:        
+    T&amp; obj_;        
+};</pre>
+
+<p><b>Takeover</b> encapsulates a reference in an object and provides access to it. </p>
+<p>Then, you implement a constructor of <b>UltimateString</b> that accepts a <b>Takeover&lt;UltimateString&gt;</b> object:</p>
+
+<pre>class UltimateString        
+{        
+    char* start_;        
+     char* end_;        
+    char* endOfStorage_; // because there's no <b>_msize</b>, sigh        
+public:        
+   UltimateString(Takeover&lt;UltimateString&gt; wrap)        
+    {        
+        UltimateString&amp; src = wrap.Get();        
+        start_ = src.start_;        
+        end_ = src.end_;        
+        endOfStorage_ = src.endOfStorage_;        
+        // Nuke the source        
+        src.start_ = src.end_ = src.endOfStorage_ = 0;        
+    }        
+    ...        
+};</pre>
+
+<p>For convenience's sake, let's name the constructor above a &quot;takeover constructor.&quot; The takeover constructor coexists with other constructors. It copies the three pointers into the constructed string and then nukes the original pointers. This last step is needed because the takeover constructor must leave the original object in a destroyable state.</p> 
+<p>So far, so good. However, how can you figure out in a piece of generic code that a type <b>T</b> implements a constructor accepting a <b>Takeover&lt;T&gt;</b>? Depending on that, you need to dispatch at compile time between different algorithms for moving objects.</p>
+<p>Here's the juiciest part of the article, because I can nicely point you to <a href="#2">[2]</a> and <a href="#8">[8]</a>. Remember the <b>Conversion</b> template? If not, trust me, it's worth a read, so print <a href="#8">[8]</a> and read it, or better yet (for me at least), buy <a href="#2">[2]</a>. <b>Conversion</b> offers a way to detect at compile time whether some time <b>U</b> can be converted to some type <b>T</b>. If you replace <b>U</b> with <b>Takeover&lt;T&gt;</b> and <b>T</b> with, well, <b>T</b>, you found the solution to our problem. Any piece of code can figure out from the outside whether an arbitrary type implemented a takeover constructor or not.</p>
+<p>A word on exception safety. Normally, moving an object should not throw exceptions because moving doesn't involve allocating new resources. This is not always true, however. Consider the following code:</p>
+
+<pre>class Widget        
+{        
+    ... does not implement a takeaway constructor ...        
+    ... copy constructor might throw exceptions ...        
+};
+
+class Midget        
+{        
+    Widget w_;        
+public:        
+    Midget(Takeover&lt;Midget&gt; wrap)        
+    {        
+        ... oops, how do you implement it to not throw exceptions? ...        
+    }        
+};</pre>
+
+<p>This problem can be avoided in two ways. One is, simply, to replace the <b>Widget</b> member with a <b>Widget*</b> (or, if you have enough nerve, with <b>std::auto_ptr&lt;Widget&gt;</b>), and to use dynamic allocation. The pointer can be smoothly copied without having to copy <b>Widget</b> itself, so the constructor is easy to write. </p>
+<p>The second way to implement a takeover constructor for <b>Midget</b> is to require two different capabilities from <b>Widget</b>:</p>
+
+<OL><LI><b>Widget</b> must implement a non-throwing <b>swap</b>, as all containers in the standard library do. It also establishes a (very shaky) framework for other types to define <b>swap</b> as well. Most important, the standard library made a point that swapping objects without throwing is a fundamental primitive operation. <b>swap</b> is very useful in a variety of situations and cannot be implemented efficiently (and non-throwingly) from the outside of a class' implementation. If you are <b>std</b>-savvy, you likely do implement <b>swap</b> for all your first-class (non-polymorphic) objects. (With luck, maybe this article convinces you to implement a takeover constructor as well.)</LI>
+<LI><b>Widget</b>'s default constructor does not throw an exception. This is usually easy to accomplish.</p>
+</OL>
+
+<p>If the two conditions above hold, then you can implement the takeover constructor like so:</p>
+
+<pre>Midget(Takeover&lt;Midget&gt; wrap)        
+: w_() // make it clear that w­_ is default-constructed        
+{        
+    w_.swap(wrap.Get().w_);        
+}</pre>
+
+<p>That is, build an empty value for the destination and swap that empty value with the value to be taken over.</p>
+<p>Takeover construction and swapping are two related and slightly overlapping operations. The relationship between them is as follows:</p>
+
+<UL><LI>You can implement a takeover constructor in terms of a non-throwing <b>swap</b>, but only if you have a non-throwing constructor available. If all your constructors might throw, <b>swap</b> is useless in implementing takeover construction.</LI>
+<LI>You <i>could</i> implement <b>swap</b> in terms of a takeover constructor, were it not for that @#!%^&amp; alignment. Consider this:</LI>
+
+<pre>void SwapViaMove(Midget&amp; lhs, Midget&amp; rhs)        
+{        
+    char buffer[sizeof(Midget)]; // MUST BE ALIGNED TO HOLD A MIDGET        
+    // Move lhs into buffer        
+    Midget* lhsMoved = new (buffer) Midget(Takeover&lt;Midget&gt;(lhs));        
+    // Move rhs over lhs        
+    lhs.~Midget();        
+    new (&amp;lhs) Midget(Takeover&lt;Midget&gt;(rhs));        
+    // Move lhs (who's now in buffer) to rhs        
+    rhs.~Midget();        
+    new (&amp;rhs) Midget(Takeover&lt;Midget&gt;(*lhsMoved));        
+    lhsMoved-&gt;~Midget();        
+}</pre>
+</UL>
+
+<p>The function is incorrect (in addition to looking quite arcane) because there's no 100-percent portable way to ensure that <b>buffer</b> is properly aligned to hold a <b>Widget</b>. </p>
+<p>If you have access to a non-throwing constructor, you can get rid of the alignment problem like this:</p>
+
+<pre>void SwapViaMove(Midget&amp; lhs, Midget&amp; rhs)        
+{        
+    Midget temp; // Won't throw        
+    // Move lhs into temp        
+    temp.~Midget();        
+    new (&amp;temp) Midget(Takeover&lt;Midget&gt;(lhs));        
+    // Move rhs over lhs        
+    lhs.~Midget();        
+    new (&amp;lhs) Midget(Takeover&lt;Midget&gt;(rhs));        
+    // Move temp to rhs        
+    rhs.~Midget();        
+    new (&amp;rhs) Midget(Takeover&lt;Midget&gt;(temp));        
+    // temp-&gt;~Midget(); not needed because the compiler does it        
+}</pre>
+
+<p>(If you think of making <b>temp</b> static to save some cycles, you've just thrown away the reentrancy of the function.)</p>
+<p>Corollary: any of non-throwing <b>swap</b> and takeover construction can be portably implemented in terms of the other if and only if you have access to a non-throwing constructor.</p>
+<p>Now when it comes to moving ranges of objects, the most effective algorithm looks like this:</p>
+
+<UL><LI>If the type is a POD, you use <b>memcpy</b>, <b>memmove</b>, or one of the fast copy routines described in <a href="#1">[1]</a>. Duff said. Pardon. ‘Nuff said.</LI>
+<LI>Else, if the type supports takeover construction, use it.</LI>
+<LI>Else use the inhuman clone-destroy routine in a loop.</LI></UL>
+
+<H3><FONT COLOR="#000080">Summary and Conclusion</FONT></H3>
+
+<p>Memory allocation in portable C and C++ is suboptimal. The C library makes it impossible to expand a memory block in place, and consequently C++ doesn't support something similar, either. In addition, C and C++ do not provide information about the size of a memory block, information that is nonetheless available to the allocator. These two shortcomings hamper an application's speed and footprint. To what extent, I don't know; I suspect the impact is negligible to small for most applications, and quite bothersome for some.</p> 
+<p>To overcome the mentioned shortcomings, you can design an allocator (<b>Mallocator</b>) that uses <b>realloc</b> for PODs. This way at least part of your objects will benefit from fast reallocation. If your C library implementation provides extensions such as <b>_msize</b> and <b>_expand</b>, you can use those in your <b>Mallocator</b> implementation, thus implementing fast reallocation for all objects.</p> 
+<p>To C++ objects, non-throwing moving is as fundamental an operation as copying. Swapping objects is somewhat conceptually equivalent to moving (under special circumstances). A solid solution to moving objects is takeover construction.</p>
+<p>However you implement it, having a means for moving objects (efficiently and without throwing exceptions) is the only way in which you can make compound containers such as <b>vector&lt; vector&lt;double&gt; &gt;</b> become a viable solution.</p> 
+
+<H3><FONT COLOR="#000080">Bibliography and Notes</FONT></H3>
+
+<p><a name="1"></a>[1] Andrei Alexandrescu. &quot;Generic&lt;Programming&gt;: Typed Buffers (II),&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, October 2001, &lt;www.cuj.com/experts/1910/alexandr.htm&gt;.</p>
+<p><a name="2"></a>[2] Andrei Alexandrescu. <i>Modern C++ Design</i> (Addison-Wesley Longman, 2001). The book is not the first to come up with the concept of policy-based designs, but it documents and applies it systematically.</p>
+<p><a name="3"></a>[3] SESE is a mantra that soared during the days of structured programming. In the Orwellian SESE-land, every function must have only one entry (by design in most languages anyway) and one exit. The &quot;single-exit&quot; predicament is terribly obsolete today, in the era of exceptions. Although it's been shown time and again that SESE code is longer, less maintainable, more &quot;McCabe complex,&quot; and less efficient than the equivalent multiple-exit code, there still are poor souls who are convinced that SESE is a great thing. (After all, Aristotle himself believed that the sun was scrolled onto the sky by flying angels.) SESE zealots were formed in the Pascal and C days. Unfortunately, if you do the age progression, those people are exactly today's development managers.</p>
+<p><a name="4"></a>[4] Microsoft's C library implementation does provide access to <b>_expand</b> and <b>_msize</b>. Say what you want, but the folks in Redmond are known for their sense of practicality.</p>
+<p><a name="5"></a>[5] Andrei Alexandrescu. &quot;Generic&lt;Programming&gt;: Typed Buffers (I),&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, August 2001, &lt;www.cuj.com/experts/1908/alexandr.htm&gt;.</p>
+<p><a name="6"></a>[6] Austern, Matt. &quot;The Standard Librarian: What Are Allocators Good For?&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, December 2000, &lt;www.cuj.com/experts/1812/austern.htm&gt;.</p>
+<p><a name="7"></a>[7] Andrei Alexandrescu. &quot;Traits: The <b>else-if-then</b> of Types,&quot; <i>C++ Report</i>, April 2000.</p>
+<p><a name="8"></a>[8] Andrei Alexandrescu. &quot;Generic&lt;Programming&gt;: Mappings between Types and Values,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, October 2000, &lt;www.cuj.com/experts/1810/alexandr.htm&gt;.</p>
+<p><a name="9"></a>[9] Andrei Alexandrescu. &quot;Generic&lt;Programming&gt;: A Policy-based <b>basic_string</b> implementation&quot;, <i>C/C++ Users Journal C++ Experts Forum</i>, June 2001, &lt;www.cuj.com/experts/1906/alexandr.htm&gt;.</p>
+
+<p><i><b>Andrei Alexandrescu</b> is a Ph.D. student at University of Washington in Seattle, and author of the acclaimed book </I>Modern C++ Design<I>. He may be contacted at <b>andrei@metalanguage.com</b>. Andrei is also one of the featured instructors of The C++ Seminar (&lt;www.gotw.ca/cpp_seminar&gt;).</i></p>
+
+</BLOCKQUOTE></BODY></HTML>

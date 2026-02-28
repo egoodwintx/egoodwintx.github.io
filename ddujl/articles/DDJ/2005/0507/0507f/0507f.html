@@ -1,0 +1,271 @@
+
+<html>
+<head>
+<title>July, 2005: High-Performance Data Management in Java</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>High-Performance Data Management in Java</h1>
+<p><i>Dr. Dobb's Journal</i> July, 2005</p>
+<h2>On-disk persistent storage, in-memory data storage, &amp; cache management</h2>
+
+
+<h3>By Charles Lamb</h3>
+
+
+<I></I>
+
+<hr>
+
+
+
+
+
+<p>Figuring out how to manage data efficiently is a critical business requirement in addition to being a technological imperative. There is a wide range of classical and modern approaches to solving the variety of data-management problems that developers face today. In this article, I show how bringing together a modern storage approach along with a couple of updated classics of memory management yields a potent synergy of high-performance data management. The three facets that I address are: </p>
+
+
+
+<ul>
+  <li>On-disk persistent storage via a log-based filesystem.</li>
+  <li>In-memory data storage via a concurrent B+tree.</li>
+  <li>The cache management magic that bridges them. </li>
+</ul>
+
+<p>The context in which I explore these facets is Sleepycat Software's Berkeley DB Java Edition (JE), an open-source, pure-Java, object-based database engine (http://www.sleepycat.com/products/je.shtml). </p>
+
+<p>The first performance tradeoff made by the architects at Sleepycat was to not support SQL/JDBC and instead use a schema-neutral, fully programmatic Java library interface that stores data in the application's native format. This makes JE a good fit for many high-performance, embedded database situations where the complexity and overhead of SQL is unnecessary. In exchange for the increased performance, the application forgoes the ability to do ad hoc querying and must limit itself to using exact, range, and set intersection queries. Examples include user profile data management in web applications and managing network device configurations. <a name="rl1"></a><a href="#l1">Listing One</a> is an example of how to do simple data insertions and retrievals. A number of more involved examples, such as inventory data management, are included in the JE distribution.</p>
+<h3>Disk-Based Data Management</h3>
+
+<p>Simplistically, traditional approaches to on-disk data storage tend to treat the disk as an extremely slow array. That is, each record is stored in its well-ordered location based upon its primary key. Data updates may require moving data around to make room, keep things in order, get rid of holes, and so on. In contrast, the JE implementation uses a log-based filesystem (LFS) approach for the on-disk data management needs. The notion of LFS was pioneered at the University of California at Berkeley in the early 1990s as a way to deal with the slowest part of all&#151;writing data to disk. The LFS approach has been implemented in a variety of disk filesystem drivers such as xfs, ext3, and Reiser. JE does not implement device drivers for raw disk partitions&#151;in fact, JE is written purely in Java. The LFS approach taken in JE is only at the application/library level and thereby plays to the strengths of how the underlying disk subsystems work.</p>
+
+<p>The LFS approach is primarily focused on increasing write performance. A log-based filesystem generally consists of multiple "log" files. The defining characteristic of a log file, which helps LFS achieve high performance, is that all <i>write</i> operations only append data to the currently active log file. In an empty database, the first data is written to a brand new log file. Each subsequent <i>write</i> appends the new data to the end of the log file and when a log file reaches the maximum allowed size (10 MB by default in JE), the currently active log is closed and a new log file is opened and becomes the active log file. <a name="rf1"></a><a href="0507ff1.html">Figure 1</a> shows the insertion of data into an almost full log, the creation of a new log, and then an insertion into the new, active log. This log-based, append-only approach greatly increases disk write performance because disk seek latency is minimized and data throughput is maximized.</p>
+
+<p>But what about updates to old data? <a name="rf2"></a><a href="0507ff2.html">Figure 2</a> shows how the new data for a record is written to the currently active log (similar to data insertion) and the "map" to the old data is changed to point to the new data. A <i>delete</i> operation only needs to update the map to note that there is no data for that key.</p>
+
+<p>What happens to older log files if updates and new data are always written to the currently active log file? A background daemon comes along periodically looking for log files that predominantly contain stale data. This cleaner daemon copies all of the nonstale data from that mostly stale log into the currently active log, then deletes the now "empty" log file from the filesystem. You can think of this like automatic disk defragmentation or as a copying garbage collector.</p>
+
+<p>What about reading data from the disk? The downside of the LFS approach is that reads of the data are from relatively random locations on the disk because any given piece of data may be in any of the existing log files. In other words, the only clustering mechanism is through insertion or update order in the log. Doesn't that defeat the whole point of increasing performance? Well, yes and no. If the discussion was only about raw disk performance then, yes, that would be a problem. However, JE efficiently caches data in-memory&#151;that way, the penalty of raw disk reading is paid once to load the data into the cache so that subsequent reads get the data quite cheaply from the cache.</p>
+<h3>Concurrent Trees</h3>
+
+<p>There are many data structures that could be used to manage the in-memory cache of the persistent, on-disk data. The classic choice is the B-tree and its variants. The inherent support for multithreading in Java makes it crucial for the tree to support multiple concurrent clients to maximize overall performance. The JE implementation adds concurrency mechanisms to a B+tree-based structure that is managed in a way that allows many readers and writers to traverse and modify the tree at the same time. The basic structure of the concurrent B+tree is in <a name="rf3"></a><a href="0507ff3.html">Figure 3</a>. Note that the internal nodes (IN) just contain keys while only the leaf nodes (LN) contain the actual data.</p>
+
+<p><a name="rf4"></a><a href="0507ff4.html">Figure 4</a> shows concurrent reading and updating of data in the tree. The data is already in the in-memory tree, so all that needs to be done is a traversal down the tree from the root until the node is found. To make things a bit more interesting, there are two users simultaneously looking for information. The Reader is searching for the data for Key 42 while, at the same time, the Updater is searching for Key 1138 to update. To allow for multiple readers and writers to concurrently traverse the tree, the JE implementation internally uses a lightweight mutual-exclusion structure called a "latch." Rather than blocking out all but one reader with a global lock, the JE implementation only latches what it absolutely needs to continue to make progress while ensuring correctness and fair access. In the tree traversal, the first entity to get to the root will latch it, figure out which node to go to next, latch that node, and then give up the latch to the root node&#151;like a slinky walking down a staircase. This two-handed latch-and-release coupling walks down the tree in such a way that no one can cut in line, thereby preserving correctness. Note that JE uses a custom latching implementation due to a requirement that the latches provide fair access through a strictly first-come, first-served policy and, therefore, JE cannot use the built-in Java synchronized mechanism.</p>
+
+<p><a name="rf5"></a><a href="0507ff5.html">Figure 5</a> shows the case where the data exists in the database but has not yet been brought into the tree. The internal nodes comprise the map to the data in the on-disk log files that was mentioned earlier. When the tree traversal eventually runs into a dead end, the bottom interior node that we end up at contains a pointer (a log file name and the offset within that log file) to the data. If the data does not exist for a given key, no mapping through the tree will exist for that key.</p>
+
+<p>Inserting data is relatively straightforward. Search the tree as usual to figure out where to hook in the new leaf node, write the new key and data to the disk, then attach the new leaf node to the tree. In the case of a deletion, the map pointer will, in essence, be set to NULL so that the in-memory leaf node will be garbage collected and the on-disk representation of the map will be updated to note that the data has been deleted.</p>
+
+<p>But what about transactions? All operations on the leaf nodes are carried out under the protection of full-blown locks. Locks are part of the transactional context and the complete set of ACID properties are adhered to. For example, if an operation aborts, all of the data in the leaf nodes continue on as they were before the transaction was attempted. The transaction contains a reference to the original data for each modified record, so undoing a transaction just resets the map entry.</p>
+
+<p>One of the tricky things about dealing with tree-like data structures is retaining the various aspects that keep it tree-like rather than degenerating into something slow such as a list. The two main tree operations for preserving treeness involve maintaining the tree's balance. The first operation involves splitting a single tree node into subnodes when the original node gets full due to inserting new data. You can read about all of the fun involved in splitting and combining nodes in the literature, but the primary issue for maintaining the high level of concurrency is that JE does not need to abort the split operations when a transaction is aborted. As noted earlier, only the leaf nodes are locked during transactions. So, the internal nodes only need to be latched while performing the split itself, thereby allowing other threads to continue to traverse the tree during the transaction. The second operation deals with combining nodes together when nodes are not full enough due to deleting data. The combining of nodes is done by an asynchronous compressor thread. It is actually good to be a bit lazy about combining nodes because the user transactions don't have to pay the price of the rebalancing operations, new data may well be inserted soon (thus saving both combine and split operations), and because the cache manager will handle the problems that arise when memory becomes full.</p>
+<h3>Cache Management</h3>
+
+<p>So far, the use of the concurrent tree takes care of the high-speed data retrieval while the LFS handles writing data to disk as quickly as possible. But what happens if the entire database won't fit in memory? Ignoring the problem is an option, but assuming that every application will always have enough memory to bring in all of the data into memory is unrealistic. Because the real world has limits, the database engine had better be able to handle running out of memory in a graceful and high-performance manner.</p>
+
+<p>The first key to dealing with memory limitations effectively is to recognize that in any given time frame, only some data will be used a lot while other data may be used little or not at all. The trick is for the cache manager to figure out which tree nodes it can evict from memory whenever it runs out and needs to make space available. There are a number of classical approaches to deciding which nodes to evict. One way would be to keep track of which nodes were used most often and throw out the ones used least often. That approach is very precise but is costly in terms of both space and time. A more efficient solution approximates the usage information by merely keeping track of how recently each node was last used&#151;this is known as the least-recently used (LRU) algorithm. </p>
+
+<p>The JE cache manager, the "evictor," approximates the LRU algorithm such that the time needed to get and hold latches and locks on the affected nodes is minimized. Rather than doing something simplistic and slow, such as locking the entire tree, the JE implementation tracks the LRU information via a list of all of the nodes. The nodes are added to the end of the LRU list whenever the nodes are created and added to the in-memory tree. The usage information is maintained very simply: Each time a node is traversed, the node's timestamp is updated to the current time.</p>
+
+<p>The evictor implementation embodies a number of high-performance tricks. At the implementation level, the LRU list can be updated while iterators are traversing it. In terms of contention management, as with the concurrent tree implementation, only the minimum number of list nodes are latched or locked to perform any given operation. Algorithmically, rather than constantly reordering the nodes in the list by LRU, the JE implementation leaves the list ordering as is.</p>
+
+<p>The evictor uses a sliding window technique to segment the LRU list for processing. That is, the evictor processes all of the nodes uncovered by the window as the window slides across the LRU list. In JE, the default window size is 10 percent of the size of the entire LRU list. A copy of the LRU list's nodes are stuffed into a priority queue where the "priority" is based on the LRU timestamp. By default, the size of the priority queue is set to 10 percent of the size of the window. So, after processing a window's worth of nodes, the priority queue will contain only the least-recently used 10 percent of the nodes in the window. All of the nodes remaining in the priority queue will then be evicted from the system. Any nodes containing data that has not yet been flushed to disk will, of course, be written to disk prior to being evicted. The evictor will iterate through each successive window on the LRU list until it is able to reclaim enough free memory. <a name="rf6"></a><a href="0507ff6.html">Figure 6</a> shows the evictor processing one window of the LRU list through the priority queue.</p>
+<h3>Performance</h3>
+
+<p>The rationale for bringing together the LFS, concurrent tree, and evictor is maximizing performance. The LFS delivers high-speed transactional write performance while the concurrent tree, in conjunction with the evictor, provides high-performance reading. The following benchmarks were performed on off-the-shelf, commodity hardware (~$1500 for a dual-2.4-GHz Xeon, 1-GB RAM, Windows XP) running JE v1.5.3 using the server version of Sun's J2SE v1.5.0 virtual machine implementation. The data records are 300 bytes in size: 6 bytes per key + 294 bytes of data. The database for these benchmarks consists of 200,000 records.</p>
+
+<p><a name="rf7"></a><a href="0507ff7.html">Figure 7</a> shows the read performance of sequential data scans of the entire database, both with and without locks and transactions (in which case, one complete scan is made per transaction). The chart also shows the performance of random reads across the entire database, both with and without locks and transactions (in which case, one random read is made per transaction). As expected, the reads via the cache are orders of magnitude faster than reading the data from disk.</p>
+
+<p><a name="rf8"></a><a href="0507ff8.html">Figure 8</a> compares the throughput of modification operations (insert, update, and delete) against a baseline of raw Java write speed using the java.nio facilities. The tests are done both with and without syncing the filesystem (via <i>fsync()</i>) at the end of each write or transaction. Syncing guarantees the on-disk durability of the data. The difference between the two right-most groups show the overhead necessary to make sure that the data is durable. The three groups on the left show how the throughput of the modification operations is near maximum performance&#151;the point of saturating the disk.</p>
+<h3>Conclusion</h3>
+
+<p>The performance of Berkeley DB Java Edition is achieved by integrating the use of the LFS, concurrent tree, and evictor stems from the willingness to leverage traditional and modern ideas, while matching the strengths and weaknesses of each approach so that the weaknesses of one are covered by the strengths of the others.</p>
+
+
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>/* See the file LICENSE for redistribution information.
+ * Copyright (c) 2004 Sleepycat Software.  All rights reserved.
+ */
+
+package com.sleepycat.examples.je;
+
+import java.io.File;
+
+import com.sleepycat.je.Cursor;
+import com.sleepycat.je.Database;
+import com.sleepycat.je.DatabaseConfig;
+import com.sleepycat.je.DatabaseEntry;
+import com.sleepycat.je.DatabaseException;
+import com.sleepycat.je.Environment;
+import com.sleepycat.je.EnvironmentConfig;
+import com.sleepycat.je.LockMode;
+import com.sleepycat.je.OperationStatus;
+import com.sleepycat.je.Transaction;
+
+/* SimpleExample creates a database environment, a database, and a database
+ * cursor, inserts and retrieves data.  */
+class SimpleExample {
+    private static final int EXIT_SUCCESS = 0;
+    private static final int EXIT_FAILURE = 1;
+    private int numRecords;   // num records to insert or retrieve
+    private int offset;       // where we want to start inserting 
+    private boolean doInsert; // if true, insert, else retrieve
+    private File envDir;
+    public SimpleExample(int numRecords, boolean doInsert, File envDir,
+                         int offset) {
+        this.numRecords = numRecords;
+        this.doInsert = doInsert;
+        this.envDir = envDir;
+        this.offset = offset;
+    }
+    /** Usage string */
+    public static void usage() {
+        System.out.println("usage: java " +  
+                           "com.sleepycat.examples.je.SimpleExample " +
+                           "&lt;dbEnvHomeDirectory&gt; " +
+                           "&lt;insert|retrieve&gt; &lt;numRecords&gt; [offset]");
+        System.exit(EXIT_FAILURE);
+    }
+    /** Main */
+    public static void main(String argv[]) {
+        if (argv.length &lt; 2) {
+            usage();
+            return;
+        }
+        File envHomeDirectory = new File(argv[0]);
+        boolean doInsertArg = false;
+        if (argv[1].equalsIgnoreCase("insert")) {
+            doInsertArg = true;
+        } else if (argv[1].equalsIgnoreCase("retrieve")) {
+            doInsertArg = false;
+        } else {
+            usage();
+        }
+        int startOffset = 0;
+        int numRecordsVal = 0;
+
+        if (doInsertArg) {
+
+            if (argv.length &gt; 2) {
+                numRecordsVal = Integer.parseInt(argv[2]);
+            } else {
+                usage();
+                return;
+            }
+
+            if (argv.length &gt; 3) {
+                startOffset = Integer.parseInt(argv[3]);
+            }
+        }
+
+        try {
+            SimpleExample app = new SimpleExample(numRecordsVal, doInsertArg,
+                                               envHomeDirectory, startOffset);
+            app.run();
+        } catch (DatabaseException e) {
+            e.printStackTrace();
+            System.exit(EXIT_FAILURE);
+        }
+        System.exit(EXIT_SUCCESS);
+    }
+    /** Insert or retrieve data */
+    public void run() throws DatabaseException {
+        /* Create a new, transactional database environment */
+        EnvironmentConfig envConfig = new EnvironmentConfig();
+        envConfig.setTransactional(true); 
+        envConfig.setAllowCreate(true);    
+        Environment exampleEnv = new Environment(envDir, envConfig);
+        
+        /* Make a database within that environment */
+        Transaction txn = exampleEnv.beginTransaction(null, null);
+        DatabaseConfig dbConfig = new DatabaseConfig();
+        dbConfig.setTransactional(true); 
+        dbConfig.setAllowCreate(true);
+        dbConfig.setSortedDuplicates(true);
+        Database exampleDb = exampleEnv.openDatabase(txn,"simpleDb",dbConfig);
+        txn.commit();
+        /* Insert or retrieve data. In our example, database records are
+         * integer pairs. */
+        if (doInsert) {
+            /* put some data in */
+            for (int i = offset; i &lt; numRecords + offset; i++) {
+                /* Note that autocommit mode, described in the Getting
+                 * Started Guide, is an alternative to explicitly
+                 * creating the transaction object. */
+                txn = exampleEnv.beginTransaction(null, null);
+                OperationStatus status = exampleDb.put(txn,
+                           new IntDatabaseEntry(i), new IntDatabaseEntry(i));
+
+                /* Note that put will throw a DatabaseException when 
+                 * error conditions are found such as deadlock. However, the
+                 * status return conveys a variety of information. For 
+                 * example, the put might succeed, or it might not succeed if 
+                 * the record exists and duplicates were not.  */
+                if (status != OperationStatus.SUCCESS) {
+                    throw new DatabaseException("Data insertion got status " +
+                                                status);
+                }
+                txn.commit();
+            }
+        } else {
+            /* retrieve the data */
+            Cursor cursor = exampleDb.openCursor(null, null);
+            IntDatabaseEntry foundKey = new IntDatabaseEntry();
+            IntDatabaseEntry foundData = new IntDatabaseEntry();
+
+            while (cursor.getNext(foundKey, foundData, LockMode.DEFAULT) ==
+                   OperationStatus.SUCCESS) {
+                System.out.println("key=" + foundKey.getInt() +
+                                   " data=" + foundData.getInt());
+            }
+            cursor.close();
+        }
+        exampleDb.close();
+        exampleEnv.close();
+    }
+    /* Here's an example of how you can extend a DatabaseEntry in a
+     * straightforward way to allow storage/retrieval of ints, or
+     * whatever kind of data you wish.  We've declared it as a static
+     * inner class, but it need not be.
+     * Also see com.sleepycat.bind and the BindingsExample for how to map
+     * between Java objects and DatabaseEntries. */
+    static /*nested*/ class IntDatabaseEntry extends DatabaseEntry {
+        IntDatabaseEntry() {
+        }
+        IntDatabaseEntry(int i) {
+            setInt(i);
+        }
+        void setInt(int i) {
+            byte[] intData = new byte[4];
+            intData[3] = (byte) (i &gt;&gt; 0);
+            intData[2] = (byte) (i &gt;&gt; 8);
+            intData[1] = (byte) (i &gt;&gt; 16);
+            intData[0] = (byte) (i &gt;&gt; 24);
+            setData(intData);
+        }
+        int getInt() {
+            byte [] val = getData();
+            return ((val[3] &amp; 0xff)+ ((val[2] &amp; 0xff) &lt;&lt; 8) +
+                    ((val[1] &amp; 0xff) &lt;&lt; 16) + ((val[0] &amp; 0xff) &lt;&lt; 24));
+        }
+    }
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

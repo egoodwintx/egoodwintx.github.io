@@ -1,0 +1,240 @@
+<html>
+<head>
+<title>July, 2004: Templates &amp; Marshaling  C++ Function Calls</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>Templates &amp; Marshaling  C++ Function Calls</h1>
+<p><i>C/C++ Users Journal</i> July, 2004</p>
+<h2> Clean C++ without SOAP, natural-language binding, and no intermediate languages</h2>
+
+
+<h3>By Mark Bartosik</h3>
+
+
+<I>Mark Bartosik is a software engineer who specializes in debugging. Mark can be contacted at mark.bartosikbugbrowser.com.</I>
+
+<hr>
+
+
+
+
+
+<p>There are a myriad of ways to connect C++ code over process or machine boundaries, none of which are truly native to C++ and most requiring some form of intermediate language. But often, IPC mechanisms such as SOAP, COM, or DCE RPC are overkill for the task at hand. Sure, they provide machine- and language-neutral interface definitions; some even provide a transport. However, this is also their weakness. If all your code is in C++, what use is language neutrality?</p>
+
+<p>Worse still, in an effort to be infinitely flexible and self-describing, SOAP can result in significant performance penalties. I've seen web servers spend more time decoding SOAP messages than doing real work.</p>
+
+<p>When an intermediate language such as IDL, WDL, or XML is used, it is typically compiled into a proxy stub. Your code interfaces with the proxy stub and the proxy stub is linked into your program. The proxy stub sits between your code and the code you want to call. The interface that the intermediate language forces you to use is typically unnatural to C++. For instance, have you ever wanted to pass an <b>std::string</b> to a COM object? COM does not understand what an <b>std::string</b> is; you must convert to/from a <b>BSTR</b> or <b>_bstr_t</b>. The complexity added to C++ code to be compatible with the IPC provider can be huge. Think about the work required to make an out-of-process call to this function:</p>
+
+<pre>
+vector&lt;string&gt; get_titles(const 
+   string &amp; author)
+
+</pre>
+
+<p>Now think about the various potential IDL prototypes for this function&#151;none of which are especially appealing. In this article, I'll show how C++ templates (and macros) can be used to automatically generate code that enables <b>get_titles</b> and other C++ functions to be called out-of-process. For example, calling <b>get_titles</b> can be as simple as: </p>
+
+<pre>
+vector&lt;string&gt; titles = 
+  proxy-&gt;get_titles(author);
+
+</pre>
+
+<p>while the implementation of <b>get_titles</b> is as simple as: </p>
+
+<pre>
+vector&lt;string&gt; get_titles(const 
+   string &amp; author)
+{
+// your code
+}
+
+</pre>
+
+<p>The steps required to call a function out-of-process are roughly:</p>
+
+
+
+<ol>
+  <li>Serialize <b>[in]</b> arguments from the caller into a buffer.</li>
+  <li>Transport the buffer to the callee's process.</li>
+  <li>Create temporary storage for the arguments in the callee's process.</li>
+  <li>Reconstruct the <b>[in]</b> arguments in the callee's process.</li>
+  <li>Dispatch the call to the correct target function passing both <b>[in]</b> and <b>[out]</b> arguments to it.</li>
+  <li>Serialize the <b>[out]</b> arguments and any return value to a buffer.</li>
+  <li>Transport the buffer back to the caller's process.</li>
+  <li>Deserialize the buffer in the caller's process and update the caller's arguments.</li>
+</ol>
+
+
+
+<p>The marshaling library I present here (available at http://www .cuj.com/code/) implements these steps. </p>
+<h3>The Implementation Challenges </h3>
+
+<p>The key implementation challenges that have to be overcome are:</p>
+
+
+
+<ul>
+  <li>How to differentiate <b>[in]</b> from <b>[out]</b> parameters?</li>
+  <li>How to dispatch to the correct function without requiring users to implement a large switch statement?</li>
+  <li>How to serialize? </li>
+  <li>How to deserialize?</li>
+  <li>How to transport?</li>
+</ul>
+
+
+
+<p>Function prototypes should express the intent of the programmer. This means clearly expressing which parameters are <b>[in]</b> and which are <b>[out]</b>. For example, <a href="0407bartosikt1.html" target="_BLANK">Table 1</a> illustrates this for an object of type <b>T</b>. This is important where IPC is involved because there's a real cost to marshaling data between processes. This is especially true when the processes are on different machines linked via a WAN. Consider the function: </p>
+
+<pre>
+void get_name(string &amp; given, string 
+   &amp; family);
+
+</pre>
+
+<p>Both the parameters are intended to be <b>[out]</b> parameters. However, with C++, only the return value can be truly <b>[out]</b>-only. Because C++ passes references on the stack, the cost difference between an <b>[out]</b> and an <b>[in/out]</b> parameter is zero. Thus, C++ does not need a true <b>[out]</b>, only a parameter type. But the cost of needlessly copying data to remote processes could be high. Clearly, you need to give the compiler some way to distinguish <b>[in/out]</b> from <b>[out]</b>-only parameters:</p>
+
+<pre>
+void get_name(marshal::out&lt;string &amp;&gt; given,
+	    marshal::out&lt;string &amp;&gt; family);
+
+</pre>
+
+<p>For consistency, I provide three adapters&#151;<b>marshal::in</b>, <b>marshal::out</b>, and <b>marshal::in_ out</b>. Most of the decision logic is in a class called <b>marshal::traits</b>. As <a href="0407bartosikt2.html" target="_BLANK">Table 2</a> shows, traits use template specialization to make decisions. The <b>marshal::traits</b> class is used to make several compile-time decisions about how to treat parameters and return values (my marshaling library requires Boost library headers, http://www.boost.org/). The most important decision is in deciding which direction to serialize each argument. Both processes must agree on this at compile time because no metainformation is sent over the wire (this is early binding). Other important decisions that <b>marshal::traits</b> is used to make include whether the data can be marshaled at all, whether the return type can be marshaled, and what is a suitable intermediate value type. For example, <b>const char *</b> is a reference type with no storage, so data is deserialized into an alternative value type with the same wire representation, which is selected by <b>marshal::traits&lt;const char*&gt;::value_type</b>. <a href="0407bartosikl1.html" target="_BLANK">Listing 1</a> includes some examples of <b>marshal::traits</b> classes. The only permitted return types are value or handle types plus void: </p>
+
+<pre>
+T, void *, const void *, void
+
+</pre>
+
+<p>Returning references or pointers to objects in another process is potentially unsafe. The objects certainly cannot be accessed directly. However, returning opaque handles (via <b>void *</b>) and value types is permitted. If you attempt to marshal this function, you get a compile-time error:</p>
+
+<pre>
+char *getenv(const char *varname );
+
+</pre>
+
+<p>However, this is allowed:</p>
+
+<pre>
+string getenv(const char *varname );
+
+</pre>
+
+<p>The first version of <b>getenv</b> is clearly a C function, whereas the second is a C++ function. This leads me to the next restriction&#151;pointer and size pairs are often used by C functions for <b>[out]</b> parameters. For example:</p>
+
+<pre>
+char * fgets(char * str, int n, FILE * stream);
+
+</pre>
+
+<p>The first parameter is an <b>[out]</b> parameter, the second parameter specifies how much data can be written. The problem is that the marshaling information is split across two parameters. There is no support for this and I make no apologies for it because I'm only interested in marshaling C++ function calls and this is a C function. Similar C++ versions of this function that can be marshaled might look like:</p>
+
+<pre>
+bool fgets(file_t file_handle, string &amp; str);
+
+</pre>
+
+<p>or</p>
+
+<pre>
+bool fgets(file_t file_handle , 
+  marshal::out&lt;string&gt; &amp;&gt; str);
+
+</pre>
+
+<p>I decided to treat pointers like references that might be equal to <b>NULL</b>. So how can you marshal arrays? <a href="0407bartosikt3.html" target="_BLANK">Table 3</a> lists my recommendations. I could have allowed fixed-length arrays to be used as parameters [1]; for example:</p>
+
+<pre>
+void send_array(int const (&amp;my_array)[10] );
+
+</pre>
+
+<p>However, such functions are rare, and it would complicate the marshaling implementation. So <b>std::vector</b> remains the preferred way to transfer arrays, although the implementation can easily be extended to support other collections (as long as the size of the collection is available and it can be default initialized).</p>
+<h3>Serialization and Encoding</h3>
+
+<p>Deciding how to go about serializing the arguments was easy. Streams are the typical C++ idiom for serialization [2]. The standard formatted C++ stream operators are not always symmetrical; for example, the standard insertion operator for <b>std::string</b> writes the whole string, but the extraction operator stops at the first whitespace. Similarly, there are insertion operators for <b>const char *</b> and <b>enum</b>, but there are no corresponding extraction operators. The main requirement is that an object inserted into a stream using the <b>operator&lt;&lt;</b> can be fully reconstructed using the <b>operator&gt;&gt;</b>. If this is not possible, as with <b>const char*</b>, then an object of type <b>T</b> can be inserted using the <b>operator&lt;&lt;</b>, but an alternative type <b>marshal::traits&lt;T&gt;::value_type</b> with the same wire representation can later be extracted and then converted back to type <b>T</b> using the function <b>marshal::traits&lt;T&gt;::to_arg</b>. The format into which the data is serialized is not important&#151;many different formats could be used. The amount of state information that these streams need to maintain is minimal. I provide the following streams:</p>
+
+<pre>
+marshal::raw_ostream, marshal::raw_istream, marshal::raw_iostream,
+marshal::lex_ostream, marshal::lex_istream, marshal::lex_iostream,
+marshal::null_ostream, marshal::null_istream
+
+</pre>
+
+<p>The real work is done in the stream operators; the actual stream class does little more than provide a type to select the appropriate insertion operators and a placeholder for the stream buffer. The <b>lex_stream</b> operators transfer data in text form, providing a simple, platform-neutral encoding scheme, although no specific character set is assumed. The <b>raw_stream</b> operators are built for speed and transfer the build-in types as a raw byte pattern (like <b>memcpy</b> does), but types such as <b>const char *</b> are run-length encoded. This is efficient but requires that the processes are running on machines and compiled with compilers that use the same bit layout for the basic types. For example, the <b>sizeof(int)</b> must be the same on both platforms and must have the same representation (Big or Little Endian). If only strictly defined types such as <b>__int32</b> are used in the interface functions, then only the bit layout needs to be the same. Alignment and calling conventions can be different without causing any problems. Some IPC mechanisms dictate a calling convention. In this case, the C++ compiler generates all the proxy stub code, so this restriction does not exist.</p>
+
+<p>The <b>null_ostream</b> does nothing. This is the default type for the debug stream (more on that later). A do-thing class is used rather than a <b>NULL</b> pointer so that the compiler can completely eliminate unused code. This is a recurring theme in the code. Most of the conditions are template arguments that select whether to instantiate code; there are relatively few runtime tests. Other potential streams include <b>asn1_</b> [3], <b>little_endian</b>, and <b>big_endian</b>.</p>
+<h3>Transport</h3>
+
+<p>My only real concern about a transport is that the implementation should be easy to swap. Again, C++ streams provide the answer. Streams typically come in two parts, the stream class and a buffer class. For example, an <b>std::ofstream</b> class uses an <b>std::filebuf</b> class to do the actual writing to the file. Typical marshaling scenarios include cross-process (same machine), across LAN, and across the Internet. I provide buffer classes that are able to use pipes (or HTTP/HTTPS) as transports, which covers each of the typical scenarios. If you write or derive your own buffer classes, you might like to add compression or encryption. If you write your own stream classes, you must remember to provide all the appropriate insertion and extraction operators.</p>
+
+<p>Typically, the same transport is used for both sending and receiving data. For example, a full-duplex pipe (or two half-duplex pipes) and HTTP requests result in HTTP responses. Data flowing in one direction can be encoded differently; for example, requests might be sent "in-the-clear," whereas return results might be compressed, encrypted, or even transported over an alternative physical network. For maximum flexibility, you can mix-and-match different types of input and output streams and different types of transport buffers.</p>
+<h3>Dispatch</h3>
+
+<p>If you have done much network programming, you have probably used a message specification. A message specification typically defines a list of messages and the fields contained within those messages. One of those fields is usually the message ID. The receiver of the message first decodes the message ID, then performs a switch on the message ID: </p>
+
+<pre>
+switch (message_id)
+{
+   case MSG_ID_X: do_x(pmessage);
+      break;
+   case MSG_ID_Y: do_y(pmessage);
+      break;
+
+</pre>
+
+<p>This is a primitive form of dispatch. Instead of a message ID, COM can use v-table indexes, function names, or dispids (dispatch IDs). Unless you are implementing COM's dispatch mechanism <b>IDispatch::Invoke</b> yourself, you will not have to write a switch statement; COM uses metainformation in type library files. I needed some form of dispatch ID that could be generated by the compiler and used to automatically lookup a function pointer.</p>
+
+<p>The C preprocessor is able to help out here&#151;a simple interface definition; see <a href="0407bartosikl2.html" target="_BLANK">Listing 2</a>. The macro expansion results in a class declaration; <a href="0407bartosikl3.html" target="_BLANK">Listing 3</a> is an abbreviated version. In this case, <b>strlen</b> has a dispatch ID of 1, and <b>get_titles</b> a dispatch ID of 2. The dispatch ID of each function is calculated by taking <b>__LINE__</b> and subtracting the value of <b>line_begin</b>. A function's dispatch ID is the number of lines including blank lines between the <b>MARSHAL</b> macro for that function and the <b>BEGIN</b> macro. When an instance of <b>proxy_t</b> is created, it populates an array that is indexed using the dispatch IDs and contains pointers to invoke functions. There are other techniques for generating the dispatch IDs, including using the initialization order of member variables, and using <b>offsetof</b> for each member variable. Each has its drawbacks. Using the preprocessor in this way means that the addition of vertical whitespace between the <b>BEGIN</b> and <b>END</b> macros alters the dispatch IDs, requiring recompilation of the caller and callee&#151;be warned. Using initialization order has a runtime overhead. <b>offsetof</b> is intended only for use with plain-old data types and can generate compiler warnings (for GCC 3.4, use <b>-Wno-invalid-offsetof</b>). The default is to use <b>offsetof</b>, but special versions of the <b>BEGIN</b> macro let the method be selected. <a href="0407bartosikl4.html" target="_BLANK">Listing 4</a> shows a relatively portable way to calculate the dispatch IDs using <b>offsetof</b>; the marshaling code uses this principle.</p>
+
+<p>There are two arguments to the <b>MARSHAL_ARGn_EX</b> macro for when functions are overloaded. The second argument specifies the function type. The preferred macro <b>MARSHAL_ARGn</b> uses the <b>typeof</b> operator; this is not yet part of Standard C++ [5], and can only be used if your compiler supports it. Before the target function can be called, the values of the parameters must be deserialized. This is easy for value types such as <b>int</b>; for <b>std::string</b>, an overloaded <b>operator&gt;&gt;</b> can be used. </p>
+
+<p>This does not work for reference types such as <b>const char *</b> because there is no suitable <b>operator&gt;&gt;</b>. An alternative type, selected by <b>marshal::traits&lt;const char *&gt;::value_type</b>, is converted to the parameter type using the function <b>marshal::traits&lt;const char *&gt;::to_arg</b>. Enumerated types also pose a problem. Enumerated types are convertible to <b>int</b> so they are easy to serialize using <b>operator&lt;&lt;</b>, but there is no corresponding <b>operator&gt;&gt;</b>. To deserialize an enumerated type, an integer must first be deserialized, then cast to the enumeration. <a href="0407bartosikl5.html" target="_BLANK">Listing 5</a> shows a simplified version of the dispatch function and how it only reads the <b>[in]</b> parameters. The selection of which parameters to read from the input stream is done by <b>read_arg</b>. It uses the <b>marshal::traits</b> class to decide whether the parameter is <b>[in]</b> or <b>[out]</b>, and only reads the <b>[in]</b> parameters from the stream.</p>
+
+<p>After dispatching the deserialized arguments to the correct function, the code waits for either an exception to occur or for the function to return, so that the <b>[out]</b> arguments can be transported back to the caller. The <b>marshal::traits</b> class is used to decide which arguments to transport back to the caller. If an exception occurs, an exception of type <b>std::runtime_error</b> is thrown in the caller's context. If the function has a void return type and no <b>[out]</b> arguments, then <b>MARSHAL_ARG_ASYNC</b> can be used to declare that the calling code does not need to wait for the callee to return. </p>
+<h3>Debug Support</h3>
+
+<p>Since I write debugging tools, debugging support is important to me [4]. When debugging networked systems, I want to see what the inputs and outputs are to a particular process. Systems that have diagnostic logging on their network interfaces are much easier to diagnose than systems that do not. The code has support for three streams&#151;output, input, and debug. If a debug stream is provided, then all traffic is logged to that stream. Configuring the debug stream to use <b>std::clog</b> provides a convenient way to demonstrate the code.</p>
+<h3>Putting It All Together</h3>
+
+<p>Using the automatically generated proxy is simple. <a href="0407bartosikl2.html" target="_BLANK">Listing 2</a> gives an example of interface definition for the functions <b>strlen</b> and <b>get_titles</b>. <a href="0407bartosikl6.html" target="_BLANK">Listings 6</a> and <a href="0407bartosikl7" target="_BLANK">7</a> illustrate how these functions are implemented and called.</p>
+
+<p>In <a href="0407bartosikl7.html" target="_BLANK">Listing 7</a>, the call to proxy.bind configures the optional debug stream to <b>std::clog</b>. The full code for these listings is available at http://www.cuj.com/code/. You should run the program pipe_callee.exe from a console window, followed by pipe_caller.exe from another console window. The output of the calling program is:</p>
+
+<pre>
+func: strlen [in](hello) [retval]5
+func: get_titles [in](Koenig) [retval]{Accelerated C++,C Traps
+  and Pitfalls,Ruminations on C++,}
+func: get_website [retval]www.bugbrowser.com
+
+</pre>
+
+<p>The code available online includes Windows and POSIX examples that bind to a named pipe. Additionally, there is code that binds to an HTTP (or HTTPS) transport buffer using Microsoft-specific APIs (WinHttp.dll and WinINet.dll) for the caller and ISAPI for the callee. There is also reference documentation. </p>
+<h3>Limitations and Future Directions</h3>
+
+<p>The key limitation with this code is that it only supports free-standing functions (not member functions) in the global namespace. With objects, additional consideration needs to be given to operators and copy constructors. To mitigate this, out-of-process interfaces are much less complex than in-process interfaces, and thus the need for objects is reduced. Pointer and size pairs are often used by C functions to return <b>[out]</b> parameters; this idiom is not supported and I recommend using <b>std::string</b> or <b>std::vector</b> instead. All marshaled types must be default constructable; alternatively, a suitable <b>traits&lt;T&gt;::value_type </b>must be provided.</p>
+
+<p>The code has been built and tested with GCC 3.2.3, GCC 3.3.1 on Linux and Windows, and requires at least Visual C++ 7.1. To take advantage of the <b>typeof</b> operator requires GCC 3.4 (under development at the time of writing). Note that support for <b>typeof</b> is optional and can be used to simplify interface specifications. Mileage with other compilers may vary. The code is still experimental, so I am interested in feedback. I would like to add configurable and chainable filters that operate on each function call; for example, uuencode, zip, encrypt, and so on. I hope to post any updates or additional transport buffers at http://www.cuj.com/ or http://www.bugbrowser.com/. </p>
+<h3>Acknowledgments</h3>
+
+<p>Thanks to Andrew Koenig and Jon Jagger for reviewing this. </p>
+<h3>References and Notes</h3>
+
+<ol>
+  <li>[1]	Vandevoode, David and Nicolai M. Josuttis. <i>C++ Templates</i>. Addison-Wesley, 2002.</li>
+  <li>[2]	Langer, Angelika and Klaus Kreft. <i>Standard C++: IOStreams and Locales</i>, Addison-Wesley, 2000.</li>
+  <li>[3]	For an explanation of ASN.1 see http://www.asn1.org/ or http://asn1 .elibel.tm.fr.</li>
+  <li>[4]	See http://www.bugbrowser.com/.</li>
+  <li>[5]	Jaakko JŠrvi et al. Decltype and auto, doc no N1418 03-0061, http://std.dkuug.dk/jtc1/sc22/wg21/docs/papers/2003/n1478.pdf. </li></ol>
+
+
+
+
+
+
+</body>
+</html>

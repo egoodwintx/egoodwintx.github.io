@@ -1,0 +1,365 @@
+<html>
+<head>
+<title>Sep02: Socket-Level Server Programming & .NET</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Socket-Level Server Programming &amp; .NET</h1>
+<p><i>Dr. Dobb's Journal</i> September 2002</p>
+
+<h3>By Paul Buis</h3>
+
+<I>
+Paul is an associate professor of computer science at Ball State University. He can be contacted at peb@bsu.edu.</I>
+
+<hr>
+
+<p>Asynchronous callbacks let you use a limited number of threads to respond in a concurrent manner to multiple simultaneous clients on servers. This technique is appropriate for clients that might use, for instance, TCP connections for extended periods. The clients can use the connections for extended periods of time because they are making multiple requests of the server. One client may send an individual request that takes a long time. The request may be time consuming to process because it involves the transmission of nontrivial amounts of data or the consumption of nontrivial amounts of server-side resources, such as CPU or disk access.</p>
+<p>The simplest way of dealing with such long-lived connections in UNIX is to fork a child process for each client. In multithreaded operating systems (such as UNIX and Windows), the easiest approach is to start a new thread each time the server accepts a new client. Using one thread per client rather than one process per client has an advantage in that starting a new thread is normally faster than starting a new process. The downside of using one thread per client is that a large number of clients may lead to a large number of active threads competing for system resources. This can result in poor performance as the CPU becomes overloaded and/or disk drives thrash.</p>
+<DDJADVERTISEMENT INLINE>
+
+<p>A more sophisticated approach is to manage a pool of threads, each waiting on a semaphore to be notified when a client comes along for them. The thread then handles one request and queues it for processing. When the processing is complete, a thread is obtained from the thread pool to send the response to the client. The pool is of fixed size, limiting the number of clients competing for resources, thus preventing the server from being overloaded. The threads are created before the client request arrives, reducing the response time for a particular request since unblocking an existing thread from a semaphore is much faster than creating a new thread. However, the problem with this approach is that it is complex to implement.</p>
+
+<p>The .NET Framework addresses this complexity with its <i>ThreadPool</i> utility class in <i>System.Threading</i> assembly. Some of the methods of the <i>Socket</i> class of the <i>System.Net.Sockets</i> assembly also use the same <i>ThreadPool</i>. An instance of the <i>Socket </i>class is a wrapper for a TCP socket handle to provide an object-oriented veneer. The <i>Socket</i> class offers several methods that wrap the Winsock 2 asynchronous functions (named <i>WSAAsync...</i>) into a straightforward callback mechanism similar to that used to respond to GUI events.</p>
+
+<p>The .NET Framework manages the thread pool for you. If a thread blocks for I/O and work is queued for processing, another thread is unblocked to keep all CPUs in a multiprocessor system busy. If the load on the CPU from other processes is light, the timeslice for the threads gets longer to prevent unneeded context switching. Conversely, if the load on the CPU from other processes is heavy, the timeslice for each thread gets smaller. When the thread pool is initialized, it contains a small number of threads. If the threads in the pool are constantly running, more threads are added to the pool. The maximum number of threads in the pool is limited. The limit may vary with the number of CPUs in the system. <i>ThreadPool.GetMaxThreads</i> returns the maximum on a particular system.</p>
+
+<p>In this article, I'll present code for .NET Framework sockets and asynchronous callbacks. The C# program in <A NAME="rl1"><A HREF="#l1">Listing One</A> is equivalent to a VB.NET program that's available electronically (see "Resource Center," page 5), except that the VB.NET program does not include code for UDP threads. In both cases, the code implements an echo server. </p>
+
+<p>In the <i>Main()</i> method, the object representing the service is constructed to listen on a specific port number. I used port 2000 as the default to avoid conflicting with the existing echo server running on port 7 on my development machine. You can specify another port as a command-line option and convert to an integer via the <i>Int32.Parse</i> utility function, which is essentially the same as the <i>atoi</i> function in C. The <i>TCPechodAsync</i> constructor creates a <i>Socket</i> object the same way the generic C code fragment using the socket API does in <A NAME="rl2"><A HREF="#l2">Listing Two</A>. The <i>IPEndPoint</i> object is analogous to the <i>struct sockaddr_in</i> in the traditional socket API. The <i>IPAddress.ANY</i> in the C# code is equivalent to the INADDR_ANY macro in the C code, denoting that the socket will be associated with any and all IP addresses on any and all interfaces on the local host.</p>
+
+<p>After constructing the <i>TCPechodAsync </i>object, the <i>Main</i> method invokes <i>Run</i>, which uses the <i>Socket</i> class's <i>BeginAccept </i>method to set up a call to the <i>FinishAccept</i> method. The call to <i>FinishAccept</i> will not be made until after a client has come along to connect to the server. Meanwhile, the main thread returns from <i>BeginAccept</i>, and then returns to <i>Main</i>. There, the example program sets up a semaphore on which to wait forever. If it did not wait, the program would terminate all the threads in the thread pool and exit. In a more involved server, <i>Main</i> could go on to set up a UDP-based server or an IPv6-based server before waiting forever.</p>
+
+<p>A reference to <i>FinishAccept</i> is encapsulated inside an object of type <i>AsyncCallback</i>. This is the .NET way of managing type safety of pointers to functions. <i>AsyncCallback</i> is declared:</p>
+
+<blockquote><p>
+public delegate void AsyncCallback</p>
+
+<p>
+		          (IAsyncResult ar);</p>
+
+</blockquote>
+
+<p>This is much prettier than the analogous C/C++ declaration: </p>
+
+<blockquote><p>
+typedef void (*AsyncCallback)</p>
+
+<p>
+		            (IAsyncResult).</p>
+
+</blockquote>
+
+<p>In addition, while a function pointer in C/C++ can be typecast in an unsafe manner, a .NET delegate function cannot. Furthermore, a delegate can be wrapped around object member functions with the same syntax used to wrap one around a static class function: Using a pointer to a C++ member function is nontrivial.</p>
+
+<p>Delegates are also easier to use than Java event listener classes. If the Java JDK provided asynchronous socket methods, it would have an interface called something like <i>AcceptListener</i> with a method named <i>FinishAccept</i>. You would then write an inner class that implemented this interface, create an instance of it, and hand that instance off to the class that was wrapped around a socket primitive. Delegates don't give you more expressive power than the aforementioned technique in Java, just more simplicity.</p>
+
+<p>The <i>FinishAccept</i> method, in turn, calls the <i>Socket</i> class's <i>EndAccept</i> method to get the socket associated with a newly connected client. The result returned by <i>EndAccept</i> would be the same if the <i>Accept</i> method was invoked instead of the <i>BeginAccept/EndAccept</i> pair. Just as <i>Run</i> set up an asynchronous call to <i>FinishAccept</i>, <i>FinishAccept</i> sets up an asynchronous call to <i>FinishReceive</i>. The interesting feature of this asynchronous call is that state information about the client connection is passed along as a property of the <i>IAsyncResult</i> parameter. The <i>ClientState </i>inner class encapsulates both the socket for the connection and the buffer that is being used for I/O with that socket.</p>
+
+<p>The first thing <i>FinishAccept</i> does to the socket returned by <i>EndAccept</i> is to set some socket options. Again, the code is very much analogous to the standard socket API. I wanted to increase the size of the operating system's send/receive buffers to increase the potential throughput of the server. To optimize throughput, these buffers need to have the same number of bytes as can be sent before TCP receives an acknowledgment. This would be equal to the product of the round-trip delay in seconds and the effective bandwidth of the network in bytes per second. In a 10-megabit Ethernet, you'd expect round trips to take about one millisecond and an effective bandwidth of a megabyte per second. Hence, a kilobyte buffer is big enough to optimize the connection. However, on higher bandwidth connections with longer round-trip delays, such as a transcontinental ATM, you need proportionally bigger buffers in the OS for optimum performance.</p>
+
+<p>After asking the operating system to begin the <i>Receive</i> operation and call <i>FinishReceive</i> when the operation completes, <i>FinishAccept</i> sets up an asynchronous call to itself to process the next client that comes along. The operating system maintains a queue of connections established with clients that the application program has not yet accepted. The maximum size of this queue is specified as a parameter to the socket <i>Listen</i> function. If too many clients attempt to connect at virtually the same time, the operating system will not have room for them in the queue and will refuse the connection. To avoid this, I was tempted to have <i>Run</i> begin multiple <i>Accept</i> operations on the listening socket. However, the documentation is quite clear that nonstatic members of the same instance of the <i>Socket</i> class are not threadsafe.</p>
+
+<p>After asking the operating system to begin the <i>Accept</i> operation for the next client, <i>FinishAccept</i> sets up an asynchronous call to <i>doInverseDNS</i> by interacting directly with the thread pool using the <i>ThreadPool.QueueUserWorkItem</i> utility function. Here, a <i>WaitCallback</i> delegate wraps the function pointer to <i>doInverseDNS</i> rather than an <i>AsyncCallback</i> delegate. The difference is that a function wrapped in a <i>WaitCallback</i> has a parameter that represents state information associated with the callback when <i>QueueUserWorkItem</i> was invoked rather than the more involved <i>IAsyncResult</i>, which has much more than just application state information.</p>
+
+<p><A NAME="rf1"><A HREF="0209bf1.htm">Figure 1</A> illustrates how each method of the class is called asynchronously from other methods via a dataflow diagram. The listening socket follows the dashed arrow, client sockets follow the solid arrow, and the inverse DNS lookup follows the dotted arrow. <i>FinishReceive </i>sets up an asynchronous call to <i>FinishSend</i>, which returns the favor by forming an endless loop that is broken only when the client breaks the connection or some exception is thrown. An exception may be thrown in odd circumstances such as when the client's host crashes and subsequently reboots. The client's host then has no idea what to do with the data the server is trying to send to it and responds with a TCP reset.</p>
+
+<p>Just as <i>BeginAccept/EndAccept</i> generates the same result as <i>Accept</i>, <i>BeginReceive/EndReceive</i> generates the same result as <i>Receive</i>, and <i>BeginSend/EndSend </i>generates the same result as <i>Send</i>. <i>BeginReceive</i> and <i>Receive</i> take essentially the same arguments as the standard socket API <i>recv</i> function. However, the .NET API adds more flags that can be used as final parameters. These are enumerated in as constants in the <i>SocketFlags</i> class. The <i>SocketFlags </i>parameter to <i>Receive</i> is a bitmask (multiple flags can be combined with a bitwise-OR). I use <i>SocketFlags.Partial</i> because I want to respond to echo requests containing a line of text smaller than the full buffer size. This behavior is the same as the socket API <i>recv</i> function with zero as the flag for the final parameter. Use of <i>SocketFlags.None</i> simplifies the common task of reading an amount of data known in advance into an appropriately sized buffer. The socket API <i>recv </i>function is called in a loop until the number of bytes returned by each invocation of <i>recv</i> totals to the buffer size.</p>
+
+<p>For the echo protocol, the server needs to take care when sending data back to the client to deal gracefully with a form of deadlock known as "netlock." Suppose a naively written client attempts to send a megabyte of data with one system call and receive the reply after the system call returns. The client will be blocked on the call to send until the OS can transfer most of the data to the server and get it acknowledged. Only when the remaining unacknowledged data can fit in the operating system's send buffer is the client unblocked from a standard call to send the data. The problem is that the server is sending the reply stream at the same time the client is still sending the request stream. Now, as the client's OS receive buffer fills up, it won't be emptied because the client is still trying to send. Eventually, the server's OS send buffer fills up and any more calls to send are blocked. </p>
+
+<p>One thing the server could do is maintain a large application-level buffer inside its program. But how large is large enough? The server has no way of knowing, since the echo protocol doesn't specify how long the request stream will be. A rogue client may even send data continuously without ever stopping to read the reply; requiring a buffer of infinite size. The enlarged OS buffers you created by setting the socket options in <i>FinishAccept </i>will help some, but the server can't prevent netlock from happening. The best you can do is to make sure that such clients don't end up consuming large amounts of server resources. Using a thread pool instead of one thread or process per client does this fairly well. A large number of such clients would still force the server to maintain a lot of state information.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>Since I have experience with the Java JDK socket class and the standard UNIX socket API in C, I encountered few surprises with the .NET framework <i>Socket</i> classes. .NET is able to take advantage of the asynchronous Winsock2 functions that are peculiar to Windows and not available on most other operating systems. The Java JDK is forced to either use only the more traditional socket API internally or emulate behaviors that are more sophisticated. Still, the .NET framework faces the same challenge of emulating Winsock2 functionality on other operating systems as it makes claims for cross-platform compatibility.</p>
+
+
+
+<p><b>DDJ</b></p>
+
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>// TCPechodAsync.cs
+// Author: Paul Buis, Computer Science Dept., Ball State University
+
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+
+/// &lt;summary&gt;
+/// Example of asynchronous callbacks for network socket I/O in .NET framework
+/// &lt;/summary&gt;
+public class TCPechodAsync 
+{
+    /// &lt;summary&gt;
+    /// max number of unaccepted clients
+    /// &lt;/summary&gt;
+   private const int osListenQueueSize = 64;
+
+    /// &lt;summary&gt;
+    /// size of OS's buffer for unsent &amp; unacknowledged data
+    /// &lt;/summary&gt;
+    private const int osSendBufferSize = 0x7ffe;
+
+    /// &lt;summary&gt;
+    /// size of OS's buffer for data that has arrived
+    /// from client but not yet received by program
+    /// &lt;/summary&gt;
+    private const int osReceiveBufferSize = 0x7ffe;
+
+    /// &lt;summary&gt;
+    ///  socket bound to a specific TCP port waiting for clients to connect
+    /// &lt;/summary&gt;
+    protected Socket listenSocket;
+
+    /// &lt;summary&gt;
+    /// socket bound to a specific UDP socket
+    /// &lt;/summary&gt;
+    protected Socket udpSocket;
+
+    /// &lt;summary&gt;
+    /// initializes listenSocket to listen for clients on specified port #
+    /// &lt;/summary&gt;
+    /// &lt;param name="port"&gt;port number to use&lt;/param&gt;
+    public TCPechodAsync(int port)
+    {
+        const AddressFamily af = AddressFamily.InterNetwork;
+        try
+        {
+           IPEndPoint localEndPoint = new IPEndPoint(IPAddress.Any, port);
+           listenSocket = new Socket(af, SocketType.Stream, ProtocolType.Tcp);
+           listenSocket.Bind(localEndPoint);
+           listenSocket.Listen(osListenQueueSize);
+
+           udpSocket = new Socket(af, SocketType.Dgram, ProtocolType.Udp);
+           udpSocket.Bind(localEndPoint);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine(e.Message);
+            Console.Error.WriteLine(e.StackTrace);
+        }
+    }
+    /// &lt;summary&gt;
+    ///  registers an event handler to respond to client connections
+    ///  and starts a thread for the UDP echo service
+    /// &lt;/summary&gt;
+    public void Run()
+    {
+        listenSocket.BeginAccept(new AsyncCallback(finishAccept), null);
+        ThreadStart threadStart = new ThreadStart(doUDP);
+        Thread udpThread = new Thread(threadStart);
+        udpThread.Start();
+    }
+    /// &lt;summary&gt;
+    /// handles UDP echo service
+    /// &lt;/summary&gt;
+    public void doUDP()
+    {
+        const int udpBuffSize = 0xffff;
+        byte[] buffer = new byte[udpBuffSize];
+        int nBytes; // number of bytes actually read
+        while (true)
+        {
+            IPEndPoint remoteIPEndPoint = new IPEndPoint(IPAddress.Any, 0);
+            EndPoint remoteEndPoint = (EndPoint)remoteIPEndPoint;
+            try
+            {
+                nBytes = udpSocket.ReceiveFrom(buffer, 
+                    ref remoteEndPoint);
+                udpSocket.SendTo(buffer, nBytes, SocketFlags.None,
+                    remoteEndPoint);
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine(e.Message);
+                Console.Error.WriteLine(e.StackTrace);
+            }
+        }
+    }
+    /// &lt;summary&gt;
+    /// event handler to respond to client connections. 
+    /// It accepts the connection, re-registers itself and 
+    /// registers a handler to respond received data.
+    /// &lt;/summary&gt;
+    /// &lt;param name="ar"&gt;result of accept operation&lt;/param&gt;
+    protected void finishAccept(IAsyncResult ar)
+    {
+        Socket clientSocket = null;
+        try
+        {
+            clientSocket = listenSocket.EndAccept(ar);
+            listenSocket.BeginAccept(new AsyncCallback(finishAccept), null);
+            clientSocket.SetSocketOption(SocketOptionLevel.Socket,
+                SocketOptionName.SendBuffer, osSendBufferSize);
+            clientSocket.SetSocketOption(SocketOptionLevel.Socket,
+                SocketOptionName.ReceiveBuffer, osReceiveBufferSize);
+            ClientState state = new ClientState(clientSocket);
+            AsyncCallback callback = new AsyncCallback(finishReceive);
+            clientSocket.BeginReceive(state.buffer, 0, state.buffer.Length,
+               SocketFlags.Partial, callback, state);
+            WaitCallback dnsCallback = new WaitCallback(doInverseDNS);
+            ThreadPool.QueueUserWorkItem(dnsCallback, 
+                                  clientSocket.RemoteEndPoint);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine(e.Message);
+            Console.Error.WriteLine(e.StackTrace);
+            if (clientSocket != null)
+                clientSocket.Close();
+        }
+    }
+    /// &lt;summary&gt;
+    /// A work item to do an inverse DNS lookup on an endpoint for logging.
+    /// This is done concurrently with finishRead() and finishSend()
+    /// &lt;/summary&gt;
+    /// &lt;param name="state"&gt;The remote endpoint containing the address that
+    ///  requires the reverse lookup&lt;/param&gt;
+    protected void doInverseDNS(Object state)
+    {
+        IPEndPoint ep = (IPEndPoint)state;
+        IPHostEntry he = Dns.GetHostByAddress(ep.Address);
+        Console.Out.WriteLine("Connection from {0} ({1}) port {2}",
+            he.HostName, ep.Address, ep.Port);
+    }
+    /// &lt;summary&gt;
+    /// event handler to process data received from client.
+    /// It starts sending data back to client and registers
+    /// handler to be notified when send is complete.
+    /// &lt;/summary&gt;
+    /// &lt;param name="ar"&gt;result of receive operation&lt;/param&gt;
+    protected void finishReceive(IAsyncResult ar)
+    {
+        ClientState state = (ClientState)ar.AsyncState;
+        try
+        {
+            int numBytes = state.socket.EndReceive(ar);
+            if (numBytes &lt;= 0)
+            {
+                state.socket.Close();
+                return;
+            }
+            AsyncCallback callback = new AsyncCallback(finishSend);
+            state.socket.BeginSend(state.buffer, 0, numBytes,
+                SocketFlags.None, callback, state);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine(e.Message);
+            Console.Error.WriteLine(e.StackTrace);
+            state.socket.Close();
+        }
+   }
+    /// &lt;summary&gt;
+    /// Event handler for completion of sending data to client.
+    /// It registers handler for next data recieve.
+    /// &lt;/summary&gt;
+    /// &lt;param name="ar"&gt;result of send operation&lt;/param&gt;
+    protected void finishSend(IAsyncResult ar)
+    {
+        ClientState state = (ClientState)ar.AsyncState;
+        try
+        {
+            state.socket.EndSend(ar);
+            AsyncCallback callback = new AsyncCallback(finishReceive);
+            state.socket.BeginReceive(state.buffer, 0, state.buffer.Length,
+                SocketFlags.Partial, callback, state);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine(e.Message);
+            Console.Error.WriteLine(e.StackTrace);
+            state.socket.Close();
+        }
+    }
+    /// &lt;summary&gt;
+    /// Parses command line and sets up the service to run
+    /// on the port specified in the command line.
+    /// &lt;/summary&gt;
+    /// &lt;param name="args"&gt;command-line argument for port number to use&lt;/param&gt;
+    public static void Main(string[] args)
+    {
+        int port;
+        switch (args.Length)
+        {
+            case 0:
+                port = 2000;
+                break;
+            case 1:
+                port = Int32.Parse(args[0]);
+                break;
+            default:
+                Console.WriteLine("Usage: TCPechodAsync [port]");
+                return;
+        }
+        TCPechodAsync echod = new TCPechodAsync(port);
+        echod.Run();
+
+        //wait forever to prevent other threads from getting killed
+        WaitHandle waiter = new ManualResetEvent(false);
+        waiter.WaitOne();
+    }
+    /// &lt;summary&gt;
+   /// Class to represent the state of interaction with one client
+    /// &lt;/summary&gt;
+    protected class ClientState
+    {
+        /// &lt;summary&gt;
+        /// size of buffer to use for all clients
+        /// &lt;/summary&gt;
+        private const int clientBufferSize = 4096;
+
+        /// &lt;summary&gt;
+        /// buffer to use for this client
+        /// &lt;/summary&gt;
+        public byte[] buffer = new byte[clientBufferSize];
+
+        /// &lt;summary&gt;
+        /// client socket
+        /// &lt;/summary&gt;
+        public Socket socket;
+
+        /// &lt;summary&gt;
+        ///  constructs a state object for specified client socket
+        /// &lt;/summary&gt;
+        /// &lt;param name="socket"&gt;socket to use for this client&lt;/param&gt;
+        public ClientState(Socket socket)
+        {
+            this.socket = socket;
+        }
+    }
+}
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two</H4>
+
+
+<pre>/* generic C code to bind a socket to a port and mark it as listening */
+SOCKET listenSocket;
+struct sockaddr_in localEndPoint;
+listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+memset(&amp;localEndPoint, 0, sizeof(localEndPoint));
+localEndPoint.sa_family=AF_INET;
+localEndPoint.sin_addr.s_addr = INADDR_ANY;
+localEndPoint.sin_port = htons((u_short) port)
+bind(listenSocket, &amp;localEndPoint, sizeof(localEndPoint));
+listen(s, 5);
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+
+
+</body>
+</html>

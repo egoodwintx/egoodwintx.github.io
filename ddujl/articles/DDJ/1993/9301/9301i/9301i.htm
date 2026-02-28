@@ -1,0 +1,209 @@
+<HTML>
+<META NAME="year" CONTENT="1993">
+<HEAD>
+<TITLE>JAN93: PROFILING FOR PERFORMANCE</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>PROFILING FOR PERFORMANCE<a name="0046_0003"></h1><P>
+<h2><a name="0046_0001"><a name="0046_0000">Simple performance measurement can be misleading</h2><P>
+<h3>Joseph M. Newcomer</h3><P>
+<p><i><a name="0046_0002"><a name="0046_0000">Joseph M. Newcomer received his PhD in the area of compiler optimization from Carnegie Mellon University in 1975.  He is currently a consultant and has been doing performance measurement of systems for 27 years.</i></p><hr><P>
+Profiling tools were developed to help identify a program's &quot;hot spots&quot;--those parts that consume significant computing resources.  Hot spots are rarely where you expect to find them.  In one compiler, for example, we found after profiling that 30 percent of the total execution time went into copying the input buffer to the lexical-analysis buffer, then copying the input buffer to the output-listing buffer (even when the listing was turned off). Avoiding these copy operations gained us considerable performance.<P>
+When studying the output from a profiling tool, it's important to understand what the tool is measuring, know the limits of the technique's accuracy, and determine whether it is in fact measuring what you think it is measuring.  This article discusses some of the pitfalls of performance measurement.<P>
+<h3><a name="0046_0004">Common Measures<a name="0046_0004"></h3><P>
+The two most important performance-measurement techniques are event measurement and program-counter sampling.  Because it is the easiest to implement, the program-counter sampling method is the most common.  With this technique, a timer interrupts the main execution, and the value of the program counter is noted.  A histogram of the sampling density identifies the hot spots.<P>
+One problem with program-counter sampling is that it only tells you that your program is spending, say, 30 percent of its time in the storage allocator.  It tells you where you are spending the time, but it doesn't say why.  For example, it could be that the storage allocator is incredibly slow.  It could also be that it is called 1,384,278 times.  Without the additional information about call frequency, the amount of time per call cannot be known.<P>
+In one case, we found the storage allocator to be the major bottleneck in the system.  The implementors of the system complained about the allocator performance.  After some measurement, we found that performance was so abysmal because a subroutine in the inner loop of a critical computation called a library routine that did a malloc/free.  We recorded the loop to avoid the library routine and to use stack-allocated storage outside the loop.  The number of storage allocations went down from over 1,000,000 to under 1000.<P>
+In another case, we had a profiler that recorded the time of each subroutine entry and exit, then computed the amount of time spent in the subroutine.  However, a subroutine actually has two time values: the amount of time the program counter spends in the subroutine, and the amount of time the program executes from subroutine entry to subroutine exit, including all the subroutines it calls.  This profiler gave misleading results because the time spent in subroutines it called was not counted.  The entire system execution profile looked rather &quot;flat,&quot; with no distinguishable hot spots when, in fact, two critical procedures accounted for 25 percent of the time.<P>
+<h3><a name="0046_0005">Timer Resolution and Accuracy<a name="0046_0005"></h3><P>
+Performance measurement on most systems is limited by the timer's accuracy.  A timer with resolution that is too coarse may produce meaningless results.  Most PC profiling tools reprogram the interval timer to get sufficiently fine resolution.  Resolution over an order of magnitude greater than that of a typical instruction-execution time is too coarse for doing procedure entry-to-exit style timing.<P>
+In a sampling system, a timer that interrupts too frequently induces too much overhead and introduces other problems with too-frequent diversions from the mainline program execution, such as breaking pipelining, changing caching patterns, and so on.  Most systems (other than current personal computers) do not have a readily accessible, &quot;on demand,&quot; high-resolution timer.<P>
+There is an additional problem: Four Gigasomethings may seem like a lot when it represents bytes of address space, but with a 20-mus timer, an unsigned 32-bit number is not large enough to count the number of ticks in 24 hours!  There are 4.32 Gigaticks per day using a 20-mus timer, but only 4.29* 10<SUP>9</SUP> values can be represented in a 32-bit number.  So we can trade off higher resolution against shorter experimental times; to get 1-mus timer resolution we can run experiments for only 4294 seconds, or slightly over 71 minutes, before we have to resort to 64-bit arithmetic.  In the profiling tool I wrote, we had 36-bit signed integers (35 bits of positive value) and a 10-mus timer.  This allowed us to accumulate times of 343,200+ seconds (or 95+ hours), which seemed comfortable.  But after a 15-hour experiment, the results were somewhat bogus because the percentage computation (n*100/total) generated integer overflows.<P>
+Timers in protected operating systems have additional problems.  For example, in most mainframe protected operating systems, time accounting is done for purposes of billing. Therefore, time spent in interrupt processing is charged to the running program.  From a billing viewpoint this may be fair, but the concept of billing for computer time has little relevance to personal workstations.  Nonetheless, the operating systems still seem to be designed with this philosophy.  High-resolution timing is not generally available to applications running as user processes.<P>
+On another occasion, our TOPS-10 operating system had been modified to use a custom-designed 10-mus timer to provide precision timing to applications.  I measured a simple counting loop using a series of tests.  The sequence of values I got for each iteration had a bimodal distribution: one peak around 100 mus and a second peak around 5 ms.  About 10 percent of the samples reported 5 ms, but they were so large that they made the average loop time seem to be about 500 mus.  Apparently, somewhere in the code an interrupt sneaked through without recording its presence.  In protected-mode operating systems, especially multitasking or multithreaded systems, it is very important that each process or thread have its associated high-resolution time.<P>
+It is not sufficient to measure even a single loop, as just demonstrated.  On another system, I created a subroutine containing a short loop, about 25 mus.  I then called it from an outer loop that called the subroutine 10, 100, 1000, and so on times, then printed out the average time.  I ended up with an outer loop value that ran the program almost two seconds between reports.  The average loop-traversal time went up after a certain value was reached, with a peculiar two-step modality.  It turns out that this was related to the context swap time, which was charged against the process.  If I had a loop that ran long enough to expend a time slice, I got charged for the context swap at the end of the time slice.  However, since the machine was lightly loaded, my process, as the highest-priority process, was immediately rescheduled.  I got charged for the set-up time as well.<P>
+<a href="#0046_000e">More Details.</A><P>
+When the loop got long enough, however, the relationship of my priority to other processes was changed, and a different process was scheduled; I got charged for the significant time to do a complete process-scheduling operation!  This created another step function in the reported average timing.  When I modified the program to keep a histogram looking for modalities of distribution, there were three peaks; the bulk were near 100 mus, but there was a peak in the histogram near 5 ms and another near 11 ms.  When I accumulated these as a time line I found the 5-ms peak appeared every time-slice quantum (150 ms) and the 11-ms peak every three time-slice quanta (450 ms).  The lesson here is to calibrate not only the short-term accuracy of the timer, but its long-term accuracy as well.<P>
+<h3><a name="0046_0006">Gating Error<a name="0046_0006"></h3><P>
+In any discrete-event measurement, there's a phenomenon known as &quot;gating error&quot; that was first recognized when vacuum-tube-based counters were used to measure radioactive-decay events.<P>
+Consider the case where we read the system time at the start and end of an interval we wish to measure.  In <a href="19930048.htm">Figure 1(a)</A>, the time line represents the interval we are measuring.  We read the clock shown on the time line in <a href="19930049.htm">Figure 1(b)</A> (with resolution 10 mus at time t when the interval starts.  The clock ticks twice, and 25 mus later we read the clock again and get time t + 20. The apparent time of the interval is 20 mus.  The next time we read the clock, however, the clock is as shown on the time line in <a href="1993004a.htm">Figure 1(c)</A>.  The initial time is reported as time t.  The clock ticks three times, so when we read the clock at the end of the interval, the time is t+30.  The interval appears to be 30 mus in length. Since statistically the distribution of these errors is uniform, if we take enough samples the two values will average out, and the result will be very close to the actual value of 25 mus.<P>
+The significance of gating is important only when the clock resolution is coarse and the number of samples is small, but it is particularly important when attempting to deal with subroutines whose time is very much less than the clock resolution.  For example, if the clock resolution is 250 mus, both a 10-mus subroutine and a 240-mus subroutine could appear as taking 0 time.  However, over a large sample size it is more likely that the 10-mus subroutine will register as taking 0 time.  If the sample size is too small, there will not be enough values to get a suitable sample.  The 24-mus subroutine may appear to take 0 mus, and the 10-mus subroutine may appear to take 250 mus.<P>
+Based on a small sample size, you may be inclined to believe either that the subroutine, which will be called a lot for &quot;real&quot; data, is taking an order of magnitude too much time, or that the subroutine is taking 0 time, so it doesn't need any work.  Either conclusion may be false.  You cannot even assign a significance to the data, because there is not enough information to compute a meaningful standard deviation.  (See the text box entitled, &quot;Running Mean and Standard Deviation.&quot;)  Consider the ill fortune of having three samples of a 10-mus subroutine each straddle one clock tick.  There will be three samples, each registering 250 mus, and a standard deviation of 0.  What is important is that the expected error is not the standard deviation, but the larger of the standard deviation and half of the clock resolution (because the gating errors are uniformly distributed across the samples).  This is one reason that high-resolution timers produce more meaningful results.<P>
+<h3><a name="0046_0007">Application vs. System Time<a name="0046_0007"></h3><P>
+A timer that records only the time spent in user space, or in the application space, gives an equally unfair view of program performance.  We once had a system whose performance was quite poor, so we profiled it.  There did not, according to the author who used my profiling tool, appear to be any significant hot spot that could account for the timing.  Examination of the code showed that an input loop was reading from the input file one character at a time, unbuffered.  When we changed it to use buffered I/O, it ran almost ten times faster.  The failure here was that the timing values returned by the operating system dealt only with the time spent in user space, not with time spent in the operating system on behalf of the user. Unless you understand what the time values mean, you won't know when they are going to mislead you.<P>
+<h3><a name="0046_0008">What Time is Being Measured?<a name="0046_0008"></h3><P>
+In comparing the performance of two UNIX products, a company created a shell script that issued a time command, ran the product, and issued another time command.  After timing, product A was reported to be 30 percent faster than product B.  Unfortunately, they had only measured this performance once.  Running a dozen or so measurements of product A revealed that they had about 30 percent variation between the smallest and largest numbers.  Similar testing on product B revealed that product A was on average about 10 percent faster than product B and that the significance of this difference was quite low.  The reason for the difference is that the time reported by the UNIX time command typically includes all sorts of operating-system overhead.  The numbers were very sensitive to the amount of network activity.  In particular, a large FTP file copy or receipt of a large mail message would generate abnormally large numbers.  Pulling the Ethernet connector and performing the same measurements showed that the 10-percent difference appeared to be significant; the probable error was much smaller.  (See the text box entitled, &quot;Probable Error.&quot;)<P>
+On the other hand, ignoring the &quot;wall clock time&quot; can be as misleading as believing it. When overall system impact is considered, in a program that consumes too many resources (that is, has a very large working set, serious paging performance problems, or poor cache-hit ratios), local performance information may not be terribly helpful.  A locally optimized program that has to coexist with other applications may have to be modified to be locally less efficient; in the context of the entire system, however, it may result in a more balanced system.<P>
+<a href="#0046_0013">More Details.</A><P>
+You can now see the importance of timer reliability.  Knowing that one sample out of every 10,000 is a hundred times too large is important.  If that one 5-ms sample falls in an infrequently called 20-mus subroutine, it could make that subroutine look vastly more expensive than it actually is, resulting in efforts to optimize an irrelevant portion of the program.<P>
+<h3><a name="0046_0009">System Perturbation<a name="0046_0009"></h3><P>
+The only precise way to measure a system is to have a totally separate system monitoring it and accumulating the data.  This monitoring must be done in such a way as to not affect the system being measured.  A full-clock-rate in-circuit emulator is a nice tool for this purpose, but it can be costly, especially for the high-end 80x86 and 680x0 machines.  So, we must often make do with a system that runs on the same system we are measuring.  Any measurement tool of this nature must necessarily perturb the system it is measuring.  A system which logs events to a disk file would perturb the disk-head positioning.  This might significantly affect the actual performance of the system.  A performance tool that recorded the amount of time spent in DOS, and also logged each event, would quite likely give an incorrect result.  This is why most performance-measurement tools do not perform any I/O during the time the measurement is being made.  However, in the presence of caches and instruction pipelines, the control transfers into the measurement tool, for whatever style is used, will change the information in the pipeline and cache, with possible serious impact on the system being measured.  Results will be artificially high.<P>
+<h3><a name="0046_000a">Paging Performance<a name="0046_000a"></h3><P>
+Most performance tools do not report anything about paging performance.  Users of virtual-memory systems have, on the whole, ignored this.  In the old days, this mattered a lot.  I once wrote a performance tool solely to collect connectivity information.  This information was used to determine which subroutines should be packed close to other subroutines so page faults could be minimized by minimizing the working set.  We thought a lot about designing an automatic packer that would take the data from this and produce a linker file that would give us the best packing.  But in practice (even for the several hundred subroutines we had) we found that &quot;eyeballing&quot; the data gave us enough information to do the job manually-- enough to get significant performance improvement.<P>
+In a now-classic case, one vendor presented its programmers with a 32-bit virtual address space, and told them to write a compiler.  These programmers were very sensitive to performance issues.  It was well known that symbol-table performance is critical to compiler performance, that hashed symbol tables perform well, that performance of a hash table degraded with frequent hash collisions, and that larger hash tables reduced the number of collisions. Studies of a large number of sample programs let them determine the hashing parameters for the most uniform distribution of symbols in the table for typical programs.  &quot;Hey, this virtual-memory stuff is great!&quot; we imagined the programmers saying, &quot;Let's make a big hash table!&quot;  So the hash table was a megabyte.  Their hashing algorithm was so well tuned that it nicely avoided collisions.  In fact, the symbol table almost always ended up with one symbol per page.  Since physical memory on this machine was only 750K, any serious compilation resulted in about two page faults per line of code compiled due to symbol-table lookups.  The symbol table and the compiler code contended for working-set space, and the result was one of the slowest compilers ever delivered.  The next release fixed this, using a 4K symbol table that could grow as needed.<P>
+One useful experiment is to malloc a large amount of memory, for example a couple megabytes if you are on a workstation.  Run your standard calibration test for short, medium, and long loops.  Then run the same test, but access bytes one page apart to start forcing paging to occur.  Run the test accessing 5 pages, 10 pages, 100 pages, and so on.  Note from the run codes whether you are getting any anomalies in your measurements induced by the paging.  If so, be aware that when you examine the numbers, a poorly performing algorithm might represent a bad algorithm, a bad data layout (causing too many page faults), or some policy in your operating system that is artificially reducing your working-set size.  If you get no anomalies, it means that an algorithm that is performing poorly because of page faulting will not be visible to you with the profiling tool you are using.  If you suspect page faulting as a performance problem, you will have to use some other tool or technique to determine paging behavior.  Knowing what the system doesn't measure can be as important as knowing what it does.<P>
+<h3><a name="0046_000b">Architectural Impact<a name="0046_000b"></h3><P>
+With modern machines, it's no longer sufficient to think about issues such as clock cycles per instruction, nor is it even possible, by classical static analysis of the instruction stream, to predict a program's performance with any accuracy.  Instruction look-ahead, instruction caches, pipelining, on-and-off-chip memory caching, interacting with interrupts, preemptive scheduling, dynamic register renaming, and so on mean that the cost of a particular instruction depends considerably on the instruction and data history which preceded it.  As I already indicated, use of a performance-monitoring tool may have significant impact on a program tuned close to the limits of the architecture.<P>
+The impact of architecture cannot be minimized.  The CDC Star 100 computer, a supercomputer of its day, used floating point for lexical analysis in its Fortran compiler.  This was because a matrix multiply between floating-point numbers (built from the individual characters) and a character-class matrix would produce a new floating-point vector that represented the character classes for each character position.  The floating-point unit was heavily pipelined; the character and integer handling was pathetic by comparison.  No amount of performance measurement or profiling would have suggested this algorithmic change.  In another example, a Fortran program which executed at 20 SPECmarks on a contemporary RISC machine was optimized to 40 SPECmarks with conventional optimization.  When the program was massaged by a program-transformation system that arranged computations to use cache-line sized array slices and to otherwise attempt to maximize cache hits, the performance rose by more than an order of magnitude.  Performance numbers such as cache flush and cache load times are almost never available to the application developer except with incredibly sophisticated (and consequently expensive) equipment.  Yet these can have a more significant impact than the small algorithmic perturbations that profilers would suggest.<P>
+Optimizations are becoming more architecture dependent.  Assembly-level coding tricks that made sense on a non-pipelined 8088 may not only be irrelevant on higher machines, they may even have a negative value.  This isn't a new problem.  IBM published a programmer's guide to the 360/91, in the early '70s that illustrated how code sequences that improved performance on lower machines in the series actually caused performance degradation in the heavily pipelined 360/91.  This was because they caused gratuitous serialization of results in the pipe when what appeared to be cruder, less-efficient code sequences did not force serialization of the pipelined operations.  The parallelism which resulted could double the speed of small loops. I must say that I have not investigated similar situations on the 386/486 architectures, mostly because I now leave these fiddling details to compilers.<P>
+<h3><a name="0046_000c">Instruction Histograms<a name="0046_000c"></h3><P>
+In one extreme case, a company I worked for needed very precise data on instruction execution.  We wanted to factor out all architectural issues, such as caching and pipelining.  The purpose was to study, in a very particular manner, the effects of code motion in an optimizing compiler.  I took advantage of the 32-bit virtual memory in a singularly profligate fashion. I computed the size of the TEXT region--the program area in which the code appears--in bytes, then used calloc to allocate that many long values.  I then ran the program with the trace-trap bit set, so I got a signal on every instruction execution.  In the signal handler, I computed the offset of the instruction in the TEXT region and used that as an array index to determine which long value to increment.  When I was done, I went through the array and for every nonzero counter value I called a disassembly subroutine to print the instruction, followed by a histogram of its frequency.  The results were amazingly informative, but the method was not practical for anything other than small subroutines.  The slowdown in performance was over 10,000:1.  Running in an unprotected MS-DOS environment, I suspect this ratio would be substantially smaller, since most of the instructions expended were done in the trace-trap-to-operating-system interface and the operating-system-to-user-signal-routine interface.<P>
+<h3><a name="0046_000d">Summary<a name="0046_000d"></h3><P>
+In any performance measurement, it is essential to understand what is being measured, how accurately it is being measured, and the reliability of the resulting numbers.  You need to know such important information as the resolution of the timer and its reproducibility ove  time.  You need to understand the influence both of external events and local events (such as page faulting in your program) on the measurements.<P>
+Having established the accuracy of your measuring tools, you must then determine what, exactly, you are measuring.  Finally, you must determine whether this measurement is actually meaningful, in the sense that this value will help you optimize your program.  Only then will you know what all those numbers mean.<P>
+What you cannot tell without serious investigation is what should be measured, because those factors are often specific to a particular architecture (such as the 80x86) or a particular instance of that architecture (such as a 486 DX50 with 256K outboard cache).  You may be measuring instruction cycles, and what you should be measuring is the cache hit ratio. Without understanding the global system issues, the significance of the numbers is unknown.<P>
+In my own profiling tool, I recorded the time spent in the profiling tool itself.  Because of the algorithm I implemented to handle recursive procedures, the time spent doing performance measurement was almost 25 times the time spent executing the program to be measured!  A rewrite of the algorithm reduced this to a factor of around ten.  So even performance-measurement tools have to be measured!<P>
+<h3><a name="0046_000e"><a name="0046_000f">Running Mean and Standard Deviation<a name="0046_000f"></h3><P>
+If you use the conventional algorithm for computing mean and standard deviation, for n samples<P>
+you need n locations to hold the samples so that the variance can be computed.  The standard deviation is the square root of the variance, s<SUP>2</SUP>.  The traditional formula is shown in <a href="1993004b.htm">Example 1(a)</A>.  We have to compute the mean, x, then go back and compute for each sample the square of the difference between the mean and the sample.<P>
+There is a simple way to keep a running mean and standard deviation without having to retain all the data.  The variance formula can be rewritten as shown in <a href="1993004c.htm"> Example 1(b)</A>.  Each time we get a new sample we can add to our running totals.  We start with the variables sum, sum2, and the counter n.  Simply compute, for each new value sample, the sum and sum-of-squares, as shown in <a href="#0046_0010">Figure 2</A>.  Any time you need the variance or standard deviation, you can instantly compute them, as shown in <a href="#0046_0011">Figure 3</A>.  This makes it easy to run a very large sample on a small machine.  It also makes your measurement program less susceptible to paging faults. If you don't need a gigantic array to store the data, you won't page fault while storing into it.<P>
+<h4><a name="0046_0010">Figure 2: Sum and sum of squares computation.</h4><P>
+<pre>
+         float var;
+         float sum = 0.0;
+         float sum2 = 0.0;
+         float sample;
+         int n = 0;
+             ...
+                compute 'sample'
+             ...
+                   sum = sum + sample;
+                   sum2 = sum2 + (sample * sample);</pre><P>
+<P>
+<h4><a name="0046_0011">Figure 3: Variance and standard deviation from running sums.</h4><P>
+<pre>
+     var = ( (float) n * sum2 - (sum * sum) ) / (float) (n * (n - 1);
+     sd = sqrt(var);</pre><P>
+<P>
+<h3><a name="0046_0012">Run-coded Modal Statistics<a name="0046_0012"></h3><P>
+Computing modal distributions normally requires keeping a lot of data, such as one table entry per sample.  When I did this I was working on small machines, so the ability to keep long runs in memory was limited by the machine size.  I got around this by using a run code.  Of course, there was some variation in the data, so a conventional run code wouldn't work.  Instead, I used a thresholding feature; I kept a running average of the current run, and any value within 5 percent was considered to be part of the run.  Whenever the value changed beyond this limit, a new run was started with a new average being kept.  A program fragment for the code that computes mean, standard deviation, and time-line runs is shown in <a href="#0046_0015">Listing One</A>, page 106.<P>
+--J.M.N.<P>
+<h3><a name="0046_0013"><a name="0046_0014">Probable Error<a name="0046_0014"></h3><P>
+Errors in measurements fall into two categories: accidental and systematic.  A useful measure for physicists is the probable error (p.e.).  This is a value such that half of the errors are greater than this value and half are less.  It is computed as shown in <a href="1993004d.htm">Example 2(a)</A>.  The value e[i] is the error term, the difference between the mean, x and the sample. The constant 0.8453 is derived from the mathematics of the standard distribution.  This gives the probable error of any one measurement.  The probable error of the mean value x, P.E., is given<P>
+by the formula shown in <a href="1993004e.htm">Example 2(b)</A>.  Thus, the larger the number of samples the more credence the number has.  If the probable error is too large, the value can be disregarded.<P>
+--J.M.N.<P>
+
+<PRE>
+
+
+_PROFILING FOR PERFORMANCE_
+by Joseph Newcomer
+
+<a name="0046_0015">
+<a name="0046_0016"></pre><B>[LISTING ONE]</B><pre><a name="0046_0016">
+
+     {
+      float sum;                // sum of values
+      float sum2;               // sum-of-squares
+      float var;                // variance
+#define NUM_RUNS 10             // choose a number
+      struct {float v;
+              int count;
+             } runs[NUM_RUNS];  // run table
+      int n_run = 0;    // current run entry in table
+      float sample;     // current sample
+
+      float suma;       // sum of run
+      int na;           // number of samples in run
+
+      // initialization
+      sum = 0.0;
+      sum2 = 0.0;
+      n = 0;
+
+      suma = 0.0;
+      na = 0;
+
+      /*******************************************************************
+      *  The loop below generates samples and keeps the averages in a    *
+      *  run-compressed sequence. The assumption here is that the values *
+      *  should not deviate much from the mean. Used in timer calibration*
+      ********************************************************************/
+      for(;;)
+         { /* runcode */
+          if(...)           // test if end of samples
+             sample = ... ; // compute sample here
+          else
+             break;         // done with computation
+
+          /*********************************************
+          *  Compute sum and sum-of-squares            *
+          *********************************************/
+          n++;
+          sum = sum + sample;
+          sum2 = sum2 + (sample * sample);
+
+          if(n &gt; 1)
+             { /* add to run? */
+
+              /*********************************************************
+              *  We add to the current run if the sample is within 5%  *
+              *  of the current average                                *
+              *********************************************************/
+              if ( (fabs(runs[n_run].v - sample)) &lt; 0.05 * suma / na )
+                 { /* run code */
+                  /*************************************************
+                  *  We are within 5% of the current run average.  *
+                  *  Increment the count of elements in the run.   *
+                  *************************************************/
+
+                  runs[n_run].count++;
+
+                  /*****************************************************
+                  *  Factor the new value into the running average.    *
+                  *  Increment the number of elements in the average.  *
+                  *****************************************************/
+                  suma = suma + sample;
+                  na++;
+
+                  /*************************************************
+                  *  Store the new average as the current average  *
+                  *************************************************/
+                  runs[n_run].v = suma / na;
+                 } /* run code */
+              else
+                 { /* start new run */
+                  /*************************************************
+                  *  We are going to start a new run.              *
+                  *   The new average is the sample value          *
+                  *************************************************/
+                  n_run++;
+                  runs[n_run].v = sample;
+                  runs[n_run].count = 1;
+
+                  na = 1;
+                  suma = sample;
+                 } /* start new run */
+             } /* add to run code? */
+          else
+             { /* first one */
+              suma = sample;
+              na = 1;
+              runs[n_run].count = 1;
+              runs[n_run].v = suma;
+             } /* first one */
+         } /* runcode */
+
+      /****************************************************************
+      *  We have completed the measurements.  Print out the mean,     *
+      *  variance, and standard deviation of the samples              *
+      ****************************************************************/
+      printf(&quot;mean = %g, var = %g, s.d. = %g\n&quot;, sum / n, var, sqrt(var));
+
+      /****************************************************************
+      *  Print out the run table                                      *
+      ****************************************************************/
+      for(i=0; i &lt;= n_run; i++)
+         { /* run distribution */
+          printf(&quot;[%2d] %g (%d)\n&quot;, i, runs[i].v, runs[i].count);
+         } /* run distribution */
+     }
+
+
+
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1993, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

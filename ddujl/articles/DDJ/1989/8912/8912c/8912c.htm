@@ -1,0 +1,789 @@
+<HTML>
+<META NAME="year" CONTENT="1989">
+<HEAD>
+
+<TITLE>DEC89: A HOME-BREW C++ PARSER</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>A HOME-BREW C++ PARSER<a name="025b_0003"><a name="025b_0003"></h1><P>
+<h2><a name="025b_0001"><a name="025b_0000">Designing your own C++ compiler begins with a good parser</h2><P>
+<h3>John M. Dlugosz</h3><P>
+<p><i><a name="025b_0002"><a name="025b_0000">John is a free-lance writer and software developer.  His upcoming book: Advanced C and Object-Oriented Programming, (MIS) will be released in mid-1990.  He can be reached at P.O. Box 867506, Plano, TX 75086; or on CompuServe at 74066,3717.</i></p><hr><P>
+When it comes to C++, still relatively few tools are available.  This fact is never more apparent than when you need a cross-reference utility.  If, for instance, you want to examine the function foo( ), you'll discover that the function could appear anywhere in your program. In other languages, it's simple to find a function by using a text-search utility, but functions may be overloaded in C++ -- you might find seven functions named foo( ).  You must then know which of those functions might be in scope.  In order to do so, you need to know about the class hierarchy.  In addition, you may need to know the types of the parameters.<P>
+That is usually no big deal -- but in extreme cases, for example, you might not know that adding a Windmill and an int generates a result of type exception_node.  In short, you have to parse the entire file down to the primitive level, maintain a symbol table, and figure out class relationships -- you practically have to compile the program!<P>
+For the purposes of this article, I'll describe a parser generator.  A table-driven parser, such as Paul Mann's LALR Parser Generator, takes a statement of the grammar (see CPP.GRM, <a href="8912c.htm#025b_000e">Listing One</A>, page 116), and produces tables.  So, let's start with the grammar.<P>
+<h3><a name="025b_0004">How's Your Grammar<a name="025b_0004"></h3><P>
+The grammar specification is really a language-design language.  As the source is being parsed, the parser calls actions in the program.  This can be viewed as an event-driven machine.  The parser sends messages to the rest of the program.  The way in which the grammar is specified determines what messages are sent, when they are sent, and in what order.  This is the key to using LALR to build a full parser program.<P>
+Look at the grammar in the declaration class.  A declaration starts with a storage class, followed by a type and the item being declared.  In addition, a declaration contains asterisks, parentheses, and brackets, as well as keywords such as near, far, const, and volatile.  The basic form of the declaration is shown below:<P>
+<pre>  Declaration -&gt; StorageClass Type Declarator ;</pre><P>
+A declarator can be a simple name, or it can be another declarator modified by adding &quot;( )&quot; (function call), &quot;[]&quot; (vector), &quot;*&quot; (pointer), or &quot;&amp;&quot; (reference) symbols.<P>
+A declarator is put together in very much the same manner as an expression.  A declarator contains operators with different levels of precedence, along with parentheses used for grouping purposes.  So, the grammar for declarations can be modeled on the grammar of expressions.<P>
+<h3><a name="025b_0005">Productions<a name="025b_0005"></h3><P>
+In order to achieve the right order of precedence (including the use of parentheses for grouping purposes) you need three levels of productions.  The innermost level (Decl3) is the simple Dname.  The next layer (Decl2) is postfix operators &quot;( )&quot; and &quot;[ ].&quot;  The outermost level (Declarator) is prefix operators &quot;*&quot; and &quot;&amp;.&quot;  To provide for grouping, the innermost layer can start over again with a declarator in parentheses.  The three levels of productions are shown in <a href="8912c.htm#025b_0006">Figure 1</A>.<P>
+<h4><a name="025b_0006"><a name="025b_0006"><B>Figure 1:</B> Productions used to determine the order of precedence</h4><P>
+<pre>
+  Declarator
+    -&gt; Decl2
+    -&gt; ReachAttribute * Const/Volatile? Declarator
+                                    =&gt; TypeModifier 3
+    -&gt; ReachAttribute &amp; Const/Volatile? Declarator
+                                    =&gt; TypeModifier 4
+
+  Decl2
+  -&gt; Decl2 (Arg-Declaration-List)    =&gt; TypeModifier 1
+  -&gt; Decl2 [ConstExp?]               =&gt; TypeModifier 2
+  -&gt; Decl3
+
+  Decl3
+    -&gt; Dname    =&gt; Dname 1
+    -&gt; (Declarator)</pre><P>
+<P>
+ReachAttribute is either a near or far keyword, or is empty.  Const/Volatile?  is the keyword const, the keyword volatile, neither, or both.  ReachAttribute appears immediately to the left of the item that it modifies (in this case a pointer or reference).  The const keyword appears just after a &quot;*&quot; (or &quot;&amp;&quot;) to indicate that the item that is pointing is constant.<P>
+So, how does this triple-decker definition work? Consider the test case *x[].  The &quot;*&quot; is read, and matches the second line of the declarator.  So x[] must match the rest of that line, which is expecting another declarator.  Because the &quot;*&quot; is in the outer level and the &quot;[]&quot; is in the inner level, the &quot;*&quot; has precedence.  Now x[] doesn't look like anything under declarator, but a declarator can be a Decl2.  If this is a Decl2, it can be turned into a declarator when it is finished.  And sure enough, Decl3 [] is listed under Decl2.  The xmatches Decl3, and an action is triggered.  Then the Decl2[] is finished, and an action is triggered.  Now the &quot;*&quot; declarator is finished, and another action is triggered.<P>
+Consider the order in which the program receives its actions -- the name x, the modifier Vector, and the modifier Pointer.  Notice that the order of precedence is built into the grammar, and is the only order possible.<P>
+The grammar sends the modifiers in the correct order to the program.  The program builds a representation of the object in response to these messages.<P>
+<h3><a name="025b_0007">Keeping Track of It<a name="025b_0007"></h3><P>
+All of the information about the source being processed is kept in nodes.  Different kinds of nodes are derived from a base class node (<a href="8912c.htm#025b_0010">Listing Two</A>, NODE.HPP, page 116).  One of the derived nodes is a type_node.  A type_node can refer to a simple type such as int or char, or to fancy types such as arrays and pointers.  These fancy types correspond to the four modifiers.  As a result, your code contains an array of &lt;something&gt;, a function that returns &lt;something&gt;, a pointer to &lt;something&gt;, and a reference to &lt;something&gt;.  If the primary type is one of these four modifiers, the to_what field points to another type node. In this way, complicated types are stored in a linked list.  The type_node:: print( ) function in NODE.CPP shows this structure clearly.<P>
+All of the actions called by the parser are in the file ACTIONS.CPP (<a href="8912c.htm#025b_0012"> Listing Three</A>, page 118).  The actions are defined with an ellipsis so that the C++ compiler will generate right-to-left passing with the caller clearing the stack, which is what the parser (written in C) is expecting to call.<P>
+The working_type structure contains all of the information about the item being parsed.  The first message is for the storage class, which is stored for future reference.  The next item in working_type is the type, which is also stored.  A const (or volatile) keyword can appear on either side of the type.  (Notice that the action is called even if the production is empty.)  As a result, a pair of calls to the ConstVol action take place.  ConstVol can be called in several places, so these calls simply stack the values received.  The purpose for ConstVol is recognized later, and the values for this addition are popped from the stack when it is ready for them.<P>
+<h3><a name="025b_0008">Atoms<a name="025b_0008"></h3><P>
+The first call in the declarator is a call to Dname.  This call looks up the last scanned token and stores the name.  (In the case of abstract declarators, the name can be empty.)  The name is stored in an atom table, and the atom number is used by the rest of the program.  The atom table can be used in the same way that an array of strings is used -- when the atom table is subscripted with an int, it gives a string.  But, when the atom table is subscripted with a string, it gives the number!  This second technique is known as an &quot;associative array&quot; and is quite handy.  When a string that is not in the table is given, that string is added to the table and a new number is assigned.  The files ATOM.CPP (<a href="8912c.htm#025b_0014">Listing Four</A> , page 120) and ATOM.HPP (<a href="8912c.htm#025b_0016">Listing Five</A>, page 120) provide more details.<P>
+<h3><a name="025b_0009">See How They Run<a name="025b_0009"></h3><P>
+As explained earlier, the type is stored as a linked list.  Dname starts off a declaration, and a new list is created.  type_root is the head of the list, and this_type is the tail end. Each modifier adds a link and moves the tail down.<P>
+When TypeModifier is called, the correct primary (function, array, pointer, or reference) is stored in the node, along with other information specific to that type.  Then a new node is added, and the pointer is moved down to that node.  In the expression *x[], Dname gets a name of x and creates the first node; TypeModifier(2) then sticks in array of, chains on another node in the to_what field, and moves the this_type pointer to point to the new node. Type_Modifier(3) then plugs in pointer to and adds on another link.  The linked list now reads (starting at the root) array of pointer to &lt;garbage&gt;.<P>
+When the declarator is finished, a call to the Declaration is made.  This call takes the base type (stored way back when with the call to StoreType) and fills it into the current node.  For example, if the line read static int x*[];, then the result is array of pointer to int.  Other stuff is filled in, and the complete declaration is ready.<P>
+The declaration must be stored in a symbol table for later reference.  The type, along with the storage class (static) and the name (x), is sent to store_thing( ).  Basically, that's now the end of the story -- the parser continues.<P>
+The storage class and type are still remembered, so declarators that are separated with commas use the same values.  Each declarator is sent to store_thing( ) when the declarator is encountered.  The parser starts over with StoreStorage for a new line, or with Dname if several declarators are contained in the same statement (that is, extern char a, *b, &amp;c; share &quot;extern char&quot;).<P>
+In DEFINE.CPP (<a href="8912c.htm#025b_0018">Listing Six</A>, page 120), store_thing( ) handles the &quot;thing&quot; after the &quot;thing&quot; is parsed.  Up to now, the only kind of node used was a type_node. Now, another kind of node is introduced -- a def_node.  def_node holds the complete definition, which is built from the type, the storage class, and the name, and is stored in a list of def_nodes.<P>
+Look back at NODE.HPP, and notice that all of the nodes are in a taxonomy.  A list of nodes is also very useful.  A list of base class nodes can hold any kind of node, but it is better to use lists with pedigree.  To do so, node_list class is defined to handle the maintenance of a variable-sized array of nodes, and a dummy class is derived from node_list for each required pedigree.  This dummy class contains an in-line function that accesses the correct element and casts the elements to the proper type.  The use of a macro allows a list (for whatever type is needed) to be defined in a single statement.  (Note the use of the token-pasting operator in the macro definition.)<P>
+After the entire file is parsed, the list contains several entries.  The AllDoneNow action is a simple loop that prints out the list.  The C++ definitions are spit back out in English-like phrases.<P>
+<h3><a name="025b_000a">Nested Definitions<a name="025b_000a"></h3><P>
+You may now be wondering about nested definitions.  Consider a case such as int (*p)(int x[]);.  In this example the parameter list is parsed after Dname for the pointer modifier, p, and before the function modifier.  This itself contains a definition.  Look at the grammar for Arg-Declaration-List -- this nonterminal grammar appears between the parentheses in the function modifier (see <a href="8912c.htm#025b_000b">Figure 2</A>).<P>
+<h4><a name="025b_000b"><a name="025b_000b"><B>Figure 2:</B> The grammar for Arg-Declaration-List</h4><P>
+<pre>
+  Arg-Declaration-List
+    -&gt; Start-Nested-Type A-Decl-List? Elipses? End-Nested-Type
+
+  Start-Nested-Type     -&gt;=&gt; NestedType 1
+  End-Nested-Type       -&gt;=&gt; NestedType 0
+
+  A-Decl-List?
+
+     -&gt;
+     -&gt; A-Decl-List
+
+  A-Decl-List
+     -&gt; A-Decl-List, Argument-Declaration
+     -&gt; Argument-Declaration
+
+  Argument-Declaration
+     -&gt; StorageClass Type_w/const Declarator =&gt; Declaration 2</pre><P>
+<P>
+Start-Nested-Type and End-Nested-Type are empty productions, and exist only to call the NestedType action at the right place.  This action saves the state of the definition parse in progress, and then restores the state again.  This second step is very simple because all of the information is stored in a structure.  The structure is placed into a linked list and a fresh structure is created.  The end call puts the old structure back.<P>
+The argument-declaration is similar to Declaration, except that it is separated with commas.  The same action Declaration is called when an argument-declaration is finished, with the parameter defined as 2 instead of 1.  This change causes the completed definition to be placed into a different list.  This new list is also stackable, because a parameter may itself be a pointer to a function.  The NestedType( ) action calls parameter_ list( ), which creates a new list to store the upcoming parameters.  The end call then pops the list off, restoring any list that was in progress.  This completed list is placed in a global variable, which is read by TypeModifier( ) and will be the next action called.<P>
+This mechanism for nested types is also used for processing class members.  Notice that the Const/Vol stack works across nested types.  Consider char *const (*p)(char const* s);, which is a pointer to a function that returns a pointer.  The first const is used by the last modifier call, and stays on the stack while the nested type is being parsed.<P>
+<h3><a name="025b_000c">Conclusion<a name="025b_000c"></h3><P>
+This program is a far cry from a full compiler, but the program's framework can be easily expanded to include additional language elements.  The first feature that you should add to the program is the use of initializers.  (The grammar presented in <a href="8912c.htm#025b_000d">Figure 3</A> contains initializers, but no actions are called yet.)  As you can see, a small amount of code can produce a very robust program.<P>
+<h4><a name="025b_000d"><a name="025b_000d"><B>Figure 3:</B> The test data for the parser</h4><P>
+<pre>
+  struct C1 * p;
+  int *p= &quot;hello there!&quot;;
+  int*names[];
+  union FOO *p;
+  const char * const *(*w)()[];
+  char a,b,*c,&amp;d;
+  int foo (int a, char* b);</pre><P>
+<P>
+
+_A HOME BREW C++ PARSER_
+by John M. Dlugosz
+
+<a name="025b_000e"><a name="025b_000e">
+<a name="025b_000f"></pre><B>[LISTING ONE]</B><pre><a name="025b_000f">
+
+/* TOKENS. */
+
+   &lt;error&gt;
+   &lt;identifier&gt;  =&gt; KW_SEARCH
+   &lt;operator&gt;    =&gt; OP_SEARCH
+   &lt;punctuator&gt;  =&gt; OP_SEARCH
+   &lt;number&gt;
+   &lt;string&gt;
+   &lt;eof&gt;
+   &lt;type&gt;
+
+/* KEYWORDS. */
+
+   auto break case cdecl char class const continue default delete do
+   double else enum extern far float for friend goto huge if inline int
+   interrupt long near new operator overload pascal private protected
+   public register return short signed sizeof static struct switch this
+   typedef union unsigned virtual void volatile while
+
+/* OPERATORS. */
+
+   || &amp;&amp;
+   &lt; &lt;= == &gt; &gt;=
+   + - * / %
+   ? ++ -- '-&gt;'
+   ! ~ ^ '|' &amp; &gt;&gt; &lt;&lt;
+   = &lt;&lt;= != %= &amp;= *= += -= /= |= &gt;&gt;= ^=
+
+/* PUNCTUATORS. */
+
+   '...' . , : ; [ ] { } ( ) ::
+
+/* NONTERMINALS. */
+
+Input -&gt; File_and_tell &lt;eof&gt;
+
+File_and_tell -&gt; File      =&gt; AllDoneNow  1   /* normal completion */
+
+File -&gt; Item | File Item
+
+Item -&gt; Declaration
+   /* or Definition.  not in yet. */
+
+
+/**************************************************************
+To recognize a declaration, the storage class and type appear
+once.  They are remembered.  Each declaration is seperated by
+commas, and share the same type.  The FinishedDeclarator calls
+an action for each one found.
+****************/
+
+Declaration
+   -&gt; StorageClass Type_w/const Declarators ;
+
+Declarators
+   -&gt; FinishedDeclarator
+   -&gt; FinishedDeclarator , Declarators
+
+FinishedDeclarator -&gt; Declarator Initializer?  =&gt; Declaration 1
+
+/*********************************/
+
+
+Initializer?
+   -&gt;
+   -&gt; = Expression
+   -&gt; = { Expression-List }
+/* -&gt; ( Expression-List ) */
+
+Expression-List
+   -&gt; Expression
+   -&gt; Expression Expression-List
+
+
+StorageClass
+   -&gt;            =&gt; StoreStorage 0
+   -&gt; static     =&gt; StoreStorage 1
+   -&gt; extern     =&gt; StoreStorage 2
+   -&gt; typedef    =&gt; StoreStorage 3
+   -&gt; auto       =&gt; StoreStorage 4
+   -&gt; register   =&gt; StoreStorage 5
+
+Type_w/const  /* const may appear before or after the type name */
+   -&gt; Const/Volatile? Type Const/Volatile?       =&gt; StoreBaseConstVol
+
+Type
+   -&gt; char            =&gt; StoreType 1
+   -&gt; signed char     =&gt; StoreType 2
+   -&gt; unsigned char   =&gt; StoreType 3
+   -&gt; int             =&gt; StoreType 4
+   -&gt; short           =&gt; StoreType 4
+   -&gt; short int       =&gt; StoreType 4
+   -&gt; signed int      =&gt; StoreType 4
+   -&gt; signed short    =&gt; StoreType 4
+   -&gt; signed short int      =&gt; StoreType 4
+   -&gt; unsigned        =&gt; StoreType 5
+   -&gt; unsigned int    =&gt; StoreType 5
+   -&gt; unsigned short    =&gt; StoreType 5
+   -&gt; unsigned short int    =&gt; StoreType 5
+   -&gt; long            =&gt; StoreType 6
+   -&gt; signed long     =&gt; StoreType 6
+   -&gt; unsigned long   =&gt; StoreType 7
+   -&gt; float           =&gt; StoreType 8
+   -&gt; double          =&gt; StoreType 9
+   -&gt; long double     =&gt; StoreType 10
+   -&gt; void            =&gt; StoreType 11
+   -&gt; enum Tag        =&gt; StoreType 12
+   -&gt; Class Tag       =&gt; StoreType 13
+   -&gt; union Tag       =&gt; StoreType 14
+
+Tag
+   -&gt; &lt;identifier&gt;    =&gt; StoreTag 1
+   -&gt; &lt;type&gt;          =&gt; StoreTag 2
+
+Class
+   -&gt; struct
+   -&gt; class
+
+OverloadableOp -&gt; * | / | = | + /* and all the others */
+
+Elipses? -&gt; | '...'
+
+/* Declarations */
+
+Declarator
+   -&gt; Decl2
+   -&gt; ReachAttribute * Const/Volatile? Declarator    =&gt; TypeModifier 3
+   -&gt; ReachAttribute &amp; Const/Volatile? Declarator    =&gt; TypeModifier 4
+
+Decl2
+   -&gt; Decl2 ( Arg-Declaration-List )       =&gt; TypeModifier 1
+   -&gt; Decl2 [ ConstExp? ]                  =&gt; TypeModifier 2
+   -&gt; Decl3
+
+Decl3
+   -&gt; Dname          =&gt; Dname 1
+   -&gt; ( Declarator )
+
+Const/Volatile?  /* const or volotile, neither, or both */
+  -&gt;                   =&gt; ConstVol 0
+  -&gt; const             =&gt; ConstVol 1
+  -&gt; volatile          =&gt; ConstVol 2
+  -&gt; const volatile    =&gt; ConstVol 3
+  -&gt; volatile const    =&gt; ConstVol 3
+
+
+ReachAttribute
+  -&gt;         =&gt; ReachType 0
+  -&gt; near    =&gt; ReachType 4
+  -&gt; far     =&gt; ReachType 8
+
+Dname
+  -&gt; SimpleDname
+  -&gt; &lt;type&gt; :: SimpleDname
+
+SimpleDname
+  -&gt; &lt;identifier&gt;
+  -&gt; &lt;type&gt;
+  -&gt; ~ &lt;type&gt;
+  -&gt; Operator-FunctionName
+
+Operator-FunctionName
+   -&gt; operator OverloadableOp  /* overload operator */
+   -&gt; operator &lt;type&gt; /* conversion operator */
+       /* this should really allow any abstract type definition, not just
+          a simple type name.  I'll change it later */
+   -&gt; operator &lt;identifier&gt;  /* ERROR production */
+
+
+/* Argument list for function declarations */
+
+Arg-Declaration-List
+   -&gt; Start-Nested-Type A-Decl-List? Elipses? End-Nested-Type
+
+Start-Nested-Type    -&gt; =&gt;  NestedType 1
+End-Nested-Type      -&gt; =&gt;  NestedType 0
+
+A-Decl-List?
+   -&gt;
+   -&gt; A-Decl-List
+
+A-Decl-List
+   -&gt; A-Decl-List , Argument-Declaration
+   -&gt; Argument-Declaration
+
+Argument-Declaration
+   -&gt; StorageClass Type_w/const Declarator  =&gt; Declaration 2
+
+/* Expressions */
+
+ConstExp?
+   -&gt;
+   -&gt; ConstExp
+
+ConstExp -&gt; Expression    /* semantics will check */
+
+Expression
+   /* stub out for now */
+   -&gt; &lt;identifier&gt;
+   -&gt; &lt;number&gt;
+   -&gt; &lt;string&gt;
+
+
+
+
+
+<a name="025b_0010"><a name="025b_0010">
+<a name="025b_0011"></pre><B>[LISTING TWO]</B><pre><a name="025b_0011">
+
+
+// the node class is central to date representation.
+// Everything it knows is in a node.
+
+enum node_flavor {  //state the derived type from a node
+   nf_base, nf_type, nf_def
+   };
+
+class node {
+protected:
+   node();
+   virtual ~node();
+public:
+   node_flavor flavor;
+   virtual void print();
+   };
+
+enum primary_t { type_void, type_char, type_int, type_long, type_float,
+      type_double, type_ldouble, type_enum, type_class, type_union,
+      type_pointer, type_reference, type_array, type_function };
+
+class def_node_list;  //forward ref
+
+class type_node : public node {
+public:
+   type_node* to_what;
+   type_node ();
+   ~type_node();
+   void print();
+   unsigned flags;
+   primary_t primary;
+   node* secondary() { return to_what; }
+   atom tag;
+   def_node_list* aggr;
+   void stuff_primary (int x, atom tagname);
+   bool isConst() { return flags&amp;1; }
+   bool isVol() { return flags&amp;2; }
+   bool isNear() { return flags&amp;4; }
+   bool isFar() { return flags&amp;8; }
+   bool isUnsigned() { return flags&amp;16; }
+   };
+
+class def_node : public node {
+public:
+   atom name;
+   int storage_class;
+   type_node* type;
+   void print();
+   def_node (atom n, int store, type_node* t);
+   };
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+/*     lists of nodes                       */
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+class node_list {
+   node** list;
+   int capacity;
+   int count;
+public:
+   node_list();
+   ~node_list() { delete list; }
+   node** access (int x);
+   int size() { return count; }
+   void add(node* n) { *access(count++) = n; }
+   };
+
+#define create_list(TYPE) class TYPE##_node_list : public node_list { \
+public:\
+TYPE##_node*&amp; operator[] (int x) { return *(TYPE##_node **)access(x); } }
+
+create_list (type);
+create_list (def);
+
+
+
+
+
+
+<a name="025b_0012"><a name="025b_0012">
+<a name="025b_0013"></pre><B>[LISTING THREE]</B><pre><a name="025b_0013">
+
+/*****************************************************
+File: ACTIONS.CPP    Copyright 1989 by John M. Dlugosz
+   the Actions called from the parser
+*****************************************************/
+
+#include &quot;usual.hpp&quot;
+#include &lt;stream.hpp&gt;
+#include &quot;atom.hpp&quot;
+#include &quot;node.hpp&quot;
+#include &quot;define.hpp&quot;
+
+// #define SHORT return 0
+/* short out actions for testing parser only.
+   if something suddenly goes wrong, I can stub
+   out all the actions to make sure I'm not walking
+   on data somewhere.  */
+#define SHORT
+   // the normal case.
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+static char last_token[81];
+
+void get_last_token()
+{
+/* copy last token from scanner into a nul-terminated string */
+int len= 80;  //maximum sig. length
+extern char *T_beg, *T_end;  //from the scanner
+char* source= T_beg;
+char* dest= last_token;
+
+//cout &lt;&lt; (unsigned)T_beg &lt;&lt; &quot;  &quot; &lt;&lt; T_end;
+//for (int x= 0;  x &lt; 5;  x++)   cout.put(T_beg[x]);
+
+while (len-- &amp;&amp; source &lt; T_end) *dest++ = *source++;
+*dest= '\0';
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+/* in a declaration, a storage class is the first thing I get.  This starts
+   it off.  Then a ConstVol, a StoreType, and a second ConstVol.  The const
+   or volatile keyword may appear before or after the type, with equal
+   effect.  The two bits are ORed together for the final result.
+   After this, I get one or more calls to Declaration.
+*/
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+// the type I'm building
+struct working_type {
+   type_node* this_type;    //the tail
+   type_node* root_type;    //the head
+   int base_type;
+   atom tag_name; // if base_type has a name
+   atom name;  //The name of the thing being declared
+   int storage_class;
+   int const_vol;
+   working_type* next;
+   } MainType;
+
+working_type* Tx= &amp;MainType;
+/* this is accessed through a pointer because a declarator can be encounted
+   while parsing another declarator.  This lets me stack them.  */
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+static int const_vol_stack[50];
+static int const_vol_stacktop= 0;
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int Declaration (int x,...)
+{
+/* values for x:  1- global or local def.
+                  2- parameters
+                  3- struct/union list
+*/
+SHORT;
+/* This finishes it off.  A complete declaration has been found. */
+Tx-&gt;this_type-&gt;stuff_primary (Tx-&gt;base_type, Tx-&gt;tag_name);
+Tx-&gt;this_type-&gt;flags |= Tx-&gt;const_vol;
+// build the 'thing' from the type_node and the name.
+store_thing (Tx-&gt;root_type, Tx-&gt;name, Tx-&gt;storage_class, x);
+// Tx-&gt;root_type-&gt;print();
+// cout.put('\n');
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int StoreBaseConstVol (int x,...)
+{
+SHORT;
+// the first two calls to ConstVol apply here.
+Tx-&gt;const_vol =  const_vol_stack[--const_vol_stacktop];
+Tx-&gt;const_vol |= const_vol_stack[--const_vol_stacktop];
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int StoreType (int x,...)
+{
+SHORT;
+Tx-&gt;base_type= x;
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int StoreTag (int x,...)
+{
+SHORT;
+/* called when a struct, union, or enum is parsed. The tag is the last
+   token read.  After this call, the StoreType call is made with 'union'
+   or whatever.  */
+get_last_token();
+Tx-&gt;tag_name= atoms[last_token];
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int StoreStorage (int x,...)
+{
+SHORT;
+/* this is the first thing called */
+Tx-&gt;storage_class= x;
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int Dname (int x,...)
+{
+SHORT;
+/* if x==1, the last token is the name of a thing being declared.  If
+   x==0, there is no name and this is an abstact declarator.  Either
+   way, build a type node and store the name.  This overwrites the type
+   node, as it will be the first thing called.  */
+
+if (x) {
+   get_last_token();
+   Tx-&gt;name= atoms[last_token];
+   }
+Tx-&gt;this_type= new type_node;
+Tx-&gt;root_type= Tx-&gt;this_type;
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int TypeModifier (int x,...)
+{
+SHORT;
+/*  1 t()     2 t[]     3 *t     4 &amp;t        */
+
+switch (x) {
+   case 1:
+      Tx-&gt;this_type-&gt;primary= type_function;
+      // attach parameter list
+      Tx-&gt;this_type-&gt;aggr= completed_def_list;
+      break;
+   case 2:
+      Tx-&gt;this_type-&gt;primary= type_array;
+      // &gt;&gt; attach size
+      break;
+   case 3:
+      Tx-&gt;this_type-&gt;primary= type_pointer;
+      Tx-&gt;this_type-&gt;flags |= const_vol_stack[--const_vol_stacktop];
+      break;
+   case 4:
+      Tx-&gt;this_type-&gt;primary= type_reference;
+      Tx-&gt;this_type-&gt;flags |= const_vol_stack[--const_vol_stacktop];
+      break;
+   }
+Tx-&gt;this_type-&gt;to_what= new type_node;
+Tx-&gt;this_type= Tx-&gt;this_type-&gt;to_what;
+
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int ConstVol (int x,...)
+{
+SHORT;
+/*  1-const  2-volatile  3-both  */
+const_vol_stack[const_vol_stacktop++]= x;
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int ReachType (int x,...)
+{
+SHORT;
+/* 0-default  1-near  2-far */
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int NestedType (int x, ...)
+{
+SHORT;
+working_type* p;
+if (x) {  //start nesting
+   p= new working_type;
+   p-&gt;next= Tx;
+   Tx= p;
+   }
+else {  //restore old type
+   p= Tx;
+   Tx= Tx-&gt;next;
+   delete p;
+   }
+parameter_list (x);  //pass on to DEFINE module
+return 0;
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+int AllDoneNow (int x, ...)
+{
+SHORT;
+cout &lt;&lt; &quot;parser complete. \n&quot;;
+for (int loop= 0;  loop &lt; global_stuff.size();  loop++) {
+   global_stuff[loop]-&gt;print();
+   cout.put ('\n');
+   }
+return 0;
+}
+
+
+
+
+
+<a name="025b_0014"><a name="025b_0014">
+<a name="025b_0015"></pre><B>[LISTING FOUR]</B><pre><a name="025b_0015">
+
+/*****************************************************
+File: ATOM.CPP       Copyright 1989 by John M. Dlugosz
+   store strings
+*****************************************************/
+
+#include &quot;usual.hpp&quot;
+#include &quot;atom.hpp&quot;
+
+extern &quot;C&quot; void* malloc (unsigned size);
+extern &quot;C&quot; void free (void*);
+extern &quot;C&quot; void* realloc (void*, unsigned);
+
+atom_storage atoms(16);
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+atom_storage::atom_storage (int size)
+{
+count= 0;
+capacity= size;
+list= (char**) malloc (size * sizeof(char*));
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+atom_storage::~atom_storage()
+{
+free (list);
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+extern &quot;C&quot; int strcmp(char*,char*);
+extern &quot;C&quot; char* strdup(char*);
+
+atom atom_storage::operator[] (char* s)
+{
+for (int loop= 0;  loop &lt; count;  loop++) {
+   if (!strcmp(s, list[loop])) return loop;  //found it
+   }
+if (count == capacity) {  // make it bigger
+   capacity += capacity/2;
+   list= (char**)realloc(list,capacity*sizeof(char*));
+   }
+list[count]= strdup(s);
+return count++;
+}
+
+
+
+
+
+
+
+<a name="025b_0016"><a name="025b_0016">
+<a name="025b_0017"></pre><B>[LISTING FIVE]</B><pre><a name="025b_0017">
+
+
+typedef int atom;
+
+class atom_storage {
+   char** list;
+   int count;
+   int capacity;
+public:
+   atom_storage(int size);
+   ~atom_storage();
+   char* operator[] (atom x) { return list[x]; }
+   atom operator[] (char*);
+   };
+
+extern atom_storage atoms;
+
+
+
+
+
+
+<a name="025b_0018"><a name="025b_0018">
+<a name="025b_0019"></pre><B>[LISTING SIX]</B><pre><a name="025b_0019">
+
+/*****************************************************
+File: DEFINE.CPP     Copyright 1989 by John M. Dlugosz
+   deal with definitions once they are parsed
+*****************************************************/
+
+#include &quot;usual.hpp&quot;
+#include &lt;stream.hpp&gt;
+#include &quot;atom.hpp&quot;
+#include &quot;node.hpp&quot;
+#include &quot;define.hpp&quot;
+
+bool local_level= FALSE;
+
+def_node_list global_stuff;
+struct p_list_struct {
+   def_node_list* l;
+   p_list_struct* next;
+   };
+static p_list_struct *p_list;
+def_node_list* completed_def_list;
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+void store_thing (type_node* t, atom name, int storage_class, int param)
+{
+/* 'param' is passed through from the grammar.  If 1, this is a declaration
+   for a local or global object.  If 2, this is part of a parameter list */
+def_node* n= new def_node (name, storage_class, t);
+
+// file it away somewhere
+switch (param) {
+   case 1:
+      if (name == -1) {
+         // &gt;&gt; I need to get a standard error reporter
+         cout &lt;&lt; &quot;abstract declarator ignored\n&quot;;
+         }
+      global_stuff.add (n);
+      break;
+   case 2:
+      // &gt;&gt; check it over
+      p_list-&gt;l-&gt;add(n);
+      break;
+   }
+}
+
+/* /\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\/\ */
+
+void parameter_list (int x)
+{
+p_list_struct* p;
+if (x) {
+   p= new p_list_struct;
+   p-&gt;next= p_list;
+   p-&gt;l= new def_node_list;
+   p_list= p;
+   }
+else {
+   p= p_list;
+   p_list= p_list-&gt;next;
+   completed_def_list= p-&gt;l;
+   delete p;
+   }
+}
+
+
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1989, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

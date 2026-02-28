@@ -1,0 +1,348 @@
+<HTML>   
+     <HEAD>
+<TITLE>February 2003/Common Knowledge</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Common Knowledge: typeints</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Stephen C. Dewhurst</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>In a recent series of articles, we designed and implemented a <b>typeof</b> facility for C++ <a href="#1">[1]</a>. One part of the implementation entailed a compile-time transformation of an expression's type into a structured integer, which was later decoded to regenerate the original type. One problem we faced was the size limitation imposed on the integer encoding due to the necessity of performing compile-time arithmetic on integers of modest precision (32 or 64 bits), while encodings of many &quot;reasonable&quot; types might require integers hundreds of bits in length.  (&quot;Unreasonable&quot; types could require integers of unbounded size.)</p>
+<p>Since traditional data-abstraction techniques are not available at compile time, we were unable to implement an extended-precision integral type; we were limited to those operations that could be employed in integer constant expressions. Our approach was to implement compile-time arithmetic operations on collections of predefined integers. For example, to left shift a quad-precision integer (composed of four integer constant-expressions <b>c1-c4</b>), we would write code similar to the following:</p> 
+
+<pre>
+typedef ShiftLeft&lt;c4,c3,c2,c1,ModLen&gt; SL;
+enum {
+   code1 = SL::code1,
+   code2 = SL::code2,
+   code3 = SL::code3,
+   code4 = SL::code4
+};
+</pre>
+
+<p>This is effective, but ungainly. We are also forced to choose the maximum precision of our result a priori (four, in this case), rather than let the complexity of the encoding adjust the precision of the result implicitly.</p>
+<p>As we noted above, compilers have strengths and weakness that correspond to the requirements imposed on them by the language they are designed to translate. A C++ compiler has need of only modest compile-time arithmetic ability, but requires extensive ability to manipulate complex types. In fact, most well-designed compilers have a notion of a &quot;type algebra,&quot; in which types are manipulated at compile time with various type-algebraic operations. For example, as the declaration of a name is parsed, the compiler will compose the name's type from its declaration-specifiers and declarators.  When the name is manipulated in expressions, its type will be manipulated in sync by other type-algebraic operations.</p>
+<p>This implies that it might be profitable to represent integers as types, and to map compile-time arithmetic operations onto type manipulation operations, so as to leverage the compiler's extensive abilities in that area. We should then be able to perform extended-precision compile-time arithmetic on this integer/type abstraction. If necessary, portions of the extended-precision results could be mapped back to the corresponding predefined integral type.</p>
+
+<H3><FONT COLOR="#000080">Mapping Integers to Types</FONT></H3>
+
+<p>Let's define a simple mapping from unsigned binary integers to C++ types by representing a zero bit as a pointer modifier, and a one bit as a <b>const</b>-qualified pointer modifier.  The pointer's base type doesn't matter (much), so we'll choose <b>char</b> for that purpose. The unmodified base type will represent the value zero. In order to support variable-length <b>typeint</b>s, we'll disallow leading zero bits (that is, unqualified pointer modifiers) in the type representation.</p>
+<p>For example, with this simple encoding, we can represent the unsigned binary integer <b>1011100</b> (decimal 92) as the type <b>char *const * *const *const *const * *</b>. Let's call this type analog of an integer a <b>typeint</b>.</p>
+<p>It's fairly easy to convert a small integer into a <b>typeint</b> <a href="#2">[2]</a>:</p>
+
+<pre>
+template &lt;int n&gt;
+struct TypeInt {
+    typedef typename Select&lt;
+        n&amp;1,
+        typename TypeInt&lt;(n&gt;&gt;1)&gt;::R *const,
+        typename TypeInt&lt;(n&gt;&gt;1)&gt;::R *
+    &gt;::R R;
+};
+
+template &lt;&gt;
+struct TypeInt&lt;0&gt;
+    { typedef char R; };
+</pre>
+
+<p>The primary <b>TypeInt</b> template recursively determines the encoding for high-order bits of the integer <b>n</b> and then appends a <b>* const</b> if the low-order bit is one or a <b>*</b> if the low-order bit is zero. The recursion terminates when the complete specialization of <b>TypeInt</b> is instantiated when <b>n</b> is zero.</p>
+<p>Converting a <b>typeint</b> to an integer is also straightforward, provided the integral value represented by the <b>typeint</b> can fit into a predefined integer:</p>
+
+<pre>
+template &lt;typename T&gt;
+struct Value
+    { enum { r = 0 }; };
+
+template &lt;typename T&gt;
+struct Value&lt;T *&gt;
+    { enum { r = Value&lt;T&gt;::r*2 }; };
+
+template &lt;typename T&gt;
+struct Value&lt;T * const&gt;
+    { enum { r = Value&lt;T&gt;::r*2 + 1 }; };
+</pre>
+
+<p>In this case, the primary template is used to terminate the recursion when all the &quot;bits&quot; (pointer modifiers) have been stripped from the <b>typeint</b>. The partial specializations recursively calculate the integer equivalent of the dereferenced <b>typeint</b> and then append a 0 or 1 bit based on the outermost pointer modifier.</p>
+
+<pre>
+cout &lt;&lt; Value&lt; TypeInt&lt;92&gt;::R &gt;::r &lt;&lt; endl; // 92
+</pre>
+
+<H3><FONT COLOR="#000080">Shifting typeints</FONT></H3>
+
+<p>Left shift will zero fill, so we have only to append the correct number of zeros:</p>
+
+<pre>
+template &lt;typename T, int n&gt;
+struct LShift
+    { typedef typename LShift&lt;T,n-1&gt;::R *R; };
+
+template &lt;typename T&gt;
+struct LShift&lt;T,0&gt;
+    { typedef T R; };
+</pre>
+
+<p>However, our <b>typeint</b> representation does not permit leading zeros, so we must special case for the possibility of shifting a zero (<b>char</b>) <b>typeint</b>:</p>
+
+<pre>
+template &lt;int n&gt;
+struct LShift&lt;char,n&gt;
+    { typedef char R; };
+</pre>
+
+<p>Finally, we must provide a complete specialization in order to disambiguate the case where a zero <b>typeint</b> is left-shifted zero bits. Otherwise, there would be an ambiguity between the partial specializations.</p>
+
+<pre>
+template &lt;&gt;
+struct LShift&lt;char,0&gt;
+    { typedef char R; };
+</pre>
+
+<p>The right-shift operation always zero fills in this implementation. Since there are no leading zeros in this implementation, this means we simply dereference the <b>typeint</b> the appropriate number of times <a href="#3">[3]</a>:</p>
+
+<pre>
+template &lt;typename T, int n&gt;
+struct RShift {
+    typedef typename Deref&lt;typename RShift&lt;T,n-1&gt;::R&gt;::R R;
+};
+
+template &lt;typename T&gt;
+struct RShift&lt;T,0&gt; {
+    typedef T R;
+};
+</pre>
+
+<H3><FONT COLOR="#000080">Bitwise Operations</FONT></H3>
+
+<p>Let's look at an implementation of bitwise or. Addition and the other bitwise operations are similar. In this implementation, we'll employ a compile-time switch to separate out the cases when one or both of the arguments is zero:</p>
+
+<pre>
+template &lt;typename A, typename B&gt;
+struct Or {
+    enum { switchval = IsPtr&lt;A&gt;::r*2 + IsPtr&lt;B&gt;::r };
+    typedef typename OrImpl&lt;switchval,A,B&gt;::R R;
+};
+</pre>
+
+<p>Since a zero <b>typeint</b> value is represented by an unqualified <b>char</b> base type, we can construct a switch-expression based on whether the arguments to the bitwise or are both non-zero (they're both pointers; the switch value is <b>3</b>), only the first argument is non-zero (<b>2</b>), only the second argument is zero (<b>1</b>), or both arguments are zero (<b>0</b>). As one might expect, the cases with one or two zero arguments are trivial:</p>
+
+<pre>
+template &lt;typename A, typename B&gt;
+struct OrImpl&lt;0,A,B&gt; {
+    typedef char R; // 0 | 0 == 0
+};
+template &lt;typename A, typename B&gt;
+struct OrImpl&lt;2,A,B&gt; {
+    typedef A R; // A | 0 == A
+};
+template &lt;typename A, typename B&gt;
+struct OrImpl&lt;1,A,B&gt; {
+    typedef B R; // 0 | B == B
+};
+</pre>
+
+<p>When both arguments are non-zero, things are a bit more interesting:</p>
+
+<pre>
+template &lt;typename A, typename B&gt;
+struct OrImpl&lt;3,A,B&gt; {
+    typedef typename Deref&lt;A&gt;::R DA;
+    typedef typename Deref&lt;B&gt;::R DB;
+    typedef typename Or&lt;DA,DB&gt;::R Temp;
+    typedef
+    typename Select&lt;
+        // either A or B has a 1 bit
+        IsConst&lt;A&gt;::r || IsConst&lt;B&gt;::r,
+        Temp * const,
+        Temp *
+    &gt;::R R;
+};
+</pre>
+
+<p>First, we dereference the two arguments to remove the low-order bit of each and recursively calculate the result of bitwise or-ing the two shortened <b>typeint</b>s. We then append the or-ed value of the low-order bits we removed earlier.</p>
+<p>This use of a compile-time switch may seem needlessly complex. Another approach might be to use exhaustive specialization instead.  There are nine cases to consider, as the table below illustrates.</p>
+
+<table border=1>
+<tr><td><b>First Argument</b></td>
+<td><b>Second Argument</b></td>
+</tr>
+<tr>
+<td><b>char</b></td>
+<td><b>char</b></td>
+</tr>
+<tr>
+<td><b>char</b></td>
+<td><b>B *</b></td>
+ </tr>
+ <tr>
+<td><b>char</b></td>
+<td><b>B * const</b></td>
+ </tr>
+ <tr>
+<td><b>A *</b></td>
+<td><b>char</b></td>
+ </tr>
+ <tr>
+<td><b>A *</b></td>
+<td><b>B *</b></td>
+ </tr>
+ <tr>
+<td><b>A *</b></td>
+<td><b>B * const</b></td>
+ </tr>
+ <tr>
+<td><b>A * const</b></td>
+<td><b>char</b></td>
+ </tr>
+ <tr>
+<td><b>A * const</b></td>
+<td><b>B *</b></td>
+</tr>
+<tr>
+<td><b>A * const</b></td>
+<td><b>B * const</b></td>
+</tr>
+</table>
+
+<p>The primary and eight partial specializations follow those listed in the table, above.</p>
+
+<pre>
+template &lt;typename A, typename B&gt;
+struct Or { typedef char R; };
+
+template &lt;typename A, typename B&gt;
+struct Or&lt;A *,B *&gt; { typedef typename Or&lt;A,B&gt;::R *R; };
+
+template &lt;typename A, typename B&gt;
+struct Or&lt;A *const,B *&gt; { 
+    typedef typename Or&lt;A,B&gt;::R *const R; 
+};
+// 5 more cases...
+template &lt;typename A, typename B&gt;
+struct Or&lt;A *const,B&gt; { typedef A *const R; };
+</pre>
+
+<p>In the case of the implementation of bitwise or, it's a tossup as to which implementation mechanism is preferable. The implementation of bitwise and can merge some cases and is, therefore, easier to implement by exhaustive specialization.</p>
+
+<pre>
+template &lt;typename A, typename B&gt;
+struct And // at least one of A or B is 0
+    { typedef char R; };
+
+template &lt;typename A, typename B&gt;
+struct And&lt;A *,B *&gt;
+    { typedef typename And&lt;A,B&gt;::R *R; };
+
+template &lt;typename A, typename B&gt;
+struct And&lt;A *const,B *&gt;
+    { typedef typename And&lt;A,B&gt;::R *R; };
+
+template &lt;typename A, typename B&gt;
+struct And&lt;A *,B *const&gt;
+    { typedef typename And&lt;A,B&gt;::R *R; };
+
+template &lt;typename A, typename B&gt;
+struct And&lt;A *const,B *const&gt;
+    { typedef typename And&lt;A,B&gt;::R *const R; };
+</pre>
+
+<H3><FONT COLOR="#000080">Uses and Limitations</FONT></H3>
+
+<p>The use of <b>typeint</b>s for extended compile-time arithmetic has some advantages over our earlier ad hoc mechanism. The original mechanism was wordy and fixed to a given precision a priori:</p>
+
+<pre>
+typedef ShiftLeft&lt;c4,c3,c2,c1,ModLen&gt; SL;
+enum {
+   code1 = SL::code1,
+   code2 = SL::code2,
+   code3 = SL::code3,
+   code4 = SL::code4
+};
+</pre>
+
+<p>The use of a <b>typeint</b> is sparer, and we do not have to specify the precision of the result in advance. The <b>typeint</b> will expand its precision as needed, up to the capacity of the compiler to manipulate it:</p>
+
+<pre>
+typedef LShift&lt;aCode, ModLen&gt;::R Code;
+</pre>
+
+<p>Unfortunately, that's where a problem lies. The <b>typeint</b> implementation is highly recursive, and many compilers cannot perform recursive template instantiation beyond a very modest depth. This effectively limits the maximum length, in bits, of a <b>typeint</b> to be conformant with the maximum instantiation depth of the compiler. While the C++ Standard suggests a minimum instantiation depth of only 17 levels (in Annex B), most compilers seem to be able to manage at least 60, while others have compiler options that will allow instantiation depth to be as high as 600-700, and still others will instantiate until resource exhaustion, typically giving results in the low thousands. We'll examine approaches to dealing with the problem of recursive template instantiation depth limitations in a future column.</p>
+
+<H3><FONT COLOR="#000080">Complex Multiplication</FONT></H3>
+
+<p>Before we close, let's have a too-quick look at an implementation for <b>typeint</b> multiplication. We'll implement it using the traditional shift-and-add approach:</p>
+
+<pre>
+        1 1 0 1 // A
+     x  1 0 0 1 // B
+     ------------
+        1 1 0 1
+      0 0 0 0
+    0 0 0 0
+ 1 1 0 1
+---------------
+ 1 1 1 0 1 0 1 // A * B
+</pre>
+
+<p>The representation of the above calculation with <b>typeint</b>s is essentially the same, but is somewhat less readable:</p>
+
+<pre>
+                char *const *const * *const
+    x                char *const * * *const
+    ---------------------------------------
+                char *const *const * *const
+                                       char
+                                       char
+          char *const *const * *const * * *
+-------------------------------------------
+char *const *const *const * *const * *const
+</pre>
+
+<p>A straightforward implementation of the shift and add multiplication algorithm is pleasingly spare:</p>
+
+<pre>
+template &lt;typename A, typename B&gt;
+struct Mul;    // no definition of primary
+
+template &lt;typename A&gt;
+struct Mul&lt;A,char&gt;  // A * 0 == 0
+    { typedef char R; };
+
+template &lt;typename A, typename B&gt;
+struct Mul&lt;A,B *&gt;  // 0 digit, just shift
+                         // A*B0 == (A*B)&lt;&lt;1
+    { typedef typename Mul&lt;A,B&gt;::R *R; };
+
+template &lt;typename A, typename B&gt;
+struct Mul&lt;A,B *const&gt; {  // 1 digit, shift and add
+                                // A*B1 == ((A*B)&lt;&lt;1)+A
+    typedef typename Mul&lt;A,B&gt;::R *Tmp;
+    typedef typename Add&lt;Tmp,A&gt;::R R;
+};
+
+template &lt;typename A&gt;
+struct Mul&lt;A,char *const&gt;  // to avoid a char * typeint
+    { typedef A R; };  // no leading zeros!
+</pre>
+
+<p>Unfortunately, this algorithm has quadratic (compile time!) complexity rather than the linear complexity of the implementations of the other operators. As a result, on a typical workstation there is a noticeable compilation delay when multiplying <b>typeint</b>s of 35 digits, and multiplication of 200-digit operands implies a lunch break at a minimum.</p>
+
+<H3><FONT COLOR="#000080">Next Time</FONT></H3>
+
+<p>In the next installment, we'll look at the multiplication implementation in more detail and examine a number of template metaprogramming techniques that dramatically improve its performance. In the installment that follows the next, we'll examine techniques for dealing with template instantiation depth limitations.</p>
+
+<H3><FONT COLOR="#000080">Notes</FONT></H3>
+
+<p><a name="1"></a>[1] S.C. Dewhurst, &quot;Common Knowledge: A Bitwise <b>typeof</b> Operator, Parts 1-3,&quot; <i>C/C++ Users Journal</i>, August, October, and December 2002.</p>
+<p><a name="2"></a>[2] The full implementation of this preliminary <b>typeint</b> facility is available on the author's website:  <a href="http://www.semantics.org/code.html">&lt;www.semantics.org/code.html&gt;</a>.  The reader may find in the same location a reimplementation of the <b>typeof</b> facility that employs <b>typeint</b>s for extended-precision compile-time arithmetic. The <b>Select</b> template is borrowed (in modified form) from Andrei Alexandrescu's Loki library. It performs a compile-time if statement, selecting its second argument if the first argument is true, and its third argument if the first argument is false.</p>
+<p><a name="3"></a>[3] Description of utilities like <b>Select</b>, <b>IsPtr</b>,<b> </b>and <b>Deref</b> are omitted for reasons of space. Their implementations are available as described in the previous note.</p>
+
+<H3><FONT COLOR="#000080">About the Author</FONT></H3>
+
+<p><b>Stephen C. Dewhurst</b> (<a href="http://www.semantics.org">&lt;www.semantics.org&gt;</a>) is the president of Semantics Consulting, Inc., located among the cranberry bogs of southeastern Massachusetts. He specializes in C++ consulting, and training in advanced C++ programming, STL, and design patterns. Steve is also one of the featured instructors of The C++ Seminar (<a href="http://www.gotw.ca/cpp_seminar">&lt;www.gotw.ca/cpp_seminar&gt;</a>).</p>
+
+</BLOCKQUOTE></BODY></HTML>

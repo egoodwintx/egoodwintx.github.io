@@ -1,0 +1,196 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v16, i06: Listing 1  getupdate</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a1.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a1_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink"><a href="a1_f2.htm">Figure 2</a></span></td>
+		<td><span class="navbarLink">Listing 1</span></td>
+		<td><span class="navbarLink"><a href="a1_l2.htm">Listing 2</a></span></td>
+		<td><a href="../../../../source/SA/2007/jun2007.tar"><b class=codeListing>jun2007.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h2>Listing 1  <i>getupdate</i></h2>
+<pre>
+#!/usr/local/bin/perl
+#########################################################################
+#
+# Name:       getupdate
+# Usage:   getupdate
+# Author:  Lisa Hamet Bernard, LHB Consulting
+#
+# This script fully automates the signature update discovery and download 
+# process for the Cisco Advanced Inspection and Prevention Security Service 
+# Module (AIP SSM) installed in each ASA 5510. The script first determines the
+# currently installed signature version.  It then FTP's into Cisco's website 
+# using given CCO account username and password.  Each file in the signature 
+# update directory is checked against the currently installed version.  If a 
+# higher numbered version is found, that update file is downloaded into the 
+# $archivedir directory, the FTP session closed, and an email is sent to the 
+# admin's account with the timestamp and new signature version number 
+# downloaded. The AIP SSM's are configured with auto-upgrade-option enabled.
+# Through this feature, they each regularly check for (and install if found) 
+# new signature update files on this server in the $archivedir directory.   
+# The transfers are performed via scp, again as user sigupdate.
+#
+# The communication from this server to the AIP SSM is performed via SSH,
+# using preshared keys for user sigupdate (same account name on both sides.)
+# This account has administrator privilege on the AIP SSM's, but needs no
+# special privileges on this server.
+#
+#########################################################################
+use Net::FTP;
+use Net::Telnet;
+use Proc::Spawn;
+
+$ccousername = "myCCOlogin";
+$ccopassword = "myCCOpassword";
+$archivedir = "/export/home/sigupdate/updates";
+$notify = "netadmin\@company.com";
+my $IPS = "192.168.1.10";
+my $user = "sigupdate";
+my $prompt = '/aipssm2# ?$/';
+
+# Get currently installed signature update version by SSH session to IPS.
+
+# Start SSH program as user $user -- must force version 1 for pre-shared key
+# exchange to work correctly.  (Key is RSA1 format.)
+
+my ($pid, $pty_fh) = spawn_pty("ssh -1l $user $IPS");
+
+# Create a Net::Telnet object to perform I/O on ssh's tty.  Use file handle
+# from SSH process.  Disable Telnetmode, since this is an SSH session. Set
+# Cmd_remove_mode so sent command is not echoed back.  Then call waitfor
+# method to look for IPS prompt to signify connection is established.
+
+$ssh = new Net::Telnet (Fhopen =&gt; $pty_fh,
+                        Prompt =&gt; $prompt,
+                        Telnetmode =&gt; 0,
+                        Cmd_remove_mode =&gt; 1,
+                        Output_record_separator =&gt; "\r");
+
+$ssh-&gt;waitfor(Match =&gt; $ssh-&gt;prompt, Errmode =&gt; "return") 
+   or &fail_exit("$notify","IPS login failed: ", $ssh-&gt;lastline);
+
+# Disable paging for the SSH login session
+
+$ssh-&gt;cmd("terminal length 0");
+
+# Send a "show version" and capture output.  Then find the line listing the
+# current signature update version.
+
+@lines = $ssh-&gt;cmd("show version");
+foreach $thisline (@lines)  {
+            if (($thisline =~ /Signature Update/))  {
+               $gotit = $thisline;
+               last;
+            }
+        }
+
+# Parse current version number from this line
+
+@words = split(' ',$gotit);
+foreach $word (@words)  {
+   if (($word =~ /S[0-9][0-9][0-9]/))  {
+      $currentver = substr($word,1);
+      last;
+   }
+}
+
+# Close SSH session.  Need to kill the process also, because close does not.
+
+$ssh-&gt;close;
+`kill $pid`;
+
+# Login to Cisco's FTP site and cd to appropriate directory.  Must force
+# passive FTP mode to work with Cisco site
+
+$ftp = Net::FTP-&gt;new("ftp-sj.cisco.com", Passive =&gt; 1);
+$ftp-&gt;login($ccousername, $ccopassword);
+$ftp-&gt;cwd("cisco/ciscosecure/ips/5.x/sigup");
+
+# Get list of files in the directory
+
+@lines = $ftp-&gt;ls();
+
+# Parse each line in the directory listing for update version number.  If 
+# version is higher than our current installed version, get it and put in 
+# $archivedir.  Make sure version number is preceded by "S" so the 
+# corresponding README file on the FTP site is skipped.
+
+$newupdate = 0;
+foreach $availfile (@lines)  {
+    @fields = split(/-/,$availfile);
+    $newversion = substr($fields[2],1);
+    if (($newversion &gt; $currentver) && ($fields[2] =~ /^S/))  {
+    $ftp-&gt;binary;
+        $ftp-&gt;get($availfile,$archivedir . "/" . $availfile);
+    $newupdate = 1;
+        $updatefile = $availfile;
+        last;
+    }
+}
+
+# Close FTP connection
+$ftp-&gt;quit();
+
+# If there is a new update, email $notify that update has been downloaded.
+
+if ($newupdate)  {
+
+$date = `/bin/date`;
+`/bin/echo "Successfully downloaded update $newversion on $date" | 
+  /bin/mailx -s "AIP SSM Signature Update Download completed" $notify`;
+}
+
+sub fail_exit {
+
+# Email address at $notify that failure has occurred on th AIP SSM with 
+# message $summary and $message.  Then write message to stderr and exit.
+
+    local ($notify, $summary, $message) = @_;
+    `/bin/echo "AIP SSM failure during signature version check. $summary 
+      $message" | /bin/mailx -s "AIP SSM signature update process 
+      failure" $notify`;
+    die $message;
+}
+</pre>
+            </table></table> 
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

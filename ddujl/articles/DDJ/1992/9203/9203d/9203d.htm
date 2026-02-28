@@ -1,0 +1,290 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>MAR92: PORTING UNIX TO THE 386 DEVICE DRIVERS</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>PORTING UNIX TO THE 386 DEVICE DRIVERS<a name="008d_0002"></h1><P>
+<h2><a name="008d_0001"><a name="008d_0000">Entering, exiting, and masking processor interrupts</h2><P>
+<h3>William Frederick Jolitz and Lynne Greer Jolitz</h3><P>
+<p><i><a name="008d_0000">Bill was the principal developer of 2.8 and 2.9BSD and was the chief architect of National Semiconductor's GENIX project, the first virtual memory microprocessor-based UNIX system.  Prior to establishing TeleMuse, a market research firm, Lynne was vice president of marketing at Symmetric Computer Systems.  They conduct seminars on BSD, ISDN, and TCP/IP. Send e-mail questions or comments to lynne@berkeley.edu.  (c) 1992 TeleMuse.</i></p><hr><P>
+Many devices work on an &quot;interrupt-driven&quot; basis.  That is to say, they signal an asynchronous event by generating an exception, which tells the processor to come and service them.  To support this need, we must have the ability to enter, exit, and mask various processor interrupts.  This is fairly complex, and merits detailed discussion.<P>
+In the original Bell Labs PDP-11/45 UNIX system, classes of devices shared a particular level of interrupt priority (although each had a distinct interrupt vector).  For example, priority level 5 was associated with terminal controllers, and priority 6 was associated with mass storage and timeslice clock devices.  In addition, the PDP-11/45 had an spl (&quot;set processor level&quot;) instruction that forced the processor itself to the given level on demand. This spl mechanism was used to temporarily raise the priority level when critical sections of code would be executed.  These critical sections would alter the variables or hardware devices upon which the interrupt service routines depended, so the affected interrupts would themselves be temporarily &quot;locked out&quot; while the world was changed.  This procedure prevented inconsistencies arising from a race condition between the interrupt code and the critical sections.  A typical case is shown in <a href="#008d_0003">Example 1</A>.<P>
+<h4><a name="008d_0003">Example 1: The spl function</h4><P>
+<pre>
+  ...
+  saved priority = spl5();
+  &lt;critical code goes here&gt;;
+  splx (saved_priority);
+  ...</pre><P>
+<P>
+All spl() functions returned the previous or &quot;old&quot; priority level so that it could be restored by a subsequent call to the splx() function, which would then force the priority indicated by its function parameter.<P>
+Most ports of UNIX attempted to preserve or emulate this mechanism, frequently by calling the routines that manage spl().  In 4.3BSD, the routines were separated out into more descriptive and less enigmatic names.  Thus, splclock(), for example, defeated all timeslice clock interrupts, and splbio() defeated mass storage devices that depended on the block I/O (or bio for short) mechanism.<P>
+<h3><a name="008d_0004">386 ISA Interrupt Mechanism in Detail<a name="008d_0004"></h3><P>
+Our 386 ISA bus machine uses a different arrangement from those outlined above; see <a href="1992008f.htm">Figure 1</A>.  Unlike the PDP-11, VAX, and 68000, the interrupt priority control is not part of the processor itself.  Instead, it's actually part of the ISA bus.  The 386 relies on two 8259 Interrupt Control Units (ICUs) attached to the processor, just like an I/O device.  So, instead of having special instructions or registers in the processor to manage interrupts, the 386 uses I/O instructions on dedicated I/O ports. Additional signals to the microprocessor allow the ICUs to indicate the presence of an interrupt and pass back information on which interrupt to dispatch to.  These ICUs function as a programmable filter of device interrupts, and the 386 can process these interrupts as presented or ignore them as a whole.<P>
+The ICUs are attached in a cascaded arrangement, with the master ICU directly connected to the 386 and the slave ICU connected to one of the eight interrupt input lines that each ICU possesses.  Because of this layout, although we have two ICUs with eight lines apiece, only 15 interrupts are actually generatable (see <a href="#008d_0008">Listing One</A>, page 90), as the third interrupt (IRQ2) is not allowed.  Even more confusing the arrangement of relative priority the interrupt priorities for the slave interrupts (IRQ8-15) are jammed in between IRQ1 and IRQ3.  And finally, to maintain compatibility with the original PC, what used to be IRQ2 is now attached to the slave to IRQ9, with the newer interrupt signals on the slave ICU (other than IRQ9) available only to the AT or 16-bit wide cards.<P>
+Each ICU has three registers full of bits (a bit corresponds to each interrupt) representing its device interrupt lines: request, &quot;in service,&quot; and mask.  Sampled interrupts are present in the request register, and interrupts that have been signaled to the processor are recorded in the &quot;in service&quot; register.  The mask register is managed by the software to selectively disable interrupts as needed -- to take them out of the running for interrupting the processor.<P>
+Unlike the PDP-11, each interrupt vector has its own interrupt priority level, discrete from all others.  Also, on the ISA there is no partitioning of priority levels and class of devices.  (For example, mass storage devices, terminals, and network devices are all spread out and interspersed.)  The choice of interrupt vector frequently is a function of the given combination of cards present in a system.<P>
+<h3><a name="008d_0005">Interrupt Group Masks<a name="008d_0005"></h3><P>
+The ICUs provide for quite a variety of programmable modes of operation, as befits a part primarily designed for real-time process control applications.  We chose to use it in &quot;fixed&quot; priority mode and implement our own priority mechanism in software.  For this purpose, we created bit mask values that we could shove into the ICU mask registers to defeat interrupts associated with each group.  Thus, for example, when spltty() is called to block the class of terminal device interrupts, the group mask __ttymask__, which has a bit set for each terminal device interrupt to be defeated, is placed in the ICU interrupt mask register.  This is quite different from the original PDP-11 arrangement!<P>
+A nested condition, where multiple different spls could be called, is a possibility.  So, the semantics of the spl routines have been altered slightly to be the OR of all masks posted instead of assignment.  Thus, if a sequence of code called both spltty() and splbio(), the effect would be to defeat both groups of devices inclusively.  There are two exceptions to this: 1. When we wish to unmask all valid interrupts with splnone() (for example, block none of the interrupts); and 2. when we wish to restore the previous state of the interrupt control unit's masks with splx(oldmask).  Both of these exceptions need to assign the mask, instead of just ORing a value to obtain the desired effect.<P>
+These group masks (see <a href="#008d_000a">Listing Two</A>, page 90) must be constructed from the interrupts the devices found during the autoconfiguration phase.  (See DDJ, November 1991.)  Lists of devices to be configured for each group (such as the tty) are collected.  If the given device is found and attached, the interrupt determined to be associated with this device (for the tty group, __ttymask__, for example) is added to the appropriate group mask. Similarly, a mask of all valid interrupt devices is maintained, so that unused interrupts are never enabled.<P>
+To manipulate the interrupt masks (see <a href="#008d_000c">Listing Three</A>, page 90) we use the spl() functions described earlier.  They are implemented in the GCC inline assembler macro fashion, so that they may be called with the smallest additional overhead.  As you might guess from this, the spl() functions are called frequently, and shortening execution is of value.  Please note that two different versions of these macros are provided, for use with assembler files and C files, with different calling conventions -- again to minimize overhead.<P>
+These functions disable the processor from handling interrupts (cli) so that the mask can appear to change &quot;atomically.&quot;  Also, in deference to high-speed 386 systems, what appear to be spurious input instructions are added after updating the ICU mask register.  These instructions do a read of a known &quot;nonexistent&quot; port.  It is known that no data will be forced on the bus, and that any outstanding output operations on the ISA bus will have been written out before this instruction finishes.  This code is necessary to mitigate the sins of &quot;clever&quot; hardware that holds port output contents in a &quot;write buffer&quot; so that output instructions can overlap execution (and it's still quite slow).  If this code is not inserted, when we turn on the processor's interrupt processing again (sti), the new mask won't have made it to the ICU and we will be running at the &quot;old&quot; priority for &quot;a while.&quot;  If this happens at an inconvenient time (during an interrupt processing routine, for instance), we might endlessly recurse and overrun the processor.  The 386 is very unforgiving in this regard--the processor will shut down and spontaneously reset itself.  Equally cleverly, the BIOS will then scrub the screen buffer and memory clean of all evidence of what led to the disaster--a debugging nightmare.<P>
+One technique commonly used by PC software developers is to attempt to memorize the contents of the screen prior to a shutdown.  It's amazing what one can remember during the 100 milliseconds or so that the chip is off doing diagnostics.  During particularly baffling sessions, different colors on console messages and speaker tones were used to convey the content of debugging information, because one could more quickly grasp a sequence of tones or colors than the text of a message.  This technique, while many times a lifesaver, was somewhat difficult to explain to a passerby when the system would hit one of these debugging sequences.  To the uninitiated, the computer would seem to have gone mad, pouring out messages and tones at a frightful rate.  In addition, such a person would never quite believe that a conclusive answer could be obtained from such an outpouring, because the text would usually be incomprehensible, although the arrangement of color and tones would be unique enough to finger the guilty party.  One might consider it a &quot;poor man's&quot; in-circuit emulator of sorts, although perfect pitch is not usually considered a requirement for systems programming!<P>
+<h3><a name="008d_0006">Wiring Interrupts to Drivers<a name="008d_0006"></h3><P>
+Our operating system drivers are written for the most part in C, thus leveraging all the benefits of programming in a high-level language, such as portability and readability. However, we need to somehow connect a device driver's interrupt function (written in C) to the corresponding hardware interrupt.  This correspondence might change depending on the whims of configuration, so this process is tied up (like the Gordian Knot) to autoconfiguration.<P>
+On the 386, we use a two-step operation.  In processing an interrupt, the 386 indexes the IDT (Interrupt Descriptor Table) to obtain the address of the interrupt entry stub routine. It then executes the stub to gain entry to the given driver.  We call this routine a &quot;stub&quot; because its whole existence is dedicated to providing a rendezvous point between the machine's concept of an interrupt and our operating system kernel's higher-level concept of an interrupt (for example, an exception handled by a C function).<P>
+One way to understand this process is to view it more conceptually.  The 386 processes an interrupt by inserting a &quot;hidden&quot; call instruction before the next consecutive instruction it would have processed otherwise.  This hidden call is an lcall or intersegment call to the function described by the interrupt's IDT entry.  The stub routine adds the necessary semantics (or &quot;glue&quot;) to expand this hidden call into a hidden driver-interrupt call, and allows the effect to be reversed and the stack cleaned off when the driver interrupt routine returns.<P>
+To allow the 386 processor to find the interrupt stubs, we need to fill out the Interrupt Descriptor Table entry associated with this.  The first 32 entries are used by the processor to deal with its own exceptions, so when we initialize the ICUs, we have them relocate up their exception index appropriately.  So IRQ0-7 from the first ICU correspond to IDT entries 32-39, and IRQ8-15 from the second ICU correspond to IDT entries 40-47.  (Note: We don't receive an interrupt on the third interrupt of the primary ICU because it is used as the cascade input by the second ICU.  However, it still requires an interrupt table entry [34] as a placeholder, even though it is never used.)  The function setidt() (see <a href="#008d_000e"> Listing Four</A>, page 91) fills out an IDT entry with the required details.<P>
+<h3><a name="008d_0007">The Interrupt Descriptor Table Entry<a name="008d_0007"></h3><P>
+Interrupts on the 386 are extremely CISC-ish; they can be directed to different ring levels (including user process ring 3), and can even context switch to another process!  No other processor we know of has such an elaborate mechanism for interrupt entry.  All details needed in the contents of the interrupt descriptor (see <a href="#008d_0010">Listing Five</A>, page 91) reflect this wealth of flexibility built into the 386.  The interrupt descriptor can be a task gate, an interrupt gate, or a trap gate.  The entry can be directed to a separate process, an interrupt entry stub (with interrupts disabled), or a trap entry stub (with interrupt status unchanged).  Because all these choices are gates (MULTICS terminology), embedded in the interrupt descriptor is the selector of another segment, described in the GDT/LDT tables.  Along with the selector, there is an offset into the selector, which locates the entry point within the selector's segment entry stub.  For our needs, the selector is always the kernel's code selector, because with our current arrangement the only place we can deal with interrupts is in the kernel.  The offset corresponds to the kernel virtual address of the interrupt (or trap) entry stub.<P>
+An additional field to note in the interrupt descriptor entry is the descriptor priority level.  It is used to allow or disallow 386 INT (software interrupt) instructions to gain entry to this interrupt descriptor, as if an interrupt had been processed from hardware.  On the earlier 8088/8086 (the original PC), these software interrupts were indistinguishable from hardware interrupts.  In fact, many of the interrupts that MS-DOS uses conflict with 386 and ICU IDT assignments.  (Luckily for MS-DOS, this is only a problem for protected mode and paging.)  To prevent software interrupt instructions from user mode processes from executing device driver code, the description priority level (dpl) field in the IDT sets the maximum ring level allowed to execute this IDT entry with a given INT instruction.<P>
+
+
+<PRE>
+
+
+_PORTING UNIX TO THE 386: DEVICE DRIVERS_
+by William Jolitz and Lynne Jolitz
+
+
+<a name="008d_0008">
+<a name="008d_0009"></pre><B>[LISTING ONE]</B><pre><a name="008d_0009">
+
+/* [Excerpted from /sys/i386/isa/icu.h] */
+ ...
+/* Interrupt enable bits -- in order of priority */
+#define IRQ0        0x0001      /* highest priority - timer */
+#define IRQ1        0x0002
+#define IRQ_SLAVE   0x0004
+#define IRQ8        0x0100
+#define IRQ9        0x0200
+#define IRQ2        IRQ9
+#define IRQ10       0x0400
+#define IRQ11       0x0800
+#define IRQ12       0x1000
+#define IRQ13       0x2000
+#define IRQ14       0x4000
+#define IRQ15       0x8000
+#define IRQ3        0x0008
+#define IRQ4        0x0010
+#define IRQ5        0x0020
+#define IRQ6        0x0040
+#define IRQ7        0x0080      /* lowest - parallel printer */
+ ...
+
+
+
+
+
+<a name="008d_000a">
+<a name="008d_000b"></pre><B>[LISTING TWO]</B><pre><a name="008d_000b">
+
+/* [Excerpted from /sys/i386/isa/icu.h] */
+  ...
+/* Interrupt &quot;level&quot; mechanism variables, masks, and macros */
+
+#define INTREN(s)   __nonemask__ &amp;= ~(s)
+#define INTRDIS(s)  __nonemask__ |= (s)
+#define INTRMASK(msk,s) msk |= (s)
+  ...
+/* [Excerpted from /sys/i386/isa/isa.c] */
+  ...
+/* Configure all ISA devices */
+isa_configure() {
+    struct isa_device *dvp;
+    struct isa_driver *dp;
+    splhigh();
+    INTREN(IRQ_SLAVE);
+    /* configure devices, constructing group masks as we go */
+    for (dvp = isa_devtab_bio; config_isadev(dvp,&amp;__biomask__); dvp++);
+    for (dvp = isa_devtab_tty; config_isadev(dvp,&amp;__ttymask__); dvp++);
+    for (dvp = isa_devtab_net; config_isadev(dvp,&amp;__netmask__); dvp++);
+    for (dvp = isa_devtab_null; config_isadev(dvp,0); dvp++);
+/* if we support slip, then any tty interrupt is a potential net intr */
+#include &quot;sl.h&quot;
+#if NSL &gt; 0
+    __netmask__ |= __ttymask__;
+    __ttymask__ |= __netmask__;
+#endif
+
+    /* if not enabled, don't allow in ANY mask to become enabled */
+    __biomask__ |= __nonemask__;
+    __ttymask__ |= __nonemask__;
+    __netmask__ |= __nonemask__;
+    __protomask__ |= __nonemask__;
+    splnone();
+}
+/* Configure an ISA device. */
+config_isadev(isdp, mp)
+    struct isa_device *isdp;
+    int *mp;
+{
+    struct isa_driver *dp;
+    if (dp = isdp-&gt;id_driver) {
+        /* does this device have any I/O shared memory? */
+        if (isdp-&gt;id_maddr) {
+            extern int atdevbase[];
+            /* convert from PC absolute physical to virtual */
+            isdp-&gt;id_maddr -= IOM_BEGIN;
+            isdp-&gt;id_maddr += (int)&amp;atdevbase;
+        }
+        /* &quot;Is there anyone on board?&quot; -- Star Trek */
+        isdp-&gt;id_alive = (*dp-&gt;probe)(isdp);
+        if (isdp-&gt;id_alive) {
+            printf(&quot;%s%d&quot;, dp-&gt;name, isdp-&gt;id_unit);
+            (*dp-&gt;attach)(isdp);
+            printf(&quot; at 0x%x &quot;, isdp-&gt;id_iobase);
+            /* have we got an interrupt to wire down? */
+            if(isdp-&gt;id_irq) {
+                int intrno;
+                intrno = ffs(isdp-&gt;id_irq)-1;
+                printf(&quot;irq %d &quot;, intrno);
+                INTREN(isdp-&gt;id_irq);
+                /* add to a group mask?? */
+                if(mp)INTRMASK(*mp,isdp-&gt;id_irq);
+                /* wire interrupt */
+                setidt(ICU_OFFSET+intrno, isdp-&gt;id_intr,
+                     SDT_SYS386IGT, SEL_KPL);
+            }
+            /* perhaps a DMA channel request as well? */
+                       if (isdp-&gt;id_drq != -1) printf(&quot;drq %d &quot;, isdp-&gt;id_drq);
+
+            printf(&quot;on isa\n&quot;);
+        }
+        return (1);
+    } else  return(0);
+}
+...
+
+
+
+
+
+<a name="008d_000c">
+<a name="008d_000d"></pre><B>[LISTING THREE]</B><pre><a name="008d_000d">
+
+/* [Excerpted from /sys/i386/include/param.h] */
+
+  ...
+#ifndef __ORPL__
+/* Interrupt Group Masks  */
+extern  u_short __highmask__;   /* interrupts masked with splhigh() */
+extern  u_short __ttymask__;    /* interrupts masked with spltty() */
+extern  u_short __biomask__;    /* interrupts masked with splbio() */
+extern  u_short __netmask__;    /* interrupts masked with splimp() */
+extern  u_short __protomask__;  /* interrupts masked with splnet() */
+extern  u_short __nonemask__;   /* interrupts masked with splnone() */
+
+asm(&quot;   .set IO_ICU1, 0x20 ; .set IO_ICU2, 0xa0 &quot;);
+
+/* adjust priority level to disable a group of interrupts */
+#define __ORPL__(m) ({ u_short oldpl, msk; \
+    msk = (msk); \
+    asm volatile (&quot; \
+    cli ;               /* modify interrupts atomically */ \
+    movw    %1, %%dx ;      /* get mask to OR in */ \
+    inb $ IO_ICU1+1, %%al ; /* get low order mask */ \
+    xchgb   %%dl, %%al ;        /* switch the old with the new */ \
+    orb %%dl, %%al ;        /* finally, OR both it in! */ \
+    outb    %%al, $ IO_ICU1+1 ;     /* and stuff it back where it came */ \
+    inb $ 0x84, %%al ;      /* post it &amp; handle write recovery */ \
+    inb $ IO_ICU2+1, %%al ; /* next, get high order mask */ \
+    xchgb   %%dh, %%al ;        /* switch the old with the new */ \
+    orb %%dh, %%al ;        /* finally, or it in! */ \
+    outb    %%al, $ IO_ICU2+1 ;     /* and stuff it back where it came */ \
+    inb $ 0x84, %%al ;      /* post it &amp; handle write recovery */ \
+    movw    %%dx, %0 ;      /* return old mask */ \
+    sti             /* allow interrupts again */ &quot; \
+    : &quot;&amp;=g&quot; (oldpl)         /* return values */ \
+    : &quot;g&quot; ((m))         /* arguments */ \
+    : &quot;ax&quot;, &quot;dx&quot;            /* registers used */ \
+    ); \
+    oldpl;              /* return the &quot;old&quot; value */ \
+})
+/* force priority mask to a set value */
+#define __SETPL__(m)    ({ u_short oldpl, msk; \
+    msk = (msk); \
+    asm volatile (&quot; \
+    cli ;               /* modify interrupts atomically */ \
+    movw    %1, %%dx ;      /* get mask to OR in */ \
+    inb $ IO_ICU1+1, %%al ; /* get low order mask */ \
+    xchgb   %%dl, %%al ;        /* switch the old with the new */ \
+    outb    %%al, $ IO_ICU1+1 ;     /* and stuff it back where it came */ \
+    inb $ 0x84, %%al ;      /* post it &amp; handle write recovery */ \
+    inb $ IO_ICU2+1, %%al ; /* next, get high order mask */ \
+    xchgb   %%dh, %%al ;        /* switch the old with the new */ \
+    outb    %%al, $ IO_ICU2+1 ;     /* and stuff it back where it came */ \
+    inb $ 0x84, %%al ;      /* post it &amp; handle write recovery */ \
+    movw    %%dx, %0 ;      /* return old mask */ \
+    sti             /* allow interrupts again */ &quot; \
+    : &quot;&amp;=g&quot; (oldpl)         /* return values */ \
+    : &quot;g&quot; ((m))         /* arguments */ \
+    : &quot;ax&quot;, &quot;dx&quot;            /* registers used */ \
+    ); \
+    oldpl;              /* return the &quot;old&quot; value */ \
+})
+#define splhigh()   __ORPL__(__highmask__)
+#define spltty()    __ORPL__(__ttymask__)
+#define splbio()    __ORPL__(__biomask__)
+#define splimp()    __ORPL__(__netmask__)
+#define splnet()    __ORPL__(__protomask__)
+#define splsoftclock()  __ORPL__(__protomask__)
+#define splx(v) ({ u_short val; \
+    val = (v); \
+    if (val == __nonemask__) (void) spl0(); /* zero is special */ \
+    else (void) __SETPL__(val); \
+})
+#endif __ORPL__
+ ...
+
+
+
+
+
+<a name="008d_000e">
+<a name="008d_000f"></pre><B>[LISTING FOUR]</B><pre><a name="008d_000f">
+
+/* [Excerpted from /sys/i386/i386/machdep.c] */
+
+  ...
+/* Fill out a gate descriptor uses as an interrupt vector. */
+setidt(idx, func, typ, dpl) char *func; {
+    struct gate_descriptor *ip = idt + idx;
+    ip-&gt;gd_looffset = (int)func;
+    ip-&gt;gd_selector = GSEL(GCODE_SEL,SEL_KPL);
+    ip-&gt;gd_stkcpy = 0;
+    ip-&gt;gd_xx = 0;
+    ip-&gt;gd_type = typ;
+    ip-&gt;gd_dpl = dpl;   /* can we allow INT's to this IDT index? */
+    ip-&gt;gd_p = 1;       /* yup, we're here, don't segment fault me */
+    ip-&gt;gd_hioffset = ((int)func)&gt;&gt;16 ;
+}
+  ...
+
+
+
+
+
+<a name="008d_0010">
+<a name="008d_0011"></pre><B>[LISTING FIVE]</B><pre><a name="008d_0011">
+
+/* [Excerpted from /sys/i386/include/segments.h] */
+
+  ...
+/* Gate descriptors (e.g. indirect descriptors)
+ * [The IDT is made up of these as well.] */
+struct  gate_descriptor {
+    unsigned gd_looffset:16 ;   /* gate offset (lsb) */
+    unsigned gd_selector:16 ;   /* gate segment selector */
+    unsigned gd_stkcpy:5 ;      /* number of stack wds to cpy */
+    unsigned gd_xx:3 ;      /* unused */
+    unsigned gd_type:5 ;        /* segment type */
+    unsigned gd_dpl:2 ;     /* segment descriptor priority level */
+    unsigned gd_p:1 ;       /* segment descriptor present */
+    unsigned gd_hioffset:16 ;   /* gate offset (msb) */
+} ;
+ ...
+</pre>
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

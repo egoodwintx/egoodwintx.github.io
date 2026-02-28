@@ -1,0 +1,147 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal January 1997: Windows NT System-Call Hooking</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Windows NT System-Call Hooking</h1>
+
+<p><i>Dr. Dobb's Journal</i> January 1997
+</p>
+<h2>NTRegmon uses hooking to show detailed information about every registry access </h2>
+
+<h3>By Mark Russinovich and Bryce Cogswell</h3>
+
+<I>Mark can be contacted at mark@osr.com and Bryce at cogswell@cs.uoregon.edu.</I>
+
+<hr>
+
+<p>In our article, "Examining VxD Service Hooking" (<i>Dr. Dobb's Journal</i>, May 1996), we focused on how Windows 95 device drivers can take advantage of built-in support for monitoring or altering system calls inside the Windows 95 kernel (Virtual Memory Manager). This ability is extremely powerful because it enables the development of applications that can see events and actions occurring inside a system at a level of detail not otherwise possible. Windows NT, besides having a less documented internal architecture, does not provide any support for hooking system calls. In this article, we describe the architecture of NT so as to clearly define what is meant by the term "system call" when it is used in the context of Windows NT. We also go inside the Windows NT kernelv (NTOSKRNL.EXE) to expose the mechanism by which a system-call request gets routed to the kernel routine that services it. We then show how device drivers can hook system calls, allowing them to see system requests both before and after they've been serviced.</p>
+
+<p>To demonstrate the types of monitoring that can be achieved with system-call hooking, we present the design and implementation of an application, NTRegmon. NTRegmon uses hooking to show detailed information about every registry access that occurs on an NT system. It also is useful for studying NT registry usage, finding undocumented application-registry settings, and debugging your own registry-enabled programs.</p>
+
+<h3>The Windows NT System-Call Architecture</h3>
+
+<p>Most Windows NT developers think of the Win32 interface when they hear the term "system call." Calls like <i>CreateFile</i>, <i>ShowWindow</i>, <i>PeekMessage</i> and others are what make up the operating system that is exported to programmers by the NT architecture. However, beneath this layer, which shares most of its definition with the Windows 95 implementation of Win32, is the real Windows NT operating system. The core components of NT are NTOSKRNL and WIN32K, named after the files they are loaded from, NTOSKRNL.EXE and WIN32K.SYS (in the system32 directory under the system root directory). When an NT system is diagrammed from the point of view of request paths, Win32 is actually a layer that runs on top of the kernel; see <a name="rf1"><a href="9701ef1.htm">Figure 1</A>. </p>
+
+<p>If you are familiar with NT's architecture from Helen Custer's <i>Inside Windows NT</i> (Microsoft Press, 1993), the sight of the WIN32K kernel-mode component may be surprising. In fact, WIN32K made its debut with NT 4.0 when much of Win32's graphics engine, previously implemented in user mode by GDI32.DLL and USER32.DLL, was moved into kernel mode to boost performance. </p>
+
+<p>When an application makes a call to a Win32 function, the call is handled by a routine in one of the Win32 DLLs that make up the Win32 subsystem. In most cases, the routine performs operations that are specific to Win32, such as validating parameters, updating internal Win32 data structures, and breaking the request up into subrequests. But in the end, the DLL will usually end up calling upon native NT services provided by NTOSKRNL or WIN32K to actually carry out the system-related parts of the request. NTOSKRNL is invoked by a call to another DLL, NTDLL.DLL, which exports NTOSKRNL services to user-level subsystems like Win32, POSIX, and OS/2.</p>
+
+<p>For example, a call to the Win32 function <i>CreateFile</i> is serviced by KERNEL32.DLL, which validates parameters and then, depending on the flags that were passed, makes one or more calls to NTOSKRNL via NTDLL wrappers. For instance, if the flags indicate that the <i>CreateFile</i> call should fail if a file of the same name already exists, a call is made to the kernel to see if that condition is true. Then the kernel is called to actually create or open the specified file, and finally, a third call to the kernel might be made to set some of the file's attributes.</p>
+
+<p>One of NTDLL's primary jobs is to initialize a register with a system-call number that identifies the service in the kernel being called, and to execute a system-call trap. For the <i>CreateFile </i>example, the NTDLL function <i>ZwCreateFile</i> is one of the routines invoked. <a name="re1"><a href="9701ee1.htm">Example 1</A>, <i>ZwCreateFile</i>'s disassembly for x86 processors, demonstrates how thin a wrapper NTDLL provides for kernel services. NTDLL contains many snippets of code that look almost exactly like the example. What makes each routine unique is its system-call number and the number of parameters that are popped off the stack when the routine is finished. Calls to WIN32K also look like the <i>ZwCreateFile</i> example, but instead of being placed in a separate DLL, they are located within USER32 and GDI32.</p>
+
+<p>"Zw"-prefixed calls, like <i>ZwCreateFile,</i> have alias names that are identical except that "Zw" is replaced with "Nt" (<i>NtCreateFile</i>); kernel services corresponding to "Zw" calls use the "Nt" prefix. Thus, an application linking with NTDLL can use <i>ZwCreateFile</i> or <i>NtCreateFile</i> to access the kernel service <i>NtCreateFile</i>.</p>
+
+<p>Nothing prevents applications from accessing NTDLL functions without going through Win32, but Win32 generally provides a more friendly interface than the native NT interface. In addition, since NTDLL's interface is undocumented, applications that access it directly run the risk, albeit small, that Microsoft may change it without notice.</p>
+
+<p>The system-call trap is how NT changes gears from user-mode to kernel-mode execution to enter the privileged world of the operating-system kernel. When a trap occurs, the processor's execution mode changes and it begins executing on a kernel-mode stack. The kernel finds the address of the service that will handle the request by looking up a data structure referenced by a field in the executing thread's Thread Environment Block (TEB). The TEB contains all the information necessary for operation of a thread, such as its registers, its priority level, a pointer to its process, and so on. The data structure in question, which we'll call the Service Table List, is shown in <a name="rf2"><a href="9701ef2.htm">Figure 2</A>. </p>
+
+<p>In the current implementation of NT 4.0, the list contains two entries that define system-call tables for NTOSKRNL and WIN32K calls. NT 3.51 and its predecessors have only one entry in the list: that for NTOSKRNL calls. Each entry is made up of four fields: The first is a pointer to an array of function addresses called a "service table;" the second field is 0 and is never referenced; the third field contains the number of system calls in the service table referenced by the first field; and the fourth field points to an argument table.</p>
+
+<p>First, the kernel's system-call trap handler uses the system-call number passed to it via a register (EAX in <a href="9701ee1.htm">Example 1</A>) to determine which entry in the Service Table List it should access. Win32 system calls have system-call numbers that start at 0x1000, whereas kernel system calls begin at 0. Next, the handler ensures that it is dealing with a valid system-call number. It compares the number to the third field of the appropriate entry in the Service Table List, which contains the highest valid system-call number for the table. (The handler subtracts 0x1000 from Win32K call numbers before the comparison.) If the call number is less than or equal to the highest acceptable number, the handler obtains a pointer to the service table and indexes into it with the system-call number to obtain the address of the service it must call. It then indexes into the argument table and reads the number of bytes it must get from the caller's stack to push onto its own stack as it calls the service. After the service returns, the handler performs some cleanup and returns from the trap into (usually) NTDLL.</p>
+
+<p>Each thread contains a pointer to a potentially unique copy of a Service Table List. However, all the Service Table Lists point to shared service and argument tables with the exception of some system threads that have NULL fields for the Win32K entry in their lists. The reason for having multiple identical Service Table Lists is unclear, but it seems to be the result of forward-thinking design. In the future, different threads may be presented for different versions of the NT kernel. Perhaps just as NT supports different user-mode personalities (POSIX, Win32, OS/2), it will also support different kernel personalities.</p>
+
+<h3>Hooking System Calls</h3>
+
+<p>Since each thread's TEB has its own Service Table List pointer, it is possible that every thread could also have its own unique table of OS services. However, in practice, the list and tables are globally shared. Simply changing an entry in either the NTOSKRNL or WIN32K service tables to point to a new hook routine in a device driver is all that is needed. Changing an entry hooks the call across all threads in the system, including any new threads that are created. Unfortunately, as NT does not provide a service-hooking function, NT version-dependent code must be written to hook specific services. </p>
+
+<p>Two variables tie system-call hooking to an implementation of NT. The first is the offset in the TEB where the Service Table List pointer is stored, and the second is the system-call numbers that identify services. Since there is no published definition for the TEB, locating the Service Table List requires manually indexing into it by a fixed number of bytes and extracting the pointer. While the offset has not changed from NT 3.51 to NT 4.0, surprisingly, it is different across hardware platforms. System-call numbers, on the other hand, while constant across hardware platforms, changed between NT 3.51 and NT 4.0. For example, under NT 3.51, the system-call number for <i>RegOpenKey</i> is 0x4D, but under NT 4.0, it is 0x51. </p>
+
+<h3>Caveats</h3>
+
+<p>What could justify writing code that makes use of undocumented offsets and identifiers that might change between versions of NT? The answer is that system-call hooking opens the door to a level of system monitoring and control that far exceeds what is possible without it. NTOSKRNL contains services used to access the file systems, registry, processes and threads, memory, disk cache, and dozens of other facilities. NT's built-in support for monitoring these facilities is basically restricted to a few query services and the performance counters that are exported to the registry. By contrast, system-call hooking can be used to watch every request made to a service and even see the parameters being passed. System-call hooking can also be used to augment service functionality and change the behavior of services.</p>
+
+<p>Even so, hooking system calls in this fashion is not for everyone. If your code must be forward compatible with future releases of NT, don't use it! On the other hand, if you require access to system information available no other way, and if it is acceptable to have version-specific releases (as with system-diagnostic applications, for example), this may be the way to go.</p>
+
+<h3>NTRegmon: System-Call Hooking at Work</h3>
+
+<p>NTRegmon graphically demonstrates the kinds of interesting information attainable only with hooking (see <a href="9701ef3.htm">Figure 3</A>). It displays complete information about every registry-related call that takes place as it is running. While Win32 provides a registry-change notification function with <i>RegNotifyChangeKeyValue</i>, applications have no control over the changes they are notified of. And without examining the registry after each notification, they have no way of knowing exactly what has changed. The framework built by NTRegmon allows a device driver to see not only changes, but any registry access <i>as it occurs.</i> If desired, a device driver could fail or alter certain registry accesses. (The complete source code and related files for NTRegmon is available electronically; see "Availability," page 3.)</p>
+
+<p>Due to its dependence on x86 TEB offsets, NTRegmon will only run on x86 systems. It is made up of a Win32 GUI, REGMON.EXE, and a device driver, REGSYS.SYS. When the GUI is started, it dynamically loads the device driver, which is immediately directed by the GUI, via <i>DeviceIoControl</i>, to hook all registry calls. The hooking procedure shown in <a name="rl1"><a href="9701e.htm#l1">Listing One</A> hides NT version-dependent code in the SYSCALL macro The macro is used to index into one of two tables of registry system-call numbers that are specific to either NT 3.51 or NT 4.0. Version information is obtained by referencing the undocumented kernel variable, <i>NtBuildNumber</i>.</p>
+
+<p>Hook routines in the device driver must have prototypes that are identical to the services they hook so that parameters are passed correctly to the original service. All the hook routines in NTREGMON perform the same steps: obtaining data on the passed parameters, invoking the original service, and storing the return parameter and status information in a buffer periodically copied to the GUI for display. <a name="rl2"><a href="9701e.htm#l2">Listing Two</A> presents <i>HookRegDeleteValueKey</i>, an example hook routine.</p>
+
+<p>Besides relying on the undocumented TEB definition and system-call numbers, NTRegmon makes use of another undocumented, version-specific data structure so that it can display the name of the process that is executing at the time of each registry access. In each hook routine, NTRegmon looks into the Process Environment Block (PEB) to copy out the process's name. It is unfortunate that the only function provided by NT to obtain process names, <i>NtQuerySystemInformation</i> call, returns information about all processes and threads that are running, instead of a specific one.</p>
+
+<p>Although many registry calls perform accesses by handle rather than by a key's path name, NTRegmon is able to display the full path name of virtually every registry request by storing the path names associated with handles in a hash table. When a handle is referenced by a call, NTRegmon<b> </b>looks up the handle in the hash table to see if its name has been stored, and if so, translates the handle back to its path name. In cases where NTRegmon did not see the <i>open</i> or <i>create</i> call corresponding to a handle, the raw hex value of the key's handle is displayed. In order to save screen real estate, NTRegmon uses some abbreviations listed in <a name="rt1"><a href="9701et1.htm">Table 1</A> for root keys.</p>
+
+<p>Although we've only implemented an x86 version of NTRegmon, a little poking around with WINDBG is all it should take to discover the platform-dependent changes that must be made to port it to the Alpha, MIPS, or PowerPC platforms.</p>
+
+<h3>Implementing Your Own Hooks</h3>
+
+<p>The simplicity of NTRegmon's hook routines shows how straightforward system-call hooking actually is. The essential information for performing system-call hooking includes the system-call number associated with a service, and the prototype definition of the service. A kernel debugger such as NuMega's NT/ICE or the Microsoft DDK's WINDBG can be used to obtain system-call numbers (use the ntcall command in NT/ICE), and some NTOSKRNL calls are either documented in the DDK or are very similar to related Win32 versions. In cases where a call is truly undocumented, there is no recourse other than to disassemble and study it under a debugger. In any case, the technique presented here should enable you to complete your own hooking routines to both gain insight into how NT works and to control and monitor it for real applications.</p>
+
+<p><b>DDJ</b></p>
+
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>VOID HookRegistry( void ){
+    // hook everything
+    RealRegOpenKey = SYSCALL( REGOPENKEY );
+    SYSCALL( REGOPENKEY ) = (PVOID) HookRegOpenKey;
+<p></p>
+    RealRegQueryKey = SYSCALL( REGQUERYKEY );
+   SYSCALL( REGQUERYKEY ) = (PVOID) HookRegQueryKey;
+<p></p>
+    RealRegQueryValueKey = SYSCALL( REGQUERYVALUEKEY );
+    SYSCALL( REGQUERYVALUEKEY ) = (PVOID) HookRegQueryValueKey;
+<p></p>
+    RealRegEnumerateValueKey = SYSCALL( REGENUMERATEVALUEKEY );
+    SYSCALL( REGENUMERATEVALUEKEY ) = (PVOID) HookRegEnumerateValueKey;
+<p></p>
+    RealRegEnumerateKey = SYSCALL( REGENUMERATEKEY );
+    SYSCALL( REGENUMERATEKEY ) = (PVOID) HookRegEnumerateKey;
+<p></p>
+    RealRegDeleteKey = SYSCALL( REGDELETEKEY );
+    SYSCALL( REGDELETEKEY ) = (PVOID) HookRegDeleteKey;
+<p></p>
+    RealRegFlushKey = SYSCALL( REGFLUSHKEY );
+    SYSCALL( REGFLUSHKEY ) = (PVOID) HookRegFlushKey;
+<p></p>
+    RealRegSetValueKey = SYSCALL( REGSETVALUEKEY );
+    SYSCALL( REGSETVALUEKEY ) = (PVOID) HookRegSetValueKey;
+<p></p>
+    RealRegCreateKey = SYSCALL( REGCREATEKEY );
+    SYSCALL( REGCREATEKEY ) = (PVOID) HookRegCreateKey;
+<p></p>
+    RealRegDeleteValueKey = SYSCALL( REGDELETEVALUEKEY );
+    SYSCALL( REGDELETEVALUEKEY ) = (PVOID) HookRegDeleteValueKey;
+    
+    RealRegCloseKey = SYSCALL( REGCLOSEKEY );
+    SYSCALL( REGCLOSEKEY ) = (PVOID) HookRegCloseKey;
+    RegHooked = TRUE;
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>NTSTATUS HookRegDeleteValueKey( IN HANDLE Handle, PUNICODE_STRING Name ){
+    NTSTATUS                ntstatus;
+    CHAR                    fullname[1024], name[20];
+<p></p>
+    GetFullName( Handle, Name, fullname );
+    MUTEX_P( RegMutex );
+    ntstatus = RealRegDeleteValueKey( Handle, Name );
+    MUTEX_V( RegMutex );
+    UpdateStore( Sequence++, "%s\tDeleteValueKey\t%s\t\t%s", 
+        GetProcess( name ), fullname,
+        ErrorString( ntstatus ));
+    return ntstatus;
+}
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

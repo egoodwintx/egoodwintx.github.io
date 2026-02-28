@@ -1,0 +1,207 @@
+<html>
+<head>
+<title>Apr02: Java Q&A</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>How Can I Make My Java Servlets Faster?</h1>
+<p><i>Dr. Dobb's Journal</i> April 2002</p>
+
+<h3>By Tim Kientzle</h3>
+
+<I>
+Tim is an independent software developer and consultant. He can be reached at <a href="mailto:kientzle@acm.org">kientzle@acm.org</a>.</I>
+
+<hr>
+
+<p>The Java Servlet API is designed to support very high performance. But achieving such performance requires careful attention to the design of your servlets. While many of the issues I'll discuss here apply to all types of Java development, some are fairly unique to servlet development.</p>
+
+
+<h3>Character Conversions</h3>
+
+
+<p>One bottleneck that surprises many Java developers &#151; especially those with C/C++ backgrounds &#151; is the high cost of writing text. A typical servlet might construct an HTML or XML page as a <i>String</i>, then use the <i>print()</i> method from <i>PrintWriter</i> or <i>ServletOutputStream</i> to emit the string to the output. Internally, the <i>print()</i> method first invokes <i>String.getBytes</i> to convert the characters into a series of bytes, then invokes <i>write()</i> to emit those bytes.</p>
+<DDJADVERTISEMENT INLINE>
+
+
+<p><i>String.getBytes()</i> is surprisingly slow. You can't realistically avoid calling it, but careful design will let you reduce how often it gets called. The key is to always use a <i>ServletOutputStream</i> instead of a <i>PrintWriter</i>. Because the<i> ServletOutputStream</i> permits you to write bytes, you have the option of preconverting characters into bytes and using the fast <i>write()</i> methods instead of the much slower <i>print()</i> methods.</p>
+
+<p>One common servlet design, for example, passes the socket into low-level page-construction methods that emit their text directly to the output. By using a <i>ServletOutputStream</i>, individual components can choose to write preconverted bytes to the output rather than characters. A component that always generates the same output might convert the text into bytes using a static initializer, as in <A NAME="rl1"><A HREF="#l1">Listing One</A>. Similarly, anytime you find yourself caching a block of constructed text, consider caching the bytes so that you only pay for one character-to-byte conversion, no matter how many times you write the same text to the output.</p>
+
+
+
+<h3>Synchronization and Threading</h3>
+
+
+<p>Java supports threading, but few ordinary Java applications use more than a handful of threads. In contrast, servlet systems sometimes run hundreds or even thousands of threads. Synchronization can become a real headache: If you fail to correctly synchronize access to critical resources, your system will behave erratically. On the other hand, over-synchronization can dramatically degrade performance.</p>
+
+
+<p>To reduce your reliance on synchronization, here are a few tips: First, beware of instance variables. Method arguments and local variables don't require synchronized access. This is especially important for servlet programming, since efficient memory usage demands that you have only one copy of most objects. The methods of that object are likely to be servicing multiple requests simultaneously in different threads.</p>
+
+<p>Limit object creation. The heap itself is a synchronized resource; only one thread can allocate memory at a time. One technique for reducing object creation is to design your methods to modify an object that the caller provides rather than create and return a new object. For example, instead of returning a <i>String</i> object, as in <A NAME="rl2"><A HREF="#l2">Listing Two</A>(a), you might instead pass in a <i>StringBuffer</i> and have your method modify that directly, as in <A NAME="rl2"><A HREF="#l2">Listing Two</A>(b).</p>
+
+<p>A more advanced technique for reducing synchronization is to take advantage of the fact that assignment of integers or object references is guaranteed to be atomic. <A NAME="rl3"><A HREF="#l3">Listing Three</A>(a) is a typical pair of synchronized methods that update and read a shared variable. Synchronization is often necessary here to ensure that multiple simultaneous calls to the <i>update()</i> and <i>read()</i> methods behave consistently. <A NAME="rl3"><A HREF="#l3">Listing Three</A>(b) accomplishes the same thing with no synchronization. The <i>update()</i> method simply creates a completely new instance in a local variable and updates the shared value with a single assignment. Similarly, the <i>read()</i> method copies the shared value into a local variable and works with it there. Of course, this type of optimization often results in additional heap allocations. However, if updates are uncommon, then <A NAME="rl3"><A HREF="#l3">Listing Three</A>(b) can be a big win.</p>
+
+
+
+<h3>Diagnosing Thread Problems</h3>
+
+
+<p>Under UNIX, sending a QUIT signal to the JVM prompts it to dump a complete thread status report to the error output. Under Windows, a Control-Break in the console window accomplishes the same thing. This report includes a complete stack trace for each currently executing thread. By studying several such reports, all taken under heavy load, you can get a rough idea of which methods are taking the most time, since those show up most often in the stack dumps.</p>
+
+
+<p>The report also lists which threads are waiting on monitors. Monitors are used to control access to shared resources. They are used by the Java compiler to implement synchronized methods and are used internally by the JVM. If you notice a lot of threads waiting on a single monitor, this may be a sign of a problem. For example, if there are a lot of threads waiting for the heap monitor, it means your program is allocating too many objects. If a lot of threads are waiting for a monitor for a particular object, then there are synchronized methods that are being heavily used by your application.</p>
+
+<p>Not all such problems will be in your code. Some parts of the Java libraries rely heavily on synchronized methods or allocate a lot of temporary objects. The JVM status report helps you identify parts of the Java libraries that are best avoided in performance-critical multithreaded software.</p>
+
+
+
+<h3>Reducing Requests</h3>
+
+
+<p>The fastest way to handle any given request is simply not to handle it at all. You can accomplish this by adding an external proxy server that sits between your web site and the public Internet. You then arrange for all HTTP requests to be handled directly by the proxy, which first checks its own cache and then, if necessary, forwards the request to your application.</p>
+
+
+<p>For this to work correctly, you must tell the proxy what content it can and cannot cache by adding appropriate HTTP headers to every response. <A NAME="rl4"><A HREF="#l4">Listing Four</A> illustrates this. Even if you are not using your own proxy cache, adding HTTP cache-control headers permits other proxy caches and browser caches to avoid making repeated requests to your site.</p>
+
+<p><A NAME="rt1"><A HREF="0204jt1.htm">Table 1</A>(a) lists headers you should include with any response that should not be cached. Generally, this will include any HTML page with dynamic elements, and may include automatically generated graphics as well. The pragma: No-cache is an older form that is recognized by some HTTP/1.0 caches; the Cache-Control header is the preferred form. You should include both.</p>
+
+<p><A NAME="rt1"><A HREF="0204jt1.htm">Table 1</A>(b) lists headers you should include with any response that can be safely cached. This generally includes all nonHTML content as well as some HTML pages that contain no dynamically updated elements. The Expires and Cache-Control headers shown here specify the same information in two different ways: One gives an exact time when the response expires and the other specifies how long the response should be kept by a cache. The Last-Modified header is used by many caches to verify whether the page has changed; the cache performs an HTTP HEAD request and compares the Last-Modified time to see if the page is unchanged. By providing this information consistently, you can reduce the amount of traffic you see by allowing caches and web browsers to simply reuse data they already have instead of generating another hit on your back-end logic. Last-Modified is generated automatically by many servlet engines if you implement the<i> getLastModified</i> method, which you should.</p>
+
+<p>In practice, it's difficult to set the Expires header correctly, since you don't necessarily know when the data will next change. But even if you just arbitrarily always set it one hour in the future, that can dramatically improve performance by reducing the number of times the proxy cache requests data from your application. Just be aware that if the data does change, old versions may be hanging around in upstream caches until they expire.</p>
+
+<p>Setting correct HTTP cache-control headers helps you even if you don't use a front-end cache. Most browsers utilize these headers to avoid making needless repeated requests. Also, many companies operate HTTP caches between their internal network and the public Internet; by properly marking your pages, you allow these caches to help reduce traffic at your server.</p>
+
+
+
+<h3>Internal Caching</h3>
+
+
+<p>You can build an internal cache of complete pages using a hash table that maps URLs to pages. You take the URL, look it up in the hash table, and quickly emit the page if it's there. You can use either the <i>getRequestURI()</i> or <i>getRequestURL()</i> methods from <i>HttpServletRequest</i> to obtain a suitable URL. Be aware, however, that the values returned by these methods do not include any query parameters. If carefully done, you can serve cached responses extremely quickly; by combining an internal cache with optimizations to reduce character-to-byte conversions, I've built complex servlet systems whose typical response is considerably faster than the textbook "Hello, World" servlet.</p>
+
+
+
+
+<h3>Caching Dynamic Content</h3>
+
+
+<p>Of course, if you have advertising or personalization that must change every time the page is requested, you have no choice but to rebuild the page. To get high performance, however, you want to rebuild only the parts of the page that must actually change.</p>
+
+
+<p>My <i>Page</i> class (available electronically; see "Resource Center," page 5) supports this by letting you either <i>append() </i>static text or <i>add()</i> dynamic elements represented by placeholder objects. For consistency, the placeholder objects implement the same <i>Servable</i> interface (also available electronically) as the <i>Page</i> class itself.</p>
+
+<p>In my servlet-based systems, the <i>Page</i> object is constructed by a template parser that assembles full pages from a variety of individual elements. After the <i>Page</i> is built, it is stored in the cache. Each time it is served, the placeholder objects are given a chance to contribute dynamic content to the outgoing response. As a result, this process lets me avoid the full page-construction process when a page is requested repeatedly. Since a small part of a typical web site accounts for the majority of the page requests, this optimization can dramatically improve overall performance.</p>
+
+
+
+<h3>A Complete Architecture</h3>
+
+
+<p>The ideas I've described fit together into a complete architecture for high-performance servlets. This architecture builds a complete response in three passes:</p>
+
+
+<p></p>
+
+<ul>
+  <li>The first pass builds a <i>Page</i> object if there's not already one in the internal cache. The <i>Page</i> object is created at the top level and passed down into template-processing machinery that adds various text and dynamic objects to the page. The result is placed into an internal cache.
+  <li>The second pass begins the process of customizing the page for a particular use. This pass simply walks the page, notifying each dynamic element of the customization necessary. For example, a personalized element that draws information from a remote server might start a background process to fetch the required data for this particular user.
+
+  <li>The third and final pass actually emits the page to users. You simply step through the page, emitting static text directly and invoking dynamic elements to emit appropriate content.
+
+</ul>
+
+
+<p>Once the page is constructed and in the cache, only the second and third passes need to be repeated. The potentially time-consuming process of parsing templates and locating information that must go into a particular page can be avoided on subsequent responses. Also, note that my <i>Page</i> object internally converts the static text into bytes the first time it is emitted. The next time the page is requested, that conversion can be skipped, providing further speedups. As a result, this architecture provides very fast response for often-requested pages.</p>
+
+
+
+<p><b>DDJ</b></p>
+
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>class Foo {
+   private static String outString = "My output";
+   private byte[] outBytes = outString.getBytes();
+
+   void writeOutput(ServletOutputStream socket) {
+      socket.write(outBytes); // Fast!
+      // socket.print(outString); // Slow!
+   }
+}
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2">Listing Two </H4>
+
+
+(a) 
+<pre>String foo() {
+   StringBuffer b
+      = new StringBuffer();
+   b.append(...);
+   b.append(...);
+   return b.toString();
+}
+
+(b)
+<pre>void foo(StringBuffer b) {
+   b.append(...);
+   b.append(...);
+}
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+<H4><A NAME="l3">Listing Three</H4>
+
+
+(a)
+<pre>class A {
+  Foo var;
+  synchronized void update(int arg) {
+     var.setProperty(arg);
+  }
+  synchronized void read() {
+     int i = var.getProperty();
+  }
+}
+
+(b)
+<pre>class A {
+  Foo var;
+  void update(int arg) {
+    Foo newVar = new Foo();
+    newVar.setProperty(arg);
+    var = newVar;
+  }
+  void read() {
+    Foo temp = var;
+    int i = temp.getProperty();
+  }
+}
+</pre>
+<P>
+<A HREF="#rl3">Back to Article</A>
+</P>
+<H4><A NAME="l4">Listing Four</H4>
+
+
+<pre>long expiration = ...; // When this response expires
+long lastModified = ...; // When this page last changed
+long now = System.currentTimeMillis();
+response.setDateHeader("Date",now);
+response.setHeader("Cache-Control","maxage="+(expiration-now)/1000);
+response.setDateHeader("Expires",expiration);
+response.setDateHeader("Last-Modified",lastModified);
+</pre>
+<P>
+<A HREF="#rl4">Back to Article</A>
+</P>
+
+
+</body>
+</html>

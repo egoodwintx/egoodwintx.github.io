@@ -1,0 +1,376 @@
+
+<html>
+<head>
+<title>January, 2006: Single Inheritance  Classes in C</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<p><i>Dr. Dobb's Journal</i>, January 2006</p>
+<h1>Single Inheritance  Classes in C</h1>
+<h2>An embedded- system perspective</h2>
+
+
+<h3>By Ron Kreymborg</h3>
+
+
+<I>Ron designs software and hardware for embedded systems. He can be reached at ron@jennaron.com.au.</I>
+
+<hr>
+
+
+
+
+
+<p>I write a lot of programs for embedded systems, and I prefer to program in C++ whenever possible. However, for some smaller processors, a C++ compiler either doesn't exist or else is expensive. Recently, I needed to port an existing C++ project to a processor for which I had only a C compiler. The project had benefited greatly from using an inheritable class structure, so I decided to try and develop a mechanism for building inheritable classes in C.</p>
+
+<p>I am not the first to do this, of course, and others have published successful methods. Miro Samek, for instance, developed a set of macros that hide the C code and allow a C++-like syntax (see <i>Practical State Charts in C/C++</i>, by Miro Samek, CMP Books, 2002). Hekon Hallingstad's class implementation (http://www.pvv.ntnu.no/~hakonhal/main.cgi/c/classes) used the <i>offsetof()</i> macro to access parent class data. Dan Saks described using C abstract types as classes (see "Abstract Types Using C," by Dan Saks, <i>Embedded Systems Programming</i>, October 2003). However, I had developed my own standalone class software over the years and my recent work was able to extend this to support classes with single inheritance.</p>
+
+<p>For want of a better name, I use the name of the header file&#151;C_Classes. Where would you use inheritance in embedded systems? Think of manufacturers building a range of chemical process controllers. They all have the same liquid crystal display, analog interfaces, power supply, RS-232 and radio interface, and similar sets of buttons and switches. The software interface to this hardware is also going to be similar. In this article, I introduce inheritance by defining a set of base classes that have drivers for all this hardware and well defined interfaces. Thus, a range of instruments can use the same base class set and only need a set of derived classes that characterize the particular functionality and set of interfaces that a new instrument will use. This makes for straightforward instrument development.</p>
+<h3>A Simple  Class Structure</h3>
+
+<p>C++ hides the class data structure within itself and provides strict rules for how it can be accessed. You don't have this luxury in C, but you can create something similar by defining a single structure to contain all the data belonging to the class. </p>
+
+<p>For example, I use my C_Classes method to define a skeleton class that could be the basis for a motor controller. The class is <i>Motor</i> and it controls only the speed and direction. The microprocessor I am programming has a number of ports that are connected to a number of motor controller chips. To set a motor's speed, you need only write the direction and revolutions-per-minute (RPM) to its respective ports. To keep things simple, I just use integers.</p>
+
+<p>The class data structure is defined in the <i>Motor</i> class header as a <i>typedef</i>:</p>
+
+<blockquote>
+typedef struct<br>
+{<br>
+  int*       mPort;<br>
+  int        mSpeed;<br>
+  DIRECTION  mDirection;<br>
+} MotorData;<br>
+
+</blockquote>
+
+<p>The <i>MotorData</i> structure is the definition template for the <i>Motor</i> class data. In C++, these variables would be declared in a private section of the class definition. The <i>mPort</i> class data variable is assigned the port address for a particular motor. This lets the same <i>Motor</i> class code manage several motors in the one application.</p>
+
+<p>The <i>DIRECTION</i> type is a simple <i>enum</i>: </p>
+
+<blockquote>
+typedef enum<br>
+{<br>
+  DR_UNKNOWN,<br>
+  DR_CCW,    // counter-clockwise<br>
+  DR_CW,     // clockwise<br>
+} DIRECTION;<br>
+
+</blockquote>
+
+<p>As in C++, the class has a constructor and a destructor. Creating an instance of the class is a call to the constructor using the statement:</p>
+
+<blockquote>
+MotorData* dMotor = MotorCtor();<br>
+
+</blockquote>
+
+<p>The constructor creates and initializes an instance of the <i>MotorData</i> structure just defined, then returns a pointer to it that is assigned to the <i>dMotor</i> class data pointer. Subsequently, the caller passes this pointer to the class at every method call. This is the technique the C++ compiler uses, only it does it under the covers. The class contains no instance data within itself: It just provides methods to manipulate the passed-in data.</p>
+
+<p>Okay, that looks simple enough, but how do you call a class method? </p>
+
+<p>Because I am developing a way to create inheritable classes, I need to be able to call methods in a base class through a derived class, add additional methods in that derived class, and override base class methods in the derived class if required. To do this, I build a table of function pointers in RAM that provides access to the public methods of the class. I create the definition of this table of vectors (or <i>vtable</i>) as another <i>typedef</i> that includes function pointer prototypes for each public method. In the <i>Motor</i> example, you need to be able to initialize the port address, and set/get the speed and direction, all via the class interface, so that makes five methods; see <a name="re1"></a><a href="0601oe1.html">Example 1</a>. Along with the <i>vtable</i> definition, the class header also includes the definition for a pointer to the <i>vtable</i> and prototypes for the constructor and destructor. These are all publicly accessible:</p>
+
+<blockquote>
+extern MOTOR* Motor;<br>
+extern MotorData* MotorCtor(void);<br>
+extern void MotorXtor(MotorData*);<br>
+
+</blockquote>
+
+<p>Part of the constructor's job is to build in RAM the <i>vtable</i> containing the five function pointers and set the public class <i>vtable</i> pointer (<i>Motor</i>) to point to that location. After a call to the constructor, users of this class can call any of the public methods through the class pointer. For example, setting the motor speed to 450 RPM, and remembering you also need to pass in the class data pointer, would be the call:</p>
+
+<blockquote>
+Motor-&gt;SetSpeed(dMotor,450);<br>
+
+</blockquote>
+
+<p>While the owner of the <i>dMotor</i> structure has no business ever looking inside it, after this call you would know that <i>dMotor-&gt;mSpeed </i>has a value equivalent to 450 RPM.</p>
+<h3>The Constructor</h3>
+
+<p>So how does the class constructor build the <i>vtable</i> and create the data instance? </p>
+
+<p>Again, the header file contains a template of the <i>vtable</i> (the <i>MOTOR typedef</i>). Within the class code file, an instance of this <i>vtable</i> is defined and this instance is copied from ROM to RAM. Continuing the example, in the <i>Motor</i> code file, the <i>vtable</i> instance along with the global class pointer declaration looks like <a name="re2"></a><a href="0601oe2.html">Example 2</a>(a). It is crucial, of course, that the instance has the same order as the template.</p>
+
+<p>The constructor function looks like <a name="re2"></a><a href="0601oe2.html">Example 2</a>(b). If there is a possibility that the class will have several instances, or be created and destroyed several times, then the class must ensure there is always only one <i>vtable</i> in RAM. To this end, every class has <i>InstCount</i> as a private variable that is used to keep track of the number of instances extant for this class. It is incremented during construction and decremented during destruction. The actual copying is conveniently done by the <i>CREATE_VTABLE</i> macro. This uses <i>cMotor</i> as a source, <i>Motor</i> as a destination, and the <i>MOTOR</i> structure size for both heap allocation and for the number of bytes to copy.</p>
+
+<p>As an aside, my original C_Classes version for standalone classes used the simple <i>Motor = </i>&amp;<i>cMotor </i>instead of the macro. You can still do this for standalone classes if RAM is in short supply.</p>
+
+<p>Again, the constructor must also create and initialize the class data on the heap for every instantiation. To this end, the constructor creates a pointer that is returned to each individual caller to manage during the life of the class instance. The <i>Allocate</i> function is defined in the C_Classes header and is a simple wrapper around <i>malloc</i> that includes an internal allocation counter. The counter can be interrogated at any time and can be useful during debugging. </p>
+
+<p>That's it for the class constructor: It must make sure the <i>vtable</i> is set up in RAM and initializes the class data. However, as you'll see, a derived class requires a little more work.</p>
+<h3>The Destructor</h3>
+
+<p>The code for a normal destructor is straightforward. If the data pointer is valid, the motor is forced to a stop and the actual disposal code is just two lines; see <a name="re3"></a><a href="0601oe3.html">Example 3</a>. The class data is destroyed when the destructor calls the <i>Free</i> function. This is defined in the C_Classes header, and like the <i>Allocate</i> function, is a wrapper around the C library <i>malloc/free</i> heap memory management. <i>Free</i> decrements the internal counter that was incremented by <i>Allocate</i>.</p>
+
+<p>The <i>vtable</i> class's destruction is handled by the <i>DestroyVtable</i> function that is also defined in the C_Classes header. While the constructor increments the class <i>InstCount</i> variable, it is decremented in <i>DestroyVtable</i>. The counter going to zero implies that this is the last instance of the class to be destroyed, and consequently, the <i>vtable</i> is deleted from RAM by a call to <i>Free</i>.</p>
+
+<p>All functions in a class code file are declared as static&#151;the only access is via the class pointer. <a name="rl1"></a><a href="#l1">Listings One</a> and <a name="rl2"></a><a href="#l2">Two</a> show the C_Classes header and code files. The <i>Motor</i> class header (plain.h) and code files (plain.c) are available electronically; see "Resource Center," page 4). </p>
+<h3>The vtable Copy Macro</h3>
+
+<p>I try not to use macros very often, but for the <i>vtable,</i> copiers save typing a lot of fiddly and error-prone syntax. The definition in the C_Classes header is:</p>
+
+<blockquote>
+#define  CREATE_VTABLE(VECTOR, <br>
+                    STRUCTURE, TYPEDEF) \<br>
+     VECTOR = (TYPEDEF*)Allocate<br>
+                    (sizeof(TYPEDEF)); \<br>
+            memcpy(VECTOR, &amp;STRUCTURE,<br>
+                    sizeof(TYPEDEF))<br>
+
+</blockquote>
+
+<p>It allocates space on the heap for the structure, assigning it to the <i>VECTOR</i> pointer, then copies the class <i>vtable</i> instance <i>STRUCTURE</i> from ROM to this space in the heap. </p>
+<h3>Data Hiding</h3>
+
+<p>At this point, C++ programmers are grumbling that I have exposed the class's data by publishing the <i>MotorData</i> structure in the header. This is true. There is nothing to stop users of this class typing a statement like:</p>
+
+<blockquote>
+newSpeed = MotorData-&gt;speed;<br>
+
+</blockquote>
+
+<p>rather than calling the appropriate method, and so blowing away the very idea of objects. For example, what if the <i>Motor</i> class provided a revolutions-per-minute interface but internally used radians-per-second? To derive from a base class, it must somehow publish its data structure. However, an ordinary class need not. You simply move the data definition into the code file and replace all exposed references to the data structure with void pointers. From the examples so far, the <i>SetSpeed</i> definition in the header would then look like:</p>
+
+<blockquote>
+void (*SetSpeed)(void*, int);<br>
+
+</blockquote>
+
+<p>and the example constructor, method call, and destructor would look like:</p>
+
+<blockquote>
+void* MotorData = MotorCtor();<br>
+Motor-&gt;SetSpeed(dMotor, 450);<br>
+MotorXtor(dMotor);<br>
+
+</blockquote>
+
+<p>Externally, the data pointer is now useless, but within the code file, a simple macro is used to cast the <i>void</i> pointer. The source-code listings (available electronically) all include the ME macro for reference. Its use in the aforementioned <i>SetSpeed</i> method would be:</p>
+
+<blockquote>
+void SetSpeed(void* d,int speed)<br>
+{<br>
+  ME(d)-&gt;mSpeed = speed;<br>
+}<br>
+
+</blockquote>
+
+<p>Of course, a little source-code sticky-nosing would allow any programmer to learn the class data structure, but I am assuming that those using these methods would not willfully bypass their intent, and using void pointers makes accidental use very unlikely. The downside is you lose the structure cross-checking capability of the compiler.</p>
+<h3>An Inheritable Class Structure</h3>
+
+<p>Inheritance in a C++ context means the ability to both derive a new class from a base class that adds new capability, and perhaps to change some functional aspect of the base class. While C++ has a syntax for this, you must do it yourself in C. The intent of my implementation is to minimize RAM usage and execution time, the former is usually a scarce resource in small microprocessors.</p>
+
+<p>The header file for a derived class includes the same <i>typedef</i> for the class methods as described earlier, but in addition, it now also includes the methods from the base class that are to be available to users of the derived class. I stay with the motor example and derive a class that provides some additional capability, like setting an acceleration rate.</p>
+
+<p>You first need to define the data structure for the derived class. This must be usable by both the derived and base classes. The mechanism I use is based on the fact that, if the base class data structure is the first entry in the derived class data structure, pointers to both a derived and a base class will point at the same data. While this limits the technique to just deriving from one base class (single inheritance), it is rare to find a requirement for multiple inheritance in small embedded systems.</p>
+
+<p>Our derived class data needs to store the acceleration rate as well, so the class data structure becomes <a name="re4"></a><a href="0601oe4.html">Example 4</a>(a). The <i>typedef</i> for the derived class <i>vtable,</i> along with the constructor/destructor and class <i>vtable</i> pointer definitions, looks like <a name="re4"></a><a href="0601oe4.html">Example 4</a>(b). The <i>MotorControl</i> class <i>vtable</i> pointer provides access to this class in the same way the <i>Motor</i> pointer did for the <i>Motor</i> class. We can use the same technique as before to initialize this pointer, but how do we provide both access to the base class methods and have it initialize our data structure?</p>
+
+<p>Like the <i>Motor</i> class, the <i>MotorControl</i> class defines an instance of the <i>vtable</i> in its code file:</p>
+
+<blockquote>
+static const MOTOR_CONTROL <br>
+                             cMotorControl = {<br>
+  SetNewSpeed<br>
+};<br>
+MOTOR_CONTROL* MotorControl;<br>
+
+</blockquote>
+
+<p>But wait! Where are the base class vectors listed in the <i>typedef</i>?</p>
+
+<p>Step back and think about what is required in a derived class. You don't want the ROM overhead of same name functions in the derived class that just pass execution on to the base class. What you do want is for the derived class to be able to call the base class and have it initialize both the derived class's <i>vtable</i> and its base class data, and from then on just provide its methods for use until destructor time.</p>
+
+<p>Harking back to the <i>Motor</i> class constructor, I called a macro to construct a copy of the <i>vtable</i> instance in RAM. If I use the same macro for the derived class, what happens?</p>
+
+<blockquote>
+CREATE_VTABLE(MotorControl, <br>
+        cMotorControl, MOTOR_CONTROL);<br>
+
+</blockquote>
+
+<p>Because it uses the size of the <i>MOTOR_CONTROL</i> structure, it copies the <i>SetNewSpeed</i> vector and leaves empty space for the other five vectors. If you now pass to the base class a pointer to where the first base class method should be in the <i>MotorControl</i> <i>vtable</i>, it can simply copy the addresses of these methods one after another back into the derived class's <i>vtable</i>. In the <i>MotorControl</i> example, the first base class method is <i>InitPort</i>, and if you take its address and pass it to the base class, the mechanism is rather simple. In the derived class:</p>
+
+<blockquote>
+void (**v)() = &amp;(MotorControl-&gt;InitPort);<br>
+
+</blockquote>
+
+<p>and in the base class:</p>
+
+<blockquote>
+  *v++ = InitPort;<br>
+  *v++ = SetSpeed;<br>
+  etc.<br>
+
+</blockquote>
+
+<p>You also need the base class to initialize the base class data in the derived class. These requirements mean that, for the base class to initialize the derived class, you must pass to the base class constructor a pointer to the data structure in the derived class and a pointer to the first of the base class vectors in the derived class RAM <i>vtable</i>. <a name="re5"></a><a href="0601oe5.html">Example 5</a>, a revised <i>Motor</i> constructor to do just that, fills out the derived class RAM <i>vtable</i> with pointers to the base class methods. The derived class data pointer is assigned to the local pointer and subsequently the constructor initializes the data back in the derived class. On the other hand, passing in a couple of nulls sets up a standalone class. (This demonstration constructor is configured to build both derived classes and instances of itself; a rare situation in practice, and a true base class would leave out the standalone code.)</p>
+
+<p>If you now call the <i>MotorControl SetSpeed</i> method, it directly executes that method in the base class.</p>
+
+<p>The derived class can override a base class method by overwriting the associated vector in the <i>vtable</i>; for example, if the derived class wanted to override the base class <i>SetDirection</i> method. Then, after the <i>vtable</i> has been built, it could replace that method with a statement such as:</p>
+
+<blockquote>
+MotorControl-&gt;SetDirection = <br>
+                                   MySetDirection;<br>
+
+</blockquote>
+
+<p>If access to the base class version is still required, you can declare a static function pointer for saving the base class pointer prior to the replacement. <a name="re6"></a><a href="0601oe6.html">Example 6</a> is the example derived class constructor.</p>
+
+<p>Because in C_Classes the base class for a derived class contains nothing other than the code, the same base class can support a number of derived classes in the one application. In the example I present here, as well as this derived class that provides controlled acceleration for one motor, another derived class could provide pulse width control for a motor attached to a peristaltic pump, with the control input parameter being liters-per-hour.</p>
+
+<p>Motor.h and motor.c are the header and code files (available electronically) for the now modified <i>Motor</i> base class, while MotorControl.h and MotorControl.c show the new <i>MotorControl</i> class. MotorVtable.h is the <i>Motor</i> base class <i>vtable</i> definition in a form that can be included in both the base class itself and any derived classes. Using this technique means there are only two places the programmer must ensure correspondence&#151;the class definition and its instance in the class code file (although it does mean the compiler gives incompatible types warnings). Main.c (available electronically) is a demonstration main program showing examples of using these classes. The ports in the microprocessor are simulated as global integers. It is instructive to create a project in something like Visual C and step through the entire program.</p>
+<h3>Compiler Dialects</h3>
+
+<p>The example listings I've presented are for Microsoft's VC7 compiler, mainly because the Visual C/C++ package is fairly common and has an excellent debugger. Other compilers may require small changes. For example, the GCC compiler versions typically provide the <i>memcpy</i> prototype in the string.h header file rather than the memory.h file. </p>
+
+<p>Most compilers will give you incompatible type warnings when referencing parental structures with derived class names. While these can be safely ignored, they can also be simply fixed with a cast to the base class structure; for example:</p>
+
+<blockquote>
+MotorXtor((MotorData*)d);<br>
+
+</blockquote>
+
+<p>I use the standard library <i>memcpy</i> in the macros. On some microprocessors, particularly those with a Harvard architecture, the compiler may require special directions when declaring the class <i>vtable</i> instance and copying it from ROM to RAM. Check this out as, otherwise, you will find the compiler copies the instance to RAM before your program runs as part of data initialization, and then <i>memcpy</i> simply copies it from one place in RAM to another.</p>
+<h3>Conclusion</h3>
+
+<p>I have presented a fairly simple method for creating classes in C. The code is transparent and regular, in that the method can apply to both standalone and inheritable classes with no change in syntax and little additional code. An inherited class need only call the base class constructor to be fully initialized. The ROM footprint is hardly different from a carefully modularized traditional C method, with the advantage of an obvious class structure.</p>
+
+<p>While not a problem in itself, the fact that the class <i>vtable</i> definition and its instance are in two different places means that you must take care they always match. This is particularly so when adding new functions to an existing design.</p>
+
+<p>In a typical small embedded system, classes are created early and rarely destroyed, in part to ensure the heap does not become fragmented over the months or years between resets, but also because in most cases all classes are in use all the time. If your app is dynamically creating and destroying classes, you need to be sure of your compiler's heap management. My recommendation is to get all heap setup over and done with during initialization.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>/******************************************************************************
+   PROJECT  C Classes
+   NAME     C_Classes.h
+   PURPOSE  A header file for C classes derived using the C_Class methods.
+   AUTHOR   Ron Kreymborg, Jennaron Research
+******************************************************************************/
+#ifndef _C_CLASSES_H
+#define _C_CLASSES_H
+
+#include &lt;stdlib.h&gt;
+#include &lt;memory.h&gt;
+
+#define TRUE        1
+#define FALSE       0
+//-----------------------------------------------------------------------------
+// A macro to copy the vtable structure in rom into ram. The VECTOR parameter
+// is the destination structure pointer, and the STRUCTURE parameter is a
+// pointer to the source vector table. Note that sizeof will ensure there is
+// space for all functions defined in the typedef.
+//
+#define CREATE_VTABLE(VECTOR, STRUCTURE, TYPEDEF) \
+        VECTOR = (TYPEDEF*)Allocate(sizeof(TYPEDEF)); \
+        memcpy(VECTOR, &amp;STRUCTURE, sizeof(TYPEDEF))
+/*
+If you want to replace the macro with a function, here is the 
+required prototype...
+void CREATE_VTABLE(void** to, void* from, int size);
+*/
+//-----------------------------------------------------------------------------
+// Free the vtable heap memory based on usage. Both parameters are pointers.
+//
+extern void DestroyVtable(void*, int*);
+//-----------------------------------------------------------------------------
+// Allocate space from the heap.
+//
+extern void* Allocate(int);
+//-----------------------------------------------------------------------------
+// Return the memory to the heap.
+//
+extern void Free(void*);
+//-----------------------------------------------------------------------------
+// Return the current count of allocated items on the heap. Call when the
+// process completes to check if all classes have been correctly shutdown.
+//
+extern int DataCount(void);
+
+#endif  // _C_CLASSES_H</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>/******************************************************************************
+   PROJECT  C Classes
+   NAME     C_Classes.c
+   PURPOSE  The C_Classes vtable heap allocation and de-allocation methods.
+   AUTHOR   Ron Kreymborg, Jennaron Research
+******************************************************************************/
+#include &lt;stdio.h&gt;
+#include "C_Classes.h"
+
+static int mDataCount;
+//-----------------------------------------------------------------------------
+// Destroy the vtable based on whether the instance count goes to zero.
+//
+void DestroyVtable(void* structure, int* count)
+{
+    if (--(*count) == 0)
+    {
+        Free(structure);
+    }
+}
+//-----------------------------------------------------------------------------
+// Remove a heap structure.
+//
+void Free(void *p)
+{
+    mDataCount--;
+    free(p);
+}
+//-----------------------------------------------------------------------------
+// Allocate the requested bytes from the heap.
+//
+void *Allocate(int size)
+{
+    void *p = malloc(size);
+    if (p)
+    {
+        mDataCount++;
+        return p;
+    }
+    else
+    {
+        // The heap space is exhausted. Provide an error handler here. Do NOT 
+        // ever return from here unless the heap has been enlarged. Put a 
+        // suitable error handler here that matches the processor environment 
+        // requirements.
+        //
+        printf("Out of heap memory");
+        while(1) {;}
+    }
+}
+//-----------------------------------------------------------------------------
+// Return the number of outstanding heap allocations.
+//
+int DataCount(void)
+{
+    return mDataCount;
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

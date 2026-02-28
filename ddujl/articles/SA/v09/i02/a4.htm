@@ -1,0 +1,251 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v09, i02: Deep Copying, not Deep Secrets</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink>Article</a></span></td>
+		<td><a href="../../../../source/SA/2000/feb2000.tar"><b class=codeListing>feb2000.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<! -- Insert Content ------ >
+
+<H1>Deep Copying, not Deep Secrets</H1><p>
+<P>Randal L. Schwartz
+<P>
+One of the modules I encountered in the CPAN had a problem with creating multiple objects. Each object was created fine, but on further use simultaneously in the program, some of the data from one object mysteriously showed up in the second one, even if the first one was freed!<P>
+Upon inspection, I found that the object was being initialized from a <I>shallow copy</I> of a template, and I told the author that he needed to <I>deep copy</I> the template instead. He was puzzled by the suggestion, and if you aren't familiar with these two terms, You may be a little confused now as well.<P>
+What is deep copying and why do we need it? I'll start with a simple example, and work back to the problem I presented.<P>
+For example, grab all the password information into a simple hash, with the key being the username, and the value being an arrayref pointing to the nine element value returned by <B>getpwent()</B>. On a first cut, we quickly hack out something like this:<P>
+<PRE>
+while (@x = getpwent()) {
+  $info{$x[0]} = \@x;
+}
+for (sort keys %info) {
+  print "$_ =&gt; @{$info{$_}}\n"
+}
+</PRE><P>
+What? Where did all the data go? We stored a reference to the data into the hash value. Well, maybe this will make it more clear:<P>
+<PRE>
+while (@x = getpwent()) {
+  $info{$x[0]} = \@x;
+  print "$info{$x[0]}\n";
+}
+</PRE><P>
+On my machine, this printed <B>ARRAY(0x80ce7fc)</B> dozens of times -- once for every user on the system. So, what does that mean? It means that we are reusing the same array repeatedly, and therefore we don't have dozens of arrayrefs pointing to distinct arrays; we have a single array with many pointers to the same data. So on the last pass through the gathering loop, <B>@x</B> is emptied, and therefore all the array references are pointing to the identical empty data.<P>
+This is because we made a <I>shallow copy</I> of the reference to <B>@x</B> into the hash value, which is a copy of only the top-level pointer, but not the contents. What we really needed was not only a copy of the reference, but a copy of to what the reference pointed. That's simple enough here:<P>
+<PRE>
+while (@x = getpwent()) {
+  $info{$x[0]} = [@x];
+}
+for (sort keys %info) {
+  print "$_ =&gt; $info{$_} =&gt; @{$info{$_}}\n"
+}
+</PRE><P>
+Notice, we've got a distinct arrayref for each hash element, pointing to an independent copy of the nine elements of the array originally contained in <B>@x</B>. This worked because we created a new anonymous arrayref with the expression <B>[@x]</B>, which also gives this anonymous array an initial value made of copies of the elements of <B>@x</B>.<P>
+So that's a basic <I>deep copy</I> -- copying not only the top level pointer, but also all the things within the data structure to maintain complete independence.<P>
+Actually, there was one other way to ensure unique sub-elements in this example, and I'll show it for completeness lest my Perl hacking friends get irritated. You don't need to copy anything if you just generate the data in a distinct array in the first place:<P>
+<PRE>
+while (my @x = getpwent()) {
+  $info{$x[0]} = \@x;
+}
+for (sort keys %info) {
+  print "$_ =&gt; $info{$_} =&gt; @{$info{$_}}\n"
+}
+</PRE><P>
+Here, each pass through the loop starts with a brand-new completely distinct lexical <B>@x</B> rather than reusing the old existing variable. So, when a reference is taken to it, and it falls out of scope at the bottom of the loop -- the variable automatically remains behind as an anonmous variable.<P>
+But let's get back to deep copying. Here's another example. Suppose Fred and Barney are sharing a house:<P>
+<PRE>
+$place = {
+  Street =&gt; "123 Shady Lane",
+  City =&gt; "Granite Junction",
+};
+$fred = {
+  First_name =&gt; "Fred",
+  Last_name =&gt; "Flintstone",
+  Address =&gt; $place,
+};
+$barney = {
+  First_name =&gt; "Barney",
+  Last_name =&gt; "Rubble",
+  Address =&gt; $place,
+};
+</PRE><P>
+Note that <B>$fred-&gt;{Address}{City}</B> is &#147;Granite Junction&#148;, just as we might expect it, as is <B>$barney-&gt;{Address}{City}</B>. But we've done a shallow copy from <B>$place</B> into both of the <B>Address</B> element values. This means that there's not two copies of the data, but just one. We can see this when we change one of the values. Let's let Fred move to his own place:<P>
+<PRE>
+$fred-&gt;{Address}{Street} = "456 Palm Drive";
+$fred-&gt;{Address}{City} = "Bedrock";
+</PRE><P>
+Looks safe enough. But what happened to Barney? He moved along with Fred!<P>
+<PRE>
+print "@{$barney-&gt;{Address}}{qw(Street City)}\n";
+</PRE><P>
+This prints Fred's new address! Why did that happen? Once again, the assignment of <B>$place</B> as the address in both cases made a shallow copy: both data structures shared a common pointer to the common street and city data. Again, a deep copy would have helped:<P>
+<PRE>
+$place = {
+  Street =&gt; "123 Shady Lane",
+  City =&gt; "Granite Junction",
+};
+$fred = {
+  First_name =&gt; "Fred",
+  Last_name =&gt; "Flintstone",
+  Address =&gt; {%$place},
+};
+$barney = {
+  First_name =&gt; "Barney",
+  Last_name =&gt; "Rubble",
+  Address =&gt; {%$place},
+};
+$fred-&gt;{Address}{Street} = "456 Palm Drive";
+$fred-&gt;{Address}{City} = "Bedrock";
+print "@{$barney-&gt;{Address}}{qw(Street City)}\n";
+</PRE><P>
+Now each <B>Address</B> field is a completely disconnected copy, so when we update one, the other stays pure. This works because just like the <B>[@x]</B> construct, we are creating a new independent anonymous hash and taking a reference to it.<P>
+But what if <B>$place</B> was itself a deeper structure? That is, suppose the street address was made up of a number and a name:<P>
+<PRE>
+$place = {
+  Street =&gt; {
+    Number =&gt; 123,
+    Name =&gt; "Shady Lane",
+  },
+  City =&gt; "Granite Junction",
+};
+$fred = {
+  First_name =&gt; "Fred",
+  Last_name =&gt; "Flintstone",
+  Address =&gt; {%$place},
+};
+$barney = {
+  First_name =&gt; "Barney",
+  Last_name =&gt; "Rubble",
+  Address =&gt; {%$place},
+};
+</PRE><P>
+We've now done something that's not quite a deep copy, but also not a shallow copy. Certainly, the hash at <B>$fred-&gt;{Address}</B> is different from <B>$barney-&gt;{Address}</B>. But they both contain a value that is identical to the <B>$place-&gt;{Street}</B> hashref! So if we move Fred just down the street:<P>
+<PRE>
+$fred-&gt;{Address}{Street}{Number} = 456;
+</PRE><P>
+then Barney moves along with him again! Now, we could fix this problem by applying the logic for copying the address one more time to the street structure:<P>
+<PRE>
+$fred = {
+  First_name =&gt; "Fred",
+  Last_name =&gt; "Flintstone",
+  Address =&gt; {
+    Street =&gt; {%{$place-&gt;{Street}}},
+    City =&gt; $place-&gt;{City},
+  },
+};
+</PRE><P>
+As you can see, it's getting more and more convoluted. And what if we change <B>City</B> to be another structure, or added another level to <B>Street</B>. Bleh.<P>
+Fortunately, we can write a simple general-purpose deep copier with a recursive subroutine. Here's a simple little deep copy routine:<P>
+<PRE>
+sub deep_copy {
+  my $this = shift;
+  if (not ref $this) {
+    $this;
+  } elsif (ref $this eq "ARRAY") {
+    [map deep_copy($_), @$this];
+  } elsif (ref $this eq "HASH") {
+    +{map { $_ =&gt; deep_copy($this-&gt;{$_}) } keys %$this};
+  } else { die "what type is $_?" }
+}
+</PRE><P>
+This subroutine expects a single item -- the top of a tree of hashrefs and listrefs and scalars. If the item is a scalar, it is simply returned, since a shallow copy of a scalar is also a deep copy. If it's an arrayref, we create a new anonymous array from the data. However, each element of this array could itself be a data structure, so we need a deep copy of it. The solution is straightforward -- simply call <B>deep_copy</B> on each item. Similarly, a new hashref is constructed by copying each element, including a deep copy of its value. (The hash key is always a simple scalar, so it needs no copy, although that would have been easy enough to add.) To see it work, let's give some data:<P>
+<PRE>
+$place = {
+  Street =&gt; {
+    Number =&gt; 123,
+    Name =&gt; [qw(Shady Lane)],
+  },
+  City =&gt; "Granite Junction",
+  Zip =&gt; [97007, 4456],
+};
+$place2 = $place;
+$place3 = {%$place};
+$place4 = deep_copy($place);
+</PRE><P>
+Hmm. How do we see what we've done, and what's being shared? Let's add a call to the standard library module, <B>Data::Dumper</B>:<P>
+<PRE>
+use Data::Dumper;
+$Data::Dumper::Indent = 1;
+print Data::Dumper-&gt;Dump(
+  [$place, $place2, $place3, $place4],
+  [qw(place place2 place3 place4)]
+);
+</PRE><P>
+And that generates on my system:
+<PRE>
+$place = {
+  'City' =&gt; 'Granite Junction',
+  'Zip' =&gt; [
+    97007,
+    4456
+  ],
+  'Street' =&gt; {
+    'Name' =&gt; [
+      'Shady',
+      'Lane'
+    ],
+    'Number' =&gt; 123
+  }
+};
+$place2 = $place;
+$place3 = {
+  'City' =&gt; 'Granite Junction',
+  'Zip' =&gt; $place-&gt;{'Zip'},
+  'Street' =&gt; $place-&gt;{'Street'}
+};
+$place4 = {
+  'City' =&gt; 'Granite Junction',
+  'Zip' =&gt; [
+    97007,
+    4456
+  ],
+  'Street' =&gt; {
+    'Number' =&gt; 123,
+    'Name' =&gt; [
+      'Shady',
+      'Lane'
+    ]
+  }
+};
+</PRE><P>
+Hey, look at that. <B>Data::Dumper</B> let me know that <B>$place2</B> is a shallow copy of <B>$place</B>, while <B>$place3</B> is an intermediately copied value. Notice the elements of <B>$place</B> inside <B>$place3</B>. And since <B>$place4</B> contains no previously seen references, we know it's a completely independent deep copy. Success! (The ordering of the hash elements is inconsistent, but that's immaterial and undetectable in normal use.)<P>
+Now, this simple <B>deep_copy</B> routine will break if there are recursive data pointers (references that point to already seen data higher in the tree). For that, you might look at the <B>dclone</B> method of the <B>Storable</B> module, found in the CPAN.<P>
+So, when you use <B>=</B> with a structure, be sure you know what you are doing. You may need a deep copy instead of that shallow copy. For further information, check out your online documentation with perldoc <B>perldsc</B> and perldoc <B>perllol</B> and even perldoc <B>perlref</B> and <B>perldoc perlreftut</B> for the basics. Until next time, enjoy! <P>
+
+<h1>About the Author</h1><p>
+Randal L. Schwartz is a two-decade veteran of the software industry <I>--</I> skilled in software design, system administration, security, technical writing, and training. He has coauthored the &#147;must-have&#148; standards: <I>Programming Perl</I>, <I>Learning Perl</I>, <I>Learning Perl for Win32 Systems</I>, and <I>Effective Perl Programming</I>, as well as writing regular columns for WebTechniques and Unix Review magazines. He's also a frequent contributor to the Perl newsgroups, and has moderated comp.lang.perl.announce since its inception. His offbeat humor and technical mastery have reached legendary proportions worldwide (but he probably started some of those legends himself). Randal's desire to give back to the Perl community inspired him to help create and provide initial funding for The Perl Institute (perl.org). He is also a founding board member of the Perl Mongers (pm.org), the worldwide association of &#147;Perl users groups&#148;. Since 1985, Randal has owned and operated Stonehenge Consulting Services, Inc.
+
+
+<! -- Begin Content ------ >
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

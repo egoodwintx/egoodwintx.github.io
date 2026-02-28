@@ -1,0 +1,274 @@
+<HTML>   
+     <HEAD>
+<TITLE>March 2002 C++ Experts Forum/Object Interconnections</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../20.03/tocmar.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Object Interconnections: Real-time CORBA, Part 3: Thread Pools and Synchronizers</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">by Douglas C. Schmidt and Steve Vinoski</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+<p>This is the third installment in our series of columns describing how CORBA has evolved to support DRE (distributed real-time and embedded) applications. Examples of DRE systems include <i>telecommunication networking</i> (e.g., central office switching), <i>telemedicine</i> (e.g., remote surgery), <i>manufacturing process automation</i> (e.g., hot rolling mills), and <i>defense systems</i> (e.g., avionics mission computing). One of the hallmarks of DRE applications is their need for strict control over the scheduling and execution of CPU and memory resources. The Real-time CORBA specification therefore enables client and server applications to:</p>
+<UL><LI>Determine the priority at which client invocations will be processed at a server.</LI>
+<LI>Allow servers to predefine thread pools to process client requests concurrently within a bounded amount of CPU and memory resources.</LI>
+<LI>Ensure that intra-process thread synchronizers used by middleware and applications have consistent semantics. </LI></UL>
+<p>Our previous column <a href="#1">[1]</a> focused on the Real-time CORBA policies and mechanisms that enable clients and servers to indicate the relative priorities of their requests so that ORB end systems can enforce these priorities end-to-end.  This column describes Real-time CORBA's support for <i>thread pools</i> and <i>synchronizers</i>. A thread pool is a concurrency model that allocates a bounded group of threads to process requests simultaneously. A synchronizer is a locking mechanism that serializes access to a shared resource and coordinates the order in which threads access the shared resource. </p>
+<p>Developers of DRE applications can use thread pools and synchronizers to bound CPU and memory resources to support DRE applications with real-time QoS (quality of service) requirements effectively. These applications are typically limited in the amount of processing time and memory they can use. It's therefore essential for real-time ORB end systems to ensure that these resources are conserved and managed carefully.</p>
+<p>Thread pools and synchronizers are also used to bound priority inversion, which is a scheduling hazard that occurs when a low-priority thread or request blocks the execution of a higher priority thread or request. DRE applications often monitor and control entities in the physical world, such as regulating the temperature of coolant in a nuclear reactor. These entities must be serviced or actuated within strict real-time deadlines to avoid catastrophic failures. It's therefore essential for real-time ORB end systems to ensure that high-priority operations can predictably receive preferential treatment relative to lower priority operations.</p>
+<p>Older ORBs that lacked support for thread pools and synchronizers typically used <i>reactive</i> concurrency models <a href="#2">[2]</a>, where a server ORB read each request from the OS, processed it to completion, retrieved the next request, and so forth.  If all requests require a fixed, relatively short amount of processing, a reactive model can be implemented with low overhead.  Many DRE applications have complex object implementations, however, whose operations run for variable and/or long durations.  To avoid unbounded priority inversion therefore, these DRE applications may need some form of preemptive multithreading, where the OS preempts low-priority threads when a higher priority thread is ready to run.</p>
+
+<H3><FONT COLOR="#000080">Real-time Application Review</FONT></H3>
+
+<p>This column continues to illustrate key Real-time CORBA capabilities using the planetary mapping system described in <a href="#1">[1]</a>. In this system, semi-autonomous drone vehicles are involved in a distributed computation to map a planet's surface. Human operators define high-level exploration goals for the drones via a <b>Base_Station</b> object, which provides set points for <b>Controller</b> objects.  <b>Controller</b> objects control the drones remotely using <b>Drone</b> objects, which reside on the drone vehicles.  <b>Drone</b> objects expose operations for monitoring and controlling individual drone behavior. Each drone sends information obtained from its sensors back to the <b>Base_Station</b> via its <b>Controller</b> object. <a href="fig1.htm">Figure 1</a> illustrates the roles and relationships between these objects.</p>
+<p>Our example real-time application applies the Real-time CORBA features found in <a href="tab1.htm">Table 1</a> to address key design challenges related to controlling thread pools and synchronization mechanisms. The remainder of this column illustrates how to apply the Real-time CORBA features outlined in <a href="tab1.htm">Table 1</a> to address key threading and synchronization design challenges that arise in our planetary mapping application.  </p> 
+
+<H3><FONT COLOR="#000080">Supporting Thread Pools Effectively</FONT></H3>
+
+<p>The base station server in our planetary mapping system must be able process requests at different levels of importance. For example, high-priority <b>edge_alarm </b>requests should be given preference to lower-priority <b>battery_low</b> requests to prevent drones from falling off the surface they are exploring. If a <b>battery_low</b> request is executing when an <b>edge_alarm</b> request arrives, the ORB end system should therefore quickly and predictably preempt the <b>battery_low</b> request and let the <b>edge_alarm</b> request run. </p>
+<p>This example follows the time-honored tradition of DRE applications that use multithreading to: </p>
+
+<UL><LI>distinguish between different types of service, such as high-priority vs. low-priority tasks </LI>
+<LI>support thread preemption to prevent unbounded priority inversion</LI></UL>
+
+<p>Prior to the Real-time CORBA specification <a href="#3">[3]</a>, there was no standard API for programming multithreaded CORBA servers.  It was therefore not possible to use CORBA to program multithreaded real-time systems without using proprietary ORB features.</p>
+<p>To address this issue and enhance portability, the Real-time CORBA specification defines a standard <i>thread pool</i> model that allows server developers to: </p>
+
+<UL><LI>preallocate a certain number of threads statically</LI>
+<LI>bound the total amount of dynamic thread creation </LI>
+<LI>partition threads into different groups of priority levels</LI>
+<LI>allow high-priority groups of threads to &quot;borrow&quot; unused threads from groups that have lower priorities</LI>
+<LI>buffer requests when threads aren't available to process them immediately.</LI>
+</UL>
+
+<p>Thread pools are useful for DRE applications that want to leverage the benefits of multithreading, while simultaneously bounding their consumption of system resources, such as stack space and CPU time.</p>
+<p>Thread pools can be defined and associated with POAs in a Real-time CORBA server.  Each POA must be associated with one thread pool, although a thread pool can be associated with multiple POAs.  <a href="fig2.htm">Figure 2</a> illustrates the association of a thread pool and a POA in a server.  A subsequent example illustrates how to associate a thread pool with multiple POAs in a server.</p>
+<p>The simplest Real-time CORBA thread-pool model allows developers to control the overall concurrency level within server ORBs and applications.  A thread pool can be created with a fixed number of statically allocated threads that an ORB will use to process client messages.  These preallocated threads will consume system resources even if they are not used, however.  Real-time CORBA therefore defines the following <b>RTCORBA::RTORB</b> interface that allows server developers to preallocate an initial number of statically allocated threads, while allowing this pool to grow dynamically to handle bursts of client requests:</p> 
+
+<pre>
+interface -RTORB {     
+  typedef unsigned long ThreadpoolId;     
+
+  ThreadpoolId create_threadpool     
+    (in unsigned long stacksize,     
+     in unsigned long dynamic_threads,     
+     in Priority default_priority,     
+     in boolean allow_request_buffering,     
+     in unsigned long max_buffered_requests,     
+     in unsigned long max_request_buffer_size);     
+  void destroy_threadpool      
+    (in ThreadpoolId threadpool) raises (InvalidThreadpool);     
+  };     
+</pre>
+
+<p>Server applications can use the <b>create_threadpool</b> operation above to specify (1) the default number of static threads that are created initially, (2) the maximum number of threads that can be created dynamically, and (3) the default priority of all the threads in a pool. The priorities of threads within a pool can change dynamically in accordance with the <b>CLIENT_PROPAGATED</b> and <b>SERVER_DECLARED</b> priority policies described in <a href="#1">[1]</a>.  If a request arrives and all existing threads are busy, a new thread may be created to handle the request.  No additional thread will be created, however, if the maximum number of dynamic threads in the pool has already been spawned.</p>
+<p>The <b>create_threadpool</b> operation returns a <b>ThreadpoolID</b>, which uniquely identifies a thread pool within a CORBA server. This ID can be passed to the <b>destroy_threadpool</b> operation in <b>RTCORBA ::RTORB</b>  to remove a thread pool when it's no longer needed. It can also be used to associate a thread pool with one or more POAs, as shown in the following example.<b> </b>We start by using the standard <b>CORBA ::ORB_init</b> factory operation to obtain an object reference to the ORB:</p>
+
+
+<pre>
+CORBA::ORB_var orb = CORBA::ORB_init (argc, argv);
+CORBA::Object_var obj =
+  orb-&gt;resolve_initial_references (&quot;RTORB&quot;);
+</pre>
+
+<p>We then narrow <b>obj</b> to obtain an object reference to the Real-time CORBA ORB:</p>
+
+<pre>
+RTCORBA::RTORB_var rt_orb =  
+  RTCORBA::RTORB::_narrow (obj);
+</pre>
+
+<p>Using the <b>rt_orb</b> object reference returned from <b>_narrow</b>, we can create a thread pool containing three threads preallocated statically:</p>
+
+<pre>
+RTCORBA::ThreadpoolId pool_id = rt_orb-&gt;create_threadpool 
+  (0, // Default stack size
+   3, // # of static threads
+   0, // Allow no dynamic threads
+   20, // Default priority of 20
+   false, // No thread borrowing
+   false, 0, 0); // No request buffering
+</pre>
+
+<p>Now that we've created the thread pool, we can associate it with two different types of POAs, one of which uses the <b>CLIENT_PROPAGATED</b> priority policy and the other of which uses the <b>SERVER_ DECLARED</b> policy. We first call a factory method on the <b>rt_orb</b> object reference to create a thread-pool policy object:</p>
+
+<pre>
+RTCORBA::ThreadpoolPolicy_var tp_policy = 
+  rt_orb-&gt;create_threadpool_policy (pool_id); 
+</pre>
+
+<p>We then create and initialize the policy lists for the POAs, starting with the <b>CLIENT_PROPAGATED</b> policy:</p>
+
+<pre>
+CORBA::PolicyList RTPOA_policies_a (2);    
+RTPOA_policies_a.length (2);   
+RTPOA_policies_a[0] = tp_policy;   
+RTPOA_policies_a[1] = rt_orb-&gt;create_priority_model_policy    
+  (RTCORBA::CLIENT_PROPAGATED,    
+   DEFAULT_PRIORITY); 
+</pre>
+
+<p>Next, we initialize the <b>SERVER_DECLARED</b> policy:</p>
+
+<pre>
+CORBA::PolicyList RTPOA_policies_b (2); 
+RTPOA_policies_b.length (2);
+RTPOA_policies_b[0] = tp_policy;
+RTPOA_policies_b[1] = rt_orb-&gt;create_priority_model_policy 
+  (RTCORBA::SERVER_DECLARED, 20);
+</pre>
+
+<p>Finally, we create the POAs, initializing them with the policies defined above:</p>
+  
+<pre>
+PortableServer::POA_var rt_poa_a =                                              
+  root_poa-&gt;create_POA (&quot;POA A&quot;,                                               
+                        PortableServer::POAManager::_nil (),                                             
+                        RTPOA_policies_a);                                             
+PortableServer::POA_var rt_poa_b =                                              
+  root_poa-&gt;create_POA (&quot;POA B&quot;,                                               
+                        PortableServer::POAManager::_nil (),                                             
+                        RTPOA_policies_b);  
+</pre>
+
+<p><a href="fig3.htm">Figure 3</a> illustrates the association between the thread pool and the two POAs that we've created.</p>
+<p>When client requests arrive for servants in <b>POA A</b>, they will be processed at the priority propagated in the service context field of the GIOP request. In contrast, regardless of the priority at which clients invoke requests, servants in <b>POA B</b> will be processed at either (1) the default priority <b>20</b> or (2) whatever priority the object was activated to run at using the <b>RTPortableServer::POA::activate_object_with_priority</b> operation.</p>
+
+<H3><FONT COLOR="#000080">Buffering Client Requests</FONT></H3>
+
+<p>The base station server must handles requests from drones and human operators. Since it cannot control when these requests occur, it may need to buffer requests to handle &quot;bursty&quot; traffic from clients. To prevent denial of service attacks, many operating systems restrict the amount of data that they will buffer on behalf of an application. If this buffer space is too small, it may be necessary to buffer the data within the middleware instead of within the OS.</p>
+<p>To support this use case, Real-time CORBA thread pools can be optionally preconfigured for a maximum buffer size or number of requests.  As shown in the <b>create_threadpool</b> operation in the previous section, Real-time CORBA thread -pool buffer capacities can be configured according to the maximum number of bytes and the maximum number of requests. </p>
+<p>If buffering is enabled for the pool, the request will be queued until a thread is available to process it.  If no queue space is available or request buffering was not specified, the ORB should raise a <b>TRANSIENT</b> exception, which indicates a temporary resource shortage.  When the client receives this exception it can reissue the request at a later point.</p>
+<p>The following code illustrates how to modify the earlier example to buffer client requests (for variety, we explicitly set the size of the stack to be 10 Kbytes):</p>
+
+<pre>
+RTCORBA::ThreadpoolId pool_id = rt_orb-&gt;create_threadpool
+  (1024 * 10,  // Stacksize   
+   3, // Static threads   
+   0, // Dynamic threads   
+   20, // Default priority is 20   
+   true, // Enable buffering   
+   128,  // Maximum # of messages   
+   64 * 1024); // Maximum # of bytes to buffer
+</pre>
+
+<p>Some Real-time CORBA ORBs don't use queues at the middleware layer in order to minimize priority inversions and excessive context switching, synchronization, and data movement overheads.  Such ORBs can validly reject requests to create a thread pool with buffers (i.e., their maximum buffer capacity is always zero).  In this case, queueing must be done within the I/O subsystem of the underlying OS.</p>
+
+<H3><FONT COLOR="#000080">Prevent Exhaustion of Threads by Low-Priority Requests</FONT></H3>
+
+<p>If drones send many low-priority requests to a base station server simultaneously, it may run out of threads in its thread pool, in which case no threads are available to process high-priority requests. For example, a number of drones could send <b>battery_low</b> requests to the base  station at the same time. If all the threads in the base station's thread pool are processing these requests, a higher priority <b>edge_alarm</b> request may be delayed, causing damage to the drone. To prevent the exhaustion of threads by low-priority requests, Real-time CORBA allows servers to partition their thread pools into groups of threads, called <i>lanes</i>, where each lane has a different priority. The <i>thread pool with lanes</i> model enables developers to bound both the overall concurrency of a server and the amount of work performed at a given priority level. </p>
+<p>The following IDL defined in the <b>RTCORBA::RTORB</b> interface is used to create thread pool with lanes:</p>
+
+<pre>
+  // ...     
+  struct ThreadpoolLane {     
+    Priority lane_priority;     
+    unsigned long static_threads;     
+    unsigned long dynamic_threads;     
+  };     
+  typedef sequence&lt;ThreadpoolLane&gt; ThreadpoolLanes;     
+  ThreadpoolId create_threadpool_with_lanes      
+    (in unsigned long stacksize,     
+     in ThreadpoolLanes lanes,     
+     in boolean allow_borrowing     
+     in boolean allow_request_buffering,     
+     in unsigned long max_buffered_requests,     
+     in unsigned long max_request_buffer_size);     
+  // ...
+</pre>
+
+<p>The <b>create_threadpool_with_lanes</b> operation provides a superset of the functionality of the <b>create_threadpool</b> operation. The difference is that a sequence of <b>ThreadpoolLanes</b> is created each time this operation is called. For each group of threads in a thread pool with lanes model, the server specifies the CORBA priority, static thread count, and dynamic thread count. Dynamic threads are assigned the lane priority.  </p>
+<p>Thread pools with lanes can be configured to allow lanes with higher priorities to borrow threads from lanes with lower priorities.  If a thread is borrowed, its priority is temporarily raised to that of the lane that borrows it.  When the invocation processing is complete, its priority reverts to its previous value and the thread returns to its original lane.  Thread pools with lanes also can be configured to support request buffering if no threads are available to process incoming requests.</p> 
+<p>The following C++ code illustrates how to create a thread pool with lanes.  We start by defining the following three lanes:</p>
+
+<pre>
+RTCORBA::ThreadpoolLane high_priority = {  
+  50, // Default priority  
+   1, // Static threads 
+   0  // Dynamic threads   
+}; 
+
+RTCORBA::ThreadpoolLane mid_priority = {   
+  35, // Default priority  
+   3, // Static Threads 
+   2  // Dynamic Threads 
+}; 
+
+RTCORBA::ThreadpoolLane low_priority = {   
+  10, // Default priority  
+   2, // Static Threads 
+   20 // Dynamic Threads 
+};
+</pre>
+   
+<p>The <b>high_priority</b> lane will contain one static thread running at a default priority of 50 and no dynamic threads.  The <b>mid_priority</b> lane will contain three static threads with a default priority of 35 and up to 2 dynamic threads. The <b>low_priority</b> lane will contain two static threads with a default priority of 10 and up to 20 dynamic threads.</p> 
+<p>We next create a <b>RTCORBA::ThreadpoolLanes </b>object; initialize it with the <b>high_priority</b>,<b> mid_priority</b>,<b> </b>and<b> low_priority </b>lanes; and call the <b>create_threadpool_with_lanes</b> factory method:</p>
+
+<pre>
+RTCORBA::ThreadpoolLanes lanes (3); lanes.length (3);  
+lanes[0] = high_priority;   
+lanes[1] = mid_priority;   
+lanes[2] = low_priority;  
+
+RTCORBA::ThreadpoolId pool_id =   
+  rt_orb-&gt;create_threadpool_with_lanes   
+    (0, // Default stacksize  
+     lanes, // Thread pool lanes  
+     false, // No thread borrowing  
+     false, 0, 0); // No request buffering
+</pre>
+
+<p>After this sequence of operations, we'll end up with the thread pool with three lanes configuration as shown in <a href="fig4.htm">Figure 4</a>, with groups of threads running at priority 10, 35, and 50.</p>
+<p>Many DRE applications statically associate global CORBA priorities to thread pools.  For example, a telecommunications application may select three distinct priorities to represent low-latency, high-throughput, and best-effort request classes.  Alternatively, a fixed set of rate-groups with corresponding global CORBA priorities is a convenient model for DRE applications, such as avionics mission computing, with real-time periodic processing requirements.  In these scenarios, it is desirable to partition the threads in a thread pool into different subsets, each with different priorities.</p>
+
+<H3><FONT COLOR="#000080">Synchronizing Operations Consistently</FONT></H3>
+
+<p>Before the Real-time CORBA specification was released in CORBA 2.4 <a href="#3">[3]</a>, CORBA did not define a threading model.  There was thus no standard, portable API that CORBA applications could use to ensure semantic consistency between their synchronization mechanisms and the internal synchronization mechanisms used by ORB middleware.  Real-time applications, however, require this consistency to enforce priority inheritance and priority ceiling protocols <a href="#4">[4]</a>. Priority inheritance means that when a thread waits on a mutex owned by a lower priority thread, the priority of the owner is increased to that of the waiter. Priority ceiling means that while a thread owns the mutex it runs at a priority higher than any other thread that may acquire the mutex.</p> 
+<p>To ensure semantic consistency between applications and ORB middleware, the Real-time CORBA specification defines a standard set of locality constrained mutex operations.  <a href="fig5.htm">Figure 5</a> illustrates the <b>RTCORBA::Mutex</b> interface defined by Real-time CORBA.</p> 
+<p>An instance of the <b>RTCORBA::Mutex</b> interface can be created by an application using the following factory method:</p>
+
+<pre>
+RTCORBA::Mutex_var mutex = rt_orb-&gt;create_mutex ();
+</pre>
+   
+<p>After being created, the <b>mutex</b> can be acquired and released to serialize access to a critical section and prevent corruption from race conditions, as follows:</p>
+
+<pre>
+mutex-&gt;lock ();
+// Critical section here...
+mutex-&gt;unlock ();
+</pre>
+   
+<p>When the mutex is no longer required, it can be destroyed using the following operation:</p>
+
+<pre>
+rt_orb-&gt;destroy_mutex (mutex);
+</pre>
+
+<p>It is important to note that Real-time CORBA doesn't prescribe a particular priority inversion protocol, such as priority inheritance or priority ceiling. It does require, however, that the protocol used by mutexes in the ORB implementation is the same as the one for the <b>RTCORBA::Mutex</b>. Moreover, Real-time CORBA doesn't prescribe any standard API to control the priority inversion protocol to be used, which means that users must rely on ORB-specific APIs.</p>
+
+<H3><FONT COLOR="#000080">Concluding Remarks</FONT></H3>
+
+<p>The Real-time CORBA specification adds QoS control capabilities to regular CORBA to improve application predictability by bounding priority inversions and managing system resources end-to-end.</p>
+<p>The ability to control how thread pools are assigned to POAs and to customize memory buffers for those pools is critical to ensure that servants have the resources they need to carry out their requests in a timely and predictable manner. You can also control predictability more precisely by using thread pools with lanes to ensure that priority inversions do not occur. Achieving proper operation synchronization that ensures proper priority inheritance requires cooperation between the ORB and the application. Our next column will show how to program Real-time CORBA features that control communication resources end-to-end. </p> 
+<p>A PowerPoint tutorial version of our columns on the Real-time CORBA specification is available at &lt;www.cs.wustl.edu/~schmidt/RT-CORBA.ppt&gt;. If you have comments, questions, or suggestions regarding Real-time CORBA or our column, please let us know at <b>object_connect@cs.wustl.edu</b>.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>1. D. Schmidt and S. Vinoski. &quot;Object Interconnections: Real-time CORBA, Part 2: Applications and Priorities,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, January 2002, &lt;www.cuj.com/experts/2001/vinoski/vinoski.htm&gt;.</p>
+<p><a name="2"></a>2. D. Schmidt, M. Stal, H. Rohnert, and F. Buschmann. <i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects</i> (Wiley and Sons, 2000), &lt;www.cs.wustl.edu/~schmidt/POSA&gt;.</p>
+<p><a name="3"></a>3. Object Management Group, &quot;The Common Object Request Broker: Architecture and Specification Revision 2.4, OMG Technical Document formal/01-02-33&quot;, October 2000, &lt;www.omg.org/cgi-bin/doc?formal/01-02-33&gt;.</p>
+<p><a name="4"></a>4. R. Rajkumar, L. Sha, and J. Lehoczky. &quot;Real-Time Synchronization Protocols for Multiprocessors,&quot; Proceedings of the Real-Time Systems Symposium, Huntsville, Alabama, December 1988.</p>
+
+<H3><FONT COLOR="#000080">About the Authors</FONT></H3>
+<p><i><B>Steve Vinoski</B> is vice president of Platform Technologies and chief architect for IONA Technologies and is also an IONA Fellow. A frequent speaker at technical conferences, he has been giving CORBA tutorials around the globe since 1993. Steve helped put together several important OMG specifications, including CORBA 1.2, 2.0, 2.2, and 2.3; the OMG IDL C++ Language Mapping; the ORB Portability Specification; and the Objects By Value Specification. In 1996, he was a charter member of the OMG Architecture Board. He is currently the chair of the OMG IDL C++ Mapping Revision Task Force. He and Michi Henning are the authors of </i>Advanced CORBA Programming with C++<i>, published in January 1999 by Addison Wesley Longman.</i></p> 
+<p><i><B>Doug Schmidt</B> is an associate professor at the University of California, Irvine. His research focuses on patterns, optimization principles, and empirical analyses of object-oriented techniques that facilitate the development of high-performance, real-time distributed object computing middleware on parallel processing platforms running over high-speed networks and embedded system interconnects.  He is the lead author of the books </i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects<i>, published in 2000 by Wiley and Sons, and </i>C++ Network Programming: Mastering Complexity with ACE and Patterns<i>, published in 2002 by Addison-Wesley. He can be contacted at <b>schmidt@uci.edu</b>. </p>
+
+</BLOCKQUOTE> 
+</body>
+</html>
+

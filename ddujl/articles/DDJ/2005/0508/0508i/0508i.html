@@ -1,0 +1,385 @@
+
+<html>
+<head>
+<title>August, 2005: NPTL: The New Implementation of Threads for Linux</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>NPTL: The New Implementation of Threads for Linux</h1>
+<p><i>Dr. Dobb's Journal</i> August, 2005</p>
+<h2>POSIX compliance and a performance boost</h2>
+
+
+<h3>By L. Blunt Jackson</h3>
+
+
+<I>Blunt is a freelance programmer and writer in Seattle. He can be reached at bluejack@bluejack.com.</I>
+
+<hr>
+
+
+
+
+
+<p>Despite the popularity of Linux, despite the rich support for applications from industrial-strength databases to enterprise server applications, despite its reputation for performance and robustness, and despite support for multiple hardware architectures, Linux has always been a second-class operating system when it comes to support for multithreaded applications. Until now.</p>
+
+<p>Heavy hitters, such as Apache, have traditionally been built on multiprocess design rather than multithreaded design, in large part because Linux's threading model had serious performance and functional drawbacks. Which is not to say that multithreaded applications could not be built: MySQL has been multithreaded for years. But the MySQL manual makes no bones about the drawbacks of threads on Linux: </p>
+
+<blockquote>
+Downside: Lots of processes. Thread creating is slow. If one thread dies the rest are usually left hanging and you must kill them all before restarting. Thread switching is somewhat expensive...<br>
+&#151;<i>MySQL Reference Manual</i>, Appendix E.5 <br>
+
+</blockquote>
+
+<p>The authors neglect to list an upside.</p>
+
+<p>Enter the Native POSIX Thread Library (NPTL). Introduced with Version 2.6 of the Linux kernel, and soon to be standard on a distribution near you, NPTL brings full compliance to the POSIX Standard for all major features, and performance boosts varying from outstanding to orders of magnitude.</p>
+<h3>A Brief History of Threads for Linux</h3>
+
+<p>The Linux kernel has been internally multithreaded from the start, but it wasn't until Version 1.09 in 1994 that support for threaded applications became readily available, and even that was strictly in user space. Kernel-level support for threads didn't come along until Version 1.3 in 1995, and this was a primitive support at best. Developers who wanted POSIX threads or something like them still had to rely on third-party libraries. Reliability, functionality, and performance suffered. Porting from a POSIX-compliant OS was frustrating. In short, Linux was late to offer production-level support for true multithreaded development.</p>
+
+<p>The best alternative for applications that could benefit from concurrent execution was multiprocess design utilizing interprocess communication, such as signals, pipes, or sockets.</p>
+
+<p>One of the early third-party libraries, authored by Xavier Leroy and named "LinuxThreads," became incorporated into the standard distribution with Linux kernel 2.0. LinuxThreads was a POSIX implementation, using the Linux <i>clone()</i> system call. Adopted by Ulrich Drepper and tied closely to glibc, LinuxThreads has been the standard tool for multithreaded development on Linux from 1996 to the present day.</p>
+
+<p>Despite improvements over the years, the implementation of LinuxThreads still relies on cloning a full process and using a special "manager thread" to provide the appearance of a multithreaded application. Of course, one look at the process table and the illusion crumbles. Users executing facilities such as top or ps might see a veritable plague of processes, often seeming to consume more memory than the machine contains! Software manuals are filled with explanations like this one, from the BIND9 FAQ: "Linux threads each show up as a process under ps...Note that the amount of memory used is not cumulative; if each process is using 10M of memory, only a total of 10M is used." Current distributions of LinuxThreads continue to have major functional divergences from the POSIX specification, as well as serious performance and scaleability limitations.</p>
+
+<p>With the growth of windowing systems, graphic applications, and enterprise-level server applications, the inadequacies of LinuxThreads could not be ignored. In 2003, IBM released the Next Generation POSIX Threads (NGPT), which offered substantial improvements over LinuxThreads. It improved support for the POSIX standard, and was notable for providing an M:N threading model in which M user-space threads are executed on N kernel threads, as opposed to Linux's traditional 1:1 model.</p>
+
+<p>Not all problems could be solved in a user-space library, however. One reason that LinuxThreads remained the dominant thread library for so long was that the remaining obstacles to POSIX compliance, and some of the major performance limitations, were inherent in the existing kernel design. A series of kernel patches introduced by Ingo Molnar of Red Hat into the 2.5 (development) series of kernels laid the groundwork for a new library that would finally make a robust, high-performance, standards-compliant multithreaded design possible on Linux. This library, part of the glibc distribution maintained by Ulrich Drepper, also of Red Hat, is NPTL.</p>
+<h3>The NPTL Implementation</h3>
+
+<p>It is instructive to understand the design choices that went into developing NPTL.</p>
+
+<p>After the release of NGPT, the Linux community debated the merits of M:N versus 1:1 threading models. When Ingo Molnar introduced the O(1) scheduler into the Linux kernel, however, the debate was largely closed. (The fact that Drepper's glibc Version 2.3, a core component of any new Linux distribution, did not support IBM's NGPT undoubtedly helped kill that project.)</p>
+
+<p>A 1:1 approach is simpler to implement, and with a constant time scheduler, there is no performance penalty. Molnar reported a demonstration in which one million concurrent threads could be run on a high-end machine. (What application could make use of such riches remains an exercise for the imaginative.)</p>
+
+<p>In a 1:1 model, each thread has some characteristics of an entire process. Molnar, however, revised the <i>clone()</i> call to optimize thread creation. The kernel supports thread-specific data areas limited only by the available hardware resources. A new mechanism for tracking threads was introduced to improve scalability and performance. Likewise, exit handling was improved for threads to dramatically reduce overhead of thread exit. In short, using <i>clone()</i> to spawn a thread is no longer a heavyweight task. Application designers need no longer resort to thread pools created as part of the startup cost of an executable (although that may still be the correct design approach for certain applications).</p>
+
+<p>Other kernel changes provided the foundations for corrections to the functional problems in LinuxThreads. Signal handling is now performed within the kernel for the process as a whole, effectively solving the problems with POSIX compliance for signal handling. Collapsing the kernel identification of all threads to a single Process ID (PID) solved many problems in areas of both functionality and performance. Resource usage is correctly tied to this single PID, making the system view of a multithreaded application accurate.</p>
+
+<p>The addition of the Fast Userspace Locking (futex) into the kernel enabled a complete reimplementation of mutexes and other synchronization mechanisms without resorting to interthread signaling. The futex, in turn, was made possible by the introduction of preemptive scheduling to the kernel.</p>
+
+<p>Finally, the transition from a parent-child relationship among threads to a true peer relationship has eliminated a number of obscure bugs prohibiting correct functionality of interthread synchronization. </p>
+<h3>Migrating to NPTL</h3>
+
+<p>LinuxThreads and NPTL are both implementations of POSIX 1003.1c. Although neither offer truly 100-percent support for the specification, both fully implement the API. Accordingly, applications that compile and link successfully against LinuxThreads will also compile under NPTL. Many applications will require no work at all to take advantage of the performance improvements NPTL offers. Just link and load.</p>
+
+<p>There are two notable exceptions:</p>
+
+
+
+<ul>
+  <li><i>getpid()</i>. Under LinuxThreads, in violation of the POSIX Standard, the <i>getpid()</i> system call returns a different ID for each thread. NPTL corrects the behavior. (See <a name="rl1"></a><a href="#l1">Listing One</a>, check_pid.c for a demonstration.)</li>
+  <li>	    However, unless an application is using the <i>getpid()</i> function to name threads (which would be both nonconforming and wildly unnecessary in light of the canonical&#151;and fully functional&#151;<i>pthread_self()</i> call), this is less likely to be a problem in the application itself than it might be for supporting scripts. Shutdown scripts, for example, may be designed to scan system facilities for the PID of both parent and children to ensure that shutdowns are thorough. Monitors that expect to see some number of child processes as an indicator of the health of the application will panic.</li>
+  <li>	    The good news, of course, is that an application with dozens, hundreds, or even thousands of threads will no longer overwhelm users who happen to execute top. System resource and memory usage will now be correctly reported without raising eyebrows&#151;or heartbeats. </li>
+  <li>Signal handling. Undoubtedly, the largest obstacle to robust, multithreaded application development under LinuxThreads involved signal handling. Because each thread had its own process ID, asynchronous signals could only be sent to a particular thread, not to the process as a whole. The POSIX Standard declares that such signals can be handled by any thread that does not block the signal, and must apply to the entire application. However, the notion of an "entire application" was only imperfectly achieved under LinuxThreads. The deviation from expected behavior is most apparent in the handling of SIGSTOP, SIGCONT, and SIGIO. Should users execute Ctrl-z, for example, only one thread stops. (The case of signals that terminate the application is less problematic. Any thread that calls <i>abort()</i> or <i>exit()</i> successfully terminates the group.) One common workaround for signal problems was to dedicate one thread&#151;usually the original "parent" thread&#151;to wait for signals. Existing applications that implement this workaround, or any of the many other custom mechanisms that attempt to provide correct signal handling for an application, undoubtedly benefits from simplifying this code.</li>
+</ul>
+<h3>Demonstrated Performance</h3>
+
+<p>In one paper early in the process of NPTL development, Ulrich Drepper and Ingo Molnar published some impressive performance data. In new implementations of their profiling methodology, I have tested thread performance against a stable 2.6 kernel on the x86 architecture. (The machine is an AMD Athlon XP, 2600 in 1 GB of RAM, but the significant data is, naturally, the comparison rather than any absolute numbers.)</p>
+
+<p>Unsurprisingly, the most dramatic performance improvement NPTL offers is in the area of thread creation and destruction. With the new lightweight implementation, creating threads is fast and scalable. Testing thread creation begins by creating a collection of top-level threads, each of which spawn a number of child threads until some number of total threads has been reached (source code can be viewed in create_prof.c, in <a name="rl2"></a><a href="#l2">Listing Two</a>). NPTL is nearly eight times faster than LinuxThreads for a small number of parent threads, and remains constant regardless of the creation conditions. LinuxThreads shows linear performance degradation. (<a name="rf1"></a><a href="0508if1.html">Figure 1</a> presents the results of this test.)</p>
+
+<p>A second interesting test of thread performance measures performance of thread contention. For this test, I provide an implementation of Dr. Edward G. Bradford's "csfast5a" application, which simulates a pipeline model by walking threads around a ring of mutexed "critical HASH(0x1875d14)." This test was originally implemented to demonstrate that spreading a set number of threads across a varying number of critical HASH(0x1875d14) would show performance improvements with an increase in the number of critical HASH(0x1875d14). Drepper's early paper published results for this test showed modest improvements in NPTL over LinuxThreads.</p>
+
+<p>The original implementation, however, yields wildly variable results for any given run because it makes no effort to prevent the scheduler from racing each thread around the ring sequentially. Naturally, threads that do not block are not going to consume much time. This implementation provides such synchronization. Using additional instrumentation not included in this listing for space reasons, I found that start-up synchronization yielded an extremely reliable number of blocking events per application run, and tightly clustered timing results. Additionally, instead of running across a variable number of critical HASH(0x1875d14) (which is not a particularly interesting scenario for our purposes), I ran a variable number of threads to better observe system behavior for different conditions. (This application is cont_prof.c, see <a name="rl3"></a><a href="#l3">Listing Three</a>.) The results in <a name="rf2"></a><a href="0508if2.html">Figure 2</a> show a strong 2x performance improvement.</p>
+<h3>Practical Notes for Developers</h3>
+
+<p>Upgrading a kernel will often require upgrading the toolchain as well. Any stable distribution should, of course, include the optimal toolset for the kernel version, but at the time of this writing, two years after the initial release of kernel 2.6 to the developer community, it remains "in development" at most big name distributions. To make NPTL available to developers as soon as possible, Red Hat backported NPTL to kernel 2.4, although installing this port is widely regarded as a delicate operation.</p>
+
+<p>Unless you are working with a distribution that guarantees the complete toolchain, note <a name="rt1"></a><a href="0508it1.html">Table 1</a>, which lists the recommended versions for compilers and libraries to smooth the process of developing against NPTL.</p>
+
+<p>Because Linux distributions continue to support LinuxThreads for backward compatibility with critical applications that have not yet ported to NPTL, the most commonly asked question in newsgroups is simply, "Which version am I using?"</p>
+
+<p>For applications that link at runtime (dynamic linking), the version linked is dictated by the kernel version. For kernels 2.6.+, an application will link the installed NPTL library. To verify this, perform this command-line test:</p>
+
+<blockquote>
+getconf GNU_LIBPTHREAD_VERSION<br>
+
+</blockquote>
+
+<p>If, however, you want (or need) to link against LinuxThreads on a 2.6 kernel at runtime, you can set the "LD_ASSUME_KERNEL" environment variable like so:</p>
+
+<blockquote>
+export LD_ASSUME_KERNEL=2.4.10<br>
+
+</blockquote>
+
+<p>Now your application will link against LinuxThreads. (Use <i>getconf</i> to confirm.)</p>
+
+<p>For applications that link at compile time (static linking), the library linked depends on where your distribution puts the libraries, and what your default paths are. This can be confusing, because for a statically linked binary, the just-mentioned tests are meaningless. Moreover, the default library for static linking on many distributions is actually the LinuxThreads library. Some distributions may not include a static NPTL library at all.</p>
+
+<p>One trick to locate your libraries is to build a dynamically linked binary and run ldd on it:</p>
+
+<blockquote>
+ldd ./test-app<br>
+
+</blockquote>
+
+<p>This provides information on what libraries will be linked at runtime and where they are. Perform this test once with LD_ASSUME_KERNEL set to your 2.6 version, and once set to some 2.4 version, and you will find your two libraries. If your distribution offers an archive library for static linking, you can then adjust your environment or link line to pick it up. </p>
+<h3>Remaining Issues</h3>
+
+<p>NPTL brings the standard threading model on Linux very close to the POSIX Standard. Early in NPTL development, Jonathan de Boyne Pollard identified a number of areas in which NPTL was non-compliant. Using kernel 2.6.8, glibc 2.3.2, and NPTL Version 0.60, I confirmed that only the following items in his list remain problematic:</p>
+
+
+
+<ul>
+  <li>User and group information is specific to each thread. Accordingly, <i>setuid()</i> only sets the user ID for the executing thread. This problem also exists with the LinuxThreads library.</li>
+  <li>Although process memory and resource consumption are now correctly reported by facilities such as ps and top, within the application, calls to rlimit and rusage remain thread specific. In August 2004, Roland McGrath submitted a patch to glibc that purports to correct this problem, so distributions with glibc 2.3.4 should show correct behavior.</li>
+  <li>Similarly, the <i>times()</i> call reports clock times in a thread-specific manner, where process-wide values are expected.</li>
+</ul>
+
+
+
+<p>Additionally, the web site http://nptl .bullopensource.org/status.php continues to track some other, very minor divergences from the POSIX Standard. </p>
+
+<p>Although NPTL offers impressive performance improvements over its predecessors, developers have shown that there are still easy wins for further performance improvement. In particular, the "fast" in futex should be taken with a grain of salt. Of course, a block-and-context-switch is never free, no matter what the technology. Good thread design must still strive to minimize contention. But kernel hackers are trading patches and design techniques that improve the performance of mutex and condvar operations further still. Because this is the way open-source software development works, the best of these patches and techniques gradually will be incorporated into future releases.</p>
+<h3>Conclusion</h3>
+
+<p>Writing high-performance, robust, multithreaded applications for Linux has traditionally been a risky proposition, requiring creative workarounds and nonstandard approaches. Existing thread libraries represent ingenious attempts to solve a problem that, prior to Version 2.6, was simply not well supported within the kernel. Given the widespread adoption of Linux in corporate, academic, and governmental bodies around the world, it may seem odd to call the most prevalent server in the world unfinished, but until now, that is exactly what Linux has been. Offering thread facilities that were clearly inferior to all its UNIX cousins and every commercial operating system, including some whose lifespan had already ended for other reasons (BeOS, NeXT), the poor support for threaded applications was perhaps Linux's only shortcoming, but it was a galling one.</p>
+
+<p>With NPTL, this shortcoming has been removed. As major distributions ramp up their 2.6 kernel releases over the coming year, the first Linux that can truly be considered "industrial strength" will be available in stable form to everyone. Developers with projects that naturally lend themselves to multithreaded design will no longer need to consider Linux ports or original development with trepidation. For the first time ever, multithreaded design for Linux can genuinely offer performance and reliability improvements over multiprocess design.</p>
+<p><b></b></p>
+<p><b>DDJ</b></p>
+<p><b></b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>#include &lt;pthread.h&gt;
+#include &lt;unistd.h&gt;   /* for getpid() */
+#include &lt;stdio.h&gt;
+#include &lt;malloc.h&gt;
+
+void* _obtain_thread_pid(void* arg)
+{
+    long *exit_status = malloc(sizeof(long));
+    (void) arg; /* keep compiler quiet. */
+    *exit_status = getpid();
+    return exit_status;
+}
+int main()
+{
+    pthread_t thread;
+    void *status_ptr;
+    long *thread_pid;
+    long process_pid = getpid();
+    /* a well behaved application tests the return value of
+    ** pthread_create to ensure there is no error. */
+    pthread_create(&amp;thread, NULL, &amp;_obtain_thread_pid, NULL);
+    pthread_join(thread, &amp;status_ptr);
+    thread_pid = (long*)status_ptr;
+    if (*thread_pid != process_pid)
+        printf("This is linked to the LinuxThreads library.\n");
+    else
+        printf("This is linked to the NPTL library.\n");
+    return 0;
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>#include &lt;pthread.h&gt;
+#include &lt;sys/time.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;errno.h&gt;
+#define __USE_POSIX
+#include &lt;limits.h&gt;
+
+static pthread_attr_t attr;
+static void* _noop_thd(void* arg)
+{
+    (void) arg;
+    return NULL;
+}
+static void* _thread_maker(void* arg)
+{
+    int to_produce = *(int*)arg;
+    /* Sequentially create a number of threads that trivially exit. */
+    while (to_produce) {
+        pthread_t noop;
+        pthread_create(&amp;noop, &amp;attr, &amp;_noop_thd, NULL);
+        pthread_join(noop, NULL);
+        to_produce--;
+    }
+    return NULL;
+}
+int main(int argc, char **argv)
+{
+    struct timeval start;
+    struct timeval fin;
+    int top, sub;
+    pthread_t *thread;
+    pthread_attr_init(&amp;attr);
+    /* Minimize stack size per thread so that we can
+    ** create more threads. */
+    pthread_attr_setstacksize(&amp;attr, PTHREAD_STACK_MIN);
+    /* Accept command line params.*/
+    if (argc &lt; 3) {
+        printf("\nUSAGE: &lt;#thread-producers&gt; &lt;#produced&gt;\n\n");
+        return 1;
+    } else {
+        top = atoi(argv[1]);
+        sub = atoi(argv[2]);
+        if (top &lt; 1) top = 1;
+        if (sub &lt; 1) sub = 1;
+        printf("Using %d parents and %d children for %d threads.\n",
+                     top, sub, top * sub);
+    }
+    thread = calloc(top, sizeof(pthread_t));
+    /* Start timer. */
+    if (gettimeofday(&amp;start, NULL)) {
+        printf("Time of day failed.");
+        abort();
+    }
+    for (int i = 0; i &lt; top; i++)
+        pthread_create(&amp;thread[i], &amp;attr, &amp;_thread_maker, &amp;sub);
+    for (int i = 0; i &lt; top; i++)
+        pthread_join(thread[i], NULL);
+    /* Stop timer. */
+    if (gettimeofday(&amp;fin, NULL)) {
+        printf("Time of day failed at end.");
+        abort();
+    }
+    /* Calculate the delta. */
+    {
+        int usec = fin.tv_usec - start.tv_usec;
+        int sec  = fin.tv_sec  - start.tv_sec;
+        if (usec &lt; 0) {
+            sec--;
+            usec += 1000000;
+        }
+        printf("Time %d sec %d usec\n", sec, usec);
+    }
+    return 0;
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>#include &lt;pthread.h&gt;
+#include &lt;sys/time.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;malloc.h&gt;
+#include &lt;string.h&gt;
+
+#define __USE_POSIX
+#include &lt;limits.h&gt;
+
+static int crit_max;     /* number of critical HASH(0x1875d14).  */
+static int iterations;   /* total per-thread iterations. */
+static int thread_count; /* total number of threads.     */
+static int start_count;  /* global protected by start_signal */
+static pthread_cond_t   go;
+static pthread_mutex_t  start_signal;
+static pthread_mutex_t *critical_region;
+static void _obtain_first_lock(int locknum)
+{
+    pthread_mutex_lock(&amp;critical_region[locknum]);
+    pthread_mutex_lock(&amp;start_signal);
+    start_count++;
+    if (start_count == thread_count) {
+        /* wait until all threads are here! */
+        pthread_mutex_unlock(&amp;start_signal);
+        pthread_cond_broadcast(&amp;go);
+    } else {
+        pthread_cond_wait(&amp;go, &amp;start_signal);
+        pthread_mutex_unlock(&amp;start_signal);
+    }
+}
+static void* _contention_loop(void* arg)
+{
+    int curr, prev, iter;
+    iter = 1;
+    prev = curr = *(int*)arg;
+    _obtain_first_lock(curr++);
+    while (iter &lt; iterations)
+    {
+       iter++;
+        if (curr == crit_max) curr = 0;
+        if (curr == prev) { /* don't block on our own lock! */
+            curr++;
+            continue;
+        }
+        pthread_mutex_lock(&amp;critical_region[curr]);
+        pthread_mutex_unlock(&amp;critical_region[prev]);
+        prev = curr;
+        curr++;
+    }
+    pthread_mutex_unlock(&amp;critical_region[prev]);
+    return NULL;
+}
+static void _configure(int argc, char** argv)
+{
+    if (argc &lt; 3) {
+        printf("\nUSAGE: &lt;threads&gt; &lt;per-thread-iterations&gt;\n\n");
+        abort();
+    } else {
+        thread_count = atoi(argv[1]);
+        iterations   = atoi(argv[2]);
+        if (thread_count &lt; 1)  thread_count = 1;
+        if (iterations   &lt; 1)  iterations   = 1;
+    }
+    crit_max = thread_count + 1;
+}
+static void _prepare(pthread_attr_t *attr, pthread_t **thds)
+{
+    pthread_attr_init(attr);
+    pthread_attr_setstacksize(attr, PTHREAD_STACK_MIN);
+    critical_region = calloc(crit_max, sizeof(pthread_mutex_t));
+    for (int i = 0; i &lt; crit_max; i++)
+        pthread_mutex_init(&amp;critical_region[i], NULL);
+    start_count = 0;
+    pthread_cond_init(&amp;go, NULL);
+    pthread_mutex_init(&amp;start_signal, NULL);
+    *thds = calloc(thread_count, sizeof(pthread_t));
+}
+int main(int argc, char **argv)
+{
+    const int usec_per_sec = 1000000;
+    long tot_usec;
+    struct timeval start;
+    struct timeval fin;
+    pthread_t     *thread;
+    pthread_attr_t attr;
+    _configure(argc, argv);
+    _prepare(&amp;attr, &amp;thread);
+    gettimeofday(&amp;start, NULL); /* start timer */
+    for (int i = 0; i &lt; thread_count; i++)
+    {
+        int *j = malloc(sizeof(int));
+        *j = i;
+        pthread_create(&amp;thread[i], &amp;attr, &amp;_contention_loop, j);
+    }
+    for (int i = 0; i &lt; thread_count; i++)
+        pthread_join(thread[i], NULL);
+    gettimeofday(&amp;fin, NULL); /* stop timer */
+    tot_usec = (fin.tv_sec  - start.tv_sec) * usec_per_sec;
+    tot_usec += fin.tv_usec - start.tv_usec;
+    printf("Total run time %.3f sec.\n", (double)tot_usec / usec_per_sec);
+    return 0;
+}</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

@@ -1,0 +1,123 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal December 1997: C++ and Garbage Collection </title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>C++ and Garbage Collection </h1>
+
+<p><i>Dr. Dobb's Journal</i> December 1997
+</p>
+<h2>Not your father's garbage collection</h2>
+
+<h3>By Mike Spertus</h3>
+
+<I>Mike is the author and chief designer of the commercial Great Circle garbage collector for C/C++. He can be reached at mps@geodesic.com.</I>
+
+<hr>
+
+<p>Memory management in C/C++ is both time consuming and error prone. Typically, about one-third of development time is spent on memory management, and most commercially available programs ship with memory leaks or premature <i>free</i>s. Even worse, no matter how well written your own code is, third-party libraries and DLLs used by your program may leak, leaving you with no way to deliver leak-free applications.</p>
+
+<p>Imagine what would happen if memory just freed itself when it was no longer in use. Programs that freed memory in the wrong place would automatically be fixed, and new code wouldn't need to free memory at all. Such automatic garbage collection is the standard in Java and Smalltalk. In this article, I'll lift the hood on the commercially available Great Circle garbage collector (from Geodesic Systems, the company I work for), focusing on the details that make it practical, transparent, and scalable.</p>
+
+<h3>Why Garbage Collection?</h3>
+
+<p>The basic idea behind garbage collection is refreshingly logical. As a program runs, the garbage collector periodically scans the program's data structures, marking everything that is in use. It begins by scanning the program's stack, registers, and the static segment. Every time it encounters a pointer, it marks the object that it points to. Then it scans that object for pointers to other heap objects. Once it has marked all reachable heap objects, it frees all the objects that haven't been marked (see <a name="rf1"><a href="9712cf1.htm">Figure 1</A>).</p>
+
+<p>The hard part of adapting garbage collection to C/C++ is identifying pointers. Since object libraries and DLLs often lack source, you can't examine the source for type information, and you can't recompile. Typically, you don't even have debugging information. The only remaining option is to relink. This isn't as bad as it sounds, since relinking lets you redefine whatever functions you like.</p>
+
+<p>What functions should you redefine? The natural candidates are memory-management functions -- <i>malloc()</i>, <i>free()</i>, <i>new</i>, and <i>delete</i>. Redefining <i>free()</i> and <i>delete</i> to Null operations protects the programmer from premature frees. This leaves only the <i>malloc()</i> and <i>new</i> allocators.</p>
+
+<p>But how does this help you identify pointers? A solution to this problem was first observed by Hans Boehm and Mark Weiser. (For more information, see their article, "Garbage Collection In an Uncooperative Environment," <i>Software Practice and Experience</i>, September 1988, as well as Boehm's "Advantages and Disadvantages of Conservative Garbage Collection," at ftp://parcftp.xerox.com/pub/gc/issues.html.) Allocators keep track of what memory has been allocated. You can test whether a data word is a pointer by asking the allocator if the word points inside an allocated object. If so, it's probably a pointer. Is this test always right? No, but it's a start.</p>
+
+<p>Great Circle implements a refined version of this pointer-finding strategy through a custom allocator that can efficiently report on the status of any address. Once you can identify pointers, you can garbage collect a program.</p>
+
+<h3>We Interrupt this Program...</h3>
+
+<p>Proper scheduling may be the most important factor in garbage collector performance. The earliest collectors only performed garbage collection when the computer ran out of memory. When a collection finally occurred, it analyzed the computer's entire address memory, interrupting operation for long periods of time. No wonder early garbage collectors were invariably associated with annoying interruptions of program operation.</p>
+
+<p>Many current garbage collectors, especially Java collectors, rely primarily on a low-priority background thread to schedule garbage collection. This approach sounds good, but leads to poor performance. The low-priority background thread provides lots of garbage collection to inactive programs that don't need it. By the same token, computation-intensive programs require large amounts of garbage collection, but don't receive any because the background collection thread doesn't have a chance to run since such a program always demands CPU cycles. As a result, background collection threads should, at best, supplement some other primary collection strategy.</p>
+
+<p>Great Circle decides when to collect garbage by watching how much memory has been allocated since the last collection. This way, programs that use lots of dynamic memory allocation receive the collection they need, while programs that don't allocate much memory don't waste a lot of time doing unnecessary garbage collection.</p>
+
+<p>To further limit program interruptions, you can do only a small part of the garbage collection each time. At first glance, this seems impossible. The heap is constantly changing, so how can you know that the analysis from earlier partial collections is still correct? Memory-management hardware in the CPU provides some help. After analyzing a page of memory, simply "write-protect" that page. If the program modifies the page, the memory-management hardware generates an exception, notifying the collector that it will need to analyze that page again.</p>
+
+<h3>Getting to the Root of the Problem</h3>
+
+<p>What does it mean for data to be garbage? C/C++ expressions access data through local variables, global variables, and compiler temporaries. This data is referred to as a "root." Data is garbage if it cannot be accessed through a pointer chain that starts at a root. Such garbage is permanently inaccessible to the program, and can be safely freed. Scanning from the roots is a major benefit of garbage collection over other forms of automatic memory management, such as reference counting. Cyclic data structures, such as the triangular structure in <a href="9712cf1.htm">Figure 1</A>, are correctly freed by garbage collection although they cannot be reclaimed by reference counting.</p>
+
+<p>Finding the roots simply requires scanning the program's registers, stacks, and static segments to find pointers to live data. The end of the stack for the current thread can be found by taking the address of a local variable, while the static segments and other thread stacks can be obtained from the operating system. A clever way to scan a program's registers in a portable way is shown in <a name="re1"><a href="9712ce1.htm">Example 1</A>. The call to <i>setjmp</i> stores the processor's registers in the <i>jmp_buf</i>. By placing the <i>jmp_buf</i> in a global variable, all the register values are scanned at the same time as the static segments. In effect, the machine-dependent register-scanning code has been reused from the standard C run-time library's implementation of <i>setjmp</i>. Amazingly, this code calls <i>setjmp</i> with no intention of ever calling <i>longjmp</i>. Slick as this approach is, it doesn't work on all configurations, such as 16-bit large model or processors with register windows, so Great Circle actually scans registers with hand-crafted assembly routines for each supported processor.</p>
+
+<h3>Scanning</h3>
+
+<p>Each time a new accessible object is identified, a pointer to it is added to the "mark stack." A collection begins with the roots on the mark stack. You then scan each word of the top item on the mark stack. If the word doesn't point inside an allocated object, it isn't a pointer. On the other hand, if it does point inside an allocated object, the collector marks the object as accessible. It then places the object on the mark stack to ensure that everything the object uses will also be protected. This process is continued until the mark stack is empty.</p>
+
+<p>After every object that can be accessed by the program has been marked as "in use," any unmarked objects can be safely freed. Because you're freeing all unused objects at once, this step is actually faster than manual memory management.</p>
+
+<p>In C++, memory reclamation goes hand-in-hand with the calling of destructors. Of course, calls to <i>delete</i> invoke destructors, so existing code will continue to operate with no changes. Also, most destructors in C++ programs are used to free memory, which is unnecessary when garbage collecting.</p>
+
+<p>For the remaining instances, the garbage collector will have to somehow invoke the destructor when it reclaims memory. Great Circle provides a <i>gcCleanup</i> class for this purpose. You simply inherit from <i>gcCleanup</i>, which automatically registers its destructor as a finalization function. Because the destructor is virtual, the total object's destructor will be correctly invoked. Because destructors might try to access any of the object's members, Great Circle always invokes a destructor before destroying any objects it uses.</p>
+
+<h3>The Allocator</h3>
+
+<p>The key to implementing the aforementioned strategy is an allocator that efficiently reports on the status of an address. By replacing the default <i>malloc</i> and <i>new</i> with a custom allocator, Great Circle tests whether a word is a pointer by checking if the address it points to is inside an allocated object. Great Circle uses two allocators: one optimized for large objects and the other for small objects. Requests for large objects are sent to the large-object allocator, while smaller requests are sent to the small-object allocator. This dual architecture is used by high-performance third-party allocators such as MicroQuill's SmartHeap and Rogue Wave's Heap.h++.</p>
+
+<h3>The Large-Object Allocator</h3>
+
+<p>The large-object allocator always allocates a group of 4096-byte pages at a time. It uses a free-list architecture similar to that described in Section 8.7 of Kernighan and Ritchie's <i>The C Programming Language</i>. Whenever it gets an allocation request, it scans the free list for a free region of memory that can accommodate the request. This allocator is fast and simple because it only manipulates entire pages.</p>
+
+<p>Conventional free-list allocators store a header at the beginning of each block. This causes several problems. First, every such header would fall at the beginning of a 4096-byte page. Each step of walking the free list would cause a processor cache collision, decimating performance. Worse, free blocks of memory are usually paged out to disk by the virtual memory subsystem because they are not in use. Walking the free list can easily thrash the disk if each free object is brought into physical memory to access its header. You can avoid both these problems by storing the block descriptors in a separate linked list of object headers (see <a name="rf2"><a href="9712cf2.htm">Figure 2</A>). Disks are as much as one million times slower than physical memory, so this is a significant optimization.</p>
+
+<h3>The Small-Object Allocator</h3>
+
+<p>Small objects of a given size are most efficiently stored in arrays. By using a variety of arrays with different element sizes, all small objects can be allocated with array-based allocators (<a name="rf3"><a href="9712cf3.htm">Figure 3</A>). The number of arrays is kept under control by allocating similarly sized objects out of the same array. For example, both 28- and 32-byte objects are allocated from an array of 32-byte elements.</p>
+
+<p>The free elements of the array form a high-performance free-list allocator. The first word of a free element is a pointer to the next free element. There is no space overhead for this pointer because it exists only when the object is free. Allocating an element is blindingly fast -- just take the first element on the free list. Freeing takes only a few instructions, too. Simply link the element to the beginning of the free list.</p>
+
+<h3>Pointer Identification</h3>
+
+<p>How does Great Circle decide whether a 32-bit <i>word</i> points inside an allocated object? If <i>word</i> is less than the lowest address in the heap or greater than the highest address, then it isn't even pointing into the heap. Because most words fail this test, this eliminates the vast majority of pointer candidates in just three or four machine instructions.</p>
+
+<p>If <i>word</i> points inside the heap area, you need a more careful analysis. The large-object allocator maintains an array of pointers with one entry for each page. Each entry points to the descriptor of the object containing that page. Shift <i>word</i> to the right to get the page number, and the corresponding array entry points to the descriptor of the object containing that page.</p>
+
+<p>If <i>word</i> points inside an allocated block, the block may be a single object or an array of small objects. The block descriptor contains an array of mark bits to indicate which subobjects of the block are in use. Address arithmetic selects the appropriate mark bit, as in <a name="re2"><a href="9712ce2.htm">Example 2</A>. This code can identify a pointer and mark what it points to in only a few machine instructions.</p>
+
+<h3>Performance</h3>
+
+<p>Garbage collection can actually improve the performance of large, memory-intensive programs. For example, relinking the large UNIX XWindows server program with Great Circle actually speeds its benchmarks. One reason for this is that the collector frees many objects at once, which is more efficient than freeing objects one at a time throughout the program.</p>
+
+<p>You might expect each collection pass to be pretty slow, since the collector must scan every word of every live object to locate possible pointers. In fact, performance comes not in spite of this scanning, but because of it. Scanning and string manipulation have always been high in the thoughts of hardware designers, and processors have special instructions to optimize scanning. Great Circle's marking loop is only a few instructions long, has no function calls that cause pipeline spills, and fits comfortably in the instruction cache. The net result is that Great Circle can scan tens of megabytes of memory per second on modern processors. Careful scheduling and incremental collection also help avoid pauses.</p>
+
+<h3>Avoiding False Negatives</h3>
+
+<p>ANSI C explicitly allows a pointer to point just beyond the end of an array. This can result in a live heap object that is not actually pointed to. An easy way to handle this situation is to always allocate an extra byte at the end of every object. Great Circle also has special code to track pointers in 16-bit DOS/Windows programs, which divide pointers into separate segment and offset components.</p>
+
+<h3>Avoiding False Positives</h3>
+
+<p>If your Social Security number just happens to equal the address of an allocated object, that object will not be reclaimed. The collector has to allow for the possibility of that number being cast to a pointer. Fortunately, because address space is huge, such "false positive" pointer identifications are rare and merely result in occasionally using a little extra memory. But you can take steps to prevent false positives from occurring.</p>
+
+<p>In the marking code, memory pointed to by the pointer candidate can be marked, whether or not there is an object at that location. Omitting the test for an object makes the marking faster and also helps eliminate false pointer positives. If there is an object at that location, the mark means that the object is in use. If that location is free, the mark serves as a warning not to allocate there, because it would make the false pointer look like a pointer to a real object.</p>
+
+<h3>Conclusion</h3>
+
+<p>Garbage collection is becoming the mainstream in C++. The more you understand how C++ garbage collection works, the better you will be able to decide when and how to use it in your programs.</p>
+
+<H4>For More Information</H4>
+
+<BLOCKQUOTE><P>
+Geodesic Systems Inc.<BR>
+414 N. Orleans, Suite 410<BR>
+Chicago, IL 60610<BR>
+312-832-1221<BR>
+http://www.geodesic.com/<BR>
+</P></BLOCKQUOTE>
+
+
+<p><b>DDJ</b></p>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

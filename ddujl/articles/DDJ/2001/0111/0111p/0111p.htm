@@ -1,0 +1,343 @@
+<html>
+<head>
+<title>Nov01: Algorithm Alley</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>An Efficient  Undo/Redo Algorithm</h1>
+<p><i>Dr. Dobb's Journal</i> November 2001</p>
+
+<h3>By Jiri Kripac</h3>
+
+<I>
+Jiri is the principal software architect for Design Variations. He can be contacted at <a href="mailto:jiri-kripac@home.com">jiri-kripac@home.com</a>.</I>
+
+<hr>
+
+<p>Undo/redo functionality is common in most contemporary software systems, but the implementations and their efficiencies vary greatly. The undo/redo mechanism needs to record enough information to be able to roll back the system to its previous states (undo) or to roll forward to states that have just been undone (redo). The information that is recorded is usually either one or both of:</p>
+<p></p>
+<DDJADVERTISEMENT INLINE>
+
+<ul>
+  <li>The sequence of operations that transformed the system from one state to the next one. Each of the operations needs to be reversible. To roll the system back or forward, the undo algorithm traverses the operations in a reverse order and for each operation performs its inverse.
+  <li>The state of the system. To roll the system back or forward, the undo algorithm reads back the previously saved state and makes it the current state.
+
+</ul>
+
+
+<p>The granularity of what the undo mechanism considers an elementary operation or an elementary unit of the system state varies. It may be the whole single operation as the user entered it or it may be decomposed into a sequence of simpler operations. The elementary unit of the system state may be as large as more-or-less saving the complete state of the system (for example, when saving the whole raster image), or it may be smaller pieces of information that represent just the changed parts of the state or the differences between the states. (For an alternative approach to undo/redo, see "C Programming" by Al Stevens, <i>DDJ</i>, November 1998.)</p>
+
+
+
+<h3>A New Undo/Redo Algorithm</h3>
+
+
+<p>The algorithm I present here performs undo/redo for a general network of interconnected objects. The relations between objects are represented by simple pointers. The algorithm intentionally works with such a basic data structure to be broadly applicable.</p>
+
+
+<p>The undo mechanism is responsible for recording information about the changes that are being done to the network of objects, and for reversing these changes. It performs two kinds of so-called "activities":</p>
+
+
+<ul>
+  <li>Recording new operations. When objects are being added, modified, or deleted by the master application (the software system the undo mechanism is a subsystem of), the undo mechanism writes the information about each operation that is performed into its undo file, one undo record per operation. The undo records are saved to a disk file so as not to occupy the main memory with data that is seldom needed.
+  <li>Reversing (undoing or redoing) existing operations. When the master application requests the undo mechanism to roll back or roll forward to another state, the undo mechanism reads back the undo records in the reverse order, reverses the operations, and performs them, modifying the network of objects. It also writes the reversed operations into the other file (the redo file when doing undo and reading from the undo file, or the undo file when doing redo and reading from the redo file).
+
+</ul>
+
+
+<p>The elementary operations that are considered by the undo mechanism are:</p>
+
+
+<ul>
+  <li>Create an object.
+  <li>Change the value of an object.
+
+  <li>Delete an object.
+
+  <li>Save the Pointer Relocation Map (PRM), which will be explained later.
+
+</ul>
+
+
+<p>These operations are written into an undo or a redo file in the form of "Create," "Change," "Delete," and "Save PRM Undo Records."</p>
+
+<p>Individual undo records are grouped in undo transactions, which are elementary units that the master application can request to undo or redo. The number of undo records for an object in a transaction is optimized. If the transaction already contains a "Change Undo Record" for an object, no more "Change Undo Records" are added, even if the object is changed several times within the same transaction, because we do not need to record all the intermediate states of the object within a single transaction. If the transaction contains a "Create Undo Record" as well as a "Delete Undo Record" for an object, both undo records are removed from the transaction because the object has been created and deleted from within the same transaction.</p>
+
+<p>When the transaction is recorded, the "Save PRM Undo Record" is written into the undo file first, followed by "Create Undo Records," "Change Undo Records," and finally "Delete Undo Records." When the transaction is reversed, this ordering causes new objects to be created first and existing objects to be deleted last. The undo mechanism also makes sure that when an object is deleted and it has not been created from within the same transaction, its address is not reused for other objects created within this transaction. The address can later be freely reused for objects created by other transactions.</p>
+
+
+
+<h3>Reversing "Delete Object" Operation</h3>
+
+
+<p>Each of the elementary operations needs to be reversible. The problem is with reversing the "Delete Object" operation: When an object is deleted, it is removed from the memory. When reversing the "Delete Object" operation, the object is recreated. However, the newly created object will have a different memory address than the original one had. There is no way to force the new object to be allocated at exactly the same memory address as the deleted one because the memory address may have already been reused.</p>
+
+
+<p>When other objects reference the object that has been deleted and undeleted, their pointers to the original object are no longer valid because the object now has a different address. This causes a serious complication to the undo algorithm.</p>
+
+<p>As far as I know, other implementations solve this problem in two ways:</p>
+
+
+<ul>
+  <li>Do not allow deleting objects. A pseudodestructor method is usually provided so that the client code can call it instead of the real destructor, but this pseudodestructor does not free the object from the memory.
+  <li>For each object, keep some kind of a proxy object that points to the actual object. These proxy objects are not deleted when the actual object is. When saving the object's state, instead of saving the pointer values, the proxy indices (assuming proxies are kept in a simple vector) are saved. When reading back the object's data, the read-in proxy indices are changed back to pointers to new objects the proxies currently point to.
+
+</ul>
+
+
+<p>The disadvantage of the first solution is that it wastes memory by keeping deleted objects around, even if they are not needed. The disadvantage of the second solution is that the additional data for the proxies needs to be kept in memory and, similar to the first solution, the proxies are never deleted from the memory, even if they correspond to deleted objects.</p>
+
+<p>The algorithm I present here efficiently solves the problem of undoing the deletion of objects. It lets the deleted objects be really freed from the memory, does not keep any additional data for each object, or any "residual data" for deleted objects. This is achieved by using the following data structure.</p>
+
+
+
+<h3>Pointer Relocation Map (PRM)</h3>
+
+
+<p>Pointer values saved in an undo or a redo file may point to objects that may have been deleted and recreated (by undoing "Delete Object" or redoing "Create Object" operations), so they may not point to memory addresses of objects that currently exist in the system. The Pointer Relocation Map maps these saved pointer values to pointers to currently existing objects.</p>
+
+
+<p>If a pointer is not found in the map, it means the object has not been relocated and the pointer maps to itself.</p>
+
+<p>There is one global PRM in the undo system that represents the current pointer relocation of pointers that are being read from undo records to pointers to currently existing objects. The PRM is being used only when reversing operations; that is, performing undo or redo. It is written into the undo file and deleted from the memory after undoing/redoing is completed because it is not needed at any other time.</p>
+
+<p>The syntax <i>PRM(ptr)</i> is used to denote the mapping of the given pointer using the current PRM. The syntax <i>PRM</i><i>-1</i><i>(ptr)</i> is used to denote the inverse mapping.</p>
+
+<p>The PRM is written into an undo or a redo file as a "Save PRM" operation. When it is read back, it is merged with the current PRM using this algorithm:</p>
+<ol>
+
+<li>	Create a temporary PRM named <i>TmpPRM</i>.<p></p>
+
+<li>For each entry <i>A</i><IMG SRC="arrow14.gif"><i>B</i> in the PRM read from the file, do: <p></p>
+</li>
+
+<ul>
+  <li>Get <i>C=PRM(B</i>), that is, map <i>B</i> using the current PRM.
+  <li>Add entry <i>A</i><IMG SRC="arrow14.gif"><i>C</i> to <i>TmpPRM</i>.
+
+  <li>If <i>B</i><IMG SRC="noteq.gif"><i>C</i>, remove the entry <i>B</i><IMG SRC="arrow14.gif"><i>C</i> from the current PRM.
+
+
+</ul>
+
+<P><li>Add all entries from <i>TmpPRM</i> to the current PRM.<p></p>
+
+</ol>
+
+<h3>Recording and Reversing Operations</h3>
+
+
+<p>There are two activity types &#151; recording and reversing &#151; and four operation types &#151; add, change, delete object, save PRM &#151; giving eight possible combinations of what the undo mechanism can be doing. All combinations will now be described in detail. This is the core of the undo algorithm.</p>
+
+
+<p>In the following discussion, <i>ptr</i> denotes the pointer to an object being dealt with. The "opposite file" means the other file than is currently being read from; that is, if reading from the undo file, it will be the redo file, and vice versa.</p>
+
+
+
+  <P><b>Record "Save PRM" Operation</b>
+  <ul>
+  <li>If the PRM is not empty, write it into the undo file and, after it has been written out, clear it. 
+
+  <li>Erase the contents of the redo file.
+</ul>
+  <P><b>Record "Create Object" Operation</b>
+<ul>
+  <li>Record "Save PRM" operation.
+
+  <li>Obtain pointer <i>ptr</i> to an object that has just been created.
+
+  <li>Write <i>"</i><i>Create ptr</i>" record into the undo file.
+
+  <li>Record "Change Object's Value" operation.
+</ul>
+
+
+  <P><b>Record "Change Object's Value" Operation</b>
+
+<ul>
+  <li>Record "Save PRM" operation.
+  <li>Write <i>Change ptr, originalObjectValue</i> record into the undo file. The <i>originalObjectValue</i> is the serialized contents of the object prior to making changes. If the object has just been created in the current transaction, do not serialize its contents and leave <i>originalObjectValue</i> empty.
+
+  <li>Let the master application change the value of the object.
+
+  </ul>
+
+  <P><b>Record "Delete Object" Operation</b>
+<ul>
+
+  <li>Record "Change Object's Value" operation.
+
+  <li>Write "<i>Delete ptr, className"</i> record into the undo file. The <i>className</i> is an identification of the class of the object, so that an object of the same class can be recreated by the undo mechanism.
+
+  <li>Let the object be deleted.
+</ul>
+ 
+
+  <P><b>Reverse "Save PRM" Operation</b>
+<ul>
+  <li>Read the "Save PRM" record from the current undo or redo file and remove the record from the file.
+
+  <li>Write "Save PRM" record, with the inverse of the read PRM, into the opposite undo or redo file.
+
+  <li>Merge the read PRM with the current PRM using the algorithm described earlier.
+
+</ul>
+
+  <P><b>Reverse "Create Object" Operation</b>
+<ul>
+  <li>Read the "<i>Create ptr"</i> record from the current undo or redo file and remove the record from the file.
+
+  <li>Write "<i>Delete ptr, className"</i> record into the opposite undo or redo file.
+
+  <li>Delete the object whose address is <i>currentPtr=PRM(ptr).</i>
+
+  <li>Remove the entry <i>ptr</i><img src="arrow14.gif"> <i>currentPtr</i> from the PRM.
+
+</ul>
+
+<P><b>Reverse "Change Object's Value" Operation</b>
+
+
+<ul>
+  <li>Read the "<i>Change ptr, originalObjectValue"</i> record from the current undo or redo file, and remove the record from the file.
+  <li>Write "<i>Change ptr, currentObjectValue" </i>record into the opposite undo or redo file. The <i>currentObjectValue</i> is the serialized contents of the object. If the object has just been created while reversing the current transaction, do not serialize its contents and leave <i>currentObjectValue</i> empty.
+
+  <li>When writing the contents of the object, inverse map the pointers using the PRM; that is, instead of writing a pointer <i>currentPtr</i>, write a pointer <i>PRM</i><i><sup>-1</sup></i><i>(currentPtr).</i>
+
+  <li>If not empty, read the <i>originalObjectValue</i> from the record into the current object.
+
+  <li>When reading <i>originalObjectValue</i> into the current object, map the pointers using the PRM; that is, when reading pointer <i>originalPtr</i>, map it to <i>PRM(originalPtr)</i>.
+</ul>
+  
+  <P><b>Reverse "Delete Object" Operation</b>
+<ul>
+  <li>Read the "<i>Delete ptr, className"</i> record from the current undo or redo file and remove the record from the file.
+
+  <li>Write<i> "Create ptr"</i> record into the opposite undo or redo file.
+
+  <li>Create a new object of the given class. Its memory address is <i>currentPtr</i>.
+
+  <li>Add entry <i>ptr</i><img src="arrow14.gif"> <i>currentPtr</i> to the PRM.
+
+</ul>
+
+<h3>Several Comments</h3>
+
+
+<p>Notice that when reversing an operation, the algorithm reads the operation from an undo or a redo file, reverses it, and writes the reverse operation to the opposite file so that the operation can be reversed again.</p>
+
+
+<p>Pointers are always written as values of pointers to the original objects, even if these objects may have been deleted and undeleted several times. The undo and redo files keep the original pointer values. The PRM maps these original pointers to pointers to the currently existing objects when reading from an undo or a redo file, or maps pointers to existing objects back to pointers to the original objects, when writing to an undo or a redo file.</p>
+
+<p>The PRM is kept in the memory only when the algorithm is in the middle of undoing or redoing. Otherwise, there is no PRM kept in the memory, nor is there any data kept in the memory for objects that have been deleted.</p>
+
+
+
+<h3>An Example</h3>
+
+
+<p>As an example (see <A NAME="rt1"></a><A HREF="0111pt1.htm">Table 1</A>), I show a network of two objects, <i>A </i>and<i> B,</i> object <i>A</i> having a <i>ptr</i> data member pointing to object <i>B.</i> Object <i>B</i> will be deleted and undeleted three times. <i>B</i> will denote the originally created object and <i>B1, B2, B3</i> will denote its recreations. In our simple example, the following will happen with these objects:</p>
+
+
+<p></p>
+
+<ul>
+  <li>Record transaction <i>T1</i>: Create object <i>A</i>.
+  <li>Record transaction <i>T2</i>: Create object <i>B</i>, make <i>A.ptr</i> point to <i>B</i>.
+
+  <li>Undo transaction <i>T2</i>.
+
+  <li>Redo transaction <i>T2</i>.
+
+  <li>Record transaction <i>T3:</i> Make <i>A.ptr</i> point to NULL, delete object <i>B1.</i>
+
+  <li>Undo transaction <i>T3</i>.
+
+  <li>Redo transaction <i>T3</i>.
+
+  <li>Undo transaction <i>T3</i>.
+
+</ul>
+
+
+<p>At the end, the network contains object <i>A</i> pointing to object <i>B3</i> (three times deleted and undeleted object <i>B</i>).</p>
+
+
+
+<h3>A Table</h3>
+
+
+<p>The columns in <A NAME="rt1"></a><A HREF="0111pt1.htm">Table 1</A> mean: </p>
+
+
+<p></p>
+
+<ul>
+  <li>Transaction: the transaction that is being performed by the master application (and recorded by the undo mechanism) or undoing or redoing an already recorded transaction.
+  <li>Result: the state of the network (of the two objects <i>A</i> and <i>B</i>) after the transaction or undo/redo has been completed.
+
+  <li>PRM: the PRM after the transaction or undo/redo has been completed.
+
+  <li>Undo File: the contents of the undo file after the transaction or undo/redo has been completed. The end of the file is at the bottom.
+
+  <li>Redo File: the contents of the redo file after the transaction or undo/redo has been completed. The end of the file is at the top so that it is more visible that reversing an operation moves it from one file to the other one.
+
+</ul>
+
+
+<p>The second argument in the "Change Undo Record" is the <i>originalObjectValue</i> that is written into the undo or the redo file. If nothing is written out, it is denoted by "-." In our simple example, <i>originalObjectValue</i> is just the value of the <i>ptr</i> data member of the object <i>A.</i> For simplicity, I do not show the serialized value of the object <i>B.</i></p>
+
+<p>Notice that at the beginning of recording transaction <i>T3</i>, the state of the PRM is written into the undo file and the PRM is cleared. </p>
+
+<p>At the end of undoing transaction <i>T3</i>, the "Save PRM" operation is reversed, merging the read-in PRM with the current PRM. When undoing transaction <i>T3</i> for the first time, the current PRM will temporarily contain mapping <i>B1</i><img src="arrow14.gif"><i>B2</i>, which has been added by reversing operation "<i>Delete B1"</i> that created a new object <i>B2</i>. This mapping is merged with mapping <i>B</i><img src="arrow14.gif"><i>B1 </i>read from the undo file, producing the current PRM that contains mapping <i>B</i><img src="arrow14.gif"><i>B2.</i> When undoing transaction <i>T3</i> for the second time, the only difference is that undoing operation "<i>Delete B1"</i> will create a new object <i>B3</i> instead of <i>B2</i>.</p>
+
+<p>At the beginning of redoing transaction <i>T3</i>, the "Save PRM" operation, read from the redo file, is reversed, merging the read-in PRM with the current PRM. The current PRM contains mapping <i>B</i><img src="arrow14.gif"><i>B2, </i>which is merged with mapping <i>B1</i><img src="arrow14.gif"><i>B </i>read from the redo file, making the current PRM temporarily contain mapping <i>B1</i><img src="arrow14.gif"><i>B2.</i> However, reversing the "<i>Create B1"</i> operation will remove the entry <i>B1</i><img src="arrow14.gif"><i>B2 </i>from the current PRM, leaving the current PRM empty.</p>
+
+
+
+<h3>Integration</h3>
+
+
+<p>To make classes undoable/redoable, the master application derives them from a base class that implements the undo functionality. Here I describe what the master application needs to do when creating, changing, and deleting undoable objects.</p>
+
+
+<p>When creating a new undoable object, the master application does not need to do anything special related to the undo mechanism. The base class constructor does the work.</p>
+
+<p>Before modifying the contents of an undoable object, the master application needs to call a method to inform the undo mechanism to serialize the original contents of the object. It is important to make sure that during the serialization, the object does not contain any bad pointer values, such as pointers to already deleted objects, because the pointers are mapped using the PRM.</p>
+
+<p>When deleting an undoable object, the destructor needs to call a method to inform the undo mechanism that the object is going to be deleted. It cannot be done automatically in the base class destructor because at this time, the object is already almost completely destroyed.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>The algorithm I present here performs undo/redo for a general network of connected objects. It differs from the known solutions in its ability to efficiently handle undoing and redoing of object creation and deletion without keeping any additional data structures in the memory or any residual data for the deleted objects.</p>
+
+
+<p>The algorithm has been implemented in C++. The actual implementation also contains other features, such as supporting partial backup of objects instead of always serializing the whole contents of the objects, but the original ideas of the algorithm are described in this article.</p>
+
+<p>We've used this algorithm in an Internet tool called "Varia" that lets Internet users do interactive 3D modeling and 3D assembly directly on their web pages. </p>
+
+<p>The tool is based on a mechanism called "Hierarchical Dependency Manager." When users change some parameters in the model, this mechanism automatically updates the entire model to reflect the changes. The update may involve automatic repositioning, resizing, changing shape, or otherwise changing many pieces of the model. </p>
+
+<p>Users can create their own intelligent modeling blocks called "components" by simply selecting on the screen what needs to be part of the new component. The intelligence means that the components keep the knowledge of how to reposition, resize, or otherwise adjust themselves when some parameters change, and how they are connected to other parts of the model.</p>
+
+<p>Hierarchical components of arbitrary complexity can be created by selecting simpler components that will become subcomponents of the new, more complex component. Because of the intelligence, the components in the hierarchy interact with each other, for example, the shape or other parameters of one component may depend on the shape or parameters of other components. This is a major difference from the existing modeling systems that treat components as 3D rigid bodies that can just be assembled together.</p>
+
+
+
+<h3>Acknowledgments</h3>
+
+
+<p>Thanks to my colleagues at Design Variations for making this company a creative place to work, and to John Ulmer for implementing the algorithm and spotting a few initial problems.</p>
+
+
+<p></p>
+
+
+<p><b>DDJ</b></p>
+</body>
+</html>

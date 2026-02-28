@@ -1,0 +1,289 @@
+<html>
+<head>
+<title>October, 2004: Timing Some Common Optimizations</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<p><i>C/C++ Users Journal</i> October, 2004</p>
+<h1>Timing Some Common Optimizations</h1>
+<h2>Does allocating and initializing a large array make a difference?</h2>
+
+
+<h3>By Andrew Koenig and Barbara E. Moo</h3>
+
+
+<I>Andrew Koenig is a former AT&amp;T researcher and programmer for more than 35 years. He is author of <i>C Traps and Pitfalls</i> and, with Barbara, coauthor of <i>Ruminations on C++ and Accelerated C++</i>. Barbara Moo is an independent consultant with 20 years of experience in the software field.</I>
+
+<hr>
+
+
+
+
+
+<p>Suppose someone asks you to write a piece of efficient C++ code that allocates an <b>n</b>-element array and initializes each element to its index. In other words, the first element (element number zero) should be set to 0, the next element to 1, and so on. How do you do it? Is this your first thought?</p>
+
+<pre>
+std::vector&lt;int&gt; v;
+for (std::vector&lt;int&gt;::size_type i = 0; 
+  i != n; ++i)
+   v.push_back(i);
+
+</pre>
+
+<p>Or do you realize that each call to <b>push_back</b> must potentially reallocate the vector, which is expensive, and even if it doesn't, to test whether reallocation is needed is hardly free? With these realizations, are you tempted to write something like this instead?</p>
+
+<pre>
+std::vector&lt;int&gt; v(n);
+for (std::vector&lt;int&gt;::size_type i = 0; 
+  i != n; ++i)
+   v[i] = i;
+
+</pre>
+
+<p>Perhaps you realize that this code is also inefficient, for two reasons:</p>
+
+
+
+<ul>
+  <li>It allocates <b>v</b> with <b>n</b> elements, which it implicitly initializes to zero and then overwrites with successive values of <b>i</b>. </li>
+  <li>It uses indices instead of pointers, which means that each use of <b>v[i]</b> requires a multiplication to compute the address in which to store <b>i</b>, and that multiplication is expensive.</li>
+</ul>
+
+
+
+<p>Realizing that these operations are expensive, do you circumvent that expense by writing something like this instead?</p>
+
+<pre>
+int* array = new int[n];
+register int* p = array;
+for (register size_t i = 0; i != n; ++i)
+  *p++ = i;
+
+</pre>
+
+<p>By using built-in arrays, this code avoids having to initialize the elements of the array more than once. By using pointers, it avoids the multiplication that would otherwise be needed to compute the address of array elements. And, of course, it avoids any overhead that might be associated with calling <b>push_back</b> for each element.</p>
+
+<p>If you are an experienced C++ programmer, you probably do this kind of optimization almost every time you write a program. When was the last time you actually took the trouble to find out how much time such optimizations save?</p>
+
+<p>In this article, we measure simple programs to estimate the cost of <b>push_back</b>, vectors (with and without double initialization), indices versus pointers, and the <b>register</b> keyword. As ever, our results are valid only on our particular computers, but they may be useful as a way of showing how much difference such optimizations may make in your context.</p>
+<h3>The Cost of push_back</h3>
+
+<p>Let's start with the most straightforward example we can imagine:</p>
+
+<pre>
+const vector&lt;int&gt;::size_type n = 1000000;
+for (int k = 0; k != 1000; ++k) {
+   vector&lt;int&gt; v;
+   for (vector&lt;int&gt;::size_type i = 0; 
+     i != n; ++i)
+      v.push_back(i);
+}
+
+</pre>
+
+<p>We have arbitrarily picked <b>1000000</b> as a value for <b>n</b> so that the program's execution time will be dominated by the time spent dealing with vector (or array) elements, rather than fixed overhead such as allocation.</p>
+
+<p>We ran this program fragment on two machines, one built about a year ago and the other about seven years old. In both cases, we turned on compiler optimization. We found execution times of 17.1 and 163 seconds, respectively. In other words, the new machine is about 9.5 times as fast as the old one.</p>
+
+<p>We observed earlier that the cost of using <b>push_back</b> comes from two sources: the need to reallocate the vector from time to time (and copy its elements), and the cost of testing for the need for reallocation. It is easy to avoid the cost of reallocation: Instead of letting the vector figure out how much space it is going to need, tell it by calling <b>reserve</b>. The change to the code is trivial:</p>
+
+<pre>
+const vector&lt;int&gt;::size_type n = 1000000;
+for (int k = 0; k != 1000; ++k) {
+   vector&lt;int&gt; v;
+   v.reserve(n);          // added
+   for (vector&lt;int&gt;::size_type i = 0; 
+     i != n; ++i)
+      v.push_back(i);
+}
+
+</pre>
+
+<p>When we make this small change, we find timings of 8.4 and 138 seconds, respectively. In other words, calling <b>reserve</b> more than doubled the speed on the new machine, but saved only about 15 percent on the old one. Apparently, the testing part of <b>push_back</b> is relatively more expensive on the old machine than on the new one.</p>
+
+<p>One way to avoid the overhead of <b>push_back</b> is to construct a vector with <b>n</b> elements directly, and then assign a new value to each of those elements:</p>
+
+<pre>
+for (int k = 0; k != 1000; ++k) {
+   vector&lt;int&gt; v(n);
+   for (vector&lt;int&gt;::size_type i = 0; 
+    i != n; ++i)
+     v[i] = i;
+}
+
+</pre>
+
+<p>On the new machine, this program runs at about the same speed: 8.4 seconds. Curiously, the old machine runs in 60 seconds, more than twice as fast as the <b>push_back</b> version.</p>
+
+<p>Having rewritten the program in this way, we realize that we are touching every element of the vector twice: The first time is when we initialize the elements; the second is when we assign new values to them. This fact suggests that we should try measuring just the assignment part of the program, so that we can see how much overhead we might be able to avoid by having a vector already allocated. We can do that by rewriting our program so that it allocates (and initializes) the vector once, then fills it 1000 times:</p>
+
+<pre>
+vector&lt;int&gt; v(n);
+for (int k = 0; k != 1000; ++k) {
+   for (vector&lt;int&gt;::size_type i = 0; 
+    i != n; ++i)
+     v[i] = i;
+}
+
+</pre>
+
+<p>This code allocates <b>v</b> outside the main loop, and then fills each element repeatedly. We can therefore expect the cost of the initialization to be buried in the rest of the program's execution time. When we change the program this way, the timings are 2.7 and 28.6 seconds, respectively.</p>
+
+<p>In other words, at least on the two machines we tried, the library takes quite a bit longer to initialize a vector's elements than it takes for us to overwrite those elements after the library has initialized them. Indeed, the library's initialization seems to take about as long as it does for us to call <b>push_back</b> on the new machine, and about twice as long on the old one. <a href="0410koenigt1.html" target="_BLANK">Table 1</a> summarizes the results so far.</p>
+<h3>Vectors and Arrays</h3>
+
+<p>Of course, most programs that use vectors or arrays expect to access their elements many times. In such contexts, what matters is not how long it takes to create or access an array or vector, but how long it takes to access or modify an element. We can estimate how long such operations take by allocating an array or vector once, and then accessing each element many times. We should do so both for reading and writing the elements because there is no reason to believe that these two operations will take the same amount of time.</p>
+
+<p>We begin by noting that we already wrote a program that creates a large array once and overwrites its elements many times:</p>
+
+<pre>
+vector&lt;int&gt; v(n);
+for (int k = 0; k != 1000; ++k) {
+  for (vector&lt;int&gt;::size_type i = 0; i != n; ++i)
+  v[i] = i;
+}
+
+</pre>
+
+<p>and we determined that this program takes 2.7 and 28.6 seconds, respectively, on our two machines. What if we change the program to read each vector element instead of writing it? Then the program looks like this:</p>
+
+<pre>
+vector&lt;int&gt; v(n);
+for (int k = 0; k != 1000; ++k) {
+   int sum = 0;
+   for (vector&lt;int&gt;::size_type i = 0; i != n; ++i)
+     sum += v[i];
+}
+
+</pre>
+
+<p>and the execution times drop to 0.86 and 17.7 seconds, respectively. In other words, reading is 3.1 times as fast as writing on the new machine but only 1.7 times as fast on the old one.</p>
+
+<p>Suppose we change the program to use a built-in array instead of a vector? Then the first program (which writes the array elements repeatedly) looks like this:</p>
+
+<pre>
+const size_t n = 1000000;
+int* array = new int[n];
+for (int k = 0; k != 1000; ++k) {
+   for (size_t i = 0; i != n; ++i)
+      array[i] = i;
+}
+delete[] array;
+
+</pre>
+
+<p>and the second program (which accesses the elements repeatedly without writing them) looks like this:</p>
+
+<pre>
+const size_t n = 1000000;
+int* array = new int[n];
+for (size_t i = 0; i != n; ++i)
+   array[i] = 0;
+for (int k = 0; k != 1000; ++k) {
+   int sum = 0;
+   for (size_t i = 0; i != n; ++i)
+      sum += array[i];
+}
+delete[] array;
+
+</pre>
+
+<p>When we measure these programs, we find that the program that writes the array elements runs in 2.7 seconds on the new machine and 32 seconds on the old one. In other words, there is no measurable difference between writing vector elements and writing array elements on the new machine, and only a very slight difference on the old.</p>
+
+<p>The program that reads the array elements takes the same 0.86 seconds on the new machine as its vector counterpart. On the old machine, however, we get a surprise: The execution time drops from 17.9 seconds for reading vector elements to 3.4 seconds for reading array elements!</p>
+
+<p>From this fact, you might be tempted to conclude that vectors are hopelessly slow on this machine. However, if we repeat the experiment by asking the compiler to provide more optimization than it normally does, we find that the execution time drops to 3.4 seconds, and it is now exactly the same for vectors and arrays.</p>
+
+<p>So apparently, this particular compiler's optimizer does not cope as well with vectors as it does with arrays unless you ask it to put in some extra effort. Once we have asked for that extra effort, there is no significant performance difference between vectors and arrays, at least as far as accessing or changing elements is concerned.</p>
+<h3>Indices and Pointers</h3>
+
+<p>What about the multiplication implicit in using indices instead of pointers or iterators? We can estimate the relevant costs easily enough, by starting with the version of our program that reads the vector or array elements (because the indexing overhead will be more visible with the faster operation) and changing it to use pointers or iterators instead. Here's the vector version:</p>
+
+<pre>
+for (int k = 0; k != 1000; ++k) {
+   int sum = 0;
+   vector&lt;int&gt;::const_iterator it = v.begin();
+   for (vector&lt;int&gt;::size_type i = 0; i != n; ++i) {
+      sum += *it;
+      ++it;
+   }
+}
+
+</pre>
+
+<p>When we run this program on the old machine, we find that the execution time is exactly the same as it is for the version with the indices&#151;provided that we ask for extra optimization as we did before. If we use the default optimization, we find that the iterator version takes 52 seconds to run, as opposed to 17.9 seconds. Clearly, the default optimization is not enough to cope with this program on this compiler.</p>
+
+<p>On the new machine, the iterator version is a tiny bit faster: 0.83 seconds instead of 0.86 seconds.</p>
+
+<p>From these numbers, we conclude that there is not much performance difference between iterators and indices, provided that the compiler's optimizer is working as it should.</p>
+
+<p>What about switching from array indices to pointers? The revised loop looks like this:</p>
+
+<pre>
+for (int k = 0; k != 1000; ++k) {
+   int sum = 0;
+   int* p = array;
+   for (size_t i = 0; i != n; ++i) {
+      sum += *p;
+      ++p;
+   }
+}
+
+</pre>
+
+<p>This program runs exactly as fast as the version that uses indices on both machines, with or without extra optimization.</p>
+<h3>Registers</h3>
+
+<p>As a final test, we decorated the last version of our program with <b>register</b> declarations, to give the compiler a hint that perhaps it should try to store some frequently used variables more efficiently:</p>
+
+<pre>
+register int* array = new int[n];
+for (register size_t i = 0; i != n; ++i)
+   array[i] = 0;
+for (register int k = 0; k != 1000; ++k) {
+   register int sum = 0;
+   register int* p = array;
+   for (register size_t i = 0; i != n; ++i) {
+      sum += *p;
+      ++p;
+   }
+}
+delete[] array;
+
+</pre>
+
+<p>We found this decoration to be just that: It had no measurable effect on the program's execution time on either machine.</p>
+<h3>Discussion</h3>
+
+<p>We have taken simple measurements of simple programs. Nevertheless, we have had several surprises, at least as far as our particular implementations are concerned:</p>
+
+
+
+<ul>
+  <li>Allocating a vector means initializing its elements, either implicitly (by specifying an element count) or explicitly (by calling <b>push_back </b>repeatedly). Either way, the cost of doing so is substantially greater than the cost of giving a value to an array or vector element.</li>
+  <li>On the other hand, programs that use arrays or vectors typically use the elements many times. Once a program has created an array or a vector, the cost of accessing or modifying elements is essentially the same for each data structure&#151;provided that you ask the compiler for enough optimization.</li>
+  <li>The extra optimization makes a huge difference in execution time on one of our machines, and almost no difference on the other.</li>
+  <li>We cannot discern any difference between using pointers (or iterators) and using indices, at least not with these particular programs.</li>
+  <li>We do not see any benefit to using <b>register</b> declarations.</li>
+</ul>
+
+
+
+<p>Perhaps the biggest surprise is that our tests do not give enough information to answer our original question definitively: How should we write an efficient program to allocate and initialize a large array?</p>
+
+<p>You might be tempted to argue that our tests do answer the question. After all, all of our tests confirm the notion that if you use arrays instead of vectors, and pointers instead of indices, your program will run no more slowly than the alternatives, and might run more quickly. So why not use the most efficient alternative?</p>
+
+<p>One answer is that it is possible to write programs that are faster than any of the ones we have shown. For example, we could surely make them even faster by unrolling loops, or making use of knowledge of our hardware to initialize more than one array element at a time, or using other tricks and techniques. </p>
+
+<p>However, every one of these optimization techniques carries a human cost: They all require effort to use, and most of them make the program harder to understand and maintain. So the question we should be asking is not, "How can we write the most efficient programs possible?" but rather, "What is the right balance between saving computer time and saving human time?" To answer that question intelligently, we must have at least a rough idea of how much human time a particular optimization costs and how much computer time it saves. </p>
+
+<p>What even our rough measurements have shown is that the amount of computer time these optimizations save varies from one context and one implementation to another. Accordingly, the optimum balance is not always easy to find. Our personal bias is to make programs as straightforward as we can. Then, if the programs turn out to run too slowly, we can find the problem and rewrite the slow parts as needed. </p>
+
+
+
+
+
+</body>
+</html>

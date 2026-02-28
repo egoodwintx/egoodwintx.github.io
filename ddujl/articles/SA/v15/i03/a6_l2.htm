@@ -1,0 +1,190 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v15, i03: Listing 2 config2db</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a6.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a6_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink"><a href="a6_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink">Listing 2</span></td>
+		<td><a href="../../../../source/SA/2006/mar2006.tar"><b class=codeListing>mar2006.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h2><B>Listing 2 </B><I>config2db</i></h2>
+            <p> 
+            <pre>
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use lib 'scripts';
+use IO::File;
+use NetAddr::IP;
+use Cisco::Reconfig;
+use MyConfigCDBI;
+$|++;
+
+sub version_file { my $f = shift; $f =~ s/\.config$/\.version/; $f }
+
+sub get_version
+{
+    my $fh = new IO::File $_[0];
+    my $version;        # The output of show version
+    my $class;
+
+    unless ($fh)
+    {
+    warn "Failed to open version file $_[0]: $!\n";
+    return (map { 'Could not read version file' } 1 .. 3);
+    }
+
+    do { local $/ = undef; $version = &lt;$fh&gt;; };
+    close $fh;
+
+    my $sw = ($version =~ m/^(.+Software .+ Version .+)$/m)[0] 
+    || 'Cannot find software version';
+    my $hw = ($version =~ 
+          m/^(cisco .+ (processor .+|bytes of memory\.?))$/mi)[0] 
+          || 'Cannot find hardware version';
+    my $sn = ($version =~ m/processor board ID (\w+( \([^\)]+\))?)/mi)[0]
+    || 'Cannot find serial number';
+
+    if ($version =~ m/cisco\s(Cat6k-|WS-C(29|3[57]|40))/)
+    {    $class = 'switch' }
+    elsif ($version =~ /cisco\s(2[56]\d\d|18\d\d
+|WS-C65\d\d|17\d\d|CISCO76\d\d)\s/ix)
+    {    $class = 'router' }
+    elsif ($version =~ /cisco\sAIR-AP/)
+    {    $class = 'access-point' }
+
+    return ($sw, $hw, $sn, $class);
+}
+
+sub get_base_info
+{
+    my %k = map { $_ =&gt; $_[0]-&gt;get($_) } 
+    ('hostname', 'snmp-server contact', 'snmp-server location');
+
+    return map { $k{$_} =~ s/^$_\s+//; chomp($k{$_}); $k{$_} } sort keys %k;
+}
+
+sub get_interfaces
+{
+    my $config = shift;
+    my @ifs = ();
+    for my $if ($config-&gt;get('interface')-&gt;all())
+    {
+    my @container = (($if-&gt;text =~ m/interface (\S+)/)[0]);
+    next unless $container[0];
+    my $desc = ($if-&gt;get('description')-&gt;text =~ m/description (.+)$/)[0];
+    push @container, $desc;
+    for my $addr ($if-&gt;get('ip address'))
+    {
+        next if $addr-&gt;text =~ m/no ip address/;
+        next unless $addr-&gt;text;
+        my ($ip, $mask, $class) = 
+        $addr-&gt;text =~ m/ip address (\S+) (\S+)\s*(secondary)?/;
+        $class ||= 'primary';
+        my $i = NetAddr::IP-&gt;new($ip, $mask);
+        next unless $i;
+        push @container, [ $i, $class ];
+    }
+    push @ifs, \@container;
+    }
+    return @ifs;
+}
+
+MyConfig::CDBI-&gt;connection('dbi:SQLite:dbname=config.db');
+
+for my $c (@ARGV)
+{
+    my $config = readconfig($c);
+    my ($dev, $loc, $ctc) = get_base_info($config);
+
+    if (not defined $dev)
+    {
+    warn "$c does not define a device host name\n";
+    next;
+    }
+
+    my $vc = version_file($c);
+    my ($sw, $hw, $sn, $cl) = get_version($vc);
+
+    # Populate our devices table
+
+    my $device = MyConfig::CDBI::Device-&gt;find_or_create(
+    device =&gt; $dev,
+    location =&gt; $loc,
+    contact =&gt; $ctc,
+    serial =&gt; $sn,
+    hardware =&gt; $hw,
+    software =&gt; $sw,
+    class =&gt; $cl
+    );
+
+    # Extract the interfaces from the configuration
+
+    for my $if (get_interfaces($config))
+    {
+    my $ifname = lc shift @$if;
+    my $desc = shift @$if;
+    print "$c $device $ifname\n";
+    my $interface = MyConfig::CDBI::Interface-&gt;find_or_create(
+        interface =&gt; $ifname,
+        device =&gt; $dev,
+        description =&gt; $desc
+    );
+    for my $ip (@$if)
+    {
+        my $subnet = MyConfig::CDBI::Subnet-&gt;find_or_create(
+        cidr =&gt; $ip-&gt;[0]-&gt;network-&gt;cidr,
+        first =&gt; scalar $ip-&gt;[0]-&gt;network-&gt;numeric,
+        last =&gt; scalar $ip-&gt;[0]-&gt;broadcast-&gt;numeric,
+        );
+        my $address = MyConfig::CDBI::Address-&gt;find_or_create(
+        ip =&gt; scalar $ip-&gt;[0]-&gt;numeric,
+        interface =&gt; lc $interface-&gt;interface,
+        device =&gt; $device-&gt;device,
+        cidr =&gt; $subnet-&gt;cidr,
+        type =&gt; $ip-&gt;[1],
+        );
+    }
+    }
+}</pre></table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

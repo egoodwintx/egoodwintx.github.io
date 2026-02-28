@@ -1,0 +1,263 @@
+<HTML>   
+     <HEAD>
+<TITLE>June 2001 C++ Experts Forum/Generic&lt;Programming&gt;</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.06/tocjun.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Generic&lt;Programming&gt;: A Policy-Based basic_string Implementation</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Andrei Alexandrescu</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>There are two novel elements about this month's installment of Generic&lt;Programming&gt;. One is the subject &#151; we will talk about implementing the standard library component <b>basic_string</b> (better known as <b>string</b>, which is a convenience <b>typedef</b> for <b>basic_string&lt;char&gt;</b>), an important element of the C++ library. But the truly interesting thing is that the code available for download is especially crafted to work with Visual C++ 6.0, a compiler known for two contradictory things &#151; its ubiquity and its weak support for generic programming.</p>
+<p>The code accompanying this article implements not one, not two, but <i>twelve</i> <b>basic_string</b>s featuring various trade-offs. They are not toys. We're talking about full-fledged, Standard-compliant, industrial-strength stuff here (er, modulo bugs, of course). You think that that's going to take an awful lot of code? Think twice. Believe me, this article is going to be a lot of fun.</p>
+
+<H3><FONT COLOR="#000080">One Size Does Not Fit All</FONT></H3>
+
+<p>First off, why would anyone bother implementing <b>basic_string</b> at all? It's already implemented by your standard library, so coming up with &quot;yet another&quot; <b>basic_string</b> implementation seems to have educational value only.</p>
+<p>Yet, many of those who have been using strings in multithreaded applications know about a difficult problem. The Standard tries to allow copy-on-write implementations of <b>basic_string</b>. (Copy-on-write is fondly called COW by its fans, and &quot;the mad cow&quot; by its opponents.) COW-based strings, which use reference counting internally, are either unusable in a multithreaded application or, if the library implementer supports multithreading, unacceptably slow even in the single-threaded parts of your application. Pick one.</p>
+<p>Further problems with COW strings might arise in applications that use dynamic loading of libraries &#151; when you free a library, there is a risk that your application might still hold shallow copies of strings allocated in the memory space of that library.</p>
+<p>Extensive discussions about the trouble with COW strings <a href="#1">[1]</a> <a href="#2">[2]</a> have convinced many STL implementers to ditch COW and use alternate optimization strategies for their <b>basic_string</b> implementations. Yet, &quot;most&quot; is not &quot;all,&quot; so when programming with threads and <b>basic_string</b>, you must use a non-COW implementation and consequently give up portability of your code across STL implementations.</p>
+<p>Furthermore, COW does have its advantages and is quite useful in a large category of applications. Wouldn't it be nice, then, if you could just choose what optimizations to use for a certain string in a certain application? &quot;Here I want a non-COW string featuring the small string optimization for strings up to 16 characters&quot; or &quot;here I'd like to take advantage of COW, and I'd like to use my own heap for allocation.&quot;</p>
+
+<H3><FONT COLOR="#000080">How to Implement basic_string in 200 Lines of Code</FONT></H3>
+
+<p>In spite of the usefulness of having multiple string implementations available, building even only <i>one</i> such implementation is a daunting task. Writing all the member functions and type definitions on top of your implementation of choice is certainly not an easy task. I know because I did implement the <b>basic_string</b> interface for an application that needed to use the COM string allocator and multiple threads.</p> 
+<p>While I was carefully writing all the utility functions as prescribed by the Standard, I noticed an interesting fact. Most member functions seem to gravitate around a small kernel of functions and types &#151; in other words, you can decompose the <b>basic_string</b> interface in &quot;core&quot; and &quot;utility.&quot; The utility part is the same no matter what implementation strategy you use, while the core part varies drastically among implementations. For example, the <b>replace</b> family consists of utility functions implemented in terms of the core function <b>resize</b>.</p>
+<p>And here's the rub: the utility part of <b>basic_string</b> is also the bulkiest one (in my implementation it has over 700 lines of code). In contrast, writing a core implementation, even a sophisticated one, is a much easier task &#151; my implementations vary between 75 and 250 lines of code. This means that you can create new implementations easily by fitting different core incarnations under the utility interface. And you don't have to implement the bulk but once. (Actually, not at all, because you can download this column's code, which is eager to be of use.) Really, you are 200 lines of code away from your dream <b>basic_string</b> implementation!</p>
+
+<H3><FONT COLOR="#000080">A Policy-Based String</FONT></H3>
+
+<p>Those of you who have read my book <a href="#3">[3]</a> (ah, don't you love marketing plugs) know what our nascent design screams for: policies! Of course, when you want to vary a specific aspect of a class' implementation and want to let the user choose what implementation of that aspect to use, you migrate that aspect into a template parameter and define an interface for it. It's not rocket science, but it is remarkably effective.</p>
+<p>The standard <b>basic_string</b> declaration looks like this:</p>
+
+<pre>
+namespace std
+{
+    template &lt;class E,
+        class T = char_traits&lt;E&gt;,
+        class A = allocator&lt;E&gt; &gt;
+    class basic_string;
+}
+</pre>
+
+<p><b>E</b> is the character type of the string (most often, either <b>char</b> or <b>wchar_t</b>), <b>T</b> controls how strings are compared and copied, and <b>A</b> is the allocator that we all know, love, and never use. We will add a fourth template argument that controls the exact implementation of the string. Because it deals with exactly how the string is stored, let's call it the <b>Storage</b> policy.</p> 
+<p>We call our new string <b>flex_string</b>, because, as you will soon see, it is quite flexible:</p>
+
+<pre>
+template &lt;class E,
+    class T = char_traits&lt;E&gt;,
+    class A = allocator&lt;E&gt; 
+    class Storage = AllocatorStringStorage&lt;E, A&gt; &gt;
+class flex_string;
+</pre>
+
+<p><b>Storage</b> defaults to <b>AllocatorStringStorage&lt;E, A&gt;</b>, which is a straightforward storage implementation that uses eager copy (sort of an antithesis of a COW). In its implementation, <b>flex_string</b> holds a <b>Storage</b> object and uses its types and member functions.</p>
+<p>How exactly you choose the interface of <b>Storage</b> might vary a little. In essence, after fiddling with my <b>basic_string</b> implementation, I found a set of functions without which I could not possibly provide an implementation, and the functions weren't redundant, either. Here's a semi-formal specification of the conditions that a <b>Storage</b> policy implementation must satisfy:</p>
+
+<pre>
+template &lt;typename E, <i>other arguments</i>&gt;
+class StorageImpl
+{
+public:
+    typedef <i>some_type</i> size_type;
+    typedef <i>some_type</i> iterator;
+    typedef <i>some_type</i> const_iterator;
+    typedef <i>some_type</i> allocator_type;
+
+    StorageImpl(const StorageImpl &amp;);
+    StorageImpl(const allocator_type&amp;);
+    StorageImpl(const E* s, size_type len, const allocator_type&amp; a);
+    StorageImpl(size_type len, E, const allocator_type&amp;);
+
+    iterator begin();
+    const_iterator begin() const;
+    iterator end();
+    const_iterator end() const;
+    size_type size() const;
+    size_type max_size() const;
+    size_type capacity() const;
+
+    void resize(size_type, E);
+    void reserve(size_type);
+    void swap(StorageImpl&amp;);
+    const E* c_str() const;
+    const E* data() const;
+    allocator_type get_allocator() const;
+};
+</pre>
+
+<p>That's pretty much it. The specification is quite simple (and would have been even simpler without the allocator, which is a pain in the neck). The idea is that you can implement <b>basic_string</b>'s entire interface in an efficient manner by ultimately leveraging <b>Storage</b>'s small kernel of types and functions.</p> 
+<p>The <b>flex_string</b> class holds a <b>Storage</b> object by value. I chose private inheritance for the sake of some minor conveniences. Hence, the <b>flex_string</b> in the code available for download looks like this:</p>
+
+<pre>
+template &lt;class E,
+    class T = std::char_traits&lt;E&gt;,
+    class A = std::allocator&lt;E&gt;,
+    class Storage = AllocatorStringStorage&lt;E, A&gt; &gt;
+class flex_string : private Storage
+{
+public:
+    typedef typename Storage::iterator iterator;
+    typedef typename Storage::const_iterator const_iterator;
+    ...
+    // 21.3.1 construct/copy/destroy
+    explicit flex_string(const A&amp; a = A())
+        : Storage(a) 
+    {}
+    ...
+};
+</pre>
+
+<H3><FONT COLOR="#000080">Implementing the Storage policy</FONT></H3>
+
+<p>Ok, time to get our hands dirty. Let's churn some <b>Storage</b> implementations. An effective string implementation would hold a pointer to a buffer. In turn, the buffer holds the length and the capacity of the string, plus the string itself. To avoid allocating memory twice (once for the bookkeeping data and once for the data), you might want to use a trick known as &quot;the <b>struct</b> hack&quot;: the buffer holds a C-style array of characters as its last element and grows dynamically to accommodate as many characters as needed. This is exactly what <b>SimpleStringStorage</b> does:</p> 
+
+<pre>
+template &lt;class E, class A = std::allocator&lt;E&gt; &gt;
+class SimpleStringStorage
+{
+    struct Data
+    {
+        E* pEnd_;
+        E* pEndOfMem_;
+        E buffer_[1];
+    };
+
+    Data* pData_;
+
+public:
+    size_type size() const
+    { return pData_-&gt;pEnd_ - pData_-&gt;buffer_; } 
+
+    size_type capacity() const
+    { return pData_-&gt;pEndOfMem_ - pData_-&gt;buffer_; } 
+    ...
+};
+</pre>
+
+<p><b>pEnd_</b> points to the end of the string, <b>pEndOfMem_</b> points to the end of the allocated buffer, and <b>buffer_</b> extends to as many characters as the string holds &#151; in other words, it &quot;continues&quot; beyond the end of <b>Data</b>'s memory. To achieve this flexibility, <b>pData_</b> does not exactly point to a <b>Data</b> object, but to a larger chunk of memory cast to a <b>Data</b>. This &quot;<b>struct</b> hack&quot; is in theory not 100 percent portable, but in practice, well, it just is.</p>
+<p><b>SimpleStringStorage</b> features another nice little optimization &#151; all empty strings are shared and point to a static <b>Data</b> instance. An alternate implementation could initialize <b>pData_</b> with zero for empty strings, but that would have propagated tests through many member functions. </p> 
+<p><b>SimpleStringStorage</b> is &quot;simple&quot; because it is aloof to the allocator passed in. <b>SimpleStringStorage</b> simply uses the standard free store (<b>new</b>/<b>delete</b>) for its memory needs. Using the passed-in allocator for allocating <b>Data</b> objects is harder than it might seem, due partly to the allocator's design (no support for objects of arbitrary size) and partly to compiler compatibility issues. You can find such a politically correct <b>Storage</b> policy implementation in the class template <b>AllocatorStringStorage</b>.</p>
+<p>Yet another possible implementation of a string storage is to simply use <b>std::vector</b> as a back-end. The implementation is a slam-dunk, and what you'll get is a lean, mean string that reuses a nicely tuned standard library facility. This also helps in minimizing object code size. You can look up that implementation in <b>VectorStringStorage</b>.</p>
+<p>All these three implementations use inheritance to use the EBO (Empty Base Optimization) <a href="#4">[4]</a> wherever possible. (Did I mention the &quot;industrial-strength&quot; buzzword?) Using EBO is very effective because most allocators are in fact empty classes.</p> 
+
+<H3><FONT COLOR="#000080">Exhilarated C++</FONT></H3>
+
+<p>Ok, so here we are, some 1,300 of lines of code later, already with three nifty <b>basic_string</b> implementations under our belt. That's 433 lines of code per implementation.  Not too bad, especially when you think that you can add new implementations quite easily.</p> 
+<p>If you think that was fun, the article has reached its goal so far. But don't forget that the opening paragraph mentions <i>a lot of</i> fun, which hopefully starts now.</p>
+<p>Let's drop in the SSO (small string optimization) <a href="#5">[5]</a>. The idea behind SSO is to store small strings right in the string object (not in dynamically-allocated storage). When the size becomes too big to fit inside the string, a dynamic allocation strategy is used. The two strategies share the memory inside string for bookkeeping data. The string class can differentiate between the two mechanisms through some sort of a tag:</p>
+
+<pre>
+template &lt;class E, other parameters&gt;
+class sso_string
+{
+    struct DynamicData { ... };
+    static const unsigned int maxSmallStringLen = 12;
+    union
+    {
+        E[maxSmallStringLen] inlineBuffer_;
+        DynamicData data_;
+    };
+    bool isSmall_;
+    ...
+};
+</pre>
+
+<p>If <b>isSmall_</b> is true, the string is stored right in <b>inlineBuffer_</b>. Otherwise, <b>data_</b> is valid. The problem is what kind of dynamic allocation strategy to use for <b>DynamicData</b>? An <b>std::vector</b>? A <b>SimpleStringStorage</b>? An <b>AllocatorStringStorage</b>? The answer, of course, is &quot;any of the above and more, please.&quot; </p> 
+<p>It's clear that using SSO is <i>orthogonal</i> on whatever alternate storage you use. Therefore, the <b>SmallStringOpt</b> class template has another storage as a template parameter:</p>
+
+<pre>
+template &lt;class E, unsigned int threshold, class Storage, typename Align = E*&gt;
+class SmallStringOpt
+{
+    enum { temp = threshold &gt; sizeof(Storage) ? threshold : sizeof(Storage) };
+
+public:
+    enum { maxSmallString = temp &gt; sizeof(Align) ? temp : sizeof(Align) };
+
+private:
+    union
+    {
+        E buf_[maxSmallString + 1];
+        Align align_;
+    };
+    ...implement the Storage policy... 
+};
+</pre>
+
+<p>The <b>buf_</b> member variable stores either a <b>Storage</b> object or the string itself. But what's that <b>Align</b> business? Well, when dealing with such &quot;seated allocation,&quot; you must be careful with alignment issues. Because there is no portable way of figuring out what alignment requirements <b>Storage</b> has, <b>SmallStringOpt</b> accepts a type that specifies the alignment and stores it in the dummy <b>align_</b> variable.</p>
+<p>How does <b>SmallStringOpt</b> make the difference between small and large strings? The last element of <b>buf_</b> (namely <b>buf_[maxSmallString]</b>) stores the difference between <b>maxSmallString</b> and the actual length of the string for small strings, and a magic number for long strings. For a string of size <b>maxSmallString</b>, <b>buf_[maxSmallString]</b> is zero, which very nicely serves as both null terminator and tag.</p>
+<p>You can see a number of tricks, casts, and low-level stuff in <b>SmallStringOpt</b> (we're talking about an <i>optimization</i> here, right?), but in the end the result is remarkable: we can combine <b>SmallStringOpt</b> with any other <b>Storage</b> implementation, including of course <b>SimpleStringStorage</b>, <b>VectorStringStorage</b>, and <b>AllocatorStringStorage</b>. So now we have <i>six</i> implementations of <b>basic_string</b> &#151; we multiplied our returns with an incremental effort. (By the way, lots of fun yet?) By now the code is 1,440 lines long, so we went down to 240 lines of code per <b>basic_string</b> implementation.  If C++ programming were karate, leveraging multiplied returns on your code investment would be like fighting with multiple opponents at once. </p>
+<p>Here's an example &#151; the instantiation:</p>
+
+<pre>
+typedef flex_string&lt;
+    char,
+    std::char_traits&lt;char&gt;,
+    std::allocator&lt;char&gt;,
+    SmallStringOpt&lt;char, 16, VectorStringStorage&lt;char, std::allocator&lt;char&gt; &gt; &gt;
+&gt; String;
+</pre>
+
+<p>specifies a string that combines an <b>std::vector</b>-based storage with the small-string optimization for strings less than at least 16 characters.</p>
+
+<H3><FONT COLOR="#000080">Back to COW</FONT></H3>
+
+<p>Like it or not, you can't ignore COW &#151; too many people find the gentle animal useful. For their sake, let's implement a <b>CowString</b> class template that, again, is able to add COW to any other <b>Storage</b>. <b>CowString</b> looks like:</p>
+
+<pre>
+template &lt;class E, class Storage&gt;
+class CowString
+{
+    struct Data
+    {
+        Storage s_;
+        unsigned int refs_;
+    };
+
+    Data* pData_;
+public:
+    ...
+};
+</pre>
+
+<p><b>Data</b> holds whatever <b>Storage</b> you choose and a reference count. <b>CowString</b> itself contains only a pointer to <b>Data</b>. Multiple <b>CowString</b>s might point to the same <b>Data</b> object. Whenever a potential change is detected, <b>CowString</b> makes a genuine duplicate of its data.</p>
+<p>Now let's take a look at this:</p>
+
+<pre>
+typedef flex_string&lt;
+    char,
+    std::char_traits&lt;char&gt;,
+    std::allocator&lt;char&gt;,
+    SmallStringOpt&lt;char, 5, 
+        CowString&lt;char, AllocatorStringStorage&lt;char, std::allocator&lt;char&gt; &gt; &gt; &gt;
+&gt; String;
+</pre>
+
+<p>What we have here is a string optimized to not use dynamic allocation for strings shorter than five characters. For longer strings, a COW strategy is used over an allocator-based implementation. </p>
+<p><b>CowString</b> doubles again the number of potential instances of <b>flex_string</b>, so now we have twelve implementations at our disposal. Total code amounts to 1,860 lines, or 155 lines of code per implementation.  There are actually twenty-four of them if you consider the order in which you apply <b>SmallStringOpt</b> and <b>CowString</b>. However, applying COW to small strings is not likely to be an effective design decision, so you'll always apply <b>SmallStringOpt</b> to <b>CowString</b> and not vice versa.</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+<p><b>basic_string</b> is a very baroque component. In spite of that, careful policy-based design can increase your productivity into the stratosphere. Using a handful of policy implementations, you can choose between straight, small-string optimized, and reference-counted <b>basic_string</b> implementation as easy as feeding arguments to a template class.  Surgeon General's warning: You might allegedly have a lot of fun while doing all that.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1] Herb Sutter. &quot;Optimizations that Aren't (In a Multithreaded World),&quot; <i>C/C++ Users Journal</i>, June 1999.</p>
+<p><a name="2"></a>[2] Kevlin Henney. &quot;From Mechanism to Method: Distinctly Qualified,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, May 2001, <b>http://www.cuj.com/experts/1905/henney.htm</b>.</p>
+<p><a name="3"></a>[3] Andrei Alexandrescu. <i>Modern C++ Design</i> (Addison-Wesley, 2001).</p>
+<p><a name="4"></a>[4] Andrei Alexandrescu. &quot;Traits on Steroids,&quot; <i>C++ Report</i>, June 2000, <b>http://ftp.sj.univali.br/prof/Fernando%20Montenegro/artigos/GenericProgramingCPP02.htm</b>.</p>
+<p><a name="5"></a>[5] Jack Reeves. &quot;String in the Real World &#151; Part 2,&quot; <i>C++ Report</i>, January 1999, <b>http://www.bleading-edge.com/Publications/C++Report/v9901/Column14.htm</b>.</p>
+
+
+<H3><FONT COLOR="#000080">About the Author</FONT></H3>
+
+<p><i><b>Andrei Alexandrescu</b> is a Development Manager at RealNetworks Inc. (<b>www.realnetworks.com</b>), based in Seattle, WA, and author of the acclaimed book </i>Modern C++ Design<i>. He may be contacted at <b>andrei@metalanguage.com</b>. Andrei is also one of the featured instructors of The C++ Seminar (<b>www.gotw.ca/cpp_seminar</b>).</i></p>
+
+<h4><a href="../../../source/2001/jun01/alexandr.zip"></a></h4>
+
+</BLOCKQUOTE></BODY></HTML>

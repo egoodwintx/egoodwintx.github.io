@@ -1,0 +1,172 @@
+<HTML>   
+     <HEAD>
+<TITLE>July 2001/A Toolbox of String Classes</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocjul.htm"></A><FONT COLOR="#FF0000">   Software Tools</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">A Toolbox of String Classes</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">John Panzer</FONT></H3>
+
+<BLOCKQUOTE>
+<p>&#147;One size fits all&#148; has never applied to strings. Now you can have as many different kinds of strings as you need, all wrapped in the std::string interface.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>The Standard C++ string class, <B>std::string</B>, is a useful and flexible tool. But it isn&#146;t optimal in every situation. For performance reasons, it can be important to be able to choose a custom string implementation. This article presents a pair of high-performance alternative implementations that preserve the standard string interface, along with a framework for easily creating new implementations.</p>
+<p>Recently, a programming team at my company discovered that <B>std::string</B> was causing a performance problem in a multithreaded server program. The reason? Constructing and initializing each string required an additional heap allocation, and the program&#146;s classes used many small strings as member variables.</p>
+<p>Their program was getting bogged down in the memory allocator. Heap allocations can be particularly expensive in multithreaded programs because of thread contention for the shared global heap. A possible solution would have been to switch to fixed-length <B>char</B> arrays. But while most of the strings were short in practice, there were occasional long strings that needed to be handled correctly. Also, this would involve changing a fair amount of string processing code.</p>
+<p>After profiling their code and identifying the bottleneck, the team ended up replacing <B>std::string</B> member variables with a custom string class designed to avoid extra heap allocations in the common cases. The custom string class has a fixed-size internal buffer to handle the common case, along with an overflow strategy to handle longer strings correctly.</p>
+<p>Unfortunately, the interface of the custom string class was not compatible with <B>std::string</B>, so the team still had to rewrite code. The result was no longer compatible with the <B>std::string</B> interface. Looking at that interface, it&#146;s easy to see that the team made the right decision. The <B>std::string</B> class has a huge interface and replicating it is not something you want to tackle during the optimization phase of a project.</p>
+<p>This is unfortunate, because ideally we would like to have a toolbox of string classes tuned for different situations, all implementing at least the standard string interface. With such a toolbox, changing string variants would involve relatively minor surgery to the source code, and experimenting with different variants would be inexpensive. And, of course, the client code would remain compatible with the standard string interface. Emulating the <B>std::string</B> iterator interface would be especially useful, because it allows standard library algorithms to work with variant strings. (An example of such a variant is the SGI STL rope class <a href="#1">[1]</a>, which is optimized for dealing with large strings.)</p>
+
+<H3><FONT COLOR="#000080">The Framework</FONT></H3>
+
+<p>Towards this goal, I decided to create an adaptor template class that would make it easier to create new string class implementations. The <B>xstr::xstring</B> adaptor, so called because it wraps any kind of implementation, provides the full standard string interface. It is designed to wrap a particular implementation interface, which is described below. Any class providing that interface can be used as an <B>xstring</B> implementation.</p>
+<p>To assemble a custom string variant with a particular implementation, combine <B>xstring</B> with that implementation class. For example, to create an <B>xstring</B> implemented by a fixed-size, 64-character buffer:</p>
+
+<pre>
+#include &lt;xstring.h&gt;
+#include &lt;fixed_char_buf.h&gt;
+
+typedef xstr::xstring&lt;
+    xstr::fixed_char_buf&lt;64&gt; &gt;
+    small_string;
+
+small_string s("Hello World!");
+s += "\n&#151;from small_string";
+</pre>
+
+<p>The template class <B>xstring</B> is contained in <B>xstring.h</B> (see &lt;www.cuj.com/code&gt;):</p>
+
+<pre>
+template &lt;class Impl&gt;
+class xstring {...};
+</pre>
+
+<p>Its interface is essentially the same as <B>std::string</B>. It also provides conversions to and from <B>std::string</B> for convenience. The <B>xstring</B> library currently provides two lightweight string implementations, <B>fixed_char_buf</B> and <B>var_char_buf</B>, which are described below.</p>
+
+<H3><FONT COLOR="#000080">The fixed_char_buf&lt;&gt; Implementation</FONT></H3>
+
+<p><a href="list1.htm">Listing 1</a> shows <B>fixed_char_buf.h</B>, the header file for the <B>fixed_char_buf</B> template. This template class uses an internal fixed-size buffer for storage, similar to the <B>c_array</B> template described in <a href="#2">[2]</a>. The first template argument specifies the size of the buffer, and the others are the same as for <B>std::string</B>:</p>
+
+<pre>
+template &lt;size_t SIZE,
+    class CharT=char,
+    class Traits=
+        std::char_traits&lt;CharT&gt; &gt;
+class fixed_char_buf;
+</pre>
+
+<p>Unlike <B>std::string</B>, <B>fixed_char_buf</B> does not have an allocator template argument, because it never does any dynamic allocation.</p>
+<p>That&#146;s also the reason to use this implementation: it avoids the overhead of additional heap allocation and may outperform <B>std::string</B> in certain situations for that reason. Of course, the tradeoff is that it is limited to <B>SIZE</B> characters. If it overflows, it will throw a <B>length_error</B> exception. Clearly this implementation isn&#146;t acceptable as a general substitute for <B>std::string</B>, but it may be perfectly reasonable for certain kinds of string data, especially if it allows substantial performance or scalability improvements.</p>
+<p>Use this implementation when you know that heap allocation is a performance problem, and all strings are limited to <B>SIZE</B> characters.</p>
+
+<H3><FONT COLOR="#000080">The var_char_buf&lt;&gt; Implementation</FONT></H3>
+
+<p><a href="list2.htm">Listing 2</a> shows <B>var_char_buf.h</B>, the header file for the <B>var_char_buf</B> template. This template class is an elaboration of <B>fixed_char_buf</B> that uses a fixed-size buffer initially, but uses dynamic memory to handle overflow. The template arguments are similar to <B>fixed_char_buf</B>, but with the addition of an allocator argument:</p>
+
+<pre>
+template &lt;size_t SIZE,
+    class CharT=char,
+    class Traits=
+        std::char_traits&lt;CharT&gt;,
+    class Alloc=allocator&lt;CharT&gt; &gt;
+class var_char_buf;
+</pre>
+
+<p>This is essentially the implementation used by the development team to solve their heap contention problem, but generalized to deal with arbitrary character types and allocators. <B>var_char_buf</B> optimizes for the case where the majority of strings are short and less than <B>SIZE</B>, but a few are longer and must be handled correctly. When a long string must be handled, there is an extra memory hit, because the class cannot return the original <B>SIZE</B> bytes to the heap. This implementation is also slightly less efficient than <B>fixed_char_buf</B>, even if its overflow capability is not used.</p>
+<p>Use this implementation when heap allocation is a performance problem, and a majority of strings are short, but a minority are longer than SIZE and need to be handled correctly.</p>
+
+<H3><FONT COLOR="#000080">Performance Measurements</FONT></H3>
+<p>I wrote a small program, <B>test_time.cc</B> (<a href="list3.htm">Listing 3</a>), to measure raw string construction time. This test measures how effective the specialized implementations are at reducing string construction time. I ran the tests on two platforms, Cygwin under Windows and Cygnus 99r1 under Solaris, using basic (non-thread-safe) and thread-safe versions of the runtime libraries. In each case, the program was compiled using g++ with optimizations turned on (<B>-O2</B>).</p>
+<p><a href="tab1.htm">Table 1</a> shows the results; the specialized strings were faster at construction than <B>std::string</B>. In the single-threaded cases, they reduced the run time by up to 30 percent. In the thread-safe cases, the specialized strings reduced the run time by up to 78 percent.</p>
+<p>This indicates that the additional overhead of locking and unlocking heap data structures can be a significant overhead in string creation time, even if there is no actual thread contention for the heap. Thus, a string implementation that minimizes heap access can provide a significant speed increase, even if thread contention is not an issue.</p>
+<p>As a second test, I wrote a multithreaded program, <B>test_mt.cc</B> (<a href="list4.htm">Listing 4</a>). This is the same as <B>test_time.cc</B>, but runs the test in parallel in multiple threads. Each thread constructs a fixed number of strings. By running the test with an increasing number of threads, I compared how the run times increase in proportion to the amount of work done. I ran this test on a two-CPU Solaris machine, again using g++ with optimizations on (<B>-O2</B>).</p>
+<p><a href="tab2.htm">Table 2</a> shows the results. It gives the total run time for each combination of string class and number of threads. As each thread does a fixed amount of work, the total workload increases from 1 to 10 in the table. Note that as the workload goes up by a factor of 10, the run time for the <B>std::string</B> goes up by a factor of 68. At the same time, the run time for the specialized strings goes up only by a factor of 10. In the 10-thread case, the specialized strings are more than 10 times faster at construction than <B>std::string</B> (7 percent and 8 percent of the base run time, respectively).</p>
+<p>The testing I have done against various small single-threaded programs shows that the specialized strings tend to perform about as well as <B>std::string</B> when construction time is not critical. For example, the <B>xr</B> cross-reference generator <a href="#3">[3]</a> takes about 4.5 seconds to process the text of <I>Moby Dick</I> using either <B>std::string</B> or <B>fixed_char_buf</B>. This isn&#146;t surprising, as it creates only as many strings as there are unique words within the text, and the majority of its running time is spent in I/O and string comparisons. The significance of these timing tests is that splitting the interface and implementations apart has not produced a noticeable slowdown on any commonly used operations.</p>
+
+<H3><FONT COLOR="#000080">Implementation Requirements</FONT></H3>
+
+<p><B>xstring</B> implementation classes must provide a &#147;minimal string&#148; interface, which is a small subset of the full <B>std::string</B> interface. This interface is designed for ease of implementation rather than ease of use. It is an STL container; as an STL concept <a href="#4">[4]</a>, it is a refinement of Austern&#146;s Container. Its iterators are Random Access Iterators. Its <B>value_type</B> is a POD (plain old data) type with an appropriate <B>char_traits&lt;&gt;</B> specialization. Beyond that, the interface supports the following operations, with semantics identical to those of <B>std::string</B>:</p>
+
+<pre>
+// Insert a range of elements:
+s.insert(iterator pos,
+         InputIter first,
+         InputIter last)
+// Erase range [first,last):
+s.erase(iterator first,
+        iterator last)
+// Reserve space for n elements,
+// or throw an exception:
+s.reserve(size_type n)
+// Return the current capacity:
+s.capacity()
+// Returns a zero-terminated C
+// string:
+s.c_str()
+// Returns a pointer to an
+// internal buffer:
+s.data()
+</pre>
+
+<p>Finally, this interface provides the following two additional operations, whose semantics are the same as the corresponding <B>assign</B> methods in <B>std::string</B>:</p>
+
+<pre>
+// Assign from range:
+
+s.range_initialize(
+    InputIter first,
+    InputIter last)
+// Assign from n characters:
+s.element_initialize(
+    size_type n,
+    value_type c)
+</pre>
+
+<p>These requirements are much easier to satisfy than the full <B>std::string</B> interface; <B>fixed_char_buf.h</B> and <B>var_char_buf.h</B> are each under 200 lines. By comparison, <B>xstring.h</B> is over 1,000 lines and requires some nontrivial template metaprogramming. Much of the <B>xstring</B> interface is devoted to functions that provide a more convenient interface to functionality already present in the minimal string interface.</p>
+<p>The <B>xstring</B> template inherits from its implementation class, so an implementation is free to provide additional member functions. This is arguably an abuse of inheritance, but it is the easiest way to provide a wrapper that allows for additional member functions. These can be very useful; for example, an implementation could provide <B>acquire_buf</B> and <B>release_buf</B> member functions to allow client code to write directly to its internal buffer.</p>
+<p>To create a new implementation, I recommend starting with <B>fixed_char_buf</B> or <B>var_char_buf</B> as an example and filling out the various member functions. The semantics of each member function are the same as for the corresponding functions in <B>std::string</B>.</p>
+<p>Examples of possible variant implementations are garbage-collected strings, strings that use specialized reference-counting schemes, or substrings (views into larger strings).</p>
+
+<H3><FONT COLOR="#000080">Correctness and Compatibility</FONT></H3>
+
+<p>The <B>xstring</B> class and the implementations presented above pass the GNU C++ library test suite <a href="#5">[5]</a>. I&#146;ve also tested it successfully against various small utility programs. In addition, the <B>xstring</B> class is based on the SGI STL <a href="#1">[1]</a> <B>std::string</B> class, so it benefits from being based on code from a high quality and widely used library. However, it has not yet been used in a large-scale program.</p>
+<p>My experience has been that compiling with a new program does occasionally find an unimplemented feature, but so far problems have always been caught at compile time and are easily fixed. I have used this library only with recent versions of GNU/Cygnus g++; compilers that don&#146;t implement modern C++ language features, such as template partial ordering, may have problems.</p>
+<p>The <B>xstring</B> interface provides source code compatibility with <B>std::string</B>. Note that passing an <B>xstring</B> to a function requiring an <B>std::string</B> will work, due to the automatic conversions provided by <B>xstring</B>. However, this performs a copy of the string contents, even if the function accepts a <B>const</B> string reference. The exception is when a function takes a non-<B>const</B> <B>std::string</B> reference. This will produce a compiler error, and you&#146;ll need to decide whether to modify the function to accept an <B>xstring</B>, or to copy to a local <B>std::string</B> and pass that. Finally, note that the <B>fixed_char_buf</B> variant will break code that assumes it can add an arbitrary number of characters to a string. Code should call <B>max_size</B> to determine the maximum possible size of a string.</p>
+
+<H3><FONT COLOR="#000080">Optimizing with xstring</FONT></H3>
+
+<OL><LI>Identify a bottleneck; if string construction or destruction is taking a lot of time, or there is a lot of thread contention for the global heap, consider using <B>fixed_char_buf</B> or <B>var_char_buf</B>.</LI>
+<LI>Decide which data should be stored using a variant, and change the types of the appropriate variables to a neutral <B>typedef</B> (for example, <B>small_string</B>).</LI>
+<LI>Create a central <B>typedef</B> for <B>small_string</B> in a shared header file, making it an alias for <B>xstring&lt;fixed_char_buf&lt;N&gt; &gt;</B> or <B>xstring&lt;var_char_buf&lt;N&gt; &gt;</B>.</LI>
+<LI>Recompile and run timing tests. You may want to change the definition of <B>small_string</B> as you investigate bottlenecks. If it doesn&#146;t help, switching back to <B>std::string</B> is a one-line edit.</LI></OL>
+
+<p>You may need to use different implementations for different kinds of data; in this case, using descriptive <B>typedef</B> names (such as <B>address_t</B> and <B>phonenum_t</B>) may be helpful.</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+<p>The <B>xstring</B> template provides standard-compatible string objects that can be constructed an order of magnitude faster than <B>std::string</B> in multithreaded programs, with comparable performance for other operations. It also provides an extensible framework for implementing new specialized string classes quickly and easily. This lowers the risk involved in using <B>std::string</B>, because it is easy to swap implementations &#151; or even create a new implementation &#151; if profiling shows the need.</p>
+
+<H3><FONT COLOR="#000080">Acknowledgments</FONT></H3>
+
+<p>Creating the <B>xstring</B> class would have been very difficult without the SGI STL <B>std::string</B> class <a href="#1">[1]</a>. Much of the code in <B>xstring</B> is derived directly from this class, and I learned a lot about template metaprogramming by studying its code. Without the work of the programmers contributing to the GNU string test suite <a href="#5">[5]</a>, it would have many more bugs. Finally, I thank my colleagues at AOL for providing an interesting C++ design challenge.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1]  Alexander Stepanov and Matthew Austern, available at &lt;http://www.sgi.com/tech/stl&gt;.</p>
+<p><a name="2"></a>[2]  Bjarne Stroustrup. <I>The C++ Programming Language</I>, 3rd Edition (Addison-Wesley, 1997), 17.5.4, Built-In Arrays.</p>
+<p><a name="3"></a>[3]  Dan Saks. &#147;C++ Theory and Practice: Replacing Character Arrays with Strings, Part 2,&#148; <I>C/C++ Users Journal</I>, February 2000.</p>
+<p><a name="4"></a>[4]  Matthew Austern. <I>Generic Programming and the STL</I> (Addison-Wesley, 1998).</p>
+<p><a name="5"></a>[5]  The egcs libstdc++-v3 string test suite is available at &lt;http://gcc.gnu.org/cgi-bin/cvsweb.cgi/egcs/libstdc++-v3/testsuite/21_strings/&gt;. </p>
+
+<p><i><B>John Panzer</B> is a principal software engineer with AOL Time Warner, currently working on large scale Internet server systems. In his spare time, he teaches classes in C++, Java, and the STL. His interests include systems design, generic programming, and object-oriented design. He can be reached at <B>jpanzer@acm.org</B> or via &lt;www.johnpanzer.com&gt;.</i></p>
+
+<h4><a href="../../../source/2001/jul01/panzer.zip"></a></h4>
+</blockquote></body></html>

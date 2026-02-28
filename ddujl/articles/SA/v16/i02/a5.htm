@@ -1,0 +1,463 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v16, i02: Xen Master is Yum</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1"></HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a5_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink"><a href="a5_l2.htm">Listing 2</a></span></td>
+		<td><span class="navbarLink"><a href="a5_l3.htm">Listing 3</a></span></td>
+		<td><span class="navbarLink"><a href="a5_l4.htm">Listing 4</a></span></td>
+	</tr>
+	<tr>
+		<td><span class="navbarLink"><a href="a5_l5.htm">Listing 5</a></span></td>
+		<td><a href="../../../../source/SA/2007/feb2007.tar"><b class=codeListing>feb2007.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><img src="a5.gif" width="200" height="167" align="right">Xen Master is Yum</h1>
+            <p>
+
+Faye Gibbins<p>
+
+Xen is a Microsoft-supported, open source, GPL’d
+hypervisor for Linux systems developed at the University of Cambridge [1]. It
+currently runs on all modern 32- and 64-bit x86 chipsets with SMP, including
+dual and quad core or uniprocessor CPUs. Using patches to the kernel (either
+versions 2.4.x or 2.6.x), it’s possible to turn a single box into a set of
+virtual machines (VMs) each independently running its own Linux distribution.<p>
+
+I’ve been investigating using Xen to securely implement
+VMs on our boxes so that we can make more efficient use of our production
+systems. This setup allows us to test our clustering software with less
+hardware expenditure and also allows us to give developers, academics, and
+senior students safe access to root.<p>
+
+In this article, I’ll describe how to set up a
+self-managed Xen cluster, which may or may not be a part of a larger network.
+Critically, the Xen cluster will minimize any security holes and be a
+well-behaved netizen. Security, authentication, and authorization will be
+maintained by Kerberos, ssh, and LDAP, while ebtables will stop any possible
+pollution of the external network.<p>
+
+Many Linux distributions now support Xen, among the most
+recent are Fedora Core 5, RedHat Linux 5 [2], and Novell. FC5 makes it particularly
+easy to set up Xen, and I will focus on that distribution. However, all the
+configurations are generic.<p>
+
+<b>Overview</b><p>
+
+Xen uses the principle of domains in its architecture.
+Domain0 is the environment that the physical hardware boots into, and the domain1
+nodes start up in the virtual environments. FC5 includes precompiled kernels to
+turn a standard install into a Xen domain0 environment. However, patching the
+kernel and building the tools from the Xen download site [3] can be fun and
+instructive when learning to use Xen.<p>
+
+A suitable machine for a Xen cluster box would typically
+include multiple CPUs and 2GB or more of fast RAM (although Xen will run on
+less). In a perfect world, the disk space allocated to each VM instance would
+be provided by a separate RAID1/5 array attached to its own dedicated
+controller to avoid IO bottlenecks in one instance from becoming a problem for
+the other Xen instances running on the system. If disk hardware and controllers
+are in short supply, though, one large volume group can be built and logical
+volumes alone can be used to separate disk allocations. This will require more
+monitoring of the disk IO to ensure each VM is not hogging the bus.<p>
+
+Regardless of whether you plan to use a single storage
+array or multiple channels, configure a separate LVM2 volume group for each Xen
+VM instance. Aside from making it easier to add additional storage capacity in
+the future, this will allow you to clone or back up the Xen environments using
+LVM snapshots. This will lead to the possibility of using LVM snapshots to
+clone VMs, thus speeding up installation of clusters.<p>
+
+"vg0” is the name I’ve given to the volume group for
+domain0’s filesystem (/boot is held on a physical partition on the bootable
+RAID set).<p>
+
+"vg_yum” is the name I’ve given to the volume group used
+to hold the distribution’s repository; the name is arbitrary and was just
+chosen as an <i>aide-mémoire</i>.<p>
+
+Volume groups vg_vm1...vg_vmN are the LVMs for each new
+Xen instance.<p>
+
+Creating an optimal flexible layout (OFL) for a Xen
+cluster is more difficult than setting up a standalone box with just one
+environment running on it. This is especially true if you’re planning to let
+inexperienced users play on the boxes with escalated privileges, or if you are
+building your cluster to cope with disparate uses on the VMs. Databases, Web
+servers, and compute boxes can be difficult to manage in their own separate
+systems, and they’re much more difficult to manage in a Xen cluster if the sys
+admin of each VM is unaware of the load others are putting upon the
+architecture. The admins may not have sight of the other VMs’ hardware usage
+patterns and could encounter difficulty investigating bottlenecks and stoppages
+inside their own VMs caused by contention on the hypervisor’s other VMs. What
+is gained by using Xen in terms of flexibility and efficient use of hardware
+could easily be lost to complexity if initial plans of usage are poorly
+developed or inadequately tested.<p>
+
+The box used for this article was built with a small FC5
+install and the following example used the 2.6.17-1.2187_FC5xen0 kernel from
+the F5 updates repository.<p>
+
+<b>Domain0 Setup</b><p>
+
+Setting up domain0’s kernel and OS securely on FC5
+requires several steps:<p>
+
+1. Remove any access to the box apart from root on
+the console, turn off ssh and any other unnecessary daemons that may be started
+at boot time. This is usually best done on a fresh build of FC5; having a
+Tripwire-like product installed and configured at this point is also a good
+idea. Domain0 needs to be protected at all times.<p>
+
+2. Create an ext3 file-system on a logical volume
+(LV) on vg_yum then copy over the yum archive from a trusted site. I use
+rsync://ftp.belnet.be; however, using a site close to you that you trust and
+for which you’ve previously verified the checksums of the RPMs is a prudent
+step, viz:<p>
+
+<pre>
+lvcreate -L50G -n yum_archive vg_yum
+mke2fs -cc -j -m 1 /dev/vg_yum/yum_archive
+mkdir /var/local_yum
+mount -t ext3 /dev/vg_yum/yum_archive /var/local_yum
+mkdir -p /var/local_yum/i386/fc5/{updates,core,extras}
+for i in updates core extras; do
+    cd /var/local_yum/i386/fc5/$i;
+    rsync -va --delete --exclude=/debug \
+      rsync://ftp.belnet.be/packages/fedora/linux/$i/5/i386/ .
+done
+</pre>
+The <b>-cc</b> on the <b>mke2fs</b> gives the disk’s controller the
+chance to remap any bad blocks, it’s very slow and not required if you’ve
+verified the disk’s media previously.<p>
+
+At this point the box need not be on the network. If you
+wish to proceed offline, configure at least one Ethernet card to be assigned a
+static IP at boot. In this example the domain0 eth0 device is given the IP
+address of 192.168.42.18/24 with the default route set to 192.168.42.1. Reboot
+the box using either GRUB to LILO to boot the Xen0 kernel.<p>
+
+An http server on domain0 should be able to serve the yum
+archive to the VM. DHCP needs to be ready to serve the IP address of the VM and
+skeletal forward; reverse config files to map the IP address to DNS must be
+present, too. As long as the various servers do the basics, it doesn’t matter
+which product is used. In this example, the functionality was provided by:<p>
+
+Apache 2.2.2<br>
+ISC DHCP Server 3.0.3<br>
+BIND 9.3.2<p>
+
+For the short and simple service needed, these are
+probably overkill, but they are well known and their setups are well
+documented. DHCP is the most important config and is included in Listing 1.<p>
+
+<b>The Build</b><p>
+
+Kickstart can be used to automate the builds and an
+example kickstart, which will build the first domain, is included in Listing 2.
+This allows for the Xen environments to be easily built and rebuilt. This
+building strategy requires apache and dhcpd to temporarily run on domain0.
+Dhcpd provides the first domain0 environment with an IP address and information
+on DNS location, and Apache serves the contents of the yum archive. I call this
+method "Xen Master is Yum”. After the first domain1 environment is built, the
+apache and dhcp servers can be shutdown on domain0, and the LV holding the yum
+archive can be unmounted from domain0 and exported to the first or other VMs.<p>
+
+A bug in the Xen setup causes corruption on the tx
+checksums of UDP packets. So, before the first domain1 VM can be built, the tx
+checksumming must be turned off on the physical Ethernet device, the virtual
+Ethernet device in domain0, and the virtual endpoint of the virtual Ethernet
+device, which connects to the bridge:<p>
+
+<pre>
+ethtool -K peth0 tx off
+ethtool -K eth0 tx off
+ethtool -K vif0.0 tx off
+</pre>
+
+The dhcpd must then be restarted to take advantage of this.<p>
+
+Xen stores its configuration files in /etc/xen. The name
+of the file corresponds to the human-readable name of the VM but not
+necessarily the DNS name of the environment. It makes sense, however, to
+maintain naming consistency. In this case, the first domain1 will have the A
+record krb5.example.com and C names yum and ldap, both in example.com’s domain
+in accordance with RFC 2606. Having an A record of krb5.example.com on the KDC
+means that, after the build, the /etc/hosts file must include the line:<p>
+
+<pre>
+192.168.42.19    krb5.example.com krb5 ldap yum kdc
+</pre>
+
+Otherwise, Kerberos will mistake the domain name during
+authentication against the KDC. See Listing 3 for an Xen configuration file
+used for building the domain.<p>
+
+The Xen configuration file /etc/xen/krb5 also holds the
+MAC address for the virtual Ethernet device to be used by Xen for the krb5 VM.
+Xen has been granted its own MAC space, 00:16:3E:xx:xx:xx, which XenSource Inc
+permits Xen admins to use [4]. However, if you’re confident of your network MAC
+address space, many experts also recommend using a MAC address that starts ‘aa’
+[5].<p>
+
+The MAC address used must match the address in
+/etc/dhcpd.conf, or the krb5 VM will not be assigned an IP address and the
+installation will fail.<p>
+
+Other parts of /etc/xen/krb5 outline the kernel and
+initrd to use to boot up the VM. Fedora conveniently provides these as part of
+its core install. They can be found on the first CD or in the repository
+outlined above. However, they don’t contain many patches added later, so you
+might want to unpack a Xen0 RPM from the updates yum repository and use those
+instead [6].<p>
+
+Also inside /etc/xen/krb5 is the setting for memory and
+CPU usage. The uuid must be unique; Xen uses it to name the domain internally.
+The disk line provides a way to export files, devices, and LVs for use in the
+VM. Using the settings in Listing 3, Xen will export the LV as a device that
+will be interpreted as an unformatted block device by the installation scripts.
+Therefore, if looked at raw, it will contain a partition table in the first few
+K. This makes it interesting to find grubd, the kernel installed inside the VM.
+FC5 neatly sidesteps this issue by providing a small Python script that seeks
+to the right location on the LV to find grub. But, this is not needed, and any
+script that can seek into the LV and return the boot-loader can be used.<p>
+
+This leaves the kernel management to the sys admin of the
+VM and reduces the exposure of domain0. It may leave open the possibility that
+a malicious admin in a domain1 could try to force domain0 to attempt the boot
+of a carefully crafted kernel, which would allow them either root in domain0 or
+enable them to perform a DOS on the cluster. Occam’s Razor would suggest the
+latter is the more difficult path to crack.<p>
+
+The "extras” line passes the location of the Kickstart
+configuration line. The kickstart file used for the krb5 domain is necessarily
+the most complex in a basic cluster install. Apache must be able to serve this
+file, but it’s not required to be placed in the yum archive. However, after
+domain1 is built, it should no longer be served from domain0 as this represents
+another avenue of attack.<p>
+
+If you’re sure your platform is secure, you can be
+reasonably confident that the kickstart file will not be intercepted by a man
+in the middle attack. The krb5 domain’s kickstart configuration file draws its
+RPMs from the archive in domain0 and then builds the KDC and LDAP services.
+Finally, it draws a set of updates from domain0’s yum archive, then it shuts
+down. It is very difficult to debug this install stage because other terminals
+usually available are not present in the Xen system. It’s possible to get some
+idea of what’s going on by redirecting any command output from the %post
+section to /dev/tty1,<p>
+
+It is essential that Xen interrupt the reboot event in
+the VM at the end of the install. A reboot would normally be the case during an
+"on iron” installation, but if the VM is not properly shut down and the Xen
+config file not changed, the domain will spring back up with the same ‘ks’
+option present and an infinite loop created.<p>
+
+With the domain krb5 down, turn off apache and dhcp in
+domain0. Then unmount the yum archive’s LV and use the Xen configuration file
+in Listing 4 to export it to krb5. Xen does not allow file systems to be shared
+between domain0 and VMs. NFS-ing the yum archive from domain0 or exporting it
+via apache from the hypervisor just isn’t secure enough, because it may be a
+long time between reboots of domain0, and it’ll likely suffer from bit rot. The
+fewer things that might force a kernel panic or eat up memory or CPU cycles in
+domain0 the better.<p>
+
+With the new Xen config file, domain krb5 may be brought
+up. It can run SElinux at this point and should be configured as the KDC and
+LDAP server for the cluster. You could keep it providing yum to the rest of the
+cluster or you could create a new domain1 VM to hold it. Now is the time,
+however, to decide whether you want domain krb5 to control access to domain0.<p>
+
+There is an argument that domain0 should be configured by
+use of sudo or similar technology. Certainly if it’s locked down via SElinux
+with specific users having specific roles in the management of the Xen cluster
+(one for the firewall, one for fixing VM issues, etc.), then these should be
+properly managed. The KDC and LDAP in domain krb5 are the proper places for
+this, and a supplemental LDAP or KDC should not be installed in domain0 for the
+same reason as above.<p>
+
+Because the VM depends on its own LDAP, slapd must be
+started before named. In Fedora Core 5, named has a dependency upon LDAP
+because of the configuration of /etc/nnswitch.conf; booting into run level 3
+will hang unless slapd is brought up before named tries to start.<p>
+
+Once krb5 is running, we can edit /etc/fstab, adding this
+line:<p>
+
+<pre>
+/dev/hda1       /var/local_yum    ext3    defaults,acl    0 0
+</pre>
+
+This mounts our yum archive inside domain0, allowing us
+to build more VMs on the cluster using a domain1 server rather than the more
+valuable domain0.<p>
+
+Even though we have a running cluster at this point,
+there is still work to do to secure it. Iptables must be properly configured,
+and other security measures required by your site still need to be implemented.
+An example script that does all this can be found in Listing 5.<p>
+
+<b>DHCP Requests and Bridging</b><p>
+
+If you’re building the Xen environment on a network it
+can, depending upon whether your routers are well managed, leak DHCP and DNS
+information. Therefore, it is necessary to stop DNS and DHCP messages from
+getting out. This is especially important in a production system if you’re
+rebuilding a Xen cluster and you don’t want your DHCP servers to accidentally
+serve, or worse reject, DHCP requests from other machines.<p>
+
+In domain0, there are three network devices present that
+can help you manage the flow of network traffic:<p>
+
+<ul><li>peth0-- This is the physical Ethernet
+device on the box. Traffic regulation here will affect all traffic physically
+entering and leaving the box.
+
+<li> eth0-- This is a virtual Ethernet
+device used to monitor and control access to domain0. Access restrictions here
+will not affect traffic flowing from the bridge (see below) and the physical
+Ethernet device. Each domain in the Xen cluster has a similar eth0.
+
+<li>xenbr0-- This is the bridge device
+responsible for forwarding the Ethernet packets between the virtual Ethernet
+devices belonging to the domains. It may not be called xenbr0 in your setup, as
+you can define its name and have more than one on a system. The network line in
+the Xen configuration line tells the Xen system which bridge to connect the
+virtual Ethernet device to. You can investigate the bridging subsystem with the
+<b>brctl</b> command.</ul><p>
+
+You may also see a device vif0.0; this is just the other
+end of the virtual Ethernet device, and playing with that is outside the scope
+of this article.<p>
+
+To stop any DHCP requests entering the box you can issue
+this command:<p>
+
+<pre>
+ebtables -A FORWARD --out-interface peth0 --protocol ipv4
+  --ip-protocol udp --i\p-destination-port 67:68 -j DROP
+
+ebtables -A FORWARD --in-interface peth0 --protocol ipv4
+  --ip-protocol udp --ip\-destination-port 67:68 -j DROP
+</pre>
+
+This has two effects-- the first line stops the
+DHCP server on domain0 sending out any DHCP information through the physical
+NIC. Crucially, it still allows DHCP traffic between the virtual bridged
+network devices in the Xen VMs. It will also stop the Xen VMs from accidentally
+sending out DHCP traffic. This means you can confidently test DHCP servers on
+the Xen cluster without irking your network admins. Or, perhaps more
+importantly from a time management point of view, it removes the need to
+closely monitor what sys admins of the VMs are doing; you can let an
+inexperienced sys admin play with DHCP knowing they can’t damage the network.<p>
+
+The second line stops your DHCP server on domain0 from
+receiving DHCP requests from clients outside the cluster. This is more of a
+convenience and stops your domain0 log files from filling with attempts of the
+DHCP server to answer queries. It also makes the DHCP server invisible on the
+wider network, thus reducing the chances of unwanted attention from network
+admins.<p>
+
+There may be other broadcast/discovery protocols on the
+network, like IPP or SMB, that you may also want to restrict on the Xen
+cluster. The ebtables command is very powerful and can fulfill most
+requirements.<p>
+
+If you’re experimenting with Xen, it’s a good idea to
+restrict all external access via the network to the VM and leave access to
+domain0 via SSH open until you’re confident your network admins are happy with
+the setup. It’s possible for a badly set up bridge to bring down even large,
+well-maintained corporate networks. If, for example, you set up spanning tree
+protocol badly, the entire network might end up thinking yours is the best
+route to traverse. Network engineers hate this.<p>
+
+<b>Monitoring</b><p>
+
+When Xen starts, it’ll bind to your terminal. To detach
+the domain1 VMs from the terminal issue CTRL-]. You can always reattach later
+using <b>xm console krb5</b> It’s possible to attach each Xen console to a different
+terminal in a "screen” session, thus allowing for very flexible continuous
+monitoring of the environment.<p>
+
+Other tools like "xentop” give you a top-like display of
+the physical resources used by the cluster, including detailed information
+about the network cards "N” and CPU usage "V”. But, it’s still a good idea to
+run a more in-depth monitoring tool on domain0, such as sa, sar, and vmstat, so
+that bottlenecks in IO can be identified. <b>ebtables</b> can also be set to log
+traffic, but the increase in monitoring in domain0 must be offset by the need
+to keep as little as possible running on it.<p>
+
+<b>Conclusion</b><p>
+
+Xen is still an emerging technology that has yet to find
+widespread use as a hypervisor in the enterprise. However, it is possible to
+successfully build stable, scalable, secure Xen clusters with current
+distributions of Linux. These builds can be on or off the network and contain
+independent authorization, authentication and auditing-- a basic
+requirement of any enterprise cluster.<p>
+
+Running a Xen cluster still requires a lot of in-depth
+knowledge, but the tools are available to play with it safely in the corporate
+and academic environments, and surely this will lead to more sys admins and
+technical architects investigating the technology. Xen’s price and versatility
+not only makes it very attractive but will also force commercial vendors to
+improve their VM products, which can only be good for the consumer. The age of
+cheap and easy virtualization on commodity hardware has arrived.<p>
+
+<b>References</b><p>
+
+1. <b>http://www.cl.cam.ac.uk/Research/SRG/netos/xen/</b><p>
+
+2. <b>http://www.theregister.co.uk/2006/09/15/redhat_xen_beta/</b><p>
+
+3. <b>http://www.cl.cam.ac.uk/Research/SRG/netos/xen/downloads.html</b><p>
+
+4. <b>http://www.cl.cam.ac.uk/Research/SRG/netos/xen/readmes/user/ \<br>
+user.html#SECTION02221000000000000000</b><p>
+
+5. <b>http://wiki.xensource.com/xenwiki/XenNetworking</b><p>
+
+6. <b>http://www.rpm.org/max-rpm/s1-rpm-miscellania-rpm2cpio.html</b><p>
+
+<i>Faye Gibbins works with the GeoSciences IT Support Team @
+Edinburgh University; she’s also Secretary of Edinburgh’s Linux User Group. She
+has 8 years sys admin experience and an Honors Degree in Astrophysics. In her
+spare time, she brews mead, grows chilis, and manufactures corset bones and
+busks. She can be contacted at: <b>fgibbins@staffmail.ed.ac.uk</b>.</i><p>
+        </table></table> 
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

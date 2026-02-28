@@ -1,0 +1,351 @@
+<HTML>
+<META NAME="year" CONTENT="1991">
+<HEAD>
+<TITLE>DEC91: FS: A FILE STATUS UTILITY FOR UNIX</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>FS: A FILE STATUS UTILITY FOR UNIX<a name="028f_0003"></h1><P>
+<h2><a name="028f_0001"><a name="028f_0000">Using system calls to extract open files</h2><P>
+<h3>Jeff Reagen</h3><P>
+<p><i><a name="028f_0002"><a name="028f_0000">Jeff is a special projects engineer for Banyan Systems and can be reached at 28 Grant Street, Milford, MA 01757.</i></p><hr><P>
+In the UNIX environment, just about every operation you can think of involves a file in some way.  For example, the interface to the hard disk occurs through some special device file in the /dev directory; and running a command implies the contents of a file must be known in order to execute them.  The number of open files and type of files are completely driven by the environment of the system.<P>
+Because UNIX is a file-based operating system by design, understanding the system's working set of open files can provide a wealth of information when exploring a running UNIX system.<P>
+In this article, I'll demonstrate how the working set of open files can be extracted from the kernel using system calls from sections two and three of the UNIX programmer's manual.  In addition, various include files are also used, because many kernel data structures are either defined or alluded to in these files.  UNIX System V, Release 3.2, Version 2.2 from Interactive Systems was used to develop the software for this article.<P>
+The file status (fs) utility that is the focus of this article allows the user to examine the current status of the UNIX file table in much the same way ps allows users to look at the list of active processes.<P>
+In UNIX, there exist two distinct address spaces or levels: user and kernel.  At user level, a program is allowed to execute nonprivileged instructions only.  Privilege operations tend to involve those instructions which access hardware devices such as the CPU or hard disk.  The kernel level is where system software executes.  This software is a collection of instructions and data structures used to manage the computer's resources.  Some of these resources include process scheduling, memory management, and the file system.  System software can do anything! There are no protection schemes operating in kernel mode to protect against misbehaving system software.<P>
+The file table is part of the system software.  It maintains a list of all open files in the UNIX system.  Each file table entry contains information about the entry as well as a pointer to an information node, or in UNIX terminology an &quot;inode.&quot;  The inode in turn contains detailed information about the file it represents.  fs uses the combination of these two kernel data structures to report the file status for every active file.  The structure declarations for a file entry and an inode entry can be found in /usr/include/sys/file.h and /usr/include/sys/inode.h respectively.<P>
+Why all the fuss, you might wonder.  Well, in UNIX a user-level program cannot reference the data structures located in the kernel address space.  To bridge this gap, a pseudo device driver, referenced through /dev/kmem is used to treat kernel memory as if it were a file. This driver comes bundled with all flavors of the UNIX system.  Walking through the implementation of fs will provide insight into how this interface is used.<P>
+Before going any further, I should say a fair amount of detective work is required when referencing kernel data structures.  You cannot just open a manual and expect it to tell you that the internal name of the file table is &quot;file.&quot;  Rather, the best advice I can offer involves exploration of the /usr/include/sys directory, where an enormous amount of kernel internal information exists.  In the case of the file table, file.h includes an external reference to an array of file structures called &quot;file.&quot;<P>
+<h3><a name="028f_0004">Implementation<a name="028f_0004"></h3><P>
+As I said earlier, the memory interface /dev/kmem was provided so application programs such as fs could have access to kernel data.  Some of these structures fs wishes to reference can be found in the include files shown in <a href="#028f_000e">Listing One</A> (page 96).  Of particular interest is nlist.h, file.h, inode.h, and var.h. nlist.h contains the definition of a name list structure.  fs declares an array of these nlist structures called kern_syms, which contains three nlist structures.  Two of these structures are used to search for the &quot;v&quot; and &quot;file&quot; kernel data structures.  These two structures play an important role for fs, as we'll see shortly.  The third entry is a null declaration the sole purpose of which is to terminate the list.  fs is only interested in using the n_name and n_value symbols in the nlist structure.  The n_name field is passed in, instructing nlist to look up the symbol matching this string.  n_value is the corresponding value of the symbol in n_name that nlist has retrieved from the kernel's symbol table.<P>
+fs begins by calling uname( ) to determine the name of the current kernel; see <a href="#028f_0010">Listing Two</A> (page 96).  Remember, most UNIX bootstraps provide the capability to boot alternative kernel images.  The kernel name is used by nlist( ) to identify the disk file containing the kernel image.  fs continues by calling nlist( ).  When the call to nlist completes, valid offsets to our kernel data structures can be taken from the n_value fields.<P>
+Next, /dev/kmem is opened.  The first open referenced through file descriptor fd is used for general-purpose work such as file seeks, reads, and file table extraction.  The second open is issued to create a private file descriptor used to directly access specified &quot;in core&quot; inode.<P>
+Now that the initialization stuff is out of the way, fs can get down to business.  First we want to get a copy of the &quot;v&quot; data structure into the user space occupied by fs.  To do so, fs creates a data structure large enough to hold the contents of &quot;v.&quot;  Next, fs must position the file pointer to the base of the &quot;v&quot; structure maintained by the kernel.  Don't get confused here!  There are two references to the &quot;v&quot; structure.  One is the kernel &quot;v&quot; structure -- this is the structure fs wishes to extract.  The second is the local fs copy -- which is where the contents of the kernel version get copied to.  Easy enough, right?<P>
+To position the file pointer, fs calls lseek using the value field returned by nlist.  The pointer is now located at the beginning of the kernel's &quot;v&quot; structure.<P>
+Next, a read is issued to read the kernel &quot;v&quot; into the local &quot;v&quot; structure declared by fs. Voila, fs has successfully pulled the contents of a kernel data structure out of kernel space and placed it into user space.<P>
+With the &quot;v&quot; structure in hand, fs calls file_entry (<a href="#028f_0012">Listing Three</A>, page 98) to examine each entry of the file table.  file_entry begins by positioning the file pointer associated with fd to the beginning of the file table in the same manner fs did for &quot;v.&quot;<P>
+A loop is used to read in each file table entry one at a time.  Because the size of a file table can vary from UNIX system to system, it doesn't make sense to &quot;hard code&quot; the value. Fortunately, UNIX puts the number of file table entries into the &quot;v&quot; structure where the kernel and other programs such as fs can gain easy access to the information.  file_entry uses this count as a loop control variable in the body of its function.<P>
+With the loop in place, file_entry just reads the next sequential file table entry.  If the reference count is greater than or equal to one, the entry is considered valid and fs begins to explore.<P>
+UNIX permits a file to be opened in many different modes, including read and/or write, write append only, and read only.  file_entry( ) displays this mode, which is taken from the f_flag field from the file structure.  Next, the file reference count and the position of the file pointer get displayed.  The reference count may be more than one!  When UNIX forks (creates) a new process, the file descriptors of the process being forked are inherited by the new &quot;child&quot; process which causes the file entry reference count to be incremented.<P>
+With all of the file entry-specific information displayed, file_entry calls inode_entry to take a look at the inode-specific information before moving on to the next entry in the file table.<P>
+inode_entry (<a href="#028f_0014">Listing Four</A>, page 98) is used to query the inode passed to it by file_entry( ).  The inode entry contains specific information about the file, including its type, size, user ID, and group ID, as well as the inode number itself.<P>
+UNIX supports many different file types.  Among these are device files, which couple the physical hardware to a file interface; FIFO files, which allow programs to communicate with one another; directories, which maintain a list of files; and of course plain files which may contain machine instructions or text.<P>
+To gather the inode information associated with the current file entry, inode_entry uses lseek to adjust the position of the inofd file pointer to the offset found in the inode field of the file structure.  On System V, Release 3.2 UNIX machines, this field is referenced through f.up.f_uinode.  inode_entry now transfers the current inode from the kernel into the user &quot;inode&quot; buffer using the read system call.  inode_entry( ) completes its work by displaying the fields of interest described earlier.<P>
+Sample output produced by fs is shown in <a href="#028f_0005">Figures 3</A> and <a href="#028f_0006">4</A>.  <a href="#028f_0005">Figure 3</A> illustrates how UNIX associates a piece of hardware, such as the video display and keyboard in this example, with a file.  Notice the operation being performed is read and/or write, and the next operation is going to take place at hexadecimal offset 4b16.<P>
+<h4><a name="028f_0005">Figure 3: Sample output describing a character device</h4><P>
+<pre>
+  Contents of file table entry #1
+     File operation flag ...... File opened for read/write
+     Reference count .......... 12
+     File pointer position .... 4b16
+     Inode number ............. 65
+     File type ................ Character device (Maj 5/Min 0)
+     File size ................ 0
+     User id .................. 0
+     Group id ................. 0</pre><P>
+<P>
+<h4><a name="028f_0006">Figure 4: Sample output describing a regular file</h4><P>
+<pre>
+  Contents of file table entry #17
+    File operation flag ................. File opened for read/write
+    Reference count ..................... 1
+    File pointer position ............... 1200
+    Inode number ........................ 974
+    File type ........................... Regular file
+    File exists on Major/Minor device ... 0/3
+    File size ........................... 11264
+    User id ............................. 0
+    Group id ............................ 0</pre><P>
+<P>
+If I did not know that the major number for the video and keyboard driver is 5, it would still be possible to determine which driver is associated with major number 5.  Because fs says the device is a character type it will have to be declared as part of the character device switch table also called &quot;cdevsw&quot;.  The cdevsw is an array of all the character devices known to the UNIX system.  The major number is used to refer to a device in the cdevsw.  So in <a href="#028f_0005">Figure 3</A>, the character device of interest is referenced by the fifth entry in the cdevsw table.<P>
+Another piece of sample output from fs describing a regular file is shown in <a href="#028f_0006">Figure 4</A>.  Attributes of interest in this example include the file system's special device name of which the file under inspection is a member, and the inode number. With these two pieces of information, the ASCII name of the file can be obtained using existing UNIX tools.  On my UNIX system, Major number 0 indicates we're dealing with a hard disk, and minor number 3 means it's disk 0 partition 3.  Minor number 3 on most i386/i486 versions of UNIX is usually the /usr file system.  There are two ways the ASCII filename can be located.  The first involves the find command.  Use find to recursively search through /usr looking at the inode number of all regular files.  <a href="#028f_0007">Figure 1</A>  describes the command syntax one may use.  Alternatively, the ncheck command could be used to search a file system for the specified inode and return the ASCII name.  <a href="#028f_0008">Figure 2</A> illustrates the use of ncheck.<P>
+<h4><a name="028f_0007">Figure 1: Using find, ls, and grep to get filename</h4><P>
+<pre>
+  find /usr -type f -exec /bin/ls -i \{\} \; | grep 974</pre><P>
+<P>
+<h4><a name="028f_0008">Figure 2: Using ncheck to obtain name of file</h4><P>
+<pre>
+  ncheck -i 974 /dev/dsk/0s3</pre><P>
+<P>
+<h3><a name="028f_0009">Installation<a name="028f_0009"></h3><P>
+Because fs relies upon kernel memory access, it must execute with Super User privileges.  One way to do this is login as root every time you want to run the program.  This is not desirable because every user would need to know the root password!  A better approach is the set user ID bit, or setuid for short.  setuid works by making root the owner of fs and then changing the mode of fs to include the setuid permission bit.  Then when fs is invoked, the setuid bit instructs UNIX to interpret the user ID to be that of root instead of the user who actually issued the command.  <a href="#028f_000a">Figure 5</A> illustrates how to initially install fs.<P>
+<h4><a name="028f_000a">Figure 5: Installation of fs</h4><P>
+<pre>
+  cp fs /bin/fs
+  chown root /bin/fs
+  chmod go+s /bin/fs</pre><P>
+<P>
+<h3><a name="028f_000b">Extensions<a name="028f_000b"></h3><P>
+This version of fs is primitive in that it displays a verbose listing of each active file table entry.  It's a trivial exercise to modify the output of fs by employing the use of option switches.  For example, an option could be used to limit the display to only those files belonging to a specified user ID or group ID.  Another option switch might display files associated with a particular file system.<P>
+A creative programmer may also decide to display the ASCII name of each file system as opposed to the major and minor number of the disk partition housing the file system.  To accomplish this, the mounted on device name taken from the inode is used as a key to search the mount table referred to by /etc/mnttab.  It's now a simple matter to extract the corresponding ASCII name from /etc/mnttab.<P>
+Actual physical disk sectors occupied by a regular file or directory can be obtained rather easily.  To implement this feature, simply pick up the pointer to the file system-specific inode from the &quot;in core&quot; inode.  Then, display the information referenced through the disk block field.  For example, a 1K System V file system uses the s5inode structure to represent the file system specific portion of the inode.  s5i_a describes which sectors contain the file contents.  The declaration of an s5inode can be found in /usr/include/sys/fs/s5inode.h.<P>
+<h3><a name="028f_000c">Uses<a name="028f_000c"></h3><P>
+fs is probably the most useful for those people whose job it is to take care of UNIX systems--the system administrator.  Administrators could use fs to profile their file systems and understand if the current file system is breaking down due to unbalanced load.  For example, if one file system always seems to have the majority of files active, then the other file systems are essentially doing nothing to enhance overall system performance.  Knowing this information, a sharp administrator might move some of the directories from the busy file system to one of the quiet ones.<P>
+Another use of fs is locating open files on a particular file system.  Remember, a file system cannot be unmounted until all files are closed!<P>
+<h3><a name="028f_000d">Conclusion<a name="028f_000d"></h3><P>
+Although fs provides a specific service, much of the software and many of the algorithms can be used to build new programs which require information maintained by the UNIX kernel.  For example, with the help of a text editor, fs could be transformed into a program used to report the configuration of various static data structures such as the process table, incore inode table, and even the file table.<P>
+Many existing UNIX programs use this algorithm to extract kernel information on a regular basis.  For example, the ps command displays the state of each process currently known to UNIX, and under BSD 4.3, systat utilizes nlist to extract the load averages maintained by the kernel.<P>
+The file status program developed here adds another useful utility to the system administrator's toolbox, or possibly provides another means for the curious programmer to explore UNIX in greater detail.<P>
+
+<PRE>
+
+_FS: A FILE STATUS UTILITY FOR UNIX_
+by Jeff Reagen
+
+<a name="028f_000e">
+<a name="028f_000f"></pre><B>[LISTING ONE]</B><pre><a name="028f_000f">
+
+/* Copyright (c) 1991 Jeff Reagen ALL RIGHTS RESERVED. */
+#include &quot;sys/types.h&quot;
+#include &quot;sys/fcntl.h&quot;
+#include &quot;sys/param.h&quot;
+#include &quot;sys/immu.h&quot;
+#include &quot;sys/fs/s5dir.h&quot;
+#include &quot;sys/signal.h&quot;
+#include &quot;sys/user.h&quot;
+#include &quot;sys/errno.h&quot;
+#include &quot;sys/cmn_err.h&quot;
+#include &quot;sys/buf.h&quot;
+#include &quot;nlist.h&quot;
+#include &quot;sys/stat.h&quot;
+#include &quot;sys/region.h&quot;
+#include &quot;sys/proc.h&quot;
+#include &quot;sys/var.h&quot;
+#include &quot;sys/sysmacros.h&quot;
+#include &quot;sys/file.h&quot;
+#include &quot;sys/inode.h&quot;
+#include &quot;sys/utsname.h&quot;
+
+long lseek();
+
+/* Symbols fs will request from the kernel. */
+struct nlist kern_syms[] = {
+        &quot;v&quot;,
+        0,
+        0,
+        0,
+        0,
+        0,
+
+        &quot;file&quot;,
+        0,
+        0,
+        0,
+        0,
+        0,
+
+        &quot;&quot;,
+        0,
+        0,
+        0,
+        0,
+        0
+};
+
+struct  nlist *pinfo;
+struct  var   v;
+int     fd;
+int     inofd;  /* file pointer for inode lookup */
+
+
+
+
+
+
+<a name="028f_0010">
+<a name="028f_0011"></pre><B>[LISTING TWO]</B><pre><a name="028f_0011">
+
+/* Copyright (c) 1991 Jeff Reagen ALL RIGHTS RESERVED. */
+main ()
+{
+        int     i;
+        long    res;
+        struct  utsname name;
+        char    realname[10];
+
+        /*  Obtain name of current kernel. It's not necessarily /unix! */
+        if (uname (&amp;name) &lt; 0)
+        {
+           printf (&quot;Cannot identify the current Unix system!\n&quot;);
+           exit (1);
+        }
+
+        /* Prefix name of kernel with a &quot;/&quot; */
+        sprintf (realname, &quot;/%s&quot;, name.sysname);
+
+        if (nlist (realname, kern_syms) &lt; 0)
+        {
+                printf (&quot;Could not get name list\n&quot;);
+                exit (1);
+        }
+        pinfo = &amp;kern_syms[0];
+
+        /* Check value of proc symbol. */
+        if (pinfo-&gt;n_value == 0)
+        {
+                printf (&quot;nlist call failed.\n&quot;);
+                exit (2);
+        }
+        if ( (fd = open (&quot;/dev/kmem&quot;, O_RDONLY)) &lt; 0)
+        {
+                printf (&quot;Cannot open /dev/kmem.\n&quot;);
+                exit (3);
+        }
+        if ( (inofd = open (&quot;/dev/kmem&quot;, O_RDONLY)) &lt; 0)
+        {
+                printf (&quot;Cannot open /dev/kmem.\n&quot;);
+                exit (3);
+        }
+
+        /* Get Unix system variable structure. */
+        if ( (res=lseek (fd, (long)kern_syms[0].n_value, 0)) == -1)
+        {
+                printf (&quot;Can't seek /dev/kmem.\n&quot;);
+                exit (4);
+        }
+        if (read (fd, &amp;v, sizeof (struct var)) &lt; 0)
+        {
+                printf (&quot;Can't read sysinfo struct from /dev/kmem.\n&quot;);
+                exit (5);
+        }
+
+        /* Display system information. */
+        file_entry();
+}
+
+
+
+
+
+
+<a name="028f_0012">
+<a name="028f_0013"></pre><B>[LISTING THREE]</B><pre><a name="028f_0013">
+
+/* Copyright (c) 1991 Jeff Reagen ALL RIGHTS RESERVED. */
+/* Examine each entry in the Unix file table. */
+file_entry()
+{
+   int res;
+   int fno;
+   struct file file;
+
+        /* Position to base of file table. */
+        if ( (res=lseek (fd, (long)kern_syms[1].n_value, 0)) == -1)
+        {
+                printf (&quot;Can't seek /dev/kmem.\n&quot;);
+                exit (4);
+        }
+
+        /* read each entry one after the other. */
+        for (fno = 0; fno &lt; v.v_file; fno++)
+        {
+           /* get next slot. */
+           if (read (fd, &amp;file, sizeof (struct file)) &lt; 0)
+           {
+                printf (&quot;Can't read file slot.\n&quot;);
+                exit (5);
+           }
+           /* Display entry info. iff referenece count indicates
+              file entry is valid. */
+           if (!file.f_count)
+           {
+              continue;   /* abort this entry! */
+           }
+           printf (&quot;Contents of file table entry #%d\n&quot;,fno);
+           printf (&quot;\tFile operation flag ................. &quot;);
+           switch (file.f_flag)
+           {
+                case FOPEN:   printf (&quot;File is opened\n&quot;);
+                              break;
+                case FREAD:   printf (&quot;File is being read\n&quot;);
+                              break;
+                case FWRITE:  printf (&quot;File is being written\n&quot;);
+                              break;
+                case FREAD|FWRITE:
+                              printf (&quot;File opened for read/write\n&quot;);
+                              break;
+                case FWRITE|FAPPEND:
+                              printf (&quot;File opened for write append\n&quot;);
+                              break;
+                case FREAD|FWRITE|FAPPEND:
+                              printf (&quot;File opened for read/write appends\n&quot;);
+                              break;
+                case FNDELAY: printf (&quot;File operating in delayed mode\n&quot;);
+                              break;
+                case FAPPEND: printf (&quot;File opened for appended operation\n&quot;);
+                              break;
+                case FSYNC:   printf (&quot;File writes are synchronous\n&quot;);
+                              break;
+                case FMASK:   printf (&quot;File masked ?????\n&quot;);
+                              break;
+                default:      printf (&quot;%x\n&quot;,file.f_flag);
+                              break;
+           }
+           printf (&quot;\tReference count ..................... %d\n&quot;,
+                        file.f_count);
+           printf (&quot;\tFile pointer position  .............. %lx\n&quot;,
+                        file.f_un.f_off);
+
+          /* process the inode */
+          inode_entry (file);
+
+          /* Pause so user can read the output. */
+          getchar(); printf(&quot;\n\n&quot;);
+
+        }
+}
+
+
+
+
+
+<a name="028f_0014">
+<a name="028f_0015"></pre><B>[LISTING FOUR]</B><pre><a name="028f_0015">
+
+/* Copyright (c) 1991 Jeff Reagen ALL RIGHTS RESERVED. */
+/* Get the inode associated with the current file table entry. */
+inode_entry (file)
+  struct file file;
+{
+   int res;
+   struct inode inode;   /* current core inode */
+           if ( (res=lseek (inofd, (long)file.f_up.f_uinode, 0)) == -1)
+           {
+                printf (&quot;Can't seek /dev/kmem for inode.\n&quot;);
+                exit (4);
+           }
+           if (read (inofd, &amp;inode, sizeof (struct inode)) &lt; 0)
+           {
+                printf (&quot;Can't read in core inode.\n&quot;);
+                exit (5);
+           }
+       printf (&quot;\tInode number ........................ %d\n&quot;, inode.i_number);
+       printf (&quot;\tFile type ........................... &quot;);
+       switch (inode.i_ftype)
+           {
+              case IFDIR: printf (&quot;Directory\n&quot;);
+                          break;
+              case IFCHR: printf (&quot;Character device (Maj %d/Min %d)\n&quot;,
+                                major(inode.i_rdev),minor(inode.i_rdev));
+                          break;
+              case IFBLK: printf (&quot;Block device\n&quot;);
+                          printf (&quot;\tBlock device .... %d\n&quot;,inode.i_dev);
+                          break;
+              case IFREG: printf (&quot;Regular file\n&quot;);
+        printf (&quot;\tFile exists on Major/Minor device ... %d/%d\n&quot;,
+                major(inode.i_dev), minor(inode.i_dev) );
+                          break;
+              case IFIFO: printf (&quot;FIFO special\n&quot;);
+                          break;
+              case IFMPC: printf (&quot;Multiplexed Character special\n&quot;);
+                          break;
+              case IFMPB: printf (&quot;Multiplexed Block special\n&quot;);
+                          break;
+              case IFNAM: printf (&quot;Special Named file\n&quot;);
+           }
+          printf (&quot;\tFile size ........................... %d\n&quot;,inode.i_size);
+          printf (&quot;\tUser id ............................. %d\n&quot;, inode.i_uid);
+          printf (&quot;\tGroup id ............................ %d\n&quot;, inode.i_gid);
+}
+</pre>
+
+<HR><P>Copyright &copy; 1991, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

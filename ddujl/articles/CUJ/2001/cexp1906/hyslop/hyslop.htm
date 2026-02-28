@@ -1,0 +1,235 @@
+<HTML>   
+     <HEAD>
+<TITLE>June 2001 C++ Experts Forum/Conversations</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../19.06/tocjun.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Conversations: Abstract Factory, Template Style</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Jim Hyslop and Herb Sutter</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+<p><i>Copyright 2001, Jim Hyslop and Herb Sutter</i></p>
+
+<p>&quot;Do we know what it is?&quot; I gestured at the device lying on the cold metal table before us. It had been one of the first to have been retrieved by the recon parties exploring the immense building buried below us in the ice.</p>
+<p>Jeannine shook her head. &quot;Nyet, tovarisch. It could be a toaster, a hyperdrive motor, a child's toy, or just junk. Last week we thought we had the power system worked out, for this and the other devices, but when we ran the juice through them nothing happened. The techs are back to the drawing board as far as the power goes, but they're hopeful that they'll get it right soon.&quot;</p>
+<p>&quot;And what makes them think they will?&quot;</p>
+<p>&quot;Hope.&quot;</p>
+<p>I glanced at the clock on the wall of the chamber. &quot;Well, it's nearly time. I'm beat, and I'm freezing. Every time we ask the recon teams to give us something new to work on, they produce something new and different. I just wish we could understand even one of these.&quot;</p>
+<p>&quot;I wish we knew more about what was coming out of our little historical ‘artifact factory' here,&quot; Jeannine agreed.</p>
+<p>&quot;That reminds me of something that happened to me back when&#151;&quot;</p>
+<p>Jeannine rolled her eyes. &quot;Tell me when we get someplace warm.&quot;</p>
+
+<hr>
+
+<p>&quot;Bad news,&quot; I called glumly over the cubicle wall to Wendy.</p> 
+<p>&quot;Wazzup?&quot; she gophered up.</p>
+<p>&quot;You know that class I worked on last week?&quot;</p>
+<p>&quot;Not intimately, but do go on.&quot;</p>
+<p>I ignored that. &quot;Well,&quot; I continued, &quot;I have to create a class factory for it. The Guru suggested I look at the class factory the client group wrote.&quot;</p>
+<p>&quot;Yeah, so?&quot; Then a sudden look of dismay crossed her face: &quot;Oh. Bob wrote that, didn't he?&quot;</p>
+<p>I nodded glumly. &quot;Well, one thing I'll give him credit for &#151; every time I crack open his code, I learn how <i>not</i> to do something.&quot; Wendy giggled and sank back into her chair.</p>
+<p>I sighed and checked out the source code. It wasn't quite as bad as I had anticipated. There was only one humongous series of cascading <b>if</b> statements &#151; I had expected a lot worse. Still, it was pretty hairy code, so with the Guru's blessing I set about implementing an Abstract Class Factory <a href="#1">[1]</a>. Absent any requirements for multithreading or other concurrency, I decided to implement the factory as a singleton:</p>
+
+<pre>
+class BaseFactory
+{
+    typedef std::auto_ptr&lt;Base&gt; (*BaseCreateFn)();
+    typedef std::map&lt;std::string, BaseCreateFn&gt; FnRegistry;
+    FnRegistry registry;
+
+    BaseFactory() {}
+    BaseFactory(const BaseFactory &amp;); // Not implemented
+    BaseFactory &amp; operator=(const BaseFactory &amp;); // Not implemented
+
+public:
+    static BaseFactory &amp; instance() { static BaseFactory bf; return bf; }
+
+    bool RegCreateFn(const std::string &amp;, BaseCreateFn);
+
+    std::auto_ptr&lt;Base&gt; Create(const std::string &amp;) const;
+};
+
+bool BaseFactory::RegCreateFn(const std::string &amp; className, BaseCreateFn fn)
+{
+    registry[className] = fn;
+    return true;
+}
+
+std::auto_ptr&lt;Base&gt; BaseFactory::Create(const std::string &amp;className) const
+{
+    std::auto_ptr&lt;Base&gt; theObject(0);
+    FnRegistry::const_iterator regEntry = registry.find(className);
+    if (regEntry != registry.end()) 
+    {
+        theObject = regEntry-&gt;second();
+    }
+    return theObject;
+}
+</pre>
+
+<p>In the <b>Base</b> implementation file, I added:</p>
+
+<pre>
+namespace 
+{
+    std::auto_ptr&lt;Base&gt; CreateBase()
+    {
+        return std::auto_ptr&lt;Base&gt;(new Base);
+    }
+
+    bool dummy = BaseFactory::instance().RegCreateFn(&quot;Base&quot;, CreateBase);
+}
+</pre>
+
+<p>&quot;OK, that's cool,&quot; I thought. &quot;You register a function with the factory, and creating an instance is as simple as one, two, three:&quot;</p>
+
+<pre>
+int main()
+{
+    std::auto_ptr&lt;Base&gt; anObject = BaseFactory::instance().Create(&quot;Base&quot;);
+}
+</pre>
+
+<p>I then proceeded to create a derived class, to test creating it via the factory. In the derived class's implementation file, I added:</p>
+
+<pre>
+namespace 
+{
+    std::auto_ptr&lt;Derived&gt; CreateDerived()
+    {
+        return std::auto_ptr&lt;Derived&gt;(new Derived);
+    }
+
+    bool dummy = BaseFactory::instance().RegCreateFn(&quot;Derived&quot;, CreateDerived);
+}
+</pre>
+
+<p>But the compiler stopped me cold &#151; it complained that it couldn't convert <b>CreateDerived</b> to the correct type. After puzzling over it for a moment, I remembered the problem I had experienced previously with implicit conversions to pointers-to-<b>Base</b> <a href="#2">[2]</a>. I realized I had just run into another situation where the compiler couldn't implicitly convert the pointers, so I had to rewrite the create function slightly:</p> 
+
+<pre>
+namespace 
+{
+    std::auto_ptr&lt;Base&gt; CreateDerived()
+    {
+        return std::auto_ptr&lt;Base&gt;(new Derived);
+    }
+
+    bool dummy = BaseFactory::instance().RegCreateFn(&quot;Derived&quot;, CreateDerived);
+}
+</pre>
+
+<p>Looking back at the base class, I realized that the registration code was almost identical, so I created a macro to wrap it up:</pre>
+
+<pre>
+#define REGISTER_CLASS(BASE_CLASS, DERIVED_CLASS) \
+namespace \
+{ \
+    std::auto_ptr&lt;BASE_CLASS&gt; Create##DERIVED_CLASS() \
+    { \
+        return std::auto_ptr&lt;BASE_CLASS&gt;(new DERIVED_CLASS); \
+    } \
+    bool dummy=BaseFactory::instance().RegCreateFn( \
+        #DERIVED_CLASS, Create##DERIVED_CLASS); \
+}
+</pre>
+
+<p>Using the macro was quite simple:</p>
+
+<pre>
+REGISTER_CLASS(Base, Base)
+</pre>
+
+<p>&quot;Not bad for a few hours' work,&quot; I muttered when I was done.</p>
+<p>&quot;Yes, indeed, my child. But you can do better.&quot;</p>
+<p>I jumped yet again at the Guru's soft voice behind me. &quot;Wha&#151;?&quot;</p>
+<p>&quot;Macro expansions like that,&quot; she explained, &quot;are difficult to read and understand, and macros are not type safe. Also, what is the purpose of the <b>bool</b> dummy variable?&quot;</p>
+<p>&quot;Well,&quot; I said, slightly defensively, &quot;it was the only way I could think of to ensure that the registration function got called automatically. I wanted to get away from the typical factory code that requires a modification each time you add a new class.&quot;</p>
+<p>She inclined her head. &quot;Wise thinking, my child. However, your factory is not very generic. We are dealing with more and more classes that require abstract factories. I want you to create a factory that will handle, not require, modification for each class hierarchy it will be used on.&quot;</p> 
+<p>&quot;A generic abstract factory? That's a pretty tall order, isn't it?&quot;</p>
+<p>&quot;My young apprentice, you are not afraid of a challenge, are you? ‘Experience is by industry achieved...' &quot;</p>
+<p>&quot; ‘... and perfected by the swift course of time,' &quot; I finished <a href="#3">[3]</a>. &quot;No, I'm not afraid of the challenge, but I don't want the swift course of time to turn the schedule aside.&quot;</p>
+<p>&quot;You are most of the way there already. All you need to do is think generically,&quot; she observed.</p>
+<p>&quot;Think generically... as in, templates!&quot; I exclaimed and turned back to my monitor. A few minutes later, I glanced behind me and saw that the Guru had disappeared again as silently as she had appeared. I shivered, but only slightly, and went back to work.</p>
+<p>After a short while, I came up with a factory template:</p>
+
+<pre>
+template &lt;class ManufacturedType, typename ClassIDKey=std::string&gt;
+class GenericFactory
+{
+    typedef std::auto_ptr&lt;ManufacturedType&gt; (*BaseCreateFn)();
+    typedef std::map&lt;ClassIDKey, BaseCreateFn&gt; FnRegistry;
+    FnRegistry registry;
+
+    GenericFactory();
+    GenericFactory(const GenericFactory&amp;); // Not implemented
+    GenericFactory &amp;operator=(const GenericFactory&amp;); // Not implemented
+
+public:
+    static GenericFactory &amp;instance();
+
+    void RegCreateFn(const ClassIDKey &amp;, BaseCreateFn);
+
+    std::auto_ptr&lt;ManufacturedType&gt; Create(const ClassIDKey &amp;className) const;
+};
+</pre>
+
+<p>I realized that not all classes would necessarily need a <b>std::string</b> as the key, so I made the key type a parameter to the template. The implementation of each function was the same as I had used for <b>BaseFactory</b>, except for the registration function. I came up with a more elegant template for that:</p> 
+
+<pre>
+template &lt;class AncestorType, class ManufacturedType, typename ClassIDKey=std::string&gt;
+class RegisterInFactory
+{
+public:
+    static std::auto_ptr&lt;AncestorType&gt; CreateInstance()
+    {
+        return std::auto_ptr&lt;AncestorType&gt;(new ManufacturedType);
+    }
+
+    RegisterInFactory(const ClassIDKey &amp;id)
+    {
+        GenericFactory&lt;AncestorType&gt;::instance().RegCreateFn(id, CreateInstance);
+    }
+};
+</pre>
+
+<p>Now, each class derived from the base class simply had to add one line to get a type-safe registration of the creation function:</p>
+
+<pre>
+RegisterInFactory&lt;Base, Base&gt; registerMe(&quot;Base&quot;);
+</pre>
+
+<p>The <b>RegisterInFactory</b> template's constructor registers the name of the class in the creation registry <a href="#4">[4]</a>.</p>
+<p>I glanced behind me, just in time to see the Guru approaching. I smiled to myself; for once I was slightly ahead of her game. &quot;Very good, my apprentice,&quot; she said, coming up behind me. &quot;Your factory is generic, portable, and does not rely on registration tables, DLL sentries, or other cumbersome techniques.&quot;</p>
+<p>&quot;There is one drawback, though,&quot; I interrupted. &quot;Because the registration relies on a static object being initialized, there is no guarantee that all the creation functions will be registered if you use the factory before <b>main</b> begins execution.&quot;</p>
+<p>&quot;Exactly, my apprentice, your factory is subject to the Static Initialization Order Fiasco, as explained by the prophet Cline <a href="#5">[5]</a>.&quot; She turned to leave.</p>
+<p>&quot;Wait a second,&quot; I called. The Guru turned back. I was trying to figure out a graceful way of asking the question that was on my mind. The Guru patiently tucked a lock of her hair behind her ear while she waited. &quot;About Bob. If he's such a bad programmer,&quot; I managed to say, &quot;how come...&quot;</p>
+<p>&quot;Why is he still here?&quot; the Guru supplied. I nodded. The Guru looked down in thought. &quot;Have you noticed that Bob hangs out with the execs? Senior management thinks he's some sort of golden boy and can do no wrong. Because of our... um... past, Bob has them convinced that any of my complaints about his job performance are just the petty grievances of a bitter ex-wife. And, according to him, anyone who agrees with me has been drawn into my little plots against him &#151; his words, not mine.&quot;</p>
+<p>&quot;Man, that must be tough. Why do you put up with it? You could find a new job like that.&quot; I snapped my fingers.</p>
+<p>She shrugged. &quot;Other than Bob, I like it here. Besides, if I left, I wouldn't get the satisfaction of bugging the heck out of him with this act.&quot; We both laughed. &quot;Seriously, though,&quot; she continued, &quot;this company has a lot of opportunities for career growth. For example, our new biomedical device division is going to need a head of software development &#151; I've applied for the position.&quot;</p>
+<p>&quot;Cool! Good luck,&quot; I said. The Guru nodded her thanks. I turned back to my workstation, to put the finishing touches on the abstract factory template.</p>
+
+<hr>
+
+<p>It was late at night a few days later when the news came, but I didn't find out about it until I got up the next morning. Still bleary-eyed, I was walking into the mess when the unusual level of noise made me put my hands over my ears and wince. &quot;What's with all the chatter?&quot; I muttered grumpily at the dozen people who were already there, talking excitedly. &quot;It's too early for you guys to be this perky.&quot;</p>
+<p>It was Major Gilb who answered, smiling. &quot;We think we've got it, my boy, we think we do.&quot;</p>
+<p>&quot;What?&quot; I grumped through mental cobwebs.</p>
+<p>&quot;Looks like the power's on,&quot; Jeannine said simply.</p>
+
+<H3><FONT COLOR="#000080">Notes and References</FONT></H3>
+
+<p><a name="1"></a>[1] Gamma, Helm, Johnson, Vlissides. <i>Design Patterns: Elements of Reusable Object-Oriented Software</i> (Addison Wesley, 1995).</p>
+<p><a name="2"></a>[2] Jim Hyslop and Herb Sutter. &quot;Conversations: Roots,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, May 2001, <b>http://www.cuj.com/experts/1905/hyslop.htm</b>.</p>
+<p><a name="3"></a>[3] William Shakespeare. <i>Two Gentlemen of Verona</i>, I iii 22.</p>
+<p><a name="4"></a>[4] The complete factory file, along with a small driver program, is available on the <i>CUJ</i> website at <b>hyslop.zip</b>.</p>
+<p><a name="5"></a>[5] Marshall Cline. C++ FAQ-Lite, <b>http://www.parashift.com/c++-faq-lite/</b>.</p>
+
+<p><i><B>Jim Hyslop</b> is a senior software designer at Leitch Technology International Inc.  He can be reached at <b>jim.hyslop@leitch.com</b>.</i></p>
+<p><i><B>Herb Sutter</b> is an independent consultant and secretary of the ISO/ANSI C++ standards committee. He can be reached at <b>hsutter@acm.org</b>.</i></p>
+
+<h4><a href="../../../source/2001/jun01/hyslop.zip"></a></h4>
+
+
+</BLOCKQUOTE></BODY></HTML>

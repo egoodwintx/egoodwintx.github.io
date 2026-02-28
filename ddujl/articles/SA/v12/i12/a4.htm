@@ -1,0 +1,469 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i12: Oracle Database Backups via UFS Snapshots and Enterprise Backup Products</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a4_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink"><a href="a4_f2.htm">Figure 2</a></span></td>
+		<td><span class="navbarLink"><a href="a4_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink"><a href="a4_l2.htm">Listing 2</a></span></td>
+	</tr>
+	<tr>
+		<td><span class="navbarLink"><a href="a4_s1.htm">Sidebar</a></span></td>
+		<td><a href="../../../../source/SA/2003/dec2003.tar"><b class=codeListing>dec2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b>Oracle Database Backups via UFS Snapshots and Enterprise Backup 
+              Products</b></h1>
+            <p> <i>Rick Moakley</i>
+            <p> In the fall of 2002, I was assigned the task of putting together 
+              a Solaris 9 system for a new machine, including system and database 
+              backups. Typically, we would install an ATL and backup product for 
+              this task, but we wanted to move away from that model to something 
+              more enterprise-centric. We use IBM's Tivoli Storage Manager for 
+              our enterprise backup product, so we looked into their Data Protection 
+              for Oracle add-on. In the meantime, I put together an interim solution, 
+              as described in this article, which worked so well that we kept 
+              it.
+            <p> I faced the task of backing up this 250+ GB Oracle database over 
+              a 100 Base T NIC, and the problem was the amount of time it would 
+              take to do so. Rough estimates indicated that it would take 8 to 
+              12 hours on a good day. Then, my research uncovered UFS snapshots. 
+              Using UFS snapshots (and a little multitasking), we were able to 
+              complete the backup in about 4 hours (during off-shift time). With 
+              this setup, there is only a minute or two of downtime for the database 
+              when doing a cold backup, and the database is in backup mode only 
+              briefly during a hot backup.
+            <p> The advantages of the resulting scripts using snapshots and multithreading 
+              the process were significant. We saw significant cost savings by 
+              not purchasing an ATL, tapes, and software. The downtime for a backup 
+              is brief, and the wall clock time is a fraction of a regular backup. 
+              Also, we don't have to maintain lists files to be backed up -- a 
+              big plus to any admin. Once the space is set aside for doing snapshots, 
+              the scripts are installed and cron'ed, and the Oracle userid is 
+              profile verified, the process runs automatically and is virtually 
+              maintenance free.
+            <p> <b>UFS Snapshots and Wrapper Scripts</b>
+            <p> UFS snapshots are a little-used facility incorporated into Solaris 
+              (since release 8) that allow a privileged user (i.e., root) to create 
+              a point in time copy of a file system afer quieting it. Copy-on-write 
+              operations place pre-change copies of the filesystem blocks into 
+              a "backing store file", and when the associated fssnap device is 
+              mounted, the blocks stored in the backing store file overlay the 
+              changes to the original. Thus, reading from the snapshot device 
+              presents a point-in-time copy of the original file system to the 
+              backup product of choice.
+            <p> Doing a database backup is typically more complicated than a file 
+              system backup, and because I was adding snapshots and multitasking 
+              to the mix, things got even more complicated. My solution was to 
+              put a couple of wrapper scripts together to manage the backup process 
+              and do the actual backups. There is a backup.parent script (Listing 
+              1) that does the management. It queries the database for its critical 
+              file information (i.e., tablespace, control filenames, archive logs, 
+              etc.), readies the database (i.e., puts it in backup mode), snapshots 
+              the required filesystems, and then starts a set of backup.child 
+              scripts (Listing 2) that do the actual backups. Each invocation 
+              of a child script is passed a filesystem, set of files within, and 
+              proceeds to do its share of the work backing up the tablespace files 
+              and deleting the snapshot when complete.
+            <p> For cold backups, the datafiles, controlfiles, and logfiles are 
+              backed up. For hot backups, the datafiles, archive logs in use between 
+              the start and end (signified by a "switch log"), and a backup copy 
+              of the control file is created and backed up.
+            <p> <b>How the Scripts Work</b>
+            <p> The scripts are pretty straightforward. The use of functions (although 
+              perhaps easier in some sense) was discouraged to facilitate easier 
+              reading by non-programmers. There are very few variables to adjust, 
+              and those are detailed in this article. When started, the scripts 
+              are passed a database instance name (the ORACLE_SID), and optionally 
+              the type of backup (cold or hot), number of concurrent streams, 
+              and a retention period (used by TSM):
+            <p> 
+            <pre>
+./backup.parent database01 HOT 4 ARC5WEEKS
+</pre>
+            The defaults are cold -- one per CPU -- and ARC5WEEKS (which must 
+            be defined by the TSM administrator). The parent script, after profiling 
+            its environment, ensures that the snapshot filesystem (i.e., snapshot_fs=/fssnap) 
+            is actually mounted (it will alert you to this and point out where 
+            to change this value). At one point in my testing, I discovered that 
+            the snapshot filesystem wasn't mounted, and the process continued 
+            merrily along its way filling up root, so I added the above section 
+            into the script.
+            <p> Provided the snapshot_fs is okay, the next step is to determine 
+              which files are actually going to be backed up. I chose to avoid 
+              manually keeping track of files or directories, which is error-prone 
+              at best, and at worst you don't know what was forgotten in a backup 
+              until you need to restore it. The script goes right to the source 
+              -- the database itself -- for each run. When the DBA adds a file, 
+              it doesn't get missed. Files are identified by doing a "switch user" 
+              to the Oracle id and executing a sqlplus command with a few selects, 
+              while spooling the output to a file. If your Oracle userid is not 
+              "oracle", change it in the script (i.e., oracle="oracle"):
+            <p> 
+            <pre>
+CONTROLFILE='v\$controlfile'
+LOGFILE='v\$logfile'
+DATAFILE='v\$datafile'
+TEMPFILE='v\$tempfile'
+...
+${su} - ${oracle} &lt;&lt; EOF &gt;&gt; $log1 2&gt;&amp;1
+${prep_script}
+sqlplus -SILENT "/ as sysdba" &lt;&lt; EON &gt;&gt;  $log2
+whenever sqlerror exit 1
+set pagesize 0
+set heading off
+set timing off
+spool $tmpfile1
+select 'CONTROLFILE::'|| name      from $CONTROLFILE;
+select 'TABLESPACE:'||tablespace_name||':'||file_name from sys.dba_data_files;
+select 'LOGFILE::'||member    from $LOGFILE;
+select 'TEMPFILE::'||NAME      from $TEMPFILE;
+spool off
+set echo off
+spool $tmpfile2
+SHOW parameter db_block_size
+spool off
+exit 0
+EON
+EOF
+</pre>
+            The resulting file can be <b>grep</b>ed for the needed files. When 
+            doing a cold backup, the control files, tablespaces files, and log 
+            files must be backed up via snapshot. For a hot backup, we only back 
+            up the tablespace files via snapshot. Special considerations are made 
+            for the control file and archive logs.
+            <p> Since each filesystem must be snapped only once, we use <b>grep</b> 
+              to select the ones we want and to weed out the ones we don't want. 
+              According to the above rules, run a <b>df</b> on each database file, 
+              writing the filesystem name to a temporary file. A <b>sort -u</b> 
+              command removes the duplicates, resulting in a list of filesystems 
+              to snapshot:
+            <p> 
+            <pre>
+if [ $hot_or_cold == "HOT" ]; then
+        pathlist=$(grep ^"TABLESPACE:" $tmpfile1 | nawk -F: '{print $NF}')
+else    pathlist=$(grep -v "TEMPFILE:" $tmpfile1 | nawk -F: '{print $NF}')
+fi
+for path in $pathlist; do
+    filesys=$(df $path|cut -f1 -d'('|tr -d ' ')
+    outfile=$(echo $filesys|tr / _)
+    echo $path &gt;&gt; $tmpname.$outfile
+    echo $filesys $tmpname.$outfile &gt;&gt; $tmpfile2
+done
+
+# sort and de-dup the temp file
+sort -u -o $filesystems $tmpfile2
+${rm} $tmpfile2
+</pre>
+            Before we snapshot the filesystems, the database must be "readied 
+            for backup". In the case of a cold backup, we do another switch user 
+            to Oracle, and a "shutdown immediate". All the commands are in stream 
+            with another "here is" document, as shown in the previous example. 
+            The process is a bit different for a hot backup; we need to put each 
+            tablespace in "backup mode". Because the list of files isn't hard-coded, 
+            we use <b>awk</b> to build a couple of "command files" with the standard 
+            commands, a complete set of BEGIN and END BACKUP tablespace commands, 
+            as well as a couple of commands to print the status of the archive 
+            logs. Note that for this method to work, the DBA must ensure that 
+            the database is running in "archive log" mode.
+            <p> Once we've prepared the database, we run through the list of filesystems, 
+              taking a snapshot of each one. Things get sticky if any of the snapshots 
+              fail. You can't just quit and leave the database in backup mode, 
+              or worse, down. Users and DBAs don't like that, and you can't just 
+              leave the snapshots hanging there. I coded the script so that if 
+              a snapshot error is encountered, it stops trying to take the others, 
+              deletes the ones already taken, and readies the database for normal 
+              operations. This rarely happens, but it's best to be prepared:
+            <p> 
+            <pre>
+chunksize=$(expr $blksize / 1024)k
+while read filesystem pathnames
+do
+    outfile=$(echo $filesystem|tr / _)
+    snapshot=$(${fssnap} -F ufs \
+        -o backing-store=$bstmpname.$outfile.bs,chunksize=$chunksize $filesystem)
+    rc=$?
+    if [ $rc -ne 0 ]; then
+        logger  -ip local1.notice $0": Error" $rc "doing snapshot for:" $filesystem
+        echo "Error" $rc "doing snapshot for:" $filesystem
+        # error? don't exit here (database status?) see below
+        break
+    else  echo $filesystem "snapshot taken, Ok"
+        logger  -ip local1.notice $0":" $filesystem "snapshot taken, Ok"
+    fi
+    echo $filesystem $pathnames $snapshot &gt;&gt; $tmpfile2
+done &lt; $filesystems
+...
+if [ $rc -ne 0 ]; then
+    if [ -f $filesystems ]; then
+        while read filesystem pathnames snapshot
+        do
+            logger  -ip local1.notice $0": Removing snapshot" $snapshot
+            echo "Removing snapshot" $snapshot
+            if [ ! -z "$snapshot" ]; then
+                ${fssnap} -i -o mountpoint,backing-store, backing-store-len $filesystem &gt;&gt; $log1
+            ${fssnap} -d $filesystem
+            fi
+        done &lt; $filesystems
+    fi
+fi
+</pre>
+            After making the snapshots, return the database to service either 
+            by restarting it for cold, or ending backup mode for hot. At this 
+            point, the backup is done as far as the database is concerned. This 
+            process takes less than two minutes on the systems utilizing this 
+            technique. The remainder of the task is to start up child processes 
+            that mount the snapshots, back up the files, and delete the snapshots 
+            when done. By spawning child processes to perform the actual backup, 
+            we multi-stream the task and reduce the wall clock time considerably.
+            <p> There are additional benefits. For example, when all the files 
+              in the file system have been backed up, the snapshot actually becomes 
+              a liability. Not only does it waste space, but until it's deleted, 
+              any write activity in the snapped filesystem will cause the snapshot 
+              to grow. When the child process finishes and deletes the snapshot, 
+              the used space is returned and becomes available for other filesystem 
+              snapshots to grow into. By starting multiple child processes and 
+              simultaneously backing up multiple filesystems, the lifespan of 
+              each snapshot is shorter, the eventual size (when the backup is 
+              complete) is smaller, and thus the total space requirement is reduced.
+            <p> <b>Benefits for Hot Backups</b>
+            <p> I occasionally hear complaints about hot backups. Most often, 
+              there is the issue of maintaining the archive logs, particularly 
+              keeping them together as part of a "backup set". There is also concern 
+              about what the <i>Oracle Backup &amp; Recovery Handbook</i> (by 
+              Rama Velpuri, 1997, Oracle Press) describes as the "split block 
+              phenomenon". Split blocks are (logical) blocks where the front half 
+              doesn't match the back half. This can occur when a block is written 
+              while it was being read by the backup task.
+            <p> To ensure that the complete block is in place following a restore, 
+              logs must be re-played during the "recover" operation. This can 
+              be a complicated process if your backup has taken hours to run, 
+              and you can wind up with a significant amount of additional data 
+              to maintain. Herein lies an additional benefit to using UFS snapshots. 
+              Because the database is only in backup mode during the moments the 
+              snapshots are being taken, you have minimal archive log data to 
+              keep, and because it only takes a moment to make the snapshot, the 
+              only split blocks can be those that were being written during the 
+              time the snapshots were actually being made.
+            <p> The <i>Oracle Backup &amp; Recovery Handbook</i> indicates that 
+              the snapshots and hot backups tablespaces should be backed up one 
+              by one and that you should not batch them together. We deviate from 
+              that rule because to perform the backup properly via snapshot, all 
+              the files in a filesystem must be in backup mode before taking the 
+              snapshot. The "backup" is then logically being made (from the database's 
+              point of view) when the snapshot occurs, not while it is being copied 
+              to tape. This is important to remember, because the backup is not 
+              truly complete until all the data has been copied to tape, and there 
+              are pluses and minuses to this effect. If your snapshot fails (filling 
+              the backing store file system, system crash, snapshots don't persist 
+              across a reboot, etc.), you must start over. But if the backup server 
+              fails during the backup, you can pick up where you left off, manually 
+              (or scripting) backing up the remaining files when you get into 
+              the office -- provided that you built your snapshot file system 
+              with sufficient free space.
+            <p> <b>Profiling and Space Needs</b>
+            <p> The considerations for using this technique (and these two scripts) 
+              include how you "profile" your Oracle environment, the space needed 
+              to hold the snapshots, and taking the snapshots. Our site uses the 
+              "oracle" userid and a "newdb" prep script to set up the environment. 
+              For the purposes of these scripts, I've included the following example 
+              of what is needed, namely the PATH information and database SID. 
+              If you have another id, or you profile things differently, you will 
+              need to either add this to your environment in the oracle userid 
+              profile, or as a script sourcing it in, or make some slight changes 
+              to the "parent" script. The backup.parent script (Listing 1) contains 
+              a <b>${prep_script}</b> variable (located right below the Oracle 
+              userid variable), which is used to call the setup routine. If your 
+              situation doesn't need this, blank it out. An example of what is 
+              needed in the setup routine is:
+            <p> 
+            <pre>
+export ORACLE_SID=$1
+export ORACLE_HOME=/opt/oracle8/product/8.1.7
+export PATH=${PATH}:${ORACLE_HOME}/bin
+</pre>
+            The space required to hold the snapshots is based on the rate of change 
+            that occurs in the filesystems being snapped (including non-database 
+            files). In my experience, allocating a separate filesystem of approximately 
+            5 to 10 percent of the size of the combined files should be sufficient 
+            to start. The only way to determine what is right for your site is 
+            to try it. Fortunately, you don't actually need to perform a backup 
+            -- you can manually make a snapshot, estimate the time it would take 
+            to back it up, then wait and query the snapshot for its "backing store" 
+            size.
+            <p> If you have a "logical volume manager" and the necessary free 
+              space, I recommend using that to build a permanent backing store 
+              filesystem and keep nothing there but snapshots. The scripts use 
+              a /fssnap file system; be sure that you change that to suit your 
+              installation. Because they are transient objects -- only good for 
+              the life of the backup -- the backing store filesystem itself can 
+              be transient if it contains only snapshots. You can create and delete 
+              it at will, and it probably does not need to be RAID protected. 
+              (There is the slight chance your backup could fail, but you must 
+              determine whether that justifies the additional disk I/O overhead 
+              or space requirements.) And, if the space requirements change, you 
+              can easily destroy and recreate it without needing to back up the 
+              files contained within.
+            <p> The most important consideration when allocating space for a snapshot 
+              files system is scheduling of the backup job. If the job is run 
+              off-shift, outside of a window used for updating the database, the 
+              space requirements will probably be minimal. If the database in 
+              question has a significant amount of write activity during normal 
+              operations, you will need to test the process to determine the space 
+              requirements. In my experience, the more write operations, the faster 
+              the snapshot grows, and the slower the backup runs, thus leading 
+              to something that looks like a geometric progression of space requirements.
+            <p> Specifying the chunk size properly can help minimize the space 
+              needs. Spreading the database over several file systems helps even 
+              more, because as each file system is backed up and the associated 
+              snapshot is deleted, that space becomes available for the remaining 
+              ones to grow into. The scripts will calculate and set chunk size 
+              and manage the snapshots, but the DBA and admin are the ones responsible 
+              for selecting the schedule. See the sidebar, "Managing the Snapshots".
+            <p> Backing store sizes (Figures 1 and 2) indicate the sizes and distribution 
+              of the 500 snapshots taken for the backup jobs run during a six-month 
+              period. Less than 20% of them exceeded 10MB in size, and roughly 
+              5% exceeded 1GB. The few occasions where they did grow into the 
+              gigabyte range were during periods where the backup either ran into 
+              early morning (prior to 8:30AM) user activity, or was run during 
+              the day. Given there are 7 filesystems holding the database files, 
+              getting 95% of the backups done with less then 7GB of backing store 
+              space makes it really cost effective.
+            <p> <b>TSM Considerations</b>
+            <p> As I mentioned, we used IBM's TSM product for doing backups. When 
+              doing backups, we used the <b>archive</b> command versus the <b>backup</b> 
+              command to more easily manage the cycles and retention. (Archives 
+              are a point-in-time copy for as long as the expiration date specified, 
+              unless deliberately deleted.)
+            <p> There was one parameter that we modified from the defaults -- 
+              "resourceutilization 10" was added to the client dsm.sys file. This 
+              parameter allows more streams (sockets) between the client and server; 
+              you may or may not need to use this. The reference describes that 
+              specifying "10" would allow up to eight simultaneous client connections 
+              to the server. The script defines the number of concurrent child 
+              processes equal to the number of processors in the host machine, 
+              but also provides a command-line option to override that default. 
+              If your environment pushes that envelope or you just want to "throttle 
+              it", you can either pass it the number of child processes to run 
+              or modify the script.
+            <p> I have other backup products at my disposal and have deliberately 
+              coded the scripts so that the preferred backup product can be used. 
+              There are three areas where this comes into play: the first is at 
+              startup checking to make sure the server is functioning; the second 
+              (immediately following) is verifying the retention period for the 
+              "archive" is valid (these two could be modified or omitted, if desired); 
+              and the third (in the child script) is the actual backup itself.
+            <p> You can substitute the appropriate syntax for using Legato Networker's 
+              "save", Veritas Netbackup's "bpbackup", or any other network backup 
+              product you want in the "child" script. The scripts generate a unique 
+              name for each backup run, and use it in the TSM <b>archive</b> command's 
+              "description" field. The description name is based on the database 
+              SID, type of backup (hot or cold), the date, and time, and process 
+              id of the parent task. This description name is also incorporated 
+              directly into the file name of the log. This makes for simpler management 
+              of the backups when performing a query or restore. For other products, 
+              this would translate to Networker's "save set id" field and Netbackup's 
+              "keyword" field.
+            <p> <b>Restore Operations</b>
+            <p> To actually restore a tablespace (or the entire database), remember 
+              that the mount point from which it was backed up is where the snapshot 
+              was mounted, not where the tablespaces are mounted. When doing the 
+              restore, you must specify the two locations; for TSM, it is "file 
+              backed up" and the "destination". Networker uses a relocate option, 
+              and Netbackup has a "rename file" where the "backup file" and "restore 
+              name" are separated by a single space. With TSM restoring a single 
+              file is a relativity straightforward task. When you restore the 
+              whole database, it becomes a bit more complex. However, the syntax 
+              is still simple, you just need to specify each filesystem on a separate 
+              command line:
+            <p> 
+            <pre>
+dsmc retrieve -replace=yes -desc=dbname.type.date.time.pid "/snapshot/filesys1/*" "/filesys1/"
+dsmc retrieve -replace=yes -desc=dbname.type.date.time.pid "/snapshot/filesys2/*" "/filesys2/"
+...
+dsmc retrieve -replace=yes -desc=dbname.type.date.time.pid "/snapshot/filesysN/*" "/filesysN/"
+</pre>
+            While I have done this for small databases, I have not yet had to 
+            restore an entire large database, thus can't accurately estimate the 
+            time to do so. Things to take into consideration are that TSM (and 
+            probably others) tend to store files in an online storage pool during 
+            the backup process, and then migrate them to tape when resources permit. 
+            Thus, while you may be able to start multiple restores, many of the 
+            restore requests will likely queue up against the same physical tape 
+            media. If you do implement this process, insure that you set a reasonable 
+            level of expectation on when such a restore might complete.
+            <p> <b>Conclusion</b>
+            <p> While no process is foolproof, these scripts can simplify the 
+              task and allow it to be automated to run during the best times for 
+              performing the backup. These scripts will determine which files 
+              are to be backed up, execute the appropriate commands to ready the 
+              database (be it shutdown for cold, or backup mode for hot), snapshot 
+              the filesystems, bring the databases back online, and run the backup 
+              tasks in parallel to minimize the wall clock time. (The latter presumes 
+              the target system is doing some data compression, and has multiple 
+              CPUs with which to do so.) Diagnostic information is written by 
+              both scripts into the /tmp filesystem, collected at the end of the 
+              run and moved to a log directory (the default being adjacent to 
+              the location in which the scripts are placed). During the run, interesting 
+              messages are written to the system log using the <b>logger</b> command, 
+              having first added a "local1.notice" facility entry to the /etc/syslog.conf 
+              file.
+            <p> When doing some tuning, I've found the following information helpful:
+            <p> 
+            <p> 
+            <ul>
+              <li> <b>netstat -k</b> has a "biostats" section that reports on 
+                hits and lookups in the cache. 
+              <li> <b>kstat -p unix::var:v_bufhwm</b> seems to provide the upper 
+                limit in K. 
+              <li> <b>mdb -k</b> with a <b>bfreelist$&lt;buf</b> command returns 
+                the number of buffers not yet allocated in the bufsize field. 
+              <li> <b>sar -b</b> will produce statistics on the buffer cache.
+            </ul>
+            <i>Rick Moakley is a Unix Systems Administrator with Epsilon Data 
+            Mgmt. Over the past 25 years, he has served in Operations, Systems 
+            Programming, Software Engineering, and Process Improvement teams with 
+            an array of roles from managing and maintaining mainframes and Unix 
+            systems, to developing applications in System 390 assembler, C, Lotus 
+            Notes, SAS, and more. During his free time, he likes "to putter around" 
+            with home projects, and spend time with his fianc&eacute;.</i>
+        </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

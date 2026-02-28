@@ -1,0 +1,333 @@
+<HTML>
+<META NAME="year" CONTENT="1995">
+
+<HEAD>
+<TITLE>SP95: Optimizing for the PowerPC</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Optimizing for the PowerPC<a name="02a1_00d5"><a name="02a1_00d3"><a name="02a1_0000"></h1><P>
+<h2>Strategies for greater performance</h2><P>
+<h3>Michael Ross</h3><P>
+<p><i><a name="02a1_00d4"><a name="02a1_0000">Michael, a software engineer for MetaWare, can be contacted at miker@metaware.com.</i></p><hr><P>
+With its great speed, low power requirements, and flexible programming model, the PowerPC represents a jump in microprocessor technology. Consequently, many developers are beginning to port their applications from the Intel architecture to the PowerPC. The PowerPC and the Pentium, however, represent two very different approaches to computer architecture, and moving applications from one platform to the other with a minimum of fuss is not always easy. You may need to change development platforms, targets, or tool vendors. <P>
+At MetaWare, we've ported our C/C++ compilers to the PowerPC. In doing so, we've learned a few tricks that I'll share with you in this article. I'll also describe some of the techniques we use to improve the code our compilers generate for the PowerPC. For the basis of my discussion I'll use the 601 model.<P>
+<h3><a name="02a1_00d6">PowerPC Quick Tour<a name="02a1_00d6"></h3><P>
+One interesting feature of the PowerPC is the branch processing unit (BPU); see <a href="199502a3.htm">Figure 1</A>. The branch processor doesn't depend on either the integer or floating-point units; it works in concert with the instruction unit to keep instructions flowing. The BPU can look ahead in the instruction queue for a branch instruction and use static branch prediction on unresolved conditional branches to permit fetching instructions from the predicted target instruction stream. When prediction is correct, a branch can be performed in zero clock cycles. This feature of the PowerPC architecture is similar to the branch table of the Pentium or the branch target buffer and the reorder buffer of Intel's upcoming processor, the P6. The Pentium's 256-element Branch Table for dynamic branch prediction does not boast the same success rate as the PowerPC's BPU, and causes a 3- to 20-cycle penalty if the prediction fails. This is also true on the P6. The PowerPC BPU has more built-in capability that doesn't rely on the integer-processing unit. Mispredicted branches, on average, incur less penalty than in the P6 and Pentium. This is because the instruction queue is only eight instructions long, and a flush of the queue is likely to incur only a 1- or 2-cycle penalty. <P>
+The BPU has three special-purpose registers that are not part of the usual general-purpose registers:<P>
+<UL>
+<li>Link register (LR).</li>
+<li>Count register (CTR).</li>
+<li>Condition register (CR). </li>
+</UL>
+The BPU calculates and saves the return pointer for subroutine calls in the LR. The CTR contains the target address for some conditional branch instructions. The LR and CTR can be easily copied to or from any general-purpose integer register. Because the BPU has these special-purpose registers, all branching except for synchronization can be carried out independent of the integer and floating-point units. Unlike the Pentium, which has many special conditions that must be fulfilled before instructions can execute in parallel (often producing stalls), the PowerPC's BPU unit helps prevent stalls from occurring. Since the PowerPC architecture reserves these registers (LR, CTR, CR) for the branch processing unit, compilers have more integer registers available for allocation of important variables. <P>
+From the compiler's point of view, the number of fast, general-purpose registers available on a processor is a key factor in the execution speed of applications. In this respect, the PowerPC has the Pentium beat. The Pentium has only eight 32-bit integer registers: ESP and EBP are dedicated to special purposes, and other registers are implicitly destroyed by certain instructions, creating a headache for register allocation. The P6 processor (with 40 general registers and a hardware-register-renaming scheme) helps, but it doesn't solve the problem, due to the need for backward compatibility. Under the PowerPC application binary interface (ABI), the compiler has 15 general-integer registers that may be used just for local variables. On the Pentium, some optimizations such as strength reduction for array accesses simply cause too much competition for registers, and rarely pay off. The PowerPC allows you to take advantage of all the possible optimizations at your disposal.<P>
+The instruction unit actually contains the instruction queue and the BPU, providing a central control over the instructions issued to the execution units, the integer unit, and the floating-point unit. The instruction unit determines the next instruction to be fetched from the 32-byte cache and controls pipeline interlocks. It allows out-of-order execution when instructions do not depend on the result of an instruction currently executing.<P>
+The PowerPC's integer unit (IU) performs all loads, stores, and integer arithmetic. It contains an ALU and an integer exception register (XER). Most integer instructions execute in one clock cycle. Loads and stores are issued and translated in sequential order, but actual memory access can occur out of order. Synchronizing instructions are available for times when order is critical. The IU contains 32 integer registers, each 32 bits wide. 64-bit versions of the PowerPC are coming soon. <P>
+The floating point unit (FPU) is fully IEEE 754 compliant and contains 32 floating-point registers, each of which can hold either a single- or double-precision operand. The FPU can look ahead and find instructions in the queue that do not depend on unexecuted instructions and process the latter early. The FPU is pipelined, so that most instructions can be issued back to back, without stalling. Unlike the stack-style access to floating operands of the Intel chips, the floating-point registers allow true random access, so complex scheduling and swapping algorithms are not necessary to achieve good performance. <P>
+<h3><a name="02a1_00d7">Measuring Performance<a name="02a1_00d7"></h3><P>
+The difference in philosophies between the PowerPC and the Pentium becomes more evident as you begin to analyze code and performance. The Pentium chip places the burden of good performance squarely on the compiler writer's shoulders. The compiler writer has to be aware of all the special conditions that allow parallel execution of integer instructions in the U and V pipes on the Pentium, and the many conditions where instruction pairing isn't possible. The PowerPC lacks all these constraints and provides a lot of hardware assistance to make the job easier. Compounding the performance problem for application vendors is the fact that the same sequence of instructions won't run universally well across the family of Intel processors. For example, to gain performance on the Pentium, you should replace integer multiply instructions with a sequence of less complex shifts and adds where possible. However, on other Intel processors such as the P6, you should do just the opposite--use the integer multiply instruction <I>rather</I> than adds and shifts. On the 80486, you need to be concerned with whether an instruction is aligned so that it crosses a 32-byte boundary, while on the Pentium this makes little difference. It's much easier to get an application that has uniform performance across the PowerPC family. A spreadsheet vendor might have to compile for the lowest common denominator on the Intel family (probably the 80486), so in many cases, customers would not get to use the power of their Pentium processors. The main thing Pentium has going for it is a huge installed base, and a lot of shrink-wrapped software for Windows/NT, DOS, and OS/2.<P>
+Although no benchmark is a real indication of how well or poorly your application will run on a given platform, the following two programs are more than just benchmarks, because people really use them in their work.<P>
+The first, Espresso, is an almost exclusively integer benchmark. Several &quot;hot spots&quot; dominate its execution time, one of which is the routine <I>massive_count</I> in cofactor.c. This routine is mainly a large sequence of If-Then-Else constructs that should be a natural for branch-prediction and cross-jumping optimizations. The C source code for Espresso is shown in <a href="#02a1_00de">Listing One</A>. Notice that in the first two loops, the bulk of the operations are of the form: <I>if (val &amp; &lt;constant&gt; ) cnt[&lt;constant subscript&gt;]++;</I>. This form shows that each operation is independent of successive ones. A good compiler will keep <I>val</I> in a register, along with the base address of the array <I>cnt</I>, and the PowerPC will fill the integer pipeline so that instructions keep executing at a one-per-cycle rate without stalls. Because the value in each condition is a constant, the BPU should be able to easily predict the need to branch or fall through. The compiler should hoist the load of the base address of <I>cnt</I> out of each If-Then-Else construct. <P>
+In assembly-language format, most PowerPC instructions use the rightmost two registers as operands and the leftmost as the destination. The code in <a href="#02a1_00e0">Listing Two</A> was generated by the MetaWare PowerPC C/C++ compiler for Solaris on PowerPC. The only surprise in <a href="#02a1_00e0">Listing Two</A> is that the test for the next If is scheduled ahead of the increment for the last one. The reason is simple: The 601 BPU is highly independent of the integer-execution unit, and the add and store instructions do not affect the condition codes in the BPU. Moving the test up avoids a stall due to a dependency on <I>%r10</I> from one instruction to the next. The distance between branch instructions is small, allowing the BPU to look ahead in the queue and easily direct the instruction stream fetch to the next set of instructions for execution. Note that the only memory references are those that are absolutely necessary. On our 60-MHz PowerPC 601 with 32 MB of RAM, Espresso executes in 48 seconds (cumulative time for all of the SPEC data input sets from the input.ref directory). It has been estimated that one in five instructions is a branch, so the importance of the BPU in the architecture really shines here. Naturally, newer versions of the PowerPC, such as the 604, would be even faster.<P>
+For comparison, <a href="#02a1_00e2">Listing Three</A> is output from the version 2.6d of the MetaWare C/C++ compiler for Unix V R4 386, on UnixWare 1.1. We compiled on a 60-MHz Pentium with the -586 switch for Pentium optimization. The ability to increment the array element to memory without loading it reduces the number of instructions needed to perform the loop. However, the real reason for this is the paucity of registers into which to load the array element. Pentium and P6 optimization lore would suggest that better instruction overlap might occur if this were more like the RISC load/store model. With the Pentium, unfortunately, this would generate an unacceptable number of spills. The P6, with its dual-integer instruction units and register renaming, may make this more feasible. Surprisingly, the Pentium is only a hair slower executing this code, managing to do all of the SPEC data sets in 50 seconds, a difference of 4 percent. The difference here appears to be in the time needed to make memory references, and the fact that the tests and branches are not independent of the integer unit. Note, however, that while this code would run the same or faster on all PowerPC variants, the same is not true of the 80x86 family, not because of clock speed, but because of differences in architecture. A 100-MHz 486 could not expect to do as well on this code, since each branch to the top of the loop would incur a 2-cycle penalty. This shows the value of branch prediction. The Pentium will suffer on integer code from its inability to pair shift and rotate instructions with variable shift counts, <I>mul</I> and <I>div</I> instructions, and some floating-point instructions. In spite of Pentium's parallel U and V pipes, some instructions don't execute in anything but the U pipe. This forces the compiler to schedule instructions so that two U pipe instructions don't occur consecutively.<P>
+<h3><a name="02a1_00d8">Floating-Point Operations<a name="02a1_00d8"></h3><P>
+Though less common in mainstream applications, floating point is certainly important for scientific programmers. As an exercise in portability and because I'm the author of MetaWare's Fortran compiler, I decided to do the floating-point comparison for this article using Fortran. To do this, I had to port the Fortran front end and library to Solaris PowerPC. To my surprise, the entire process took under four hours, most of which was actual compiling and linking, and the result was a compiler that passed all but three of the Fortran 77 validation suite tests on the first try. (It's been passing entirely on other platforms for years.) Solaris made the process painless.<P>
+With the compiler ported, I was able to run the familiar LINPACK benchmark. LINPACK is showing its age, but it is still used in a wide variety of real applications. One routine, SAXPY, contains a loop that is the main time consumer in the benchmark. The PowerPC version of this loop is in <a href="#02a1_00e4">Listing Four</A>. Here you can see another thoughtful aspect of the PowerPC architecture. Not many RISC architectures include instructions like floating multiply and add (or subtract). The HP PA architecture has such an instruction, but its restrictions make it unusable for LINPACK. The Pentium, for all its CISCness, includes no such instruction. The compiler has reduced the addressing computations in this loop by doing strength reduction. And of course, there's no lack of general floating-point registers to work with. <P>
+<a href="#02a1_00e6">Listing Five</A> shows how the Pentium compares. In spite of best efforts and some good optimization techniques such as loop reversal and loop unrolling, Pentium doesn't come off too well here. The major problem again is lack of registers and the rather odd floating-point stack architecture. Pentium turns in a performance of 7.616 Mflops, compared to the PowerPC's 8.58 Mflops.<P>
+<h3><a name="02a1_00d9">Optimization Techniques<a name="02a1_00d9"></h3><P>
+The compiler uses a number of techniques to make your code run more efficiently: common-subexpression elimination, dead-store elimination, register allocation, and global-constant propagation. The impact of these optimizations depends upon the architecture and the application code itself. For example, <a href="#02a1_00e8">Listing Six</A> shows the assembly-language output on the Pentium using the SAXPY loop without any optimization turned on.<P>
+<a href="#02a1_00e8">Listing Six</A> also shows the useless overhead in loading the address of the array element and performing the loop. The net effect is a loss in performance down to 5.317 Mflops. <P>
+The general optimizations pay off. If you compare the optimized and unoptimized code, you'll mainly see the effects of register allocation, loop unrolling, and induction elimination. But for fast code, each code generator needs to pay attention to the specific quirks of the target machine. For each architecture, the MetaWare compiler uses two phases, massage and expand, that work on the intermediate language form of the program. Here, the compiler must consider whether the machine has transcendental floating-point instructions and scaled-indexing addressing modes, and whether multiply or a series of shifts and adds is faster for that particular processor. On the PowerPC, for example, the compiler does not replace constant multiply with shifts and adds unless the final instruction sequence is no more than two instructions longer. The reason is that multiplies are fairly cheap on a PowerPC. On the Pentium, you look for things like block moves that might tie up too many registers and decrease the register pressure by combining base and index registers. On most of the architectures, these phases try to eliminate the use of a special frame-pointer register where possible and use the stack pointer instead, freeing up another general register for other purposes. With the Pentium, this is particularly important, since registers are so scarce.<P>
+A third phase for code improvement combines peephole optimization and scheduling. Each code generator has the option of both a high-level scheduling pass on the intermediate language and a low-level scheduling pass on the actual machine instructions. Because this is table driven, the code that actually does the scheduling can be the same in both cases. The tables take into account the vagaries of U and V pipe pairing on the Pentium and the pipeline stages of results on the PowerPC.<P>
+<h3><a name="02a1_00da">Programming for Performance<a name="02a1_00da"></h3><P>
+As is evident from the PowerPC design, hardware dynamic-branch prediction is beginning to supplant the older branch-delay slot design, where an instruction was moved after a branch to execute while waiting for the branch to take effect. Most chips have a finite cache or instruction queue that they can examine in order to predict the branch. If you keep the distance between a conditional branch and its target small and use expressions that are easily dynamically evaluated by something like the PowerPC's BPU, you'll increase the chance that the BPU will effectively predict whether the branch will be taken. Also, if the target and the branch fall within the cache size, your code will likely execute faster. You should separate expressions and their consumers as widely as possible, within cache limits. For example, given the expressions in <a href="#02a1_00dc">Figure 2(a)</A>, consider reordering the statements to <a href="#02a1_00dc">Figure 2(b)</A>. This makes it possible to complete all the operations of the first statement while processing some of the independent operations of the second, thus avoiding any possible stalls waiting for the completion of the first statement.<P>
+For processors like the Pentium, look through the critical regions of your code after profiling your application. If your critical loops have more than four or five heavily used variables, try to reduce that number. Since the Pentium only has a few general registers available for local variables, you can give the compiler a boost in optimizing your code if you confine the number of heavily used variables or constants to a small number in loops. For floating-point code, think about ways to break down transcendentals or floating-point divide instructions into different expressions. For example, the MetaWare compiler tries to replace <I>ARCSIN</I> with <I>ARCTAN2(X,SQRT((1-X)*(1+X))</I>, which can be done with inline code. <P>
+By breaking down complex operations into simpler ones, you'll give most processors the chance to schedule your code for faster execution. You can't always depend on your compiler to make transformations for you. Keep your floating-point expressions smaller than the size of the Pentium's floating-point stack. If you write a huge expression with more than seven or eight intermediate results, you are forcing the compiler to spill from the stack to some temporary location, or to use memory-reference instructions to complete the calculation, resulting in slower code. A little extra care in the critical regions of your program, keeping the characteristics of current processors in mind, can pay large dividends in performance.<P>
+<h3><a name="02a1_00db">Conclusion<a name="02a1_00db"></h3><P>
+With the PowerPC's price-to-performance ratio closing in on that of the Pentium, users are finding this architecture more attractive. In addition to the Macintosh, there will soon be opportunities to field applications on Solaris and OS/2 for the PowerPC. The Mac already has fairly successful DOS 80x86 emulation, enabling you to run a lot of shrink-wrapped software without sacrificing your software investment. New applications can benefit from the scalability of the PowerPC family and the new speed it offers. However, you'll need to rethink strategies in order to wring out that last ounce of performance.<P>
+<B><a href="199502a4.htm">Figure 1</A>:</B> PowerPC 601 block diagram.<P>
+<a name="02a1_00dc"><a name="02a1_00dc"><B>Figure 2:</B> Reordering statements to improve performance.<pre>
+(a)
+x=y*z+2.0<P>z=<img src="sqrt10.gif"> x<P>c=<img src="pi10.gif">*(r*r)
+
+(b)
+x=y*z+2.0<P>c=<img src="pi10.gif">*(r*r)<P>z <img src="sqrt10.gif"> x</pre><P>
+<P>
+<h4><a name="02a1_00dd"><a name="02a1_00de"><a name="02a1_00de">Listing One</h4><pre>
+#include &quot;espresso.h&quot;
+void massive_count(pcube *T){
+    int *count = cdata.part_zeros;
+    pcube *T1;
+    /* Clear the column counts (count of # zeros in each column) */
+    {  
+    register int i;
+    for(i = cube.size - 1; i &gt;= 0; i--)
+    count[i] = 0;
+    }
+    /* Count the number of zeros in each column */
+    {  
+    register int i, *cnt;
+    register unsigned int val;
+    register pcube p, cof = T[0], full = cube.fullset;
+    for(T1 = T+2; (p = *T1++) != NULL; )
+    for(i = LOOP(p); i &gt; 0; i--)
+        if (val = full[i] &amp; ~ (p[i] | cof[i])) {
+        cnt = count + ((i-1) &lt;&lt; LOGBPI);
+#if BPI == 32
+        if (val &amp; 0xFF000000) {
+        if (val &amp; 0x80000000) cnt[31]++;
+        if (val &amp; 0x40000000) cnt[30]++;
+        if (val &amp; 0x20000000) cnt[29]++;
+        if (val &amp; 0x10000000) cnt[28]++;
+        if (val &amp; 0x08000000) cnt[27]++;
+        if (val &amp; 0x04000000) cnt[26]++;
+        if (val &amp; 0x02000000) cnt[25]++;
+        if (val &amp; 0x01000000) cnt[24]++;
+        }
+        if (val &amp; 0x00FF0000) {
+        if (val &amp; 0x00800000) cnt[23]++;
+        if (val &amp; 0x00400000) cnt[22]++;
+        if (val &amp; 0x00200000) cnt[21]++;
+        if (val &amp; 0x00100000) cnt[20]++;
+        if (val &amp; 0x00080000) cnt[19]++;
+        if (val &amp; 0x00040000) cnt[18]++;
+        if (val &amp; 0x00020000) cnt[17]++;
+        if (val &amp; 0x00010000) cnt[16]++;
+        }
+#endif
+        if (val &amp; 0xFF00) {
+        if (val &amp; 0x8000) cnt[15]++;
+        if (val &amp; 0x4000) cnt[14]++;
+        if (val &amp; 0x2000) cnt[13]++;
+        if (val &amp; 0x1000) cnt[12]++;
+        if (val &amp; 0x0800) cnt[11]++;
+        if (val &amp; 0x0400) cnt[10]++;
+        if (val &amp; 0x0200) cnt[ 9]++;
+        if (val &amp; 0x0100) cnt[ 8]++;
+        }
+        if (val &amp; 0x00FF) {
+        if (val &amp; 0x0080) cnt[ 7]++;
+        if (val &amp; 0x0040) cnt[ 6]++;
+        if (val &amp; 0x0020) cnt[ 5]++;
+        if (val &amp; 0x0010) cnt[ 4]++;
+        if (val &amp; 0x0008) cnt[ 3]++;
+        if (val &amp; 0x0004) cnt[ 2]++;
+        if (val &amp; 0x0002) cnt[ 1]++;
+        if (val &amp; 0x0001) cnt[ 0]++;
+        }
+          }
+ }
+    /*
+     * Perform counts for each variable:
+     *    cdata.var_zeros[var] = number of zeros in the variable
+     *    cdata.parts_active[var] = number of active parts for each variable
+     *    cdata.vars_active = number of variables which are active
+     *    cdata.vars_unate = number of variables which are active and unate
+     *
+     *    best -- the variable which is best for splitting based on:
+     *    mostactive -- most # active parts in any variable
+     *    mostzero -- most # zeros in any variable
+     *    mostbalanced -- minimum over the maximum # zeros / part / variable
+     */
+    {  
+    register int var, i, lastbit, active, maxactive;
+    int best = -1, mostactive = 0, mostzero = 0, mostbalanced = 32000;
+    cdata.vars_unate = cdata.vars_active = 0;
+    for(var = 0; var &lt; cube.num_vars; var++) {
+    if (var &lt; cube.num_binary_vars) { /* special hack for binary vars */
+        i = count[var*2];
+        lastbit = count[var*2 + 1];
+        active = (i &gt; 0) + (lastbit &gt; 0);
+        cdata.var_zeros[var] = i + lastbit;
+        maxactive = MAX(i, lastbit);
+        } 
+        else{
+        maxactive = active = cdata.var_zeros[var] = 0;
+        lastbit = cube.last_part[var];
+        for(i = cube.first_part[var]; i &lt;= lastbit; i++) {
+        cdata.var_zeros[var] += count[i];
+        active += (count[i] &gt; 0);
+        if (active &gt; maxactive) maxactive = active;
+        }
+    }
+    /* first priority is to maximize the number of active parts */
+    /* for binary case, this will usually select the output first */
+    if (active &gt; mostactive)
+        best = var, mostactive = active, mostzero = cdata.var_zeros[best],
+        mostbalanced = maxactive;
+    else if (active == mostactive)
+        /* secondary condition is to maximize the number zeros */
+        /* for binary variables, this is the same as minimum # of 2's */
+        if (cdata.var_zeros[var] &gt; mostzero)
+        best = var, mostzero = cdata.var_zeros[best],
+        mostbalanced = maxactive;
+        else if (cdata.var_zeros[var] == mostzero)
+        /* third condition is to pick a balanced variable */
+        /* for binary vars, this means roughly equal # 0's and 1's */
+        if (maxactive &lt; mostbalanced)
+            best = var, mostbalanced = maxactive;
+    cdata.parts_active[var] = active;
+    cdata.is_unate[var] = (active == 1);
+    cdata.vars_active += (active &gt; 0);
+    cdata.vars_unate += (active == 1);
+        }
+    cdata.best = best;
+    }
+}
+</pre>
+<h4><a name="02a1_00df"><a name="02a1_00e0"><a name="02a1_00e0">Listing Two</h4><pre>
+ !137 |      if (val = full[i] &amp; ~ (p[i] | cof[i])) {
+        sli     %r8,%r11,2      !+a4  Shift i, which is %r11, left 2
+        lwzx    %r10,%r8,%r12   !+a8  Add %r8(p) and %r12 to form address, load
+        lwzx    %r7,%r8,%r4     !+ac  Add %r4 (cof) and %r8 (i&lt;&lt;2), load
+        nor     %r10,%r7,%r10   !+b0  or not operation
+        lwzx    %r8,%r8,%r5     !+b4  Add %r5 (full), %r8(i), load
+        and.    %r8,%r8,%r10    !+b8 and of full[i] &amp;~ (p[i] | cof[i])
+                                ! val ends up in %r8
+        beq     ..LL63  !+bc
+!138 |          cnt = count + ((i-1) &lt;&lt; LOGBPI);
+        sli     %r10,%r11,7     !+c0
+        addi    %r6,%r10,-128   !+c4
+        add     %r7,%r29,%r6    !+c8 Get base address assigned to cnt in %r7
+!139 |#if BPI == 32
+!140 |      if (val &amp; 0xFF000000) {
+        andis.  %r10,%r8,65280  !+cc  Test bits in val
+        beq     ..LL64  !+d0          Branch  if bits not set
+!141 |          if (val &amp; 0x80000000) cnt[31]++;
+        andis.  %r10,%r8,32768  !+d4  Test bits in val
+        beq     ..LL65  !+d8          Branch if bits not set
+        lwz     %r10,+124(%r7)  !+dc  Base address already in %r7, load element
+        andis.  %r31,%r8,16384  !+e0 Scheduling places test of val ahead
+                                ! to avoid integer pipeline stall
+        addi    %r10,%r10,1     !+e4 add 1 to cnt[31]
+        stw     %r10,+124(%r7)  !+e8 Store element to memory
+!142 |          if (val &amp; 0x40000000) cnt[30]++;
+        beq     ..LL66  !+ec  Branch on pretested condition
+        b       ..LL67  !+f0
+        andis.  %r10,%r8,16384  !+f4 Test next bits in val
+        beq     ..LL66  !+f8         Branch if not set
+        lwz     %r10,+120(%r7)  !+fc  Load cnt[30]
+        andis.  %r31,%r8,8192   !+100 Test next bits
+        addi    %r10,%r10,1     !+104 Increment cnt[30]
+              stw     %r10,+120(%r7)  !+108  Store back to memory                                         
+</pre>
+<h4><a name="02a1_00e1"><a name="02a1_00e2"><a name="02a1_00e2">Listing Three</h4><pre>
+/136 :  for(i = LOOP(p); i &gt; 0; i--)
+        movl    (%edx),%eax
+        andl    $1023,%eax      / 0x3ff
+        testl   %eax,%eax    / initialize i, get it into %eax, test for zero
+        jle     .L43
+.L44:
+/137 :      if (val = full[i] &amp; ~ (p[i] | cof[i])) {
+        movl    (%edx,%eax,4),%ebx   / Load cof[i] into %ebx
+        movl    68(%esp),%esi        / Load index into %esi
+        orl     (%esi,%eax,4),%ebx   / or together, from memory
+        movl    64(%esp),%esi        / load full[i] index
+        notl    %ebx                 / not of expr
+        andl    (%esi,%eax,4),%ebx   / and from memory
+        testl   %ebx,%ebx            / val now in %ebx
+        je      .L45
+/138 :          cnt = count + ((i-1) &lt;&lt; LOGBPI);
+        movl    %eax,%edi            / Copy i
+        shll    $7,%edi              / Shift left
+        testl   $-16777216,%ebx / 0xff000000  / Test bits in val
+        lea     -128(%edi,%ecx),%esi   / Get base address into %esi
+/139 : #if BPI == 32
+/140 :      if (val &amp; 0xFF000000) {
+        je      .L46                       / Branch on bits not set
+/141 :          if (val &amp; 0x80000000) cnt[31]++;
+        testl   $-2147483648,%ebx    / Test bits in val
+        je      .L47                 / branch on bits not set
+        incl    -4(%edi,%ecx)        / Increment cnt[31]
+.L47:
+/142 :          if (val &amp; 0x40000000) cnt[30]++;
+        testl   $1073741824,%ebx        / 0x40000000
+        je      .L48
+        incl    120(%esi)
+.L48:
+/143 :          if (val &amp; 0x20000000) cnt[29]++;
+        testl   $536870912,%ebx / 0x20000000
+        je      .L49
+        incl    116(%esi)            
+</pre>
+<h4><a name="02a1_00e3"><a name="02a1_00e4"><a name="02a1_00e2">Listing Fourx</h4><pre>
+!459 |      do 30 i = 1,n
+        addi    %r11,%r7,4      !+68 Pointer to dy(i)
+        addi    %r10,%r5,4      !+6c Pointer to dx(i)
+        mtctr   %r9     !+70    
+        addi    %r10,%r10,-8    !+74  Array bias
+        addi    %r11,%r11,-8    !+78
+!460 |        dy(i) = dy(i) + da*dx(i)
+        lfs     %f12,+4(%r11)   !+7c Load dy(i)
+        lfsu    %f0,+4(%r10)    !+80 Load dx(i)
+        fmadds  %f0,%f0,%f13,%f12       !+84 Floating multiply and add
+        stfsu   %f0,+4(%r11)    !+88 Store result into dy(i)
+!461 |   30 continue
+        addi    %r12,%r12,1     !+8c Increment loop counter
+        bdnz    ..LL97  !+90   test and branch non-zero
+        b       ..LL98  !+94
+</pre>
+<h4><a name="02a1_00e5"><a name="02a1_00e6"><a name="02a1_00e6">Listing Five</h4><pre>
+/459 :       do 30 i = 1,n
+    cmpl    $2,%ecx  / Check for loop execution
+    movl    68(%esp),%esi / Get pointer to dx
+    movl    60(%esp),%edx /
+    jle    .L82
+    jmp    .L83
+.L81:
+.L91:
+    movl    %eax,%edi
+.L83:
+/460 :         dy(i) = dy(i) + da*dx(i)
+    flds    -4(%edx,%edi,4) / load dx(i)
+    fmul    %st(1),%st     / da * dx(i)
+    addl    $-2,%ecx       / Loop was reversed to count down
+    lea     2(%edi),%eax
+    fadds   -4(%esi,%edi,4) / Add dy(i)
+    cmpl    $2,%ecx
+    fstps   -4(%esi,%edi,4) / Store result to dy(i)
+/461 :    30 continue
+      flds    (%edx,%edi,4)  / Next loop iteration, loop unrolling
+      fmul    %st(1),%st
+      fadds   (%esi,%edi,4)
+      fstps   (%esi,%edi,4)
+      jg    .L91
+      jmp   .L92
+</pre>
+<h4><a name="02a1_00e7"><a name="02a1_00e8"><a name="02a1_00e8">Listing Six</h4><pre>
+/459 :       do 30 i = 1,n
+        movl    $1,.L98.I
+        decl    %ecx
+                    lea     1(%ecx),%eax
+                   andl    %eax,%eax
+                   jle     .L55
+                   jmp     .L57       
+ .L57:
+/460 :         dy(i) = dy(i) + da*dx(i)
+        movl    .L98.I,%ecx    / I is now static, loaded from memory
+        movl    24(%ebp),%edi  
+        flds    -4(%edi,%ecx,4)
+        movl    16(%ebp),%edx  / Load index
+        movl    12(%ebp),%esi  / Load address of array element
+        flds    -4(%edx,%ecx,4) / Load one array element to floating stack
+        fmuls   (%esi)          / Multiply
+        faddp   %st,%st(1)      / Add
+        fstps   -4(%edi,%ecx,4)  / Store result
+/461 :    30 continue
+        incl    %ecx            / Do loop book keeping
+        movl    %ecx,.L98.I
+        decl    %eax
+        andl    %eax,%eax
+        jg      .L57
+End Listings
+</pre>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<HR><P>Copyright &copy; 1995, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

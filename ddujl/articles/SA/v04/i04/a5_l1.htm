@@ -1,0 +1,360 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE><title>v04, i04: Listing 1: backup.scr</title></TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#990000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink><a href="a5.htm">Article</a></span></td>
+		<td><span class=navbarLink>Listing 1</span></td>
+		<td><span class=navbarLink><a href="a5_l2.htm">Listing 2</a></span></td>
+		<td><span class=navbarLink><a href="a5_l3.htm">Listing 3</a></span></td>
+		<td><span class=navbarLink><a href="a5_l4.htm">Listing 4</a></span></td>
+	</tr>
+	<tr>
+		<td><span class=navbarLink><a href="a5_l5.htm">Listing 5</a></span></td>
+		<td><a href="../../../../source/SA/1995/jul95.tar"><b class=codeListing>jul95.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<H1>Listing 1: backup.scr</H1><p>
+<PRE>
+#!/bin/ksh
+#
+# backup.scr
+#
+# This script backs up an RS/6000 system
+# using the backup command.  Each filesystem
+# is written individually to the tape and
+# followed by an end of file mark.  This
+# method increases the amount of data
+# available in the event of a media error
+# since only one filesystem will usually be
+# impacted.
+#
+# The list of filesystems to backup is
+# dynamically constructed using the
+# lsfs command.  Non-jfs filesystems,
+# cdrom filesystems, and nfs filesystems
+# are specifically excluded.  In particular,
+# nfs filesystems will be backed up
+# from the machine they actually reside on.
+#
+# If the tape device being used is an 8 mm
+# tape the blocksize is set to 1024 for the
+# duration of the backup and reset to the
+# previous value at the end.  If this script
+# is stopped or aborts the blocksize
+# should be manually changed to the previous
+# value.
+#
+# The format of the tape is as follows:
+#
+#   BOT
+#   header file (format is below)
+#   EOF
+#   filesystem 1
+#   EOF
+#   filesystem 2
+#   EOF
+#   .
+#   .
+#   filesystem n
+#   EOF
+#
+# Header File Format
+#
+#   Line 1:     hostname
+#   Line 2:     date and time
+#   Line 3:     Level indicator
+#   Lines 4-n+3:        i FILESYSTEM_NAME
+#      (where i is 1 for the first,
+#      2 for the second, and
+#      so on.  This is the value of
+#      the advance file command
+#      to get this filesystem.)
+#
+# Parameters:
+#
+#  p1 : (required) the level of backup
+#       to do (0-9, 0=full)
+#
+#  p2 : (optional) the tape device to write
+#       backups to.  The /dev/ qualifier and
+#       the .n suffix may be present or
+#       absent, i.e. /dev/rmt1.1 is the
+#       same as /dev/rmt1 is the same as
+#       rmt1.1 is the same as rmt1.  If a
+#       .n suffix is used on the device name
+#       (i.e. rmt0.3), it MUST be a
+#       non-rewinding device, or the
+#       successive filesystems will overwrite
+#       one another.  The non-rewinding
+#       device suffixes are .1, .3, .5, &amp; .7.
+#       If the .n suffix is absent then the
+#       value .1 (i.e. $DEFAULT_SUFFIX)
+#       is used.  If the parameter is omitted
+#       the value /dev/rmt0.1 is used.
+#
+# Exit Status:
+#
+#   0 : Backup completed successfully
+#   91: Error writing EOF to tape
+#   92: Error rewinding the tape
+#   93: Error ejecting the tape
+#   94: Wrong number of parameters
+#   95: Error writing header file to tape
+#   96: Error during actual data backup
+#   97: Parameter 1 was not a valid
+#       backup level (0-9).
+#   98: Parameter 2 was not a valid
+#       tape device
+#
+#
+DEFAULT_TAPE=/dev/rmt0
+DEFAULT_SUFFIX='.1'
+USAGE=&quot;$0 backup_level [optional_tapedev]&quot;
+BACKUPLOG=/usr/local/backuplog
+integer j
+integer savep1
+blocksize=-1
+basetape=&quot;&quot;
+#####################################################
+#
+# This function creates a list of filesystems to back
+# up in variable filesys.
+# Note 1: /tmp is excluded because it is temporary.
+#         /usr is excluded because it is included
+#         in weekly MKSYSB
+#
+make_list_of_filesystems()
+{
+filesys=`lsfs -c -v jfs | tail +2 | grep -v -E \
+&quot;/mnt:|/blv:|/tmp:|/usr:&quot; | cut -f1 -d&quot;:&quot;`
+}
+#####################################################
+#
+# This function makes and writes a header file on
+# the front of the tape, using tar.
+#
+make_header()
+{
+hostname &gt;/tmp/!backuplist
+date &gt;&gt;/tmp/!backuplist
+print &quot;This is a level $dumplevel backup.&quot; \
+&gt;&gt;/tmp/!backuplist
+((j=0))
+for i in $filesys
+do
+((j=j+1))
+print $j $i &gt;&gt;/tmp/!backuplist
+done
+savedir=`pwd`
+cd /tmp
+tar -cf $tapedev !backuplist
+if [[ $? != 0 ]]
+then
+print &quot;Error $? from tar writing the backup list.&quot;
+exit 95
+fi
+cd $savedir
+rm /tmp/!backuplist
+}
+#####################################################
+#
+# If the selected tape drive is an 8mm unit, this
+# function will set the block size of the drive
+# to 1024.  If the current value is
+# different it is saved and restored later.
+#
+set_blocksize()
+{
+blocksize=-1                    # -1 means no reset
+if [[ -n `lsdev -Cc tape|grep $basetape|grep 8mm` ]]
+then
+blocksize= \
+`lsattr -E -a block_size -l $basetape|cut -f2 -d' '`
+chdev -l $basetape -a block_size=1024
+fi
+}
+#####################################################
+#
+# If the tape blocksize was changed earlier, restore
+# the old value.
+#
+reset_blocksize()
+{
+if [[ $blocksize != -1 ]]
+then
+chdev -l $basetape -a block_size=$blocksize
+fi
+}
+#####################################################
+#
+# This function writes an end of file to a tape drive
+#
+tapeeof()
+{
+tctl -f $tapedev weof
+if [[ $? != 0 ]]
+then
+print &quot;Error writing eof to $tapedev.  Exiting.&quot; \
+| tee -a $BACKUPLOG
+exit 91
+fi
+}
+#####################################################
+#
+# This function rewinds a tape
+#
+rewind()
+{
+tctl -f $tapedev rewind
+if [[ $? != 0 ]]
+then
+print &quot;Error rewinding $tapedev.  Exiting.&quot; \
+| tee -a $BACKUPLOG
+exit 92
+fi
+}
+#####################################################
+#
+# This function rewinds and ejects a tape
+#
+eject()
+{
+tctl -f $tapedev rewoffl
+if [[ $? != 0 ]]
+then
+print &quot;Error ejecting $tapedev.  Exiting.&quot; \
+| tee -a $BACKUPLOG
+exit 93
+fi
+}
+#####################################################
+#
+# This function checks the parameters and sets
+# up the $tapedev symbol.
+#
+checkparm()
+{
+if [[ $savecount &lt; 1 || \
+$savecount &gt; 2 ]]
+then
+print &quot;Wrong no. of parameters, usage = $USAGE.&quot; \
+| tee -a $BACKUPLOG
+print &quot;Exiting.&quot; | tee -a $BACKUPLOG
+exit 94
+fi
+if (( savep1 &lt; 0 || \
+savep1 &gt; 9 ))
+then
+print &quot;Sorry, parm 1 is not a level (0-9).&quot; \
+| tee -a $BACKUPLOG
+print &quot;Exiting.&quot; | tee -a $BACKUPLOG
+exit 97
+fi
+
+dumplevel=$savep1
+tapedev=${DEFAULT_TAPE}${DEFAULT_SUFFIX}
+if [[ $savecount = 2 ]]
+then
+tapedev=&quot;/dev/`basename $savep2`&quot;
+if [[ `print $tapedev | cut -c6-8` != &quot;rmt&quot; || \
+-z `ls $tapedev 2&gt;/dev/null` ]]
+then
+print &quot;Sorry, parm 2 is not a tape drive.&quot; \
+| tee -a $BACKUPLOG
+exit 98
+fi
+if [[  -z `print $tapedev | grep &quot;\.&quot;` ]]
+then
+tapedev=$tapedev${DEFAULT_SUFFIX}
+else
+suffix=`print $tapedev | cut -f2 -d'.'`
+if [[ $suffix != 1 &amp;&amp; \
+$suffix != 3 &amp;&amp; \
+$suffix != 5 &amp;&amp; \
+$suffix != 7 ]]
+then
+print &quot;Sorry, parm 2 must be non-rewinding.&quot; \
+| tee -a $BACKUPLOG
+exit 98
+fi
+fi
+fi
+basetape=`basename $tapedev | cut -f1 -d'.'`
+}
+#####################################################
+#
+# This function backs up the file system named
+# by function paramater $1 to tape $tapedev
+#
+doback()
+{
+print '*** backing up filesystem' $1 \
+| tee -a $BACKUPLOG
+backup -$dumplevel -f $tapedev -u $1 2&gt;&amp;1 \
+| tee -a $BACKUPLOG
+print '*** DONE backing up filesystem' $1 \
+| tee -a $BACKUPLOG
+}
+#####################################################
+#
+# main
+#
+hostn=`hostname -s`
+print &quot;Daily Backup begins at `date` on $hostn&quot; \
+| tee -a $BACKUPLOG
+savecount=$#
+savep1=$1
+savep2=$2
+checkparm                       # check the parms
+rewind                          # rewind the tape
+set_blocksize                   # set tape blocksize
+filesys=&quot;&quot;
+make_list_of_filesystems        # make list of fsys
+cd /
+make_header                     # do the header file
+for i in $filesys
+do
+doback $i                     # backup fsys $i
+done
+reset_blocksize                 # restore blocksize
+eject                           # eject the tape
+print &quot;Daily System Backup completed at `date`&quot; \
+| tee -a $BACKUPLOG
+exit 0
+</pre><p>
+<p>
+
+
+<P>
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

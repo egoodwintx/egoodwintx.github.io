@@ -1,0 +1,684 @@
+<HTML>
+<META NAME="year" CONTENT="1990">
+<HEAD>
+
+<TITLE>OCT90: OPENING OS/2'S BACKDOOR</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>OPENING OS/2'S BACKDOOR<a name="01fc_0003"><a name="01fc_0003"></h1><P>
+<h2><a name="01fc_0001"><a name="01fc_0000">DEVHLP.SYS provides low-level services</h2><P>
+<h3>Andrew Schulman</h3><P>
+<p><i><a name="01fc_0002"><a name="01fc_0000">Andrew is an engineer/writer at Phar Lap Software in Cambridge, Mass.  He is a contributing editor for Dr. Dobb's Journal.  Andrew can be reached by phone at 617-876-2102 or on CompuServe at 76320,302.</i></p><hr><P>
+Unlike real-mode MS-DOS, which gives the programmer total access to its 1-Mbyte sandbox, the protected-mode OS/2 operating system takes strict control over its vastly larger address space (up to 16 Mbytes of physical memory mapped into up to 1 gigabyte of virtual memory).  Strict control over memory is necessary not only because there is so much more of it in OS/2, but also because OS/2 supports multitasking (again in contrast to MS-DOS, which only allows multitasking via interrupt handlers).<P>
+However, &quot;there ain't no such thing as a free lunch.&quot;  OS/2's tight management of memory means that an application can't freely peek and poke arbitrary locations in memory.  While this is good because it prevents tasks from bashing the operating system (or each other), it does make it nearly impossible for applications to perform memory-mapped I/O or access memory on adapter cards.<P>
+It also makes it difficult to write OS/2 diagnostic tools.  For example, probably every PC programmer has a utility such as CORELOOK, MAPMEM, RAMSCAN, or XRAY in his or her \BIN directory.  How would you port such a utility to OS/2?  Or how would you write a program that displays all named semaphores in the system?  (Hint: Walk through memory, looking for strings that begin with the pattern &quot;\SEM\&quot;.  The real puzzle, of course, is how to walk through all of memory.)<P>
+The OS/2 application program interface (API) does have one function that seems to help with this task: VioGetPhysBuf( ).  You pass in a 32-bit absolute physical address, presumably corresponding to a video adapter's display buffer, and VioGetPhysBuf( ) returns a selector that can be used to manipulate the buffer directly.  There's nothing to prevent us from using this to manipulate memory not on a video adapter.<P>
+The VIOPHYSBUF structure that VioGetPhysBuf( ) takes has one crucial restriction, however: The physical address must be in the range AOOOOh through BFFFFh.  This makes some sense because, without restrictions, the single VioGetPhysBuf() entry point could be used as a Trojan horse to defeat OS/2 memory protection.  But then we're stuck with the riddle of how to examine physical memory locations outside the range AOOOO-BFFFF.<P>
+With mounting irritation, we comb through IBM's OS/2 documentation looking for some function that will do the trick (in API-rich environments such as OS/2 or Windows, programming seems to have been reduced to the ability to search through a parts catalog).  Finally, in the section on device drivers, we find something that sounds like what we're looking for:<P>
+<pre>PhysToUVirt Map Physical To User Virtual Address</pre><P>
+IBM's documentation says that this &quot;converts a 32-bit physical address to a valid selector offset pair addressable out of the current LDT.&quot;  This is, in fact, exactly what's needed to do memory-mapped I/O: Bang on adapter cards and walk through physical memory.<P>
+PhysToUVirt is a DevHlp, one of about 55 helper routines OS/2 provides for device drivers. In his indispensable book Inside OS/2 (Microsoft Press, 1988), Gordon Letwin refers to the DevHlps as OS/2's &quot;backdoor.&quot;  Many of the device helpers have capabilities found nowhere else in OS/2.  A few examples: ABIOSCommonEntry and ABIOSCall (call the PS/2 ROM BIOS), AllocPhys (allocates physical memory), Lock (lock virtual memory against relocation or swap), RealToProt (switch from real to protected mode), SetIRQ (attach an interrupt handler to an IRQ level), and VirtToPhys (convert locked virtual address to physical address).<P>
+There's one hitch: Only device drivers can call the DevHlps.  Unlike the rest of the OS/2 API, device helpers use a register-based, parameter-passing mechanism much like the &quot;old&quot; (but by no means defunct) MS-DOS INT 21 interface.  All device helpers share a common entry point, whose address is made known to the driver only at initialization time.  Individual functions (such as PhysToUVirt) are specified with a number in the DL register.<P>
+<a href="9010b.htm#01fc_0004">Figure 1</A> shows a sample invocation of the PhysToUVirt device helper.  A moment's consideration should convince you that this facility to map physical addresses into a user's address space is all that is required to circumvent any inconveniences of protected mode.  Combined with the Intel SGDT instruction, the PhysToUVirt DevHlp could be used to control the protected-mode environment.  OS/2's designers probably made a wise choice in allowing this function to be called only from a device driver.<P>
+<h4><a name="01fc_0004"><a name="01fc_0004">Figure 1: Invoking the PhysToUVirt DevHlp</h4><P>
+<pre>
+    MOV AX, address_high        ;top of 32-bit physical absolute address
+    MOV BX, address_low         ;bottom of 32-bit physical absolute address
+    MOV CX, length              ;count of bytes to map (0=64k)
+    MOV DH, request_type        ;0=code, 1=data, 2=cancel
+    MOV DL, DevHlp_PhysToUVirt  ;17h
+    CALL DWORD PTR [DevHlp]
+    JNC ok                      ;carry set=error, clear=ok
+    ;AX contains error code
+  ok:;ES:BX contains virtual address
+</pre><P>
+<P>
+Now, you could get the company's device-driver guru to write a separate OS/2 device driver to accompany each application that you wish could call a DevHlp.  For example, to use PhysToUVirt, write a device driver that maps access to physical memory onto the read and write operations.  This would resemble the Unix /dev/mem device: A memory fetch is a read, and a store is a write; memory is just another stream of bytes.<P>
+This is a good idea, but the resulting driver only supports the PhysToUVirt DevHlp.  When you realize that you also need the VirtToPhys DevHlp, you're out of luck.  Isn't there any way for a &quot;normal&quot; OS/2 Ring 3 application to call any device helper?<P>
+<a href="9010b.htm#01fc_000d">More Details.</A><P>
+There is.  Using the function DosDev IOCtl( ) (equivalent to ioctl( ) in Unix and INT 21h AH = 44h in MS-DOS), any OS/2 application can call a device driver, and the device driver can then call the device helper on the application's behalf.  Because DosDevIOCtl( ) allows a program to issue any device-specific commands that are not supported by other OS/2 API functions, now all we need is a device driver that acts as a DevHlp &quot;server,&quot; accepting DevHlp requests sent to it via ioctl packets.<P>
+I have written such a driver, called DEVHLP.SYS.  It is a totally generic device driver, whose sole purpose is to call device helpers on behalf of &quot;normal&quot; Ring 3 applications.  In one sense, it is a &quot;fake&quot; device driver that solely provides an ioctl interface without actually controlling a device; it doesn't even support the read and write functions.  In an ther sense, though, you could say that DEVHLP.SYS provides access to the DEVHLP device.  The two hundred lines of assembler source (DEVHLP.ASM) appear in <a href="9010b.htm#01fc_000f">Listing One</A> (page 94).<P>
+In addition to being used for controlling devices without having to write an assembly language device driver (for example, DEVHLP.SYS is being used to interface with an image scanner from a Modula-2 program), DEVHLP.SYS has been used in several OS/2 diagnostic utilities.  In the accompanying text box (&quot;Walking the OS/2 Device Chain&quot;), Art Rothstein describes his program DRVRLIST.  In a future DDJ article, I will use DEVHLP.SYS to write a program for browsing the OS/2 global descriptor table (GDT).<P>
+DEVHLP.SYS works in OS/2, Versions 1.0, 1.1, and 1.2 (both Microsoft's standard and IBM's extended editions).  It will definitely have to be changed for 32-bit OS/2 2.0.  Note, however, that we have here a general principle: In any operating system in which device drivers are allowed operations to which regular applications are denied access, just map the device driver operations onto application ioctl requests to the device driver.<P>
+<h3><a name="01fc_0005">How to Use DEVHLP.SYS<a name="01fc_0005"></h3><P>
+Because DEVHLP.SYS is a device driver, it must be loaded at system boot time by adding the following line to your OS/2 CONFIG.SYS: device = devhlp.sys.<P>
+An application calls DEVHLP.SYS using the OS/2 function DosDevIOCtl( ), whose parameters are shown in <a href="9010b.htm#01fc_0006">Figure 2</A>.  Note that DosDevIOCtl( ) requires a handle to a device; an application can get this handle by opening the file named &quot;DEVHLPXX,&quot; using either the OS/2 function DosOpen( ) or a function such as open( ) in C.<P>
+<h4><a name="01fc_0006"><a name="01fc_0006">Figure 2: Parameters for calling DosDevIOCtl( )</h4><P>
+<pre>
+  USHORT DosDevIOCtl(pvData, pvParms, usFunction, usCategory, hDevice)
+  PVOID pvData;        /* far pointer to data packet--&gt;driver */
+  PVOID pvParms;       /* far pointer to parameter packet&lt;--driver */
+  USHORT usFunction;   /* two-byte device function */
+  USHORT usCategory;   /* two-byte device category */
+  HFILE hDevice;       /* two-byte device handle */
+</pre><P>
+<P>
+Applications ask for ioctl services using a category number and a function code; DEVHLP.SYS currently provides only one service: The DEVHLP service, whose category number is 128 (the first available user-defined category) and whose function code has been more-or-less arbitrarily set to 60h.<P>
+The two remaining DosDevIOCtl( ) parameters point to the actual request packet passed to the driver, and to a data packet into which the driver should place return values.  The two pointers can be identical.<P>
+In the case of DEVHLP.SYS (because we simply want applications to be able to make DevHlp calls, and because the DevHlps expect their parameters in the CPU registers) the request packet expected by DEVHLP.SYS is simply an image of the registers.  The values an application puts in the REGS data structure should correspond exactly to what an OS/2 device driver would put in the real CPU registers.  DEVHLP.SYS will load the real registers from these fields of the parameter packet, and will call [DevHlp].  Upon return from DevHlp, DEVHLP.SYS will store the contents of the registers back into the data packet.  This is basically a form of &quot;remote procedure call.&quot;<P>
+The C REGS structure shown in <a href="9010b.htm#01fc_0007">Figure 3</A>, used both for the request packet passed to the driver and for the data packet passed back by the driver, closely resembles the union REGS used in the function int86( ) provided by most MS-DOS C compilers. Of course, the same structure can be created in any programming language for which there is an OS/2 version.<P>
+<h4><a name="01fc_0007"><a name="01fc_0007">Figure 3: the DEVHLP parameter/data packet</h4><P>
+<pre>
+  typedef struct{
+          USHORT ax, bx, cx, dx, si, di, ds, es, flags;
+          } REGS;
+</pre><P>
+<P>
+Now it is simple to write a version of a DevHlp to be called by a Ring 3 application.  For example, <a href="9010b.htm#01fc_0008">Figure 4</A> shows a C version of PhysToUVirt( ), which uses the OS/2-supplied macros HIUSHORT( ), LOUSHORT( ), MAKEUSHORT( ), and MAKEP( ).  This version opens and closes the DEVHLPXX handle inside the function; if you expect to make a lot of calls to PhysToUVirt( ) you could, of course, open DEVHLPXX during program initialization.  <a href="9010b.htm#01fc_0008">Figure 4</A> also shows a C enumeration for the three requests handled by PhysToUVirt: Creating read-only executable addresses, creating read/write addresses, and releasing addresses.<P>
+<h4><a name="01fc_0008"><a name="01fc_0008">Figure 4: PhysToUVirt( ) in C</h4><P>
+<pre>
+  #define DevHlp_PhysToUVirt    0x17
+
+  typedef enum {
+    UVirt Exec=0, UVirt_ReadWrite, UVirt_Release
+    }UVIRT_TYPE;
+
+  //turn physical address into virtual address
+  void far *PhysToUVirt(ULONG addr, USHORT size, UVIRT_TYPE type)
+  {
+     REGS r;
+     USHORT sel, ret=1;
+     HFILE devhlp;
+     r.ax = HIUSHORT (addr);
+     r.bx = LOUSHORT (addr);
+     r.cx = size;
+     r.si = r.di = r.ds = r.es = 0;//not used
+     r.dx = MAKEUSHORT(DevHlp_PhysToUVirt, type);
+     if ((devhlp = open(&quot;DEVHLPXX&quot;, 0))!= -1)
+     {
+
+        ret = DosDevIOCtl(&amp;r, &amp;r, 0x60, 128, devhlp);
+        close(devhlp);
+     }
+     //if DosDevIOCtl failed OR if DevHlp set carry flag ...
+     if (ret || (r.flags &amp; 1))
+        return NULL;
+     else
+        return MAKEP(r.es, r.bx);
+     }
+</pre><P>
+<P>
+Calling PhysToUVirt( ) is also simple.  For example, to examine 100 bytes at absolute location FE008h, refer to <a href="9010b.htm#01fc_0009">Figure 5(a)</A> and <a href="9010b.htm#01fc_0009">Figure 5(b)</A> to cancel the selector.<P>
+<h4><a name="01fc_0009"><a name="01fc_0009">Figure 5: Calling PhysToUVirt( )</h4><P>
+<pre>
+  (a) char far *copyright;
+      copyright = PhysToUVirt(0xFE008L, 100, UVirt_ReadWrite);
+
+  (b)   #define Cancel(pv)\
+           PhysToUVirt((ULONG) pv, 0, UVirt_Release)
+      Cancel(copyright);
+</pre><P>
+<P>
+To walk through all of physical memory, just call PhysToUVirt( ) in a loop that increments the physical address each time by 64K.  To map an entire 64K into your address space at one time, pass PhysToUVirt( ) a size parameter of zero.  Break out of the loop if PhysToUVirt() fails.  And remember to cancel your selectors each time through the loop: Selectors are a precious resource in OS/2!<P>
+<h3><a name="01fc_000a">Device-Driver Documentation<a name="01fc_000a"></h3><P>
+In order to use DEVHLP.SYS effectively, you must know about the DevHlps.  The best documentation I have seen is IBM's OS/2 Technical Reference 1.1: I/O Subsystems and Device Drivers.  Volume 1 contains thorough descriptions of device driver functions, DevHlps, and numerous DosDevIOCtl calls.  Volume 2 describes Presentation Manager (PM) &quot;presentation drivers.&quot;<P>
+Ray Duncan's Advanced OS/2 Programming (Microsoft Press, 1989) contains an excellent 70-page chapter on device drivers, with an additional 40 pages of reference material on the DevHlps.<P>
+Raymond Westwater's Writing OS/2 Device Drivers (Addison-Wesley, 1989) contains a great deal of useful information (Ray gives a course in OS/2 device drivers for &quot;Microsoft University&quot;) but I wish it were better organized.  The author sells a useful $50 toolkit for writing OS/2 device drivers in C (contact FutureWare, 842 State Rd., Princeton, NJ 08540, 201-343-2033). Unfortunately, the material on writing OS/2 device drivers in C is not included in Ray's book.  Also, the book is already a little out of date, missing such DevHlps as ABIOSCommonEntry, ABIOSCall, and GetLIDEntry, all important for communicating with the OS/2-compatible Micro Channel ABIOS on IBM PS/2 machines.<P>
+Speaking of ABIOS, the key documentation for this crucial topic is Phoenix Technologies' ABIOS for IBM PS/2 Computers and Compatibles: The Complete Guide to ROM-Based System Software for OS/2 (Addison-Wesley, 1989).  The Phoenix book documents calling the ABIOSCommonEntry and ABIOSCall DevHlps from an OS/2 device driver.<P>
+Finally, as this article was going to press, IBM has released a program somewhat like DEVHLP, which reveals just about everything there is to know about OS/2 1.x memory utilization.  The program is available in the PCMagnet forum on CompuServe as THESEU.ZIP (no source code is available, however).<P>
+<h3><a name="01fc_000b">Debugging<a name="01fc_000b"></h3><P>
+OS/2 device drivers can be a pain to debug.  One of the reasons I wrote the generic device driver DEVHLP.SYS was to avoid having to debug any device driver other than DEVHLP.SYS itself.  However, if you are writing OS/2 device drivers, in addition to the debugger that comes with Ray Westwater's package mentioned earlier, there is also the Universal Device Drive Debugger for OS/2, ($249 from OS TECHnologies, 532 Longley Rd., Groton, MA 01450, 508-448-9653).<P>
+One important feature of this debugger is its ability to operate in real, as well as protected mode.  Recall that OS/2 device drivers can be bimodal.  Few debuggers can handle bimodal applications (try using Microsoft Code-View on a DOS program that switches from real into protected mode using DPMI, for example), much less bimodal device drivers.  The OSTECHnologies debugger works in the real mode as well as the protected-mode portion of an OS/2 device driver.<P>
+This brings up an important point: Device drivers are the only place in OS/2 where you can switch between real and protected mode!  Microsoft and IBM seem to have designed OS/2 with the assumption that real mode was simply going to disappear by imperial edict.  Why did they think that?<P>
+<h3><a name="01fc_000c">Design Principles<a name="01fc_000c"></h3><P>
+DEVHLP.SYS was designed to provide the absolute minimum necessary for application access to DevHlps.  No seat belts are provided!  Using DEVHLP.SYS, it is trivial to crash OS/2.<P>
+There is another aspect to the driver's minimal design: Ironically, DEVHLP.SYS knows practically nothing about the DevHlps!  The only DevHlp it specifically knows about is VerifyAccess, which it uses to ensure that the addresses for your parameter and data packets are valid, and that the DS and ES register values you pass in are legal.  Other than that, DEVHLP.SYS just blindly loads registers from the parameter packet, invokes [DevHlp], and stores the registers into the data packet.<P>
+This &quot;ignorant&quot; design is greatly preferable to a seemingly more intelligent design that would provide separate PhysToUVirt, Lock, ABIOSCommonEntry, and so on, ioctl functions.  The problem with such an approach is not only that it makes the driver larger, but also that it fails to support future DevHlps.  The &quot;ignorant&quot; design of DEVHLP.SYS is precisely what should enable it to work even with new DevHlps.  Such extensibility is usually given the glorified title &quot;object-oriented programming&quot; (see any discussion of virtual functions in C++) but really it's just common sense that the more ignorant a tool is of any specific protocol, the more likely it is to work with future protocols!<P>
+<h3><a name="01fc_000d"><a name="01fc_000d"><a name="01fc_000e">Walking the OS/2 Device Chain<a name="01fc_000e"></h3><P>
+Arthur Rothstein<P>
+Arthur Rothstein is a programmer at Morgan Labs, a developer of PC-based transaction processing systems in San Francisco, Calif.  Arthur can be reached through Morgan Labs, 690 Market St., San Francisco, CA 94104.<P>
+DRVRLIST.EXE is a DEVHLP application that lists the device drivers in OS/2.  The design considerations are similar to those of the analogous DOS program.  Descriptive information about a driver is contained in its device control block (DCB), and the DCBs are linked via a double-word pointer at offset 0.  The last DCB in the chain has a pointer with offset 0FFFFH. The challenge is to find the first in the chain.<P>
+The first two DCBs are NUL and CON, and both are in OS/2's global data segment.  This segment is mapped by a bimodal selector, one that describes the same physical memory whether the CPU is in real or protected mode.  The bimodal selector varies with the maintenance level of the kernel.  The segment is also mapped by selector 50H, which does not vary with the kernel maintenance level (it even works with IBM SE 1.2).  The program, source code for which appears in DRVRLIST.C in <a href="9010b.htm#01fc_0011">Listing Two</A> (page 96), and which uses the header file DEVHLP.H in <a href="9010b.htm#01fc_0013">Listing Three</A> (page 97), searches for the first occurrence of the driver name, &quot;NUL&quot; followed by five blanks, then backs up 10 bytes. When displaying the driver address, the program uses the bimodal selector instead of 50H.<P>
+Here is sample output from DRVRLIST under OS/2 1.1:<P>
+<pre>
+  Address Name
+  9C0:03EE NUL
+  9C0:040A CON
+  798:0000 COM1
+  748:0000 SINGLEQ$
+  730:0000 MOUSE$
+  720:0000 POINTER$
+  6D0:0000 DEVHLPXX
+  390:0000 Block device, 3 logical units
+  380:0000 PRN
+  380:001A LPT1
+  380:0034 LPT2
+  380:004E LPT3
+  360:0000 KBD$
+  350:0000 SCREEN$
+  340:0000 CLOCK$
+</pre><P>
+The DCBs are mapped by GDT selectors, which the program, running at privilege Level 3, cannot access.  Given a GDT selector, the program uses the VirtToPhys device helper to get the physical address mapped by the selector, then the PhysToUVirt device helper to get an LDT selector to the same physical memory.  These two calls in sequence constitute function MakeSel( ).  The LDT selector acquired by MakeSel( ) maps a full 64K byte starting at the physical address, usually more than the GDT selector maps.  The program uses this LDT selector to access a DCB.  After the program finishes using a given selector, it again calls the PhysToUVirt device helper, this time to release the selector.  The release is performed in function ReleaseSel( ).<P>
+The global data segment and the DCBs are fixed in memory.  Their GDT selectors and the physical addresses to which these selectors map remain unchanged at least until the system is rebooted.  In general the reverse is true.  Selectors come and go, and those that are unchanged may map to various physical addresses during the life of the system.  An example of the first is the process control block, which is assigned to a unique GDT selector during the life of a process.  An example of the second is selector 28H, which maps the LDT of the active thread.  When the selectors -- or their physical memory -- are not fixed, an application must lock the memory with the Lock device helper, before calling VirtToPhys or PhysToUVirt to ensure valid results.  Even then you must exercise caution.  We don't know, for example, how OS/2 reacts when it attempts to kill a process whose process control block has been locked by another application.<P>
+<pre></pre><P>
+<P>
+
+_OPENING OS/2'S BACKDOOR_
+by Andrew Schulman
+
+<a name="01fc_000f"><a name="01fc_000f">
+<a name="01fc_0010"></pre><B>[LISTING ONE]</B><pre><a name="01fc_0010">
+
+; DEVHLP.ASM
+; to produce DEVHLP.SYS (&quot;OS/2 Device Driver in a Can&quot;)
+; Andrew Schulman, 32 Andrew St., Cambridge MA 02139
+; with revisions by Art Rothstein, Morgan Labs, San Francisco, CA
+
+; DEF file:
+; LIBRARY DEVHLP
+; DESCRIPTION 'DEVHLP.SYS (c) Andrew Schulman 1990'
+; PROTMODE
+
+; masm devhlp; &amp;&amp; link devhlp,devhlp.sys,,,devhlp.def
+
+; put in OS/2 config.sys:
+; device=devhlp.sys
+
+; access with DosOpen (&quot;DEVHLPXX&quot;), DosDevIOCTL (category 128, func 60h)
+
+.286p
+
+; the only specific DevHlp that DEVHLP.SYS knows about
+VerifyAccess        equ 27h
+
+ioctlpkt struc
+                    db 13 dup (?)   ; header
+        cat         db ?            ; category
+        fun         db ?            ; function
+        param       dd ?            ; param area
+        dataptr     dd ?            ; data area
+ioctlpkt ends
+
+regs    struc
+        regs_ax     dw ?
+        regs_bx     dw ?
+        regs_cx     dw ?
+        regs_dx     dw ?
+        regs_si     dw ?
+        regs_di     dw ?
+        regs_ds     dw ?
+        regs_es     dw ?
+        regs_flags  dw ?
+regs    ends
+
+regs_size   equ     size regs
+
+dgroup  group   _DATA
+
+_DATA   segment word public 'DATA'
+
+header  dd -1
+        dw 8880h
+        dw Strat
+        dw 0
+        db 'DEVHLPXX'
+        db 8 dup (0)
+
+DevHlp  dd 0
+
+dispch  dw Init             ; 0 -- Init
+        dw 12 dup (Error)   ; 1..12 -- not supported
+        dw DevOp            ; 13 -- DevOpen
+        dw DevOp            ; 14 -- DevClose
+        dw Error            ; 15 -- not supported
+        dw GenIOCtl         ; 16 -- DevIOCtl
+        dw 10 dup (Error)   ; 17..26 -- not supported
+
+enddata dw 0
+_DATA   ends
+
+_TEXT   segment word public 'CODE'
+
+        assume cs:_TEXT, ds:DGROUP, es:NOTHING
+
+Strat   proc far
+        mov di, es:[bx+2]
+        and di, 0ffh
+        cmp di, 26                       ; max # of commands
+        jle Strat1
+        call Error
+        jmp short Strat2
+Strat1: add di, di
+        call word ptr [di+dispch]
+Strat2: mov word ptr es:[bx+3], ax       ; set request header status
+        ret
+Strat   endp
+
+; used by DevOpen and DevClose
+DevOp   proc near
+        mov ax, 0100h
+        ret
+DevOp   endp
+
+GenIOCtl    proc near
+        push es
+        push bx
+        cmp es:[bx].cat, 128
+        jne bad
+        cmp es:[bx].fun, 60h
+        jne bad
+        call Do_DevHlp
+        jc bad
+        mov ax, 0100h            ; no error
+        jmp short done
+bad:    mov ax, 8101h            ; error
+done:   pop bx
+        pop es
+        ret
+GenIOCtl endp
+
+Do_DevHlp proc near
+        ; verify user's access:
+        ; VerifyAccess will shut down user's app in the event of error
+        mov ax, word ptr es:[bx+17]      ; selector of parameter block
+        mov di, word ptr es:[bx+15]      ; offset
+        mov cx, regs_size                ; length to be read
+        mov dx, VerifyAccess             ; read
+        call DevHlp
+        jnc ok1
+        ret
+
+ok1:    mov ax, word ptr es:[bx+21]      ; selector of data buffer
+        mov di, word ptr es:[bx+19]      ; offset
+        mov cx, regs_size                ; length to be written
+        mov dx, (1 SHL 8) + VerifyAccess ; read/write
+        call DevHlp
+        jnc ok2
+        ret
+
+ok2:    push ds                  ; see if we should verify ds
+        lds di, es:[bx].param
+        mov ax, [di].regs_ds
+        pop ds
+        test ax, ax              ; need to verify?
+        je nods                  ; skip if no
+        xor di, di               ; verify seg:0 for read, 1 byte
+        mov cx, 1                ; length
+        mov dx, VerifyAccess     ; read=0
+        call DevHlp
+        jc fini                  ; if carry flag set
+
+nods:   push ds                  ; see if we should verify es
+        lds di, es:[bx].param
+        mov ax, [di].regs_es
+        pop ds
+        test ax, ax              ; need to verify?
+        je noes                  ; skip if no
+        xor di, di               ; verify seg:0 for read, 1 byte
+        mov cx, 1                ; length
+        mov dx, VerifyAccess     ; read=0
+        call DevHlp
+        jc fini                  ; if carry flag set
+
+noes:   push ds                  ; going to be bashed!
+        push es
+        push bx
+
+        ; save DevHlp address on stack so we can change ds
+        push word ptr DevHlp+2
+        push word ptr DevHlp
+
+        ; get the parameters for DevHlp from regs
+        lds di, es:[bx].param
+        mov ax, [di].regs_ax
+        mov bx, [di].regs_bx
+        mov cx, [di].regs_cx
+        mov dx, [di].regs_dx
+        mov si, [di].regs_si
+        mov es, [di].regs_es
+        push    [di].regs_ds
+        mov di, [di].regs_di
+        pop ds
+
+        ; here it is, the whole point of this exercise!
+        mov bp, sp
+        call dword ptr [bp]
+        pop bp          ; pull DevHlp address off stack
+        pop bp          ; without changing carry flag
+        jc fini
+
+        ; save ES:BX to put in out-regs: destroys DX
+        mov bp, es
+        mov dx, bx
+
+        ; get back old DS, ES:BX
+        pop bx
+        pop es
+        pop ds
+
+        ; save FLAGS, SI, DS on stack
+        pushf
+        push si
+        push ds
+
+        ; set up regs to return to the app
+        lds si, es:[bx].dataptr
+        mov [si].regs_ax, ax
+        pop [si].regs_ds
+        pop [si].regs_si
+        pop [si].regs_flags
+        mov [si].regs_cx, cx
+        mov [si].regs_bx, dx
+        mov [si].regs_es, bp
+        mov [si].regs_di, di
+        clc
+fini:   ret
+Do_DevHlp   endp
+
+Error   proc near
+        mov ax, 8103h
+        ret
+Error   endp
+
+Init    proc near
+        mov ax, es:[bx+14]
+        mov word ptr DevHlp, ax
+        mov ax, es:[bx+16]
+        mov word ptr DevHlp+2, ax
+
+        mov word ptr es:[bx+14], offset _TEXT:Init       ; end of code
+        mov word ptr es:[bx+16], offset DGROUP:enddata
+        mov ax, 0100h
+        ret
+Init    endp
+
+_TEXT   ends
+
+        end
+
+
+
+<a name="01fc_0011"><a name="01fc_0011">
+<a name="01fc_0012"></pre><B>[LISTING TWO]</B><pre><a name="01fc_0012">
+
+/* DRVRLIST.C
+   list the device drivers in OS/2
+   Art Rothstein, 1990
+
+   we assume the first driver in the chain is NUL and is in the global data
+   segment, and that the second driver (CON) is the same segment.
+
+   cl -AL drvrlist.c (four-byte data pointers required for memchr)
+*/
+#define INCL_DOSDEVICES
+#include &lt;os2.h&gt;
+#include &lt;process.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;string.h&gt;
+#include &quot;devhlp.h&quot;
+
+USHORT devhlp ;
+
+SEL MakeSel( SEL selValue)
+{
+  extern USHORT devhlp ;
+  REGS regs ;
+  USHORT ret ;
+
+  regs.dx = DevHlp_VirtToPhys ;         // function requested
+  regs.ds = selValue ;                  // selector
+  regs.es = 0 ;                         // avoid trap
+  regs.si = 0 ;                         // offset
+  ret = DosDevIOCtl( &amp;regs, &amp;regs, 0x60, 128, devhlp) ;
+  if ( ret != 0  ||  regs.flags.carry != 0)
+    return 0 ;
+  // physical address in ax:bx
+  regs.cx = 0 ;                                  // limit 65,535
+  regs.dx = MAKEUSHORT( DevHlp_PhysToUVirt, UVirt_ReadWrite);
+  regs.es = 0 ;                                  // avoid trap
+  ret = DosDevIOCtl( &amp;regs, &amp;regs, 0x60, 128, devhlp) ;
+  if ( ret != 0  ||  regs.flags.carry != 0)      // if error
+    return 0 ;
+  return regs.es ;                               // return the selector
+}
+
+BOOL ReleaseSel( SEL selValue)
+{
+  extern USHORT devhlp ;
+  REGS regs ;
+  USHORT ret ;
+
+  regs.ax = selValue ;                           // selector to free
+  regs.dx = MAKEUSHORT( DevHlp_PhysToUVirt, UVirt_Release);
+  regs.ds = 0 ;                                  // safety
+  regs.es = 0 ;
+  ret = DosDevIOCtl( &amp;regs, &amp;regs, 0x60, 128, devhlp) ;
+  if ( ret != 0  ||  regs.flags.carry != 0)     // if error
+    return FALSE ;
+  return TRUE ;                                 // successful return
+}
+
+void main( void)
+{
+  USHORT usOffsetDriver
+       , usBytesLeft;                       // in search for NUL device
+  PCH pchGlobal ;                           // pointer to system global data
+  static CHAR szDriverName[] = &quot;DEVHLPXX&quot;   // device helper driver
+        , szNullDriver[] = &quot;NUL     &quot;;      // first driver in system
+
+  typedef struct _DDHEADER  {               // device driver header
+    struct _DDHEADER * pddNext ;            // chain to next driver
+    USHORT fsAttribute ;                    // driver attributes
+    USHORT usStrategyEntryOffset ;
+    USHORT usIDCEntryOffset ;               // inter device communication
+    CHAR chName[ 8] ;                       // name for character devices
+    USHORT usIDCEntrySegmentProt ;
+    USHORT usIDCDataSegmentProt ;
+    USHORT usIDCEntrySegmentReal ;
+    USHORT usIDCDataSegmentReal ;
+  }  DDHEADER ;
+  typedef DDHEADER * PDDHEADER ;
+  PDDHEADER pddCurrent                      // current DCB
+      , pddNext;                            // next DCB
+  SEL selDriver ;                           // selector of DCB
+
+  // open the DEVHLP device
+  if ((devhlp = open(szDriverName, 0)) == -1) {
+    puts( &quot;Can't find DEVHLP.SYS&quot;) ;
+    exit( 1) ;
+  }
+
+  // locate the first driver
+  selDriver = 0x50 ;                        // global data segment
+  usOffsetDriver = 0 ;
+  usBytesLeft = 32000 ;                     // should be large enough
+  pchGlobal = MAKEP( MakeSel( selDriver), usOffsetDriver) ;
+  do  {
+    PCH pchMatch ;
+
+    pchMatch = memchr( pchGlobal + 1, 'N', usBytesLeft); //look for first char
+    if ( pchMatch == NULL)  {               // if no match
+      ReleaseSel( SELECTOROF( pchGlobal)) ; // release the selector
+      puts( &quot;NUL driver not found&quot;) ;       // and give up
+      exit( 1) ;
+    }  // if no match
+                        // partial match
+    usBytesLeft -= pchMatch - pchGlobal ;   // reduce residual count
+    pchGlobal = pchMatch ;                  // point to start of match
+  }  while ( memcmp( pchGlobal              // break out if name matches
+           , szNullDriver                   //  exactly
+           , sizeof szNullDriver - 1) != 0);
+
+  // run the chain
+  printf( &quot;  Address Name\n&quot;) ;                      // column headings
+  for ( usOffsetDriver = OFFSETOF( pchGlobal) - 0x0a // back up to DCB start
+    , pddCurrent = ( PDDHEADER) ( pchGlobal - 0x0a)
+    , selDriver = SELECTOROF( pddCurrent-&gt;pddNext)   // selector of next DCB
+      ; ; ) {
+    printf( &quot;%4X:%04X &quot;, selDriver, usOffsetDriver);
+    if ( ( pddCurrent-&gt;fsAttribute &amp; 0x8000) == 0)  // if block driver
+      printf( &quot;Block device, %d logical units\n&quot;
+          , pddCurrent-&gt;chName[ 0]);                // number of units
+    else                                            // if character driver
+      printf( &quot;%-8.8s\n&quot;, pddCurrent-&gt;chName);
+    selDriver = SELECTOROF( pddCurrent-&gt;pddNext) ;  // point to next DCB
+    usOffsetDriver = OFFSETOF( pddCurrent-&gt;pddNext) ;
+    if ( usOffsetDriver == 0xffff)                  // if end of chain
+      break ;                                       // we are done
+    pddNext = MAKEP( MakeSel( selDriver), usOffsetDriver) ;
+    ReleaseSel( SELECTOROF( pddCurrent)) ;          // free previous DCB
+    pddCurrent = pddNext ;                          // age the pointer
+  }  // loop once for each device driver
+
+  // release the last selector
+  ReleaseSel( SELECTOROF( pddCurrent)) ;
+
+  exit( 0) ;
+}
+
+
+
+<a name="01fc_0013"><a name="01fc_0013">
+<a name="01fc_0014"></pre><B>[LISTING THREE]</B><pre><a name="01fc_0014">
+
+/* DEVHLP.H -- for use with DosDevIOCtl and DEVHLP.SYS */
+
+#define DevHlp_SchedClockAddr       0x00
+#define DevHlp_DevDone              0x01
+#define DevHlp_Yield                0x02
+#define DevHlp_TCYield              0x03
+#define DevHlp_Block                0x04
+#define DevHlp_Run                  0x05
+#define DevHlp_SemRequest           0x06
+#define DevHlp_SemClear             0x07
+#define DevHlp_SemHandle            0x08
+#define DevHlp_PushReqPacket        0x09
+#define DevHlp_PullReqPacket        0x0A
+#define DevHlp_PullParticular       0x0B
+#define DevHlp_SortReqPacket        0x0C
+#define DevHlp_AllocReqPacket       0x0D
+#define DevHlp_FreeReqPacket        0x0E
+#define DevHlp_QueueInit            0x0F
+#define DevHlp_QueueFlush           0x10
+#define DevHlp_QueueWrite           0x11
+#define DevHlp_QueueRead            0x12
+#define DevHlp_Lock                 0x13
+#define DevHlp_Unlock               0x14
+#define DevHlp_PhysToVirt           0x15
+#define DevHlp_VirtToPhys           0x16
+#define DevHlp_PhysToUVirt          0x17
+#define DevHlp_AllocPhys            0x18
+#define DevHlp_FreePhys             0x19
+#define DevHlp_SetROMVector         0x1A
+#define DevHlp_SetIRQ               0x1B
+#define DevHlp_UnSetIRQ             0x1C
+#define DevHlp_SetTimer             0x1D
+#define DevHlp_ResetTimer           0x1E
+#define DevHlp_MonitorCreate        0x1F
+#define DevHlp_Register             0x20
+#define DevHlp_DeRegister           0x21
+#define DevHlp_MonWrite             0x22
+#define DevHlp_MonFlush             0x23
+#define DevHlp_GetDosVar            0x24
+#define DevHlp_SendEvent            0x25
+#define DevHlp_ROMCritSection       0x26
+#define DevHlp_VerifyAccess         0x27
+#define DevHlp_SysTrace             0x28
+#define DevHlp_AttachDD             0x2A
+#define DevHlp_AllocGDTSelector     0x2D
+#define DevHlp_PhysToGDTSelector    0x2E
+#define DevHlp_RealToProt           0x2F
+#define DevHlp_ProtToReal           0x30
+#define DevHlp_EOI                  0x31
+#define DevHlp_UnPhysToVirt         0x32
+#define DevHlp_TickCount            0x33
+#define DevHlp_GetLIDEntry          0x34
+#define DevHlp_FreeLIDEntry         0x35
+#define DevHlp_ABIOSCall            0x36
+#define DevHlp_ABIOSCommonEntry     0x37
+#define DevHlp_RegisterStackUsage   0x38
+
+#define UVirt_Exec                  0
+#define UVirt_ReadWrite             1
+#define UVirt_Release               2
+
+#pragma pack(1)
+
+typedef struct {
+    unsigned int carry              : 1;
+    unsigned int                    : 1;
+    unsigned int parity             : 1;
+    unsigned int                    : 1;
+    unsigned int aux                : 1;
+    unsigned int                    : 1;
+    unsigned int zero               : 1;
+    unsigned int sign               : 1;
+    unsigned int trap               : 1;
+    unsigned int int_en             : 1;
+    unsigned int direction          : 1;
+    unsigned int overflow           : 1;
+    unsigned int iopl               : 2;
+    unsigned int nest_task          : 1;
+    unsigned int                    : 1;
+    } FLAGS;
+
+typedef struct {
+    USHORT ax,bx,cx,dx,si,di,ds,es;
+    FLAGS  flags;
+    } REGS;
+
+
+[Figure 1 Invoking the PhysToUVirt DevHlp]
+
+    MOV AX, address_high        ; top of 32-bit physical absolute address
+    MOV BX, address_low         ; bottom of 32-bit physical absolute address
+    MOV CX, length              ; count of bytes to map (0=64k)
+    MOV DH, request_type        ; 0=code, 1=data, 2=cancel
+    MOV DL, DevHlp_PhysToUVirt  ; 17h
+    CALL DWORD PTR [DevHlp]
+    JNC ok                      ; carry set=error, clear=ok
+    ; AX contains error code
+ok: ; ES:BX contains virtual address
+
+
+[Figure 2 Parameters for calling DosDevIOCtl()]
+
+USHORT DosDevIOCtl(pvData, pvParms, usFunction, usCategory, hDevice)
+PVOID pvData;       /* far pointer to data packet &lt;- driver */
+PVOID pvParms;      /* far pointer to parameter packet -&gt; driver */
+USHORT usFunction;  /* two-byte device function */
+USHORT usCategory;  /* two-byte device category */
+HFILE hDevice;      /* two-byte device handle */
+
+
+[Figure 3 The DEVHLP parameter/data packet]
+
+typedef struct {
+   USHORT ax, bx, cx, dx, si, di, ds, es, flags;
+   } REGS;
+
+[Figure 4 PhysToUVirt() in C]
+
+#define DevHlp_PhysToUVirt      0x17
+
+typedef enum {
+   UVirt_Exec=0, UVirt_ReadWrite, UVirt_Release
+   } UVIRT_TYPE;
+
+// turn physical address into virtual address
+void far *PhysToUVirt(ULONG addr, USHORT size, UVIRT_TYPE type)
+{
+   REGS r;
+   USHORT sel, ret=1;
+   HFILE devhlp;
+   r.ax = HIUSHORT(addr);
+   r.bx = LOUSHORT(addr);
+   r.cx = size;
+   r.si = r.di = r.ds = r.es = 0;  // not used
+   r.dx = MAKEUSHORT(DevHlp_PhysToUVirt, type);
+   if ((devhlp = open(&quot;DEVHLPXX&quot;, 0)) != -1)
+   {
+      ret = DosDevIOCtl(&amp;r, &amp;r, 0x60, 128, devhlp);
+      close(devhlp);
+   }
+   // if DosDevIOCtl failed OR if DevHlp set carry flag...
+   if (ret || (r.flags &amp; 1))
+      return NULL;
+   else
+      return MAKEP(r.es, r.bx);
+}
+
+
+
+<P>
+<P>
+</pre></BODY></HTML>

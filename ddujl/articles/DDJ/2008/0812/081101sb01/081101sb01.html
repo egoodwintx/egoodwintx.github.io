@@ -1,0 +1,263 @@
+<html>
+<head>
+<title>File Descriptors And Multithreaded Programs</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> December 2008</p>
+
+<h1>File Descriptors And Multithreaded Programs</h1>
+<h2>Putting the "rev" back in "revocation"</h2>
+
+
+<h3>By Sergey Babkin</h3>
+
+
+<I>Sergey is a senior developer for Aleri. He can be contacted at babkin @verizon.net.</I>
+
+<hr>
+
+
+
+
+<p>When writing multithreaded programs that work with sockets, a common pattern is to have two threads per socket&#151;one thread writes the data to the socket, another one reads the data. Obviously, the socket library used for this should be threadsafe to start with and support a read from a socket in one thread and a write to the socket in the other thread without corrupting the library's socket state. The raw system calls read() and write() support this. Your experience with the more sophisticated libraries may vary.</p>
+
+<p>The write thread may be implicit: It may be just a mutex that allows any thread to write into a socket without interference from other threads. But reading is different. It's asynchronous, with data supplied by the other side. It's impossible to predict when the data will come in. Even if the remote side never sends any data, having a reading thread is still useful to detect a dropped connection. Otherwise, if only the return codes of writing are checked, the connection drop won't be detected until the next write, and that might be a while. It might never be detected if the application has no new data to send to the socket. Such sloppy implementations are surprisingly common&#151;you can identify these applications by lots of half-closed sockets sitting around in the operating system.</p>
+
+<p>This approach is not limited to sockets. It's just as applicable to named pipes, serial ports, or any other communication with an independent source of data. For sockets there is also a variation when a thread is listening for incoming connections, and for all practical purposes, it can also be considered a reading thread, with no writing thread.</p>
+
+<p>All of this works well as long as the remote side cooperates nicely. But sometimes there are emergencies. Sometimes  the application needs to just drop the connection and be done with it. Maybe the application was requested to exit, and now it needs to drop all the clients. Maybe just a subsystem of the application needs to be shut down. Or perhaps a single client has violated the protocol and its connection has to be dropped. </p>
+
+<p>This means that this reading thread must be stopped. How? Turns out, the answer is not that simple. Even as the widespread libraries go, lots and lots of them get it wrong. I'm going to describe how to get it at least reasonably right and how to fix it in the existing libraries. </p>
+
+<p>The first obvious option is by using a kill thread call. But many thread libraries don't support this call, and the libraries supporting it often advise against using it (for example, Posix has it only as a compatibility call and advises against using it in the new programs). So it would have portability issues. Even if your library supports it, the related synchronization may be tricky. All this means that this isn't a very good option.</p>
+
+<p>The next option is to use a <i>select()</i> call. But a simple <i>select()</i> on a single file descriptor is not going to fix anything. It would get blocked just as easily as the simple <i>read()</i>. So the further option is to make a <i>select()</i> with a timeout. Maybe every second the timeout would expire, the thread would wake up and check the state of the control block, and if asked to stop, it would stop. Not exactly an optimal solution, either. On one hand, there is a noticeable delay. One second may not seem like much but it quickly accumulates. If you're closing 100 files, it would take quite a <i>while</i>. On the other hand, every second there are a bunch of threads that wake up, check their states, and go back to sleep&#151;this accumulates, too. The accumulation of a delay can be dealt with by splitting the stopping of the thread into two library calls: One call to set the exit indication, another call to wait for the read thread to exit. Then the first call can be applied to all the sockets first, the read threads would "time out in parallel," and the second calls will quickly collect them. This splitting is useful even with the other approaches. </p>
+
+<p>A better solution is to call <i>select()</i> on two file descriptors: the socket and the indicator. The indicator can be the read side of a pipe. When the reader thread needs to be stopped, write some data into the pipe, and it will wake up <i>select()</i>. The downside is that now you need three times the number of file descriptors: one for the original socket, one for the read side of the pipe, and one for the write side of the pipe. If you're trying to be portable to Windows, you may have issues with the pipes. On the other hand, Windows has an analog of <i>select()</i> that can work on both files and synchronization primitives (such as semaphores), so you can avoid the overhead of extra file descriptors.</p>
+
+<p>If you need to stop a thread that is listening for the new connections, you may not even need the extra file descriptor. Just have this thread check a flag after each accepted connection, whether it's requested to exit. Then at exit time, set this flag and connect a new socket from your own program to the listening socket, and immediately close the new connection. Accepting this connection makes the listening thread wake up, and it would then check the exit flag and exit.</p>
+
+<p>This <i>select()</i> solution is pretty robust and should be used whenever the extra overhead is acceptable.</p>
+
+<p>But what about another obvious option: What if we just close the file descriptor? It is not that different from the socket being closed from the other side by the peer, and the application should already be able to handle that! Yes, it's a pretty efficient way. And it limits the intrusion into the library. You will need to get direct access to the OS file descriptor, but the other changes are smaller. Still, it's not entirely simple.</p>
+
+<p>The trouble is with the synchronization. There is an inherent race. The reader thread works generally as in Listing One.</p>
+
+
+<pre class="code">
+// "state" contains the library-level socket state
+while(true) {
+    int len = read(state.fd, inbuf, sizeof(inbuf));
+    if (len &lt;= 0)
+        if (len &lt; 0) {
+            // ...report the error...
+        }
+        state.open = false;
+        close(state.fd);
+        break;
+    }
+    processInput(inbuf, len);
+}
+
+</pre>
+<div class="caption">
+   Listing One
+</div>	
+	
+
+<p>The <i>close()</i> call not only stops communications but also frees the OS-level file descriptor. When the reader thread makes a call to <i>read()</i> or <i>close()</i>, it's using the value of state.fd that is no longer valid. In the best case, this value would still be invalid and the calls would return an error, with the only consequence being a spurious error message. In the worst case, another thread might open some file in the meantime, and the OS would reuse this value for its file descriptor. Then the reader thread would read or close the wrong file!</p>
+
+<p>For the socket connections, a solution is to use the <i>shutdown()</i> system call. It stops the communication without freeing the file descriptor. The logic for stopping the reader thread is shown in Listing Two. On some operating systems, this is also the only working solution: On FreeBSD, a <i>close()</i> without <i>shutdown()</i> does not wake up the processes waiting in a <i>read()</i> or <i>select()</i>.</p>
+
+	
+
+<pre class="code">  
+shutdown(fd, SHUT_RDWR);
+joinReaderThread(); // wait for it to exit
+destroyState(state);
+
+</pre>
+<div class="caption">
+   Listing Two
+</div>	
+	
+
+<p>The reader thread would receive the shutdown indication and close the socket before exiting, so afterwards it's safe to destroy the state without causing races.</p>
+
+<p>Another issue to consider is that closing by <i>shutdown()</i> or by <i>close()</i> may not be considered a read event in the OS. If a library does <i>select()</i> or its more modern analog <i>poll()</i> waiting for read events only, then it would not be woken up. Closing a socket always counts as an error event and as a write event, but somehow not as a read event. So the <i>select()</i> waiting for a read-ready event just continues sitting there and waiting. Check the library you use, and if needed, modify it to check for the error events, too.</p>
+
+<p>However, <i>shutdown()</i> works only on the sockets with established connections, not on the ones listening for new connections nor on the other kinds of file descriptors.</p>
+
+<p>If you can change the code of the library (which is thankfully an option for open source libraries), can we still make it work without the <i>shutdown()</i> call? Yes: We need to add a mutex for accessing the state; see Listing Three.</p>
+
+
+<pre class="code">
+// reader thread:
+    // "state" contains the library-level socket state
+    while(true) {
+        int fd;
+        lock(state.mutex);
+            fd = state.open? state.fd : -1;
+        unlock(state.mutex);
+        if (fd &lt; 0)
+            break;
+        int len = read(fd, inbuf, sizeof(inbuf));
+        if (len &lt;= 0)
+            if (state.open &amp;&amp; len &lt; 0) {
+                // ...report the error...
+            }
+            lock(state.mutex);
+                if (state.open) {
+                    state.open = false;
+                    close(state.fd);
+                }
+            unlock(state.mutex);
+            break;
+        }
+        processInput(inbuf, len);
+    }
+// stopping code:
+    lock(state.mutex);
+        if (state.open) {
+            state.open = false;
+            close(state.fd);
+        }
+    unlock(state.mutex);
+
+</pre>
+<div class="caption">
+   Listing Three
+</div>	
+	
+
+<p>Now the reader thread checks the state before doing its system calls and avoids doing any more calls on the closed socket. But not always! Note that there is still a little time between <i>unlock()</i> and <i>read()</i>, which becomes a race window. And there is no way to close it reliably. It would be very nice if the OS allowed the release of locks atomically when entering sleep on the <i>read()</i> system call. But it doesn't. So the best attempt to fix this is by adding a little sleep in the revocation code, as in Listing Four. It's not pretty, but it works okay in practice.</p>
+
+	
+
+<pre class="code">
+// stopping code:
+    lock(state.mutex);
+        if (state.open) {
+            state.open = false;
+            usleep(20000); // 20 msec
+            close(state.fd);
+        }
+    unlock(state.mutex);</pre>
+<div class="caption">
+  Listing Four
+</div>	
+	
+
+<p>The same approach can be used even without access to the source code of the library (other than to get the file descriptor, and even that can be worked around with dirty tricks). To do it, create a wrapper API. In the C++ code, you can define a wrapper class over the library class. This wrapper class would have a mutex and wrap the underlying calls safely. Listing Five is the skeleton of such a class.</p>
+
+
+<pre class="code">
+class WrapSocket : protected LibSocket {
+protected:
+    mutex mutex_;
+    bool open_; // flag: this socket is open
+public:
+    ...
+    int read(char *buf, int blen) {
+        bool ok;
+        mutex_.lock();
+            // LibSocket::fd accesses the field in the parent class
+            ok = open_ &amp;&amp; LibSocket::fd &gt;= 0;
+        mutex_.unlock();
+        if (!ok)
+            return 0; // EOF
+        return LibSocket::read(buf, blen);
+    }
+    void stop_reader() {
+        mutex_.lock();
+            if (open_) {
+                int workfd = LibSocket::fd ;
+                // prevent LibSocket from messing up things
+                LibSocket::fd  = -1; 
+                open_ = false;
+                usleep(20000); // 20 msec
+                ::close(workfd);
+            }
+        mutex_.unlock();
+    }
+    ....
+}</pre>
+<div class="caption">
+  Listing Five
+</div>	
+	
+
+<p>The only extra trick is that when you take away the socket, you need to set the library's idea of it to a known invalid value "-1", preventing the underlying library from doing unsafe things.</p>
+
+<p>A better solution has been suggested to me by Robert Watson of the FreeBSD Project. The <i>dup2()</i> system call takes a file descriptor and copies it to another file descriptor, in the process closing the file that used to be referred to from the new file descriptor. So it's a perfect atomic operation to avoid the race. The stopping code is shown in Listing Six.</p>
+
+	
+	
+
+<pre class="code">
+// stopping code:
+    lock(state.mutex);
+        if (state.open) {
+            int nullfd;
+            nullfd = open("/dev/null", O_RDONLY);
+            if (nullfd &lt; 0) {
+                state.fd = false;
+                // should not happen but just in case
+                usleep(20000); // 20 msec
+                close(state.fd);
+            } else {
+                dup2(nullfd, state.fd);
+                close(nullfd);
+            }
+        }
+    unlock(state.mutex);</pre>
+<div class="caption">
+  Listing Six
+</div>	
+	
+
+<p>Opening the device /dev/null provides a file descriptor that returns EOF all the time. And opening it with a read-only flag makes sure that it can't be written-to either. It's a perfect placeholder descriptor that does nothing.</p>
+
+<p>Many UNIX implementations support similar functionality directly in the kernel. It's called "revocation." When a filesystem gets forced-unmounted, all the file descriptors of the open files on it are revoked: They return an error on any future calls, yet the descriptors themselves aren't closed. A similar thing is done when the controlling TTY process exits&#151;<i>revoke()</i> causes the file descriptors of this TTY in all the other processes to be revoked. But the programs waiting for input from this TTY would not necessarily wake up until this TTY gets actually closed. What the <i>dup2()</i> call gives us is a sort of application-level revocation.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+	
+	
+	
+	
+	
+	
+	
+	
+
+	
+	
+	
+	
+
+	
+	
+
+
+
+</body>
+</html>

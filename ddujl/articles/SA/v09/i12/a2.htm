@@ -1,0 +1,144 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v09, i12: Protocol Analysis for Performance Tuning</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink>Article</a></span></td>
+		<td><a href="../../../../source/SA/2000/dec2000.tar"><b class=codeListing>dec2000.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<! -- Insert Content ------ >
+
+<H1>Protocol Analysis for Performance Tuning</H1><p>
+<P>Adam Anderson and Dave Felps
+<P>
+Performance tuning of applications is difficult, even in situations involving only one computer and one developer. The addition of other developers, network operations staff, and the modern distributed computing environment considerably increases the inherent difficulty of this problem. However, investigating and tuning code or systems that are not at the root of the problem can be avoided by using a protocol analyzer to precisely indicate the responsible element.<P>
+In our situation, the processing of nightly uploads from our customer must be completed during a set interval to meet our contractual obligations for application availability. Nearly every IT organization faces similar pressure to achieve particular performance goals, and the penalties for failing to do so are often costly.<P>
+Our application is built on an n-tier architecture, using Java and Oracle. We extensively use packet capture and protocol analysis to provide granular visibility into this distributed application environment. This visibility has allowed us to cut processing times by 80-90%, often early in the development process.<P>
+<B>Tools and Techniques</b><p>Protocol capture and analysis tools (often referred to as sniffers) are available for nearly every platform and vary widely in functionality. Commercial protocol analysis tools incorporate packet decodes and software experts that can provide a deeper look into the traffic. For basic analysis of the timing and flow of packets between nodes, almost any sniffer will suffice. For detailed analysis and error discovery, however, the protocol decodes in a commercial quality analyzer will be necessary.<P>
+A sniffer must be running on a system whose network card is receiving and sending the packets in order to capture the appropriate traffic. In a shared media network (which is rare), this is not an issue because all nodes see all packets. This is not the case in a modern switched network, so one of several other tactics must be used.<P>
+For testing purposes, installation of the sniffer on the client or server in the test environment will allow capture of the necessary packets. For more complex applications (with multiple interactions among several machines) or for capture of packets in the production environment, this is impractical. Another approach would be to use the SPAN port or port mirror functionality found on most manageable Ethernet switches. Last, and least elegant, is the insertion of a half-duplex device, such as a hub or repeater, between the node to be monitored and the Ethernet switch. This allows for the sniffer to be placed on this new, shared segment where it can capture the traffic.<P>
+<B>The CAM Cycle</b><p>In practice, one look at the packet captures is rarely enough to suggest a solution to the problem. In our environment, several iterations of a Capture-Analyze-Modify cycle are typically required. Close coordination of the development and network operations teams is also important because both skill sets are required to maximize the return on the analysis process. An effective approach is to identify the performance issue, configure and place the sniffer to capture the relevant traffic, prepare any other information capture (CPU and disk load utilities, etc.), and then baseline the application.<P>
+The baseline pass is critical for establishing the current performance formally and providing a starting point for the analysis. Users or IT staff will often relate that an application &#147;feels slow&#148;. The baseline provides an actual metric of the application speed as reflected by the flows of packets to and from the entities in the system. It is also useful to baseline from more than one client workstation in client-server and applications, since this will often reveal differences in the client configurations that could affect performance.<P>
+<B>Packet Flow in our Application</b><p>Each night we process several uploaded files from one of our clients. These files consist of fixed-length records that must be parsed, validated and inserted into the database or used to update existing records. The application behavior as viewed from a sniffer (with the database connect and initialization skipped) is summarized below:<P>
+<pre>
+#   Source     Dest.      Delta Time    Prot. Detail
+
+1   Client     Server     0 ms          SQL   select &lt;sequence&gt;
+2   Server     Client     .8 ms         SQL   return &lt;result&gt;
+3   Client     Server     15 ms         SQL   select &lt;query&gt;
+4   Server     Client     .7 ms         SQL   return &lt;result&gt;
+5   Client     Server     14 ms         SQL   select &lt;query&gt;
+6   Server     Client     .7 ms         SQL   return &lt;result&gt;
+  .
+  . [~25 additional queries omitted]
+  .
+7   Client     Server     15 ms         SQL   insert &lt;record&gt;
+8   Server     Client     1.5 ms        SQL   return &lt;result&gt;
+9   Client     Server     17 ms         SQL   insert &lt;record&gt;
+10  Server     Client     1.4 ms        SQL   return &lt;result&gt;
+  .
+  . [~10 additional inserts omitted]
+  .
+11  Client     Server     22 ms         SQL   commit
+12  Server     Client     17 ms         SQL   return &lt;result&gt;
+</pre>
+Each row of the file to be imported leads to about 30 SQL select statements, the results of which later drive the creation of the insert statement. After all of the inserts have completed, the transaction is committed to the database. The details of the actual SQL statements have been omitted (as well as many of the repetitive statements) in the interest of clarity. The key data in this example is the flow of traffic between the two nodes and the timing of the packets themselves.<P>
+This pseudo-capture represents the final state of the application after tuning. Note that there are no packet retransmits or transport-level errors, and the response times from the database server are all less than 2 ms. The delta time between packets that comprise the request-response (i.e., packets 1 and 2), are brief. During this time, the DB server must receive and process the request, execute the query, and create and send the response. The delta time between packets 2 and 3 represents the processing time on the client to receive and act on the response, process the import data to create the next query, and send that query to the DB server.<P>
+Clearly, the client spends considerably more time processing the data and generating requests than the DB server spends responding to them. Client-side processing time outstrips DB processing time by a factor of 10-20 in this example. There is very little room here for improvement in the overall processing time by reducing the amount of time that the DB server spends in processing requests. There is also no evidence to suggest network congestion or latency as a bottleneck, since the wait times are clearly a result of client-side processing.<P>
+<B>Discovery of a Database Configuration Issue</b><p>On initial deployment, the performance of the application was very poor, taking several seconds to import a single row. Several ad hoc theories were advanced -- ranging from poor network performance, to inefficient database design, to sloppy coding practices. The sniffer was quickly set up and baseline captures were taken to try to isolate the problem. The representative packet flow below holds several interesting findings:<P>
+<pre>
+#   Source     Dest.     Delta Time   Prot.   Detail
+
+1   Client     Server    0 ms         SQL     select &lt;sequence&gt;
+2   Server     Client    .8 ms        SQL     return &lt;result&gt;
+3   Client     Server    30 ms        SQL     select &lt;query&gt;
+4   Server     Client    264 ms       SQL     return &lt;result&gt;
+5   Client     Server    32 ms        SQL     select &lt;query&gt;
+6   Server     Client    314 ms       SQL     return &lt;result&gt;
+  .
+  . [~25 additional queries omitted]
+  .
+7   Client     Server    42 ms        SQL     insert &lt;record&gt;
+8   Server     Client    1.5 ms       SQL     return &lt;result&gt;
+9   Client     Server    38 ms        SQL     insert &lt;record&gt;
+10  Server     Client    1.4 ms       SQL     return &lt;result&gt;
+  .
+  . [~10 additional inserts omitted]
+  .
+11  Client     Server    22 ms          SQL     commit
+12  Server     Client    17 ms          SQL     return &lt;result&gt;
+</pre>
+The application traffic flow is the same, with the exception of slightly higher delta times overall, and several extremely high response times from the DB server. Packets 1 and 2 are a request for a sequence number from the DB and the response, which arrives in less than 1 ms. This was consistent for each record imported, as was the time for DB response on the inserts. If network congestion or retransmits due to errors were the cause of the performance problems, we would expect to see the retransmitted packets and a random distribution of long response times. The client-side processing time was also higher than we expected, but it was the select statements that accounted for about 90% of the time to process each import record.<P>
+The DBA checked the configuration and determined that the indices on a key table had been removed to speed up insertion into that table from another one-time process. Replacement of the indices reduced the response time on the select statements to less than 1 ms, cutting a tremendous amount of wait time out of the application flow. The number of packets processed per minute jumped by almost 2 orders of magnitude. Use of the sniffer allowed an impartial view of the problem, and clearly indicated the source of the problem.<P>
+<B>Discovery of an Application Issue</b><p>Before long, more functionality was added to the import engine and the processing on each record became more involved. As monitoring of the application's performance continued, an unusual trend was discovered. As the import engine worked its way through the set of records, its performance worsened proportionally to the number of records imported. Again, the sniffer was used to capture the actual application traffic and confirm the suspicion.<P>
+The time between the responses from the DB and requests from the client was growing longer and longer. The DB performance was constant and nearly identical to the previous versions of the code. This indicated that the DB was not the entity in the system to focus on, and instead, the developers went to the application code itself.<P>
+Our application uses the JDBC package for access to the Oracle DB. To connect to a data source using JDBC, you must create a connection. Within the connection, you create statements that define the database query. The snippet below shows the original flow of the application using a single query to illustrate the problem. There are many queries and other logic for each line imported:<P>
+<pre>
+Connection conn = DriverManager.getConnection("connection string");
+
+Statement stmt = conn.createStatement();
+while (iter.hasNext())
+{              
+   query = buildQuery(iter.next());
+   ResultSet rs = stmt.executeQuery(query);
+}
+stmt.close();
+conn.close();
+</pre>
+A single statement object was getting reused for every import line. The statement object was building overhead with each iteration caused the performance degradation of the application. The fix turned out to be incredibly simple and is shown below. In this code, we create a new statement object for every line that is imported.<P>
+<pre>
+Connection conn = DriverManager.getConnection("connection
+        string");
+
+Statement stmt;
+while (iter.hasNext())
+{              
+   stmt = conn.createStatement();
+   query = buildQuery(iter.next());
+   ResultSet rs = stmt.executeQuery(query);
+   stmt.close();
+}
+conn.close();
+</pre>
+Because the sniffer focused our effort on the processing time in the client application (and not the DB), we were able to quickly resolve this issue. The timing of the flow of packets and clear indication of steadily increasing processing time suggested we look for  some type of resource leak. As a result, the statement handling issue above was quickly identified and a fix soon followed.<P>
+<B>Conclusion</b><p>The sniffer can be a powerful tool in troubleshooting a wide variety of distributed computing issues, especially performance problems. In our environment, one of the greatest advantages has been the ability of a packet capture and its subsequent analysis to focus staff on the root of a thorny problem. With the current pace of development and the demands on network staff, any tool that can reduce our workload is welcome.<P>
+<p>
+<h1>About the Author</h1><p>
+Adam Anderson is currently CIO of Servana, an ASP in Austin, Texas. When not at work or playing with his 4-year-old daughter, Caitlin, he can be reached at: adam@servana.com.<P>
+Dave Felps is an application developer at Servana, in Austin, Texas.  When not busy  pounding Java bugs or creating new ones, he can be found drinking beer. He can be reached at: david@io.com.
+
+
+
+<! -- Begin Content ------ >
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

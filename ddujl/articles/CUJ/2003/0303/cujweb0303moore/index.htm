@@ -1,0 +1,134 @@
+<HTML>   
+     <HEAD>
+<TITLE>March 2003/Quick and Easy XML Creation with C++ Classes</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+
+<HR>
+
+<H2 ALIGN="center">Quick and Easy XML Creation with C++ Classes</H2>
+<H3 ALIGN="center">Scott Moore</H3>
+
+<HR>
+
+<p>XML is a great communications format. The flexibility and expressiveness of XML belies its simplicity. Even better, the current technologies surrounding XML are powerful and have a lot of industry momentum. One of oldest XML technologies is DOM (Document Object Model) <a href="#1">[1]</a> &#151; a standard, language-neutral API for manipulating XML as a tree of nodes. There are several DOM implementations that are freely available. Microsoft and Apache both provide one.</p> 
+<p>My company writes enterprise financial software, implemented as a three-tier system. Our middle tier is essentially a SOAP (Simple Object Access Protocol) <a href="#2">[2]</a> service running under MTS (Microsoft Transaction Server). Because SOAP is XML based, you can use existing XML technologies like DOM to create, parse, and modify SOAP messages. This is exactly how our middle tier reads and writes SOAP messages, using Microsoft's DOM implementation. Our SOAP server needs to respond to SOAP requests very quickly (like most servers), so anything that might improve performance warrants investigation. Because SOAP requests to our middleware are small, using DOM to parse and extract the information has not posed scalability problems. However, a few SOAP responses can get very large, with thousands of nodes, and the response time is sluggish at best.</p>
+<p>Investigating further, I wrote a program to create both small and large XML documents using Microsoft's DOM v3.0 <a href="#3">[3]</a> and timed the performance. My initial benchmarks showed that doubling the number of nodes could more than triple the processing time. Fortunately, that's not always the case. By rewriting how the nodes were created and added to the document, I got it back down to roughly linear performance.</p>
+<p>But even with the rewrite's better performance, it was still taking too long. I concluded that I needed to create the SOAP responses using a different XML technology. I had only two criteria: speed and ease of use. As far as speed goes, I needed something with roughly linear performance, but many times faster than DOM. Getting other developers to use it means it can't be complicated and unwieldy, thus the ease-of-use criteria. Searching around the Internet didn't turn up anything, so I decided to write my own.</p>
+<p>Since, ultimately, the XML needs to be in a character buffer to send over HTTP, I decided appending XML to a string would be the most efficient approach. A simple XML API on top of the string buffer would solve the ease-of-use problem, and the solution progressed from there.</p>
+
+<H3>Enter XMLSTACK</H3>
+
+<p>Unlike HTML, one of XML's requirements is that it be well formed. This includes criteria such as all beginning element tags must have matching ending tags and no tags can overlap each other. I decided the best way to meet this criteria was to use a stack implementation. As element nodes are pushed onto the stack, the starting tag information is written to the XML buffer. Popping the element off the stack forces it to write the ending tag. Once I had that concept down, everything else fell into place. I decided to name my implementation <b>XMLStack</b>, with the objects modeled after their counterparts in DOM.</p>
+<p>An example is worth a thousand words, so take a look at <a href="web0303c_list1.htm" target="_blank">Listing 
+  1</a>. This code demonstrates how to create the XML in <a href="web0303c_fig1.htm" target="_blank">Figure 
+  1</a> (formatted for clarity). Much like DOM's document object, the <b>AXMLStackDocument</b> 
+  object is the basis for the XML document. The document doesn't actually write 
+  any XML itself, but it does hold the XML buffer and creates all the node types 
+  that do the actual XML writing.</p>
+<p>In <a href="web0303c_fig1.htm" target="_blank">Figure 1</a>, the first node 
+  I need to create is an element node called <b>&lt;Book&gt;</b>. This is performed 
+  by calling <b>pushElement(&quot;Book&quot;)</b> on the document object. The 
+  <b>&lt;Book&gt;</b> element has two child elements called <b>&lt;Title&gt;</b> 
+  and <b>&lt;Author&gt;</b>. To create the <b>&lt;Title&gt;</b> element as a child 
+  of <b>&lt;Book&gt;</b>, call <b>pushElement (&quot;Title&quot;)</b> while <b>&lt;Book&gt;</b> 
+  is still on the stack. Now, this is where things start to get interesting. The 
+  <b>&lt;Title&gt;</b> element has a value of <b>&quot;Aerospace Engineering For 
+  Dummies&quot;</b>, which gets placed between the starting and ending tag. The 
+  <b>pushElement()</b> method returns a reference to the element node just created, 
+  which is what I'm assigning to. Element nodes define an assignment operator 
+  (<b>=</b>) for strings and all C++ scalar types, thus providing a natural C++ 
+  syntax for assigning values. After assigning <b>&quot;Aerospace Engineering 
+  For Dummies&quot;</b>, I <b>pop()</b> the <b>&lt;Title&gt;</b> element off the 
+  document's stack, which causes the ending tag <b>&lt;/Title&gt;</b> to get written 
+  to the buffer.</p> 
+<p>Next, I push the <b>&lt;Author&gt;</b> element onto the stack. It's important to keep in mind when to pop elements off the stack. If I didn't previously pop <b>&lt;Title&gt;</b>, then <b>&lt;Author&gt;</b> would get created as a child of <b>&lt;Title&gt;</b>, which is incorrect. <b>&lt;Author&gt;</b> is a child of <b>&lt;Book&gt;</b>, so I pop <b>&lt;Title&gt;</b>, leaving only the <b>&lt;Book&gt;</b> element on top of the stack. Since <b>&lt;Author&gt;</b> has two child elements, I leave it on the stack until the <b>&lt;LastName&gt;</b> and <b>&lt;FirstName&gt;</b> elements are pushed and popped. Notice that for <b>&lt;LastName&gt;</b>, I called <b>setValue()</b> instead of using the assignment operator. You can use the two interchangeably. Actually, the assignment operator just turns around and calls <b>setValue()</b>. However, there's no performance penalty for using the assignment operator because it is inlined. Once <b>&lt;FirstName&gt;</b> is assigned the value <b>&quot;Bob&quot;</b>, the only thing left to do is to pop the remaining elements off the stack. To get the XML in the string buffer, call the <b>xml()</b> method on the document.</p> 
+<p>Rather than reinvent the wheel, I decided to use <b>std::basic_string</b> as my character buffer. You may know <b>std::basic_string</b> as the more commonly used <b>typedef</b>'s <b>std::string</b> or <b>std::wstring</b>. Rather than hardcode a particular instantiation of <b>basic_string</b>, the <b>XMLStack</b> classes are templates, which accept the same arguments as <b>basic_string</b>. This means the XML buffer can either be ANSI or Unicode (or even some other encoding). Providing this flexibility did have a cost however &#151; encoding conversions. When writing to the XML buffer, some classes have hardcoded strings that get placed into the XML buffer. Since the code cannot assume a particular encoding, I created a class called <b>ConvertEncoding</b> that converts strings to the correct encoding. During testing, I noticed that this constant conversion was a performance drain. After restructuring the code, I almost completely eliminated this penalty by performing the conversion once in the constructor of the <b>XMLStackDocument</b> class. Now, all node classes just reference the properly encoded string from the document class. There are two predefined <b>typedef</b>s for the <b>XMLStackDocument</b> class: <b>AXMLStackDocument</b> for ANSI characters and <b>WXMLStackDocument</b> for Unicode characters.</p>
+<p>The next coding example, shown in <a href="web0303c_list2.htm" target="_blank">Listing 
+  2</a>, creates the XML shown in <a href="web0303c_fig2.htm" target="_blank">Figure 
+  2</a>. This XML has a couple of new node types: processing instructions and 
+  attributes. Also, this time around, I will be working with Unicode instead of 
+  ANSI, so I'll use the predefined <b>WXMLStackDocument</b> <b>typedef</b>. Just 
+  like elements, processing instructions get pushed onto the stack and can be 
+  assigned a value. Unlike elements, processing instructions do not accept child 
+  nodes, so you must always pop them before creating other nodes. If you do try 
+  to push a node on top of a processing instruction, an <b>XMLStackException</b> 
+  will get thrown.</p> 
+<p>Notice the <b>&lt;Book&gt;</b> element has an attribute called <b>Status</b>. Elements are the only nodes that support attributes. To create an attribute node, I call the document's <b>top()</b> method, which returns the node currently on top of the stack (<b>&lt;Book&gt;</b>). I then use the element's <b>createAttribute()</b> method to create a <b>Status</b> attribute and assign it the Unicode string <b>&quot;BackOrdered&quot;</b>. Take a look at the line where I assign <b>&lt;PubId&gt;</b> the integer <b>736</b>. As I mentioned before, the assignment operator is overloaded to accept all the C++ scalar types. It will automatically convert the integer <b>736</b> to a string and assign it to <b>&lt;PubId&gt;</b>. Skip a few lines down to the <b>setValue(19.99, 2)</b> method. This assigns a <b>float</b> or <b>double</b> to the node and accepts an optional second argument for the scale (number of digits to the right of the decimal point). The default is six. This is one case where you might want to skip the assignment operator (which uses the default value) if you need finer control of the string conversion. At the end of the code, I make a call to <b>popAll()</b> instead of several <b>pop()</b> calls. The <b>popAll()</b> method calls <b>pop()</b> until no more nodes remain on the document's stack.</p>
+
+<H3>Namespace Support</H3>
+
+<p>In my final coding example (<a href="web0303c_list3.htm" target="_blank">Listing 
+  3</a> and <a href="web0303c_fig3.htm" target="_blank">Figure 3</a>), I introduce 
+  the namespace <a href="#4">[4]</a> capabilities. Both elements and attributes 
+  can be placed into namespaces, which helps avoid name collisions when working 
+  with two or more XML documents. Namespaces are supported in the classes, but 
+  there isn't any validation performed on them. For instance, you can declare 
+  a namespace prefix (e.g., <b>&quot;Prefix:ElementName&quot;</b>) on an element 
+  name even if the namespace URI (Uniform Resource Identifier) for that prefix 
+  was never previously defined. No exception will be thrown. However, any XML 
+  parser will treat that as an error, so the resulting XML will be invalid.</p>
+<p>The XML in <a href="web0303c_fig3.htm" target="_blank">Figure 3</a> is a simple 
+  SOAP message to a hypothetical service, which returns the current time in a 
+  given time zone. SOAP makes heavy use of namespaces, so it's a good way to demonstrate 
+  this capability. In <a href="web0303c_list3.htm" target="_blank">Listing 3</a>, 
+  the first element I create is <b>&lt;Envelope&gt;</b>, with a namespace prefix 
+  of <b>&quot;SOAP-ENV&quot;</b> and a namespace URI of <b>&quot;http://schemas.xmlsoap.org/soap/envelope/&quot;</b>. 
+  The namespace prefix is provided with the element name, separated by a colon. 
+  The second parameter to <b>pushElement()</b> is the namespace URI. Since the 
+  namespace URI is defined with the <b>&lt;Envelope&gt;</b> element, it will automatically 
+  get written in the starting tag as an attribute (e.g., <b>&quot;xmlns:SOAP-ENV=&quot;http://schemas.xmlsoap.org/soap/envelope/&quot;&quot;</b>). 
+  The prefix <b>&quot;xmlns&quot;</b> declares a namespace. However, there are 
+  a couple of other attributes that need to get created, one of them being another 
+  namespace declaration (<b>&quot;http://www.time.gov/&quot;</b>). This is performed 
+  by calling <b>createAttribute()</b> twice on the <b>&lt;Envelope&gt;</b> element. 
+  The namespace declaration <b>&quot;xmlns:TS&quot;</b> is just treated as an 
+  attribute named <b>&quot;xmlns:TS&quot;</b> with a value of <b>&quot;http://www.time.gov/&quot;</b> 
+  for the namespace URI.</p> 
+<p>Next, I create an empty element called <b>&quot;SOAP-ENV:Header&quot;</b>. Now comes the SOAP body or payload. After pushing the <b>&quot;SOAP-ENV:Body&quot;</b> element onto the stack, I create an element called <b>&quot;TS:GetCurrentTimeRequest&quot;</b>. <b>GetCurrentTimeRequest</b> is a method of my hypothetical SOAP service that returns the current time for a time zone. It's also part of the namespace <b>&quot;http://www.time.gov/&quot;</b>, which is why it's prefixed with <b>&quot;TS&quot;</b>. However, unlike the way DOM works, I do not pass the namespace URI (<b>http://www.time.gov/</b>) as the second parameter because it's already been declared in an ancestor element. If I did pass it, it would write out the namespace declaration again in the starting tag (e.g., <b>&lt;TS:GetCurrentTimeRequest xmlns:TS=&quot;http://www.time.gov&quot;&gt;</b>). This isn't actually a problem, but there's no need to do it and it keeps the resulting XML smaller. The document object does not validate or keep track of previous namespace declarations, which is why it would automatically write the namespace declaration out again. The only thing left to do is create the <b>&lt;TimeZone&gt;</b> element, assign it the value of <b>&quot;Eastern&quot;</b> and then pop all the remaining nodes off the stack.</p>
+
+<H3>Other Node Types</H3>
+
+<p>There are several other node types that weren't covered by the examples that I want to mention. If you want to place a comment in the XML, all you need to do is call <b>pushComment(&quot;My comment&quot;)</b> on the document object and it will insert the comment into the XML buffer surrounded by the appropriate delimiters (e.g., <b>&lt;!&#151;My comment&#151;&gt;</b>). Remember to pop it off the stack, because comments don't accept child nodes and will throw an <b>XMLStackException</b> if you forget.</p> 
+<p>Although not formally introduced, in my sample code, text nodes have been used behind the scenes. Text nodes are just text that isn't markup (e.g., element tags). When assigning a value to an element node, the code actually pushes a text node on the stack, assigns the value to it, and pops it off. Text nodes also automatically convert the reserved characters <b>&amp;</b> and <b>&lt;</b> to their proper entity references <a href="#5">[5]</a> (<b>&amp;amp;</b> and <b>&amp;lt;</b> respectively). Text nodes are created by calling <b>pushText(&quot;This &amp; That&quot;)</b> on the document object. The resulting XML will look like <b>&quot;This &amp;amp; That&quot;</b>.</p>
+<p>Another text-like node is called a CDATA section. The difference between the two is that CDATA sections do not require you to escape the reserved characters <b>&amp;</b> and <b>&lt;</b>. This makes them ideal for text that includes markup. On the other hand, CDATA sections cannot contain other CDATA sections, so it's not the perfect solution. The problem is CDATA sections have the ending delimiter <b>&quot;]]&gt;&quot;</b>, and it cannot be escaped. If that delimiter can possibly appear in your text, then you will need to use a text node, or a combination of the two. CDATA sections are created by calling <b>pushCDATASection(&quot;This &amp; That&quot;)</b>. The resulting XML will look like <b>&quot;&lt;![CDATA[This &amp; That]]&gt;&quot;</b>. Neither text nodes nor CDATA sections accept child nodes, so pop them before pushing other nodes onto the stack.</p>
+<p>The last node provides a way to place raw text into the buffer. No character processing is performed on the string. It could be XML or maybe just text that you know doesn't need to be checked for reserved characters (e.g., checking for reserved characters does exact a small performance penalty). Another use for it could be to write an embedded DTD (Document Type Definition), since support for creating DTDs is not inherently provided. To use it, call <b>pushRawXML(string, string)</b>. The first parameter is the text that gets written to the XML buffer when the node is pushed. The second parameter is the text that gets written when the node is popped. Either parameter can be an empty string, and it does accept child nodes.</p> 
+
+<H3>Performance</H3>
+
+<p>As I mentioned in the beginning, one of my criteria for the code is that it 
+  be fast. Microsoft's DOM implementation has an extension that will create an 
+  XML string from the nodes in DOM. On my PC, I benchmarked creating the XML in 
+  <a href="web0303c_fig2.htm" target="_blank">Figure 2</a> with version 3 of their 
+  DOM and my <b>XMLStack</b> classes (10,000 times in succession). The <b>XMLStack</b> 
+  classes were consistently five-six times faster. Creating very large documents 
+  (thousands and thousands of nodes) typically netted over three times the performance 
+  using my code. When creating XML in a server environment, this can make a significant 
+  difference in how well your server scales. Also, the <b>XMLStack</b> code to 
+  create <a href="web0303c_fig2.htm" target="_blank">Figure 2</a> is about half 
+  the length of the DOM code.</p> 
+
+<H3>Error Checking</H3>
+
+<p>To be fair, Microsoft's code is also error checking the XML as the nodes are created, something my classes do not do, except in some limited cases. If the <b>_DEBUG</b> preprocessor symbol is defined, then I do perform some validation on element and attribute names. It's not comprehensive, but it does catch some of the common errors (whitespace or illegal characters in names).</p> 
+
+<H3>Conclusion</H3>
+
+<p>DOMs provide a lot of flexibility in XML creation, manipulation, and searching. Sometimes, however, your XML requirements might be more basic, and programmatically creating XML as fast as possible becomes the priority. The <b>XMLStack</b> classes meet that criteria and can make you more productive at the same time. After all, writing less code to achieve the same result is usually a good thing.</p>
+
+<H3>References</H3>
+
+<p><a name="1"></a>[1] The DOM specification and related materials can be found at the W3C website: <a href="http://www.w3c.org/DOM/">&lt;www.w3c.org/DOM/&gt;</a>.</p>
+<p><a name="2"></a>[2] Don Box et. al. &quot;Simple Object Access Protocol (SOAP) 1.1,&quot; May 2000, <a href="http://www.w3.org/TR/SOAP/">&lt;www.w3.org/TR/SOAP/&gt;</a>.</p>
+<p><a name="3"></a>[3] Microsoft's DOM (MSXML) can be downloaded at Microsoft's MSDN site: <a href="http://msdn.microsoft.com/xml">&lt;http://msdn.microsoft.com/xml&gt;</a>.</p>
+<p><a name="4"></a>[4] Various authors. &quot;Namespaces in XML,&quot; January 1999, <a href="http://www.w3.org/TR/1999/REC-xml-names-19990114/">&lt;www.w3.org/TR/1999/REC-xml-names-19990114/&gt;</a>.</p>
+<p><a name="5"></a>[5] There are a few other reserved characters, such as <b>&gt;</b>, that could also be escaped. However, escaping those characters is optional. For efficiency, text nodes only convert the absolute minimum required.</p>
+
+<H3>Download the Code</H3>
+
+<p><a href="ftp://ftp.cuj.com/pub/2003/2103/moore.zip">&lt;moore.zip&gt;</a></p>
+
+<H3>About the Author</H3>
+
+<p><b>Scott Moore</b> is a senior developer at netDecide (<a href="mailto:Scott.Moore@netDecide.com">Scott.Moore@netDecide.com</a>). He enjoys learning new technologies and continually strives to write practical code. By his definition, practical code is bug free, performs well and falls somewhere between being perfect (e.g., academia) and getting something out the door. Scott has a BS in computer science from James Madison University.</p> 
+
+</BODY></HTML>

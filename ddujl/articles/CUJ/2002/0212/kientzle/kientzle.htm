@@ -1,0 +1,77 @@
+<HTML>   
+     <HEAD>
+<TITLE>December 2002/Fast UDP-Based Network Storage</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocdec.htm"></A><FONT COLOR="#FF0000">   Internet &amp; Network Programming</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Fast UDP-Based Network Storage</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Tim Kientzle</FONT></H3>
+
+<BLOCKQUOTE>
+<p>If network performance is critical, you can bypass that database of yours with this clever approach.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+<p>The relational database is the hands-down winner for general-purpose data storage. But that generality makes it less than ideal for some applications. In many cases, especially those where very high performance is critical, a custom server will fit your requirements much better.</p>
+<p>Over the last few years, I&#146;ve been examining ways to manage session data for clusters of web servers. This particular application needs high-performance, low-latency storage of small pieces of data. After examining a number of different approaches, I found that a combination of UDP-based transport and memory-based storage gave exemplary performance in less than 200 lines of straightforward C code.</p>
+<p>In this article, I&#146;ll explain why UDP is often a better fit than TCP for performance-driven network applications. I&#146;ll then share the techniques you&#146;ll need to build your own custom storage service. Full example source code is available at &lt;www.cuj.com/code&gt;.</p>
+
+<H3><FONT COLOR="#000080">TCP&#146;s Drawbacks</FONT></H3>
+
+<p>TCP is a natural fit for many services. A client opens a TCP connection to the server, and the two then exchange commands and results over that connection. The TCP connection itself defines a persistent session that the server uses to associate various resources with a particular client.</p>
+<p>TCP can be complex to use. Because connections can be long lived, TCP servers must support multiple simultaneous connections. Many servers use a separate thread or process for each connection, but this approach degrades under high load due to task-switching overhead. Single-threaded servers reduce task-switching overhead, but must use complex asynchronous I/O to juggle the connections.</p>
+<p>Latency is also a problem with TCP. TCP&#146;s three-way handshake adds a noticeable delay to each new connection. To reduce overhead, the operating system deliberately delays short packets in the hope that more data will follow, which adds additional latency at the end of each request or response. If most requests are short, that additional delay can be added to every request.</p>
+
+<H3><FONT COLOR="#000080">UDP to the Rescue</FONT></H3>
+
+<p>UDP is less well known than TCP. It provides a mechanism for programs to send and receive single-packet messages over IP. Although it has some significant limitations, UDP does manage to avoid the latency and connection-management problems that dog TCP.</p>
+<p>UDP clients send explicit packets; there is no connection to worry about and no delay before a packet is sent. Similarly, the server does not need to maintain knowledge of each client. The server simply receives a request, builds a response packet, and fires it back. This makes UDP ideal for simple request-response protocols such as DNS, NTP, or CLDAP.</p>
+
+<H3><FONT COLOR="#000080">UDP&#146;s Limitations</FONT></H3>
+
+<p>UDP&#146;s primary limitations are reliability and security. UDP provides no transmission guarantees, which means that a message might not get to its intended recipient. Over switched Ethernet, this is not much of a problem, as lost packets are rare. However, robust clients do need to be prepared to retry requests.</p>
+<p>Security is a more subtle issue. UDP servers tend to be subject to spoofing attacks, in which a request packet is sent with a forged source address. As a result, UDP is most useful inside a network protected by a good firewall. Any authentication information must be provided with each request, which can lead to excessive overhead if strong cryptographic authentication is required. Of course, if you&#146;re choosing UDP for performance reasons, strong cryptographic authentication is probably not a concern.</p>
+
+<H3><FONT COLOR="#000080">The UDP API</FONT></H3>
+
+<p>UDP is supported by the standard Unix sockets API. Because there are no connections to deal with, only sending and receiving of packets, this portion of the API is really quite simple.</p>
+<p>The first step for the server is to create the socket using the <B>socket</B> call and bind it to a specific port using the <B>bind</B> call, as shown in <a href="list1.htm">Listing 1</a>. The server then simply waits for a packet to arrive and responds when it does. The socket&#146;s API provides a <B>recvfrom</B> call, which waits for an incoming packet and places it into your buffer. The <B>recvfrom</B> call also provides you with the address of the sender, which you can then use in a corresponding <B>sendto</B> call to send a response. <a href="list2.htm">Listing 2</a> outlines this process.</p>
+<p>The client is only a little different. Because the client doesn&#146;t care what port it uses, the <B>bind</B> call is unnecessary. The client needs to build an <B>addr</B> structure with the server address and then send the request using <B>sendto</B>.</p>
+<p>A naive client would then wait for a response with <B>recvfrom</B>. Unfortunately, this will simply hang if the response packet doesn&#146;t arrive. As a practical matter, it&#146;s necessary to enforce some sort of timeout. The standard technique on Unix is to use a <B>select</B> call to wait for data on the socket and then only call <B>recvfrom</B> when and if data does arrive. <a href="list3.htm">Listing 3</a> provides a rough outline of the client logic.</p>
+
+<H3><FONT COLOR="#000080">Session Storage</FONT></H3>
+
+<p>The specific application that led me to consider UDP was session storage for web server farms. Websites routinely track a certain amount of information about each visitor. This involves assigning each visitor a session token, which is generally stored in a client-side cookie. The client provides that information with each request, and the server can then use it to access information about the user. For example, the server might store the user&#146;s name, geographic location, or shopping cart information.</p>
+<p>Many websites store this data on each front-end server, often in RAM. This creates a number of awkward problems: it is difficult or impossible to mix different implementation technologies; the failure of a front-end server will lose session data; the load-balancing mechanism must provide &#147;session persistence,&#148; in which requests from a single user are consistently dispatched to the same server.</p>
+<p>Using a shared back-end session server eliminates these problems. A standard protocol allows different implementation technologies to be mixed on the same site. Front-end servers can come and go without affecting current users. Session persistence is not required, since any front-end server can access the session data at any time.</p>
+
+<H3><FONT COLOR="#000080">UDP-Based Session Storage</FONT></H3>
+
+<p>Session storage requires only a few operations: clients need to be able to allocate a session, read a session, or write to a session. To keep things simple, I&#146;ve kept the request and response formats identical: 1-byte operation/status code, 7-byte session identifier, and up to 1,024 bytes of session data. Valid responses always set the status byte to zero, so you can simply treat the first eight bytes as a session key.</p>
+<p>To create a new session, the client sends a packet whose first byte is zero. The server responds with a newly created session, which includes a newly allocated session key. That key will generally be encoded into a cookie for the user&#146;s web browser. To read or write the session data, the client provides the correct operation code (<B>1</B> to read, <B>2</B> to write) and session key. For a write operation, the session data is appended. In either case, the server will always respond with the full session (whose first byte is always zero) unless there is an error, in which case the first byte of the response indicates the nature of the problem.</p>
+
+<H3><FONT COLOR="#000080">Limitations</FONT></H3>
+
+<p>This protocol is very simple and should be easy to implement in just about any programming language. However, there are a few awkward points that you may need to consider. First, there is no explicit support for session timeouts; if the web application needs sessions to expire, it will need to store an expiration time in the session data.</p>
+<p>If your session data is very large, the resulting UDP packets will be transferred as multiple IP fragments. This increases the likelihood of dropped packets, so it should be avoided over long-haul networks.</p>
+<p>One way to limit the size of your session data is to store only the most critical data on the session server. The remaining data can be stored in a slower but more flexible relational database. For example, a shopping cart might store the total number of items in the session server so that every page can display a basic shopping cart status, while the complete list of items is kept in a relational database.</p>
+
+<H3><FONT COLOR="#000080">Implementation Notes</FONT></H3>
+
+<p>The programs <B>udpserver.c</B> and <B>udpclient.c</B> (available for download at &lt;www.cuj.com/code&gt;) provide a sample implementation of this protocol. The client exercises the full <B>get</B>/<B>put</B> protocol to ensure that it gets consistent results and should be easy to modify for your own requirements.</p>
+<p>The server is more interesting. To keep things as efficient as possible, the server is single threaded and stores all session data in memory. By limiting each session to 1,024 bytes of data, a server with 1 GB of memory can handle just under one million simultaneous sessions without swapping. This is more than enough for most websites.</p>
+<p>The combination of UDP and simple memory-based storage gives impressive performance. This server can easily saturate a 100 Mbps Ethernet &#151; upwards of 15,000 requests per second. A full client request, including the network round trip, takes a mere 300 microseconds, which is faster than most hard disks. I&#146;ve not yet had the opportunity to benchmark this server over Gigabit Ethernet.</p>
+<p>Recall that the server chooses the session IDs. This is a key feature of the protocol, which allows the server to store the array index directly as part of the session ID. Incoming requests can then be immediately mapped to a particular array slot. Since there are only a limited number of array slots, the server keeps a list of the least recently used slots and reuses them as necessary. Filling the remainder of the session ID with a random value helps guard against any conflicts caused by this reuse.</p>
+
+<H3><FONT COLOR="#000080">Future Directions</FONT></H3>
+
+<p>The current implementation does not provide any persistence. While this is fine for most e-commerce sites that only need short-term session management, it&#146;s less appropriate for portal sites that want to use long-lived cookies to provide easy access. Long-lived sessions really require some form of disk-based storage. Adding disk-based storage requires care to avoid impacting performance.</p>
+<p>One approach would use two threads. One thread is similar to the current fast-running server, handling most requests directly from memory. Sessions that are not immediately available in memory are placed on a queue to be handled by the second thread. That thread moves sessions from disk into memory before sending a response. Of course, the simple approach of embedding a slot number into the session ID will not work with such a design. Instead, use a hash table or balanced tree to map session IDs to sessions.</p>
+
+<p><i><B>Tim Kientzle</B>  is an independent consultant, instructor, and software developer based in Oakland, California. He can be contacted at <B>kientzle@acm.org</B>.</i></p>
+
+<h4><a href="../../../source/2002/dec02/kientzle.zip"></a></h4>
+</blockquote></body></html>

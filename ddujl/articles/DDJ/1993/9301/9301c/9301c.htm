@@ -1,0 +1,137 @@
+<HTML>
+<META NAME="year" CONTENT="1993">
+<HEAD>
+<TITLE>JAN93: 64-BIT PROGRAMMING IN A 32-BIT WORLD</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>64-BIT PROGRAMMING IN A 32-BIT WORLD<a name="0026_0003"></h1><P>
+<h2><a name="0026_0001"><a name="0026_0000">Writing portable code for 16-, 32-, and 64-bit architectures</h2><P>
+<h3>Andy Nicholson</h3><P>
+<p><i><a name="0026_0002"><a name="0026_0000">Andy is a computer scientist with Cray Research and can be contacted at droid @cray.com.</i></p><hr><P>
+Compared to 16-bit programming, 32 bits means faster programs, more memory with straightforward addressing, and better processor architecture.  Still, many programmers are already thinking about the even greater advantages of 64-bit processors.<P>
+Cray Research computers have always used 64-bit words and addressed large memories. However, as part of our ongoing effort to develop standard software and to interoperate with other systems, we end up porting code which originated on 32-bit processors.  As a result, we regularly encounter what we refer to as &quot;32 bit-isms&quot; -- code written under the assumption that a machine word is 32 bits.  Because of the difficulties in porting this code, we've established a few simple guidelines for writing code portable across 16-, 32-, or 64-bit (or more) processors.<P>
+Because of its heritage, C has a plethora of data types and data constructs.  You can use not only char, short, int, and long, but their unsigned brothers as well, and you can mix them up in structures and unions.  You can get really busy making unions of structures of unions, and if your complex data types are not complex enough, you can then throw in bitfields to spice things up.  And of course, you can cast your data elements to be any other kind of data type you want.  These are power tools, and as with other power tools, you must use them safely or you'll end up cutting off your fingers and hands.<P>
+<h3><a name="0026_0004">High-level Structures for High-level Code<a name="0026_0004"></h3><P>
+In their classic book The Elements of Programming Style, Kernighan and Plauger suggest that you &quot;choose a data representation that makes the program simple.&quot;  To me, this means using high-level data structures for high-level programming, and low-level data structures for low-level programming.<P>
+My favorite example of a 32 bit-ism is a bug I found in our port of version 1 of Gated, a routing protocol engine used for internetworking from Cornell University.  In a Berkeley networking environment, it's natural to use inet_addr( ) to convert string representations of Internet addresses into a useful binary format.  Internet addresses happen to be 32 bits, the same word size of many computers running Berkeley networking code.<P>
+There's also a high-level definition of an Internet address: struct in_ addr.  For convenience, the structure definition includes the subfield s_ addr, which is a scalar type (unsigned long) containing the Internet address.  inet_addr() accepts a pointer to a char and returns an unsigned long, and inet_addr will return -1 on encountering an error in converting the address string.<P>
+Gated reads a configuration file that has Internet addresses in text format and stores them in a sockaddr_in--a high-level structure that includes the struct in_addr.  The code in <a href="#0026_0005">Example 1(a)</A> worked on a 32-bit machine but failed when we ported it to a Cray Research computer.  Why?<P>
+<h4><a name="0026_0005">Example 1: High-level structures for high-level code.</h4><P>
+<pre>
+  (a)
+
+  struct sockaddr_in saddrin
+  char *str;
+
+  if ((saddrin.sin_addr.s_addr = inet_addr(str)) == (unsigned long)-1) {
+              do_some_error_handling;
+  }
+
+  (b)
+
+  struct sockaddr_in saddrin
+
+  char *str;
+
+  if (inet_aton(str, &amp;saddrin.sin_addr) ! = OK) {
+                 do_some_error_handling;
+   }</pre><P>
+<P>
+Because as long as inet_addr can correctly interpret the string, everything is fine.  But this code never catches the situation where inet_addr returns an error on our 64-bit machine. You have to consider the bit sizes of the items being compared to determine what's wrong.<P>
+First, inet_addr returns its error value, (unsigned long)-1, which is a 64-bit word of all 1 bits.  This value is then stored in the s_addr field of an in_addr.  in_addr must be 32 bits to match an Internet address, so it is a 32-bit bitfield of an unsigned int (ints are 64 bits with our compiler).  Now we have 32 1 bits stored.  The stored value is compared with (unsigned long)-1.  Since we have stored 32 1 bits in an unsigned int, the compiler automatically promotes the 32 bits to 64; thus the comparison of 0x00000000 ffffffff to 0xffffffff ffffffff fails.  This was a difficult bug to detect, particularly because of the implicit promotion from 32 to 64 bits.<P>
+So what do you do about this bug?  One fix is to compare against 0xffffffff instead of -1, but that makes the code even more dependent on objects being a particular size.  Another is to use an intermediate unsigned long variable for the result and comparison before storing the result in the sockaddr_in.  But that complicates the code.<P>
+The real problem is the expected equivalence of an unsigned long and a 32-bit quantity, such as an Internet address.  An Internet address must be stored as 32 bits, but it is sometimes convenient to access the parts of an address as a scalar type.  On a machine with a 32-bit word, it seems okay to access the address as a long (which is thought to be 32 bits).  Instead of assuming that a low-level data item (32 bits of Internet address) is equivalent to a machine word, the high-level data-type struct in_addr should be used consistently.  And since an in_addr has no invalid values, there should be a separate status return value.<P>
+The solution is to define a new function that works like inet_addr but returns a status value and accepts a struct in_addr as a result parameter; see <a href="#0026_0005">Example 1(b)</A>.  This code is portable across architectures regardless of word size because high-level data elements are used consistently and return values are not overloaded.  Trying to change inet_addr( ) this way would break many programs, although the NET2 release from Berkeley does define the new function inet_aton( ).<P>
+<h3><a name="0026_0006">Low-level Structures for Low-level Code<a name="0026_0006"></h3><P>
+Low-level programming implies direct manipulation of physical devices or protocol-specific wire formats.  For example, device drivers often must manipulate control registers with very specific bit patterns.  Furthermore, network protocols transmit data items with specific bit patterns that must be interpreted properly.<P>
+This is where your data structures must exactly mirror the physical data item to be manipulated.  Bitfields are wonderful because they precisely specify the number of bits and their arrangement.  In fact, it's this precision which makes bitfields superior to using shorts, ints, and longs to map physical structures--short, int, and long may change from machine to machine, but bitfields remain consistent.<P>
+When mapping a physical structure, the use of bitfields allows precision in defining the format, forcing you to use a coding style consistent in its accessing of the structure.  Each field is named, and your code is written to access those fields directly.  One thing you don't want to do is use arrays of scalar types (short, int, or long) when accessing physical structures.  Code which accesses these arrays assumes a particular bit size which may be incorrect when porting to an architecture with different word-size characteristics.<P>
+One problem we ran into when porting the PEX graphics library concerns a structure which maps a protocol message.  On a machine where ints are the same size as the elements in the message, the code in <a href="#0026_0007">Example 2(a)</A> works great.  In this case the 32-bit data elements are fine on a 32-bit machine; on a 64-bit Cray computer, they're terrible.  It's necessary to change not only the definition of the structure to <a href="#0026_0007">Example 2(b)</A>, but all the code that references the coord array as well.  Thus we're faced with the choice of either rewriting all the code referencing this message or defining a low-level structure and a high-level structure and having special code to copy from one to the other.  I don't know about you, but I don't look forward to rooting out every reference of zcoord = draw_ msg.coord[2];.  Furthermore, hunting down code like <a href="#0026_0007">Example 2(c)</A> is a dirty job when it comes time to port to a new architecture. This particular problem causes the same difficulties regardless of the word sizes.  You just can't assume that machine words, shorts, ints, and longs are a particular size and have portable code.<P>
+<h4><a name="0026_0007">Example 2: Low-level structures for low-level code.</h4><P>
+<pre>
+  (a)
+
+  struct draw_msg {
+        int     objectid;
+        int     coord[3];
+  }
+
+  (b)
+
+  struct draw_msg {
+        int     objectid:32;
+        int     coord1:32;
+        int     coord2:32;
+        int     coord3:32;
+  }
+
+(c)
+
+  int *iptr, *optr, *limit;
+  int xyz[3];
+
+  iptr = draw_msg.coord;
+  limit = draw_msg.coord + sizeof(draw_msg.coord);
+
+  optr = xyz;
+  while (iptr &lt; limit)
+           *optr++ = *iptr++;</pre><P>
+<P>
+<h3><a name="0026_0008">Structure Packing and Word Alignment<a name="0026_0008"></h3><P>
+The variance of word sizes from machine to machine causes another problem because of structure packing by compilers.  C compilers align word-size data items on word boundaries, which usually leaves holes between data elements when a word-size item follows a smaller item (the exception being when there are enough small items to exactly fill a word).<P>
+Clever programmers sometimes declare unions with two or more structures, fill the union using one of the structures, and then use a different structure to look at the union; see <a href="#0026_0009">Example 3(a)</A>.  But suppose that this code is written for a 16-bit machine with 16-bit ints and 32-bit longs.  Then code which accesses the different structures can expect reasonable mappings (see <a href="19930028.htm">Figure 1</A>) and the code in <a href="#0026_0009">Example 3(b)</A> will behave as expected.  However, if this code is ported to another machine with 32-bit words, the mappings change.  If the new machine's compiler allows you to use 16-bit ints, the alignment will change to that shown in <a href="19930029.htm">Figure 2</A>.  Or, if the compiler follows the K&amp;R suggestion that ints be the same as a word (32 bits), the alignment will be that shown in <a href="1993002a.htm">Figure 3</A>.  In either case you'll have problems.<P>
+<h4><a name="0026_0009">Example 3: Structure packing and word alignment.</h4><P>
+<pre>
+  (a)
+  union parse_hdr {
+        struct hdr {
+                char data1;
+                char data2;
+                int  data3;
+                int  data4;
+
+        } hdr;
+        struct tkn {
+                int  class;
+                long tag;
+        } tkn;
+  } parse_item;
+
+  (b)
+
+  char *ptr = msgbuf;
+
+  parse_item.hdr.data1 = *ptr++;
+  parse_item.hdr.data2 = *ptr++;
+  parse_item.hdr.data3 = (*ptr++ &lt;&lt; 8 | *ptr++);
+  parse_item.hdr.data4 = (*ptr++ &lt;&lt; 8 | *ptr++);
+
+  if (parse.tkn.class &gt;= MIN_TOKEN_CLASS &amp;&amp;
+           parse.tkn.class &lt;= MAX_TOKEN_CLASS) {
+        interpret_tag(parse.tkn.tag);
+         }</pre><P>
+<P>
+In the first case (<a href="1993002b.htm">Figure 2</A>), the tag field no longer lines up as expected and will be garbage.  In the second case (<a href="1993002c.htm">Figure 3</A>), neither the class nor the tag fields will be meaningful and the code that relies on two chars packing an int will be incorrect.  The best way to write portable code is to once again not make assumptions about the sizes of standard data types and how they map onto other data types.<P>
+<h3><a name="0026_000a">Machine Addressing Characteristics<a name="0026_000a"></h3><P>
+All processors can address words in memory on word boundaries and are usually optimized for this.  Some processors allow other types of memory accesses (such as byte addressing and half-word addressing on half-word boundaries), and others even have extra hardware to allow word and half-word addressing on odd boundaries.<P>
+While addressing mechanisms between machines vary, the fastest addressing mode is word addressing on word boundaries.  The addition of other modes requires extra hardware, usually adding clock cycles to the memory reference.  (These extra modes and the special hardware support they require run counter to the philosophy behind RISC processors.  Cray computers, for example, support word addressing on word boundaries--nothing more.)<P>
+On machines that do not offer a variety of data-type addressing modes, the compiler may simulate some of them.  For example, a compiler can simulate half-word addressing within a word by generating instructions to read the word and shift and mask the half-word into the expected position.  This takes extra clock cycles and generates bigger code.<P>
+In this regard, bitfields are inefficient because they generate the maximum extra code to pull the field out of a word.  When you then access another bitfield in the same word, the process starts all over again by referencing the word in memory which contains the bitfield. This generates a lot of code to save a little space.<P>
+When designing data structures, we try to save space by using the smallest data types capable of holding our data.  chars and shorts are popular, and when we really get stingy we pull out the bitfields.  But this spends a dollar to save a dime--all this storage efficiency has a hidden cost in program speed and size.<P>
+Suppose you allocate only a few copies of a really compacted structure.  You have a lot of code that accesses the fields of those structures, and you execute that code a lot.  Then your code will be much slower because of the overhead of nonword addressing--it may even be larger because of the extra instructions necessary to pull the fields apart.  The extra code generated may take up more space than you originally saved.<P>
+This is where you can have your cake, eat it, and even lose weight in the bargain.  In high-level data structures where specific bit positioning isn't necessary, you should use words for all the fields and not worry about the extra space they take up.  Somewhere in the machine-dependent section of the program, you should have a typedef for a word like this:<P>
+<pre>/* an int is a word             */
+/* on this particular machine   */
+typedef word int;</pre><P>
+Using all words for the fields of a high-level data structure has the following benefits:<P>
+<UL>
+<li>It's very portable to other machine architectures</li>
+<li>The compiler generates the fastest possible code</li>
+<li>The processor executes the fastest possible memory references</li>
+<li>There are absolutely no structure-alignment surprises.</li>
+</UL>
+I admit there are times when you simply can't do this (if, for example, you have a large structure which would be 25 percent larger using thousands of words that you'll access infrequently).  But using words will often save space and increase speed, and it will always be more portable.<P>
+<h3><a name="0026_000b">Conclusion<a name="0026_000b"></h3><P>
+Writing code that is portable across machine architectures is simple.  The most basic rule is to hide the machine word size as much as possible and to be very specific about data element bit sizes when mapping physical data structures.  Or, as I suggested earlier, use high-level data structures for high-level programming, and low-level data structures for low-level programming.  Don't make assumptions about the sizes of standard C scalar types, and work with the machine--not against it--when formulating high-level data structures.<P>
+
+
+<HR><P>Copyright &copy; 1993, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

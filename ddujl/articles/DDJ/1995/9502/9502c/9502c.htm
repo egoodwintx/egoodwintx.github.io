@@ -1,0 +1,169 @@
+<HTML>
+<META NAME="year" CONTENT="1995">
+
+<HEAD>
+<TITLE>FEB95: The Condor Distributed Processing System</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>The Condor Distributed Processing System<a name="00a5_0029"></h1><P>
+<h2><a name="00a5_0027"><a name="00a5_0000">Checkpoint and migration of UNIX processes </h2><P>
+<h3>Todd Tannenbaum and Michael Litzkow</h3><P>
+<p><i><a name="00a5_0028"><a name="00a5_0000">Todd is the director of the Model Advanced Facility, which pilots leading-edge computing technology into the College of Engineering at the University of Wisconsin-Madison. Michael is a researcher in the computer science department at the University of Wisconsin-Madison and is the primary author of Condor. You can contact them at condor@cs.wisc.edu.</i></p><hr><P>
+Over the years, the University of Wisconsin-Madison has developed a powerful, distributed batch-processing system for UNIX called &quot;Condor.&quot; Condor allows us to utilize otherwise idle CPU cycles in a &quot;pool&quot;--that is, a cluster of workstations connected via a network that are watched over by the Condor &quot;central manager&quot; (see <a href="199500a7.htm">Figure 1</A>). Users can submit jobs to Condor from any workstation in the pool. Condor will then find an idle workstation in the pool and run the job there until someone starts using that workstation again. Through remote system calls, Condor ensures that the file system and other machine characteristics on a remote-execution machine appear identical to those of the job's submitting machine. These calls allow Condor to provide necessary file access for the job even in environments where files are not generally available via more-common file-sharing mechanisms such as NFS or AFS. When it detects activity on a workstation upon which it is running a job, Condor creates a &quot;checkpoint&quot; of the job before killing it. This checkpoint is written to disk and contains all of the process's state information necessary for Condor to restart the job exactly where it left off. Condor keeps the checkpoint queued on disk until another workstation in the pool becomes idle and, thus, available. Condor then transfers the checkpoint to this new workstation and restarts the job right where it left off, effectively migrating the process from one available workstation to another.<P>
+A complete discussion of Condor is clearly beyond the scope of this article. Instead, we will discuss exactly how Condor transparently implements checkpoint/restart of a UNIX process and how remote procedure calls (RPCs) transparently provide a consistent file-system environment suitable for process migration.<P>
+<h3><a name="00a5_002a">The Basic Condor Framework<a name="00a5_002a"></h3><P>
+One of the major components of Condor is its facility for transparently checkpointing and subsequently restarting a process, possibly on a different machine. By &quot;transparent&quot; we mean that the user code is not specially written to accommodate the checkpoint/restart or migration and generally has no knowledge that such an event has taken place. This mechanism is implemented entirely at user level, with absolutely no modifications to the UNIX kernel. <P>
+Condor supports checkpoint and migration of most user programs without forcing users to change a single line of source code. However, checkpoint/migration support does require users to link their binary with the Condor Checkpointing Library (the Condor system includes a utility that will do this with one command). The Checkpointing Library first installs a signal handler which contains the code to asynchronously checkpoint the process. Then it augments a wide array of UNIX system calls to support checkpoint/restart as well as migration.<P>
+Condor controlling daemons (background UNIX programs) continuously monitor system activity. When Condor notices external system activity (such as someone typing on the keyboard) on a machine running a Condor user job, the daemon sends the job a &quot;checkpoint&quot; signal; see <a href="199500a8.htm">Figure 2</A>. This signal invokes code in the Checkpointing Library that writes out a checkpoint file to disk and then terminates the process. The checkpoint file is transferred back to the machine from which the Condor job was originally submitted. When the Condor central manager locates a newly available idle machine in the pool, the job's original binary executable is transferred to the machine, along with the most recent checkpoint file for that job. Now when the user's job is executed, the Condor Checkpointing Library (which is linked in with the job's binary) will know that this is not the first time this process has run. It will therefore restart by reading in the accompanying checkpoint file and manipulating its state so as to emulate as accurately as possible the state of the old process at checkpoint time. The checkpointing process was invoked by a signal, and now at restart time, things are manipulated so that it appears to the user code that the process has just returned from that signal handler. <P>
+<h3><a name="00a5_002b">Inside the Checkpointing Library<a name="00a5_002b"></h3><P>
+To checkpoint and restart a process, you must consider all the components that constitute the state of that process. UNIX processes consist of an address space generally divided into text, data, and stack areas, along with other miscellaneous state information maintained by the kernel; see <a href="199500a9.htm">Figure 3</A>. The state of the process's registers, any special handling requested for various signals, and the status of open files and file descriptors fall into this category.<P>
+<h3><a name="00a5_002c">Text and Data Areas<a name="00a5_002c"></h3><P>
+Statically linked UNIX processes are born with their entire text loaded into virtual memory by the kernel, generally beginning at address 0. Since exactly the same executable file serves for both the original invocation and the restarted process, we don't have to do anything special to save and restore the text area. (Note that modern programming practice requires that text be loaded read-only, so there is no chance that the text will be modified at run time.)<P>
+The data space of a UNIX process generally consists of three areas: initialized data, uninitialized data, and the heap. Initialized and/or uninitialized data contains global and statically declared variables. Initialized data is given values by the programmer at compile time. Uninitialized data is space allocated at compile time, but not given values by the programmer (the kernel will zero fill this area at load time). The heap is data allocated at run time by the <I>brk()</I> or <I>sbrk()</I>, UNIX system calls typically used by the C function <I>malloc()</I>. A process's data generally begins at some pagesize boundary above the text and is a contiguous area of memory: The initialized data begins at the first pagesize boundary above the text, the uninitialized data comes next, and this is followed by the heap, which grows toward higher addresses at run time. Note that once the process begins execution, the initialized data may be overwritten, and thus at restart time, we cannot depend on the information in the executable file for this area. Instead, the entire data segment is written to the checkpoint file at checkpoint time and read back into the same address space at restart time. All you need to know are the starting and ending addresses of the data segment. The starting address is platform specific, but is usually a static value which can be found as a linker directive or, on some versions of UNIX, in the man pages. The ending address of the data segment is effectively the top of the heap and can be obtained within UNIX via the <I>sbrk()</I> system call. Condor restores the data space early in the restart process.<P>
+<h3><a name="00a5_002d">Stack Area<a name="00a5_002d"></h3><P>
+The stack area is that part of the address space allocated at run time to accommodate the information needed by the procedure-call mechanism, procedure-call arguments, and automatic variables and arrays. The size of the stack varies at run time whenever a procedure is entered or exited. On some systems, the stack begins at a fixed address near the top of virtual memory and grows toward lower addresses; on others, it begins at an address in the middle of virtual memory (to allow space for heap allocation) and grows toward higher-numbered addresses. When porting Condor to a new UNIX platform, Condor must be told in which direction the stack grows.<P>
+Preserving the state of the stack requires saving and restoring two distinct pieces of information. First, the stack context (or &quot;stack environment&quot;) must be saved. The stack context is a small collection of stack-related information that most notably contains the stack pointer (which keeps track of a process's current position within the stack data area). Second, the data which makes up the stack itself (the &quot;stack space&quot;) must be saved.<P>
+To save and restore the stack context, Condor uses the standard C functions <I>setjmp()</I> and <I>longjmp()</I>. You call <I>setjmp()</I> with a pointer to a system-defined type called a JMP_BUF. <I>setjmp()</I> saves the current stack context into the JMP_BUF and returns 0. If <I>longjmp()</I> is then called with a pointer to the JMP_BUF and some value other than 0, the stack context saved in JMP_BUF is restored and we return to the point in the code where the original <I>setjmp()</I> call was made. This time, the return value from <I>setjmp()</I> is the one specified in the <I>longjmp()</I> call--that is, something other than 0. <P>
+However, a limitation of <I>setjmp()</I>/<I>longjmp()</I> is that the JMP_BUF does not contain the actual data contained in the stack space itself, only pointers into the stack space. The developers of <I>setjmp()</I>/<I>longjmp()</I> designed it to work within the lifespan of a single process. However, when Condor restarts a checkpointed process, it first creates a new process, then manipulates its state so as to emulate the state of the old process. This new process will have its own new stack space. Therefore, Condor also needs to save the actual contents of the stack space at checkpoint time. At restart time, Condor must replace the stack space of the new process with the checkpointed stack space before utilizing <I>longjmp()</I> to reset the stack context back to its state at checkpoint time.<P>
+Saving the contents of the stack space into the checkpoint file is trivial. Again, all we need to know is the stack's start and end points. The start of the stack is a well-known static location defined as a constant on some platforms and obtained from the man pages on others. The end of the stack, by definition, is pointed to by the stack pointer. Thus, to determine the end of the stack, Condor does a <I>setjmp()</I> and pulls the stack-pointer value out of the JMP_BUF.<P>
+Restoring the stack is trickier because we would like to be able to use the stack space (for local variables) while we are replacing it. Directly replacing the stack space of a process with the space saved in the checkpoint file is a sure way to send the process off to never-never land! To avoid this, Condor moves the stack pointer to a safe buffer reserved in the process's data area. The stack pointer is moved with yet another call to <I>setjmp()</I>, manually manipulating the stack pointer in the JMP_BUF to point to our buffer in the data area, followed by a <I>longjmp()</I>. Then, with the Condor stack-restore procedure using a secure stack space in the data area, we can safely restore a new process's original stack space with the one previously saved in the checkpoint file.<P>
+<h3><a name="00a5_002e">Open Files<a name="00a5_002e"></h3><P>
+Files held open by a process at checkpoint time should be reopened with the same &quot;attributes&quot; at restart. The attributes of an open file include its file-descriptor number, the mode in which it is opened (read, write, or read/write), the offset to which it is positioned, and whether or not it is a duplicate of another file descriptor. Since much of this information is not made available to user code by the kernel, we record several attributes at the time the file descriptor is created via an <I>open()</I> or <I>dup()</I> system call. Information recorded includes the pathname of the file, the file-descriptor number, the mode, and (if it is a duplicate) the base-file descriptor number. The offset at which each file descriptor is positioned is captured at checkpoint time by performing an <I>lseek()</I> system call upon each descriptor. All of this information is kept in a table in the process data space (recall that the data space is restored early in the restart process). Later in the restart process, we walk through this table and reopen and reposition all of the files as they were at checkpoint time. Of course, an important part of a file's state is its content; we assume that this is stored safely in the file system and that nobody tampered with it between checkpoint and restart times.<P>
+An interesting method is used to record information from a system call such as <I>open()</I> without the need for any modification of the user code. We do this by providing our own versions of <I>open()</I> and <I>close()</I>, which record the information in the table, then call the original, system-provided <I>open()</I> or <I>close()</I> routines. A straightforward implementation of this would result in a naming conflict; for example, our augmented <I>open()</I> routine would cover up the system <I>open()</I> routine. To see how we avoid the naming conflict, see the accompanying text box entitled, &quot;Augmenting UNIX System Calls.&quot;<P>
+<h3><a name="00a5_002f">Signals<a name="00a5_002f"></h3><P>
+An easily overlooked part of the state of a process is its collection of signal-handling attributes. In UNIX processes, signals may be blocked or ignored; they may take default action or invoke a programmer-defined signal handler. At checkpoint time, a table is built, again in the process's data segment, which records the handling status for each possible signal. The set of blocked signals is obtained from the <I>sigprocmask()</I> system call, and the handling of each individual signal is obtained from the <I>sigaction()</I> system call. During restart, Condor restores signal state by stepping through the table. If a signal has been sent to a process while that process has the signal blocked, the signal is said to be &quot;pending.&quot; If a signal is pending at checkpoint time, the same situation must be recreated at restart time. To handle pending signals, we determine the set of pending signals at checkpoint time with the <I>sigispending()</I> system call. During restart, the Condor library code will first block each pending signal, then send itself an instance of each pending signal. This ensures that if the user code later unblocks the signal, it will be delivered.<P>
+<h3><a name="00a5_0030">CPU State<a name="00a5_0030"></h3><P>
+Saving and restoring the state of a process's CPU is potentially the most machine-dependent part of the checkpointing code. Various processors have different numbers of integer and floating-point registers, special-purpose registers, floating-point hardware, instruction queues, and so on. You might think that it would be necessary to build an assembler-code module for each CPU to accomplish this task, but we've discovered that the signal mechanism already available within the UNIX system call set can (in most cases) be leveraged to do this work without assembler code. This is why a checkpoint is always invoked by sending the process a signal. A characteristic of the UNIX signal mechanism is that the signal handler could do anything at all with the CPU, but when it returns, the interrupted user code should continue on without error. This means that the signal-handling mechanism provided by the system saves and restores all the CPU state we need.<P>
+<h3><a name="00a5_0031">Pulling It Together: A Complete Checkpoint and Restart Cycle <a name="00a5_0031"></h3><P>
+Now that we've discussed some of the details, we can return to the big picture: how a Condor checkpoint/restart is actually accomplished. <a href="#00a5_0036">Listing One</A> contains selected functions from Condor that illustrate this. When our original process is born, Condor code installs a signal handler for the checkpointing signal, initializes its data structures, and calls the user's <I>main()</I>. At some arbitrary point during execution of the user code, the process will receive a checkpoint signal which invokes <I>checkpoint()</I>. This routine records information about the stack context, signal state, and open files into data structures in the process's data area. Then, it writes the data and stack spaces into a checkpoint file, and the process exits. At restart time, Condor executes the same program with a special set of arguments that cause <I>restore()</I> to be called instead of the user's <I>main()</I>. The <I>restore()</I> routine overwrites its own data segment with the segment stored in the checkpoint file. Now it has the list of open files, signal handlers, and so on, in its own data space, and restores those parts of the state. Next, it switches its stack to a temporary location in the data space and overwrites the stack of its own process with the stack saved in the checkpoint file. The <I>restore()</I> routine then returns to the stack location that was current at the time of the <I>checkpoint()</I>; that is, <I>restart()</I> returns to <I>checkpoint()</I>. Now <I>checkpoint()</I> returns, but recall that this routine is a signal handler: It restores all CPU registers and returns to the user code that was interrupted by the checkpoint signal. The user code resumes where it left off and is none the wiser. <P>
+<h3><a name="00a5_0032">Location-Independent File-System Access via Remote System Calls<a name="00a5_0032"></h3><P>
+Process migration requires that a process can access the same set of files in a consistent fashion from different machines. While this functionality is provided in many environments via a networked file system (NFS, for example), it is often desirable to share computing resources between machines which do not have a common file system. For example, we have migrated processes between our site at the University of Wisconsin-Madison, and several sites in Europe and Russia. Since these sites certainly do not share a common file system, Condor provides its own means of location-independent file access. This is done by maintaining a process (called a &quot;shadow&quot;) on the machine where the job was submitted, which acts as an agent for file access by the migrated process (see <a href="199500aa.htm">Figure 2</A>). All calls to system routines that use file descriptors by the user's code are augmented by the Condor Checkpoint Library so that they are rerouted via RPCs to the shadow. (Again, see &quot;Augmenting UNIX System Calls.&quot;) The shadow process then executes the system call and passes the result back to the Condor Checkpointing Library, which passes back the result to the user code. Whether the user code uses <I>write()</I> directly, calls <I>printf(),</I> or calls some other routine we have never heard of that ultimately exercises the <I>write()</I> system call somewhere along the line, this redirection for functions at the system-call level will ensure correct action.<P>
+<h3><a name="00a5_0033">Limitations <a name="00a5_0033"></h3><P>
+While the designers of truly distributed operating systems such as vkernel and sprite have carefully defined and implemented their process models to accommodate migration, UNIX users are not so fortunate. In Condor, we have taken the viewpoint that we can save and restore enough of the state of a process to accommodate the needs of a wide variety of real-world user code. There is, however, no way we can save all the state necessary for every kind of process. The most glaring deficiency is our inability to migrate one or more members of a set of communicating processes. In fact, no attempt is made to deal with processes that execute <I>fork()</I> or <I>exec()</I>, or that communicate with other processes via signals, sockets, pipes, files, or any other means. Some inventive users have found ways to use Condor for communicating processes, but they were forced to change their code to accommodate our limitations. Another major limitation is that the Condor Checkpointing Library must be linked in with the user's code. This is fine for folks who build and run their own software, but it does not work for users of third-party software, who do not have access to the source. We have considered schemes to provide a checkpointing C library for dynamically linked third-party programs, but so far we have not implemented anything. A major obstacle to such work is the fact that shared-library implementations vary widely across platforms, and such a facility would not be very portable.<P>
+<h3><a name="00a5_0034">Availability<a name="00a5_0034"></h3><P>
+Work on Condor is on-going, and Condor is available for free. Both binary-only distributions as well as distributions with complete source code are available for many different UNIX platforms via anonymous FTP over the Internet to ftp.cs.wisc.edu in the /condor directory.<P>
+<h2>Augmenting UNIX System Calls</h2><P>
+The UNIX man pages distinguish between &quot;system calls&quot; and &quot;C-library routines&quot; (system calls are described in section 2, and library routines are described in section 3). However, from the programmer's point of view, these two items appear to be very similar. There may seem to be no fundamental difference between a call to <I>write()</I> and a call to <I>printf()</I>; each is simply a procedure call requesting some service provided by &quot;the system.&quot; To see the difference, consider the plight of a programmer who wants to alter the functionality of each of these calls, but doesn't want to change their names. Preserving the names is crucial if you want to link the altered <I>write()</I> and <I>printf()</I> routines with existing code, which should not be aware of the change. The programmer wanting to change <I>printf()</I> has at his disposal all the tools and routines available to the original designer of <I>printf()</I>, but the programmer wanting to change <I>write()</I> has a problem. How can you get the kernel to transfer data to the disk without calling <I>write()</I>? We cannot call <I>write()</I> from within a routine called <I>write()</I>; that would be recursion, and definitely not what we want here. The solution is a little-known routine called <I>syscall()</I>.<P>
+Every UNIX system call is associated with a number (defined by a macro in <I>&lt;syscall.h&gt;</I>). You can replace an invocation of a system call with a call to the <I>syscall</I> routine. In this case, the first argument is the system-call number, and the remaining arguments are just the normal arguments to the system call. For instance, the <I>write()</I> in <a href="#00a5_0035">Example 1</A> counts the number of times <I>write()</I> was called in the program; otherwise, it acts exactly like a normal <I>write()</I>.<P>
+Interestingly, this trick works even if the user code never calls <I>write()</I> directly, but only indirectly via standard C-library calls--<I>printf()</I>, for example.<P>
+The Condor checkpointing code uses this mechanism to augment the functionality of a number of system calls. For example, we augment the <I>open()</I> system call so that it records both the name of the file being opened and the file-descriptor number returned. This information is later used to reopen the file at restart time.<P>
+--M.L.<P>
+<a href="199500ab.htm">Figure 1</A>  When any machine in the Condor pool submits a job, the Central Manager will select an otherwise-idle machine to perform the remote execution.
+<a href="199500ac.htm">Figure 2</A>  Framework for remote job execution between a submitting machine and a remote-execution machine.
+<a href="199500ad.htm">Figure 3</A>  Address-space layout of UNIX processes.
+<h4><a name="00a5_0035"><B>Example 1:</B> Augmenting the write() system call.<a name="00a5_0035"></h4><P>
+<pre>int   number_of_writes = 0;
+write( int fd, void *buf, size_t
+    len )   {
+    number_of_writes++;
+    return syscall( SYS_write, fd,
+    buf, len );
+ }</pre><P>
+<P>
+<h4><a name="00a5_0036">Listing One <a name="00a5_0036"></h4><pre>
+
+/** This is the signal handler which actually effects a checkpoint. This 
+function must be previously installed as a signal handler, since we assume the
+signal handling code provided by the system will save and restore important 
+elements of our context (register values, etc). A process wishing to checkpoint
+itself should generate the correct signal, not directly call this function. */
+void
+Checkpoint( int sig, int code, void *scp )
+{
+   if( SETJMP(Env) == 0 ) { // Save place here
+    // dprintf() will log messages into condor system admin log files
+    dprintf( D_ALWAYS, &quot;About to save MyImage\n&quot; );   
+    // This routine will step through our File state table and fills in 
+    // information, for instance lseek all file descriptors to fill in 
+        // where the file pointer for each open file is
+    SaveFileState();
+    // Here we fill in Signal state table (which signals are pending, etc)
+    SaveSignalState();
+    // These will now write out our data &amp; stack into the checkpoint file
+    MyImage.Save();
+    MyImage.Write();
+    dprintf( D_ALWAYS,  &quot;Ckpt exit\n&quot;);
+    // now that we have saved all of our state, we terminate this process
+    // we terminate with a signal so that the condor controlling daemons
+    // (of whom one is our parent) will know that we exited after a 
+        // checkpoint, as opposed to the user code exiting on its own
+    terminate_with_sig( SIGUSR2 );  // this exits 
+} else {         
+    // We get here from the longjmp in RestoreStack() during restart!
+    // Patch registers handles any messy CPU register business which is not
+    // handled by UNIX itself as part of a signal handler.  Note that
+    // on all platforms except HPUX, this is a null procedure
+    patch_registers( scp );
+    // Close the checkpoint file, etc,  before we re-open all files
+    MyImage.Close();
+    // Re-open and lseek back all previously opened files, then
+    // re-install any user signal handlers and block/resend any pending 
+    // signals.
+    RestoreFileState();
+    RestoreSignalState();
+    return;    // here we go back to user code (end of signal handler)
+    }
+}
+
+/** Given an &quot;image&quot; object containing checkpoint information which we have
+  just read in from disk, this method actually effects the restart. **/
+void
+Image::Restore()
+{
+    int     save_fd = fd;
+    int     user_data;
+       // Overwrite our data segment with the one saved at checkpoint time.
+    RestoreSeg( &quot;DATA&quot; );
+       // We have just overwritten our data segment, so the image
+       // we are working with has been overwritten too.  Fortunately,
+       // the only thing that has changed is the file descriptor, which we 
+       // also saved on the stack above at the start of this function.
+    fd = save_fd;
+       // Now we're going to restore the stack, so we move our execution
+       // stack to a temporary area (in the data segment), then call
+       // the RestoreStack() routine.
+    ExecuteOnTmpStk( RestoreStack );
+      // RestoreStack() also does the jump back to user code
+    fprintf( stderr, &quot;Error, should never get here\n&quot; );
+    exit( 1 );
+}
+void
+RestoreStack()
+{
+     // This function rewrites the stack data area.  Thus, we are called from
+     // ExecuteOnTmpStk() which has repositioned the stack pointer into a safe
+     // temporary chunk of memory in the data area
+     // First, call our routine to restore stack data from the checkpoint file
+     MyImage.RestoreSeg( &quot;STACK&quot; );
+     // Now, restore the stack context, i.e. put the stack pointer back where
+     // it was at checkpoint time.  Do this via a LONGJMP using a JMP_BUF
+     // we created at checkpoint time in the Checkpoint() routine.
+     // Will move execution back to the else clause in Checkpoint() routine!!
+     LONGJMP( Env, 1 );   
+}
+static void (*SaveFunc)();
+static jmp_buf Env;
+
+const int   TmpStackSize = 4096;
+static char TmpStack[ TmpStackSize ];   // buffer will end up in data area
+/* Execute the given function on a temporary stack in the data area. */
+void
+ExecuteOnTmpStk( void (*func)() )
+{
+    jmp_buf env;
+    SaveFunc = func;  // save in global; we're going to lose stack frame
+    if( SETJMP(env) == 0 ) {
+            // First time through - move SP
+        if( StackGrowsDown() ) {
+            JMP_BUF_SP(env) = (long)TmpStack + TmpStackSize;
+        } else {
+            JMP_BUF_SP(env) = (long)TmpStack;
+        }
+        LONGJMP( env, 1 );
+    } else {
+            // Second time through - call the function
+        SaveFunc();
+    }
+}
+
+</pre>
+<HR><P>Copyright &copy; 1995, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

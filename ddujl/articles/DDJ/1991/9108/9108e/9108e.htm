@@ -1,0 +1,276 @@
+<HTML>
+<META NAME="year" CONTENT="1991">
+<HEAD>
+<TITLE>AUG91: PORTING UNIX TO THE 386: THE BASIC KERNEL</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>PORTING UNIX TO THE 386: THE BASIC KERNEL<a name="01c8_0002"></h1><P>
+<h2><a name="01c8_0001"><a name="01c8_0000">Overview and initialization</h2><P>
+ This article contains the following executables: 386BSD.891<P>
+<h3>William Frederick Jolitz and Lynne Greer Jolitz</h3><P>
+<p><i><a name="01c8_0000">Bill was the principal developer of 2.8 and 2.9BSD and was the chief architect of National Semiconductor's GENIX project, the first virtual memory micro-processor-based UNIX system. Prior to establishing TeleMuse, a market research firm, Lynne was vice president of marketing at Symmetric Computer Systems.  They conduct seminars on BSD, ISDN, and TCP/IP.  Send e-mail questions or comments to lynne@berkeley.edu.  Copyright (c) 1991 TeleMuse.</i></p><hr><P>
+In the previous article we examined the machine-dependent layer initialization of the &quot;stripped-down&quot; kernel -- the machine-dependent portion of the kernel which installs the kernel into the position to execute processes (via the bootstrap procedure) and prepares the system for initialization of the minimum machine-independent portions of the kernel (processes, files, and pertinent tables).  We viewed our 386BSD kernel as a kind of &quot;virtual machine&quot; (not to be confused with the &quot;virtual&quot; in &quot;virtual memory&quot;), where functions underlie other functions transparently.  When initialized, the system can use portions that require little direction to initialize even larger portions.  Thus, this virtual machine assembles itself tool by tool, much like a set of Russian dolls.  The machine-dependent kernel initialization is the innermost of the dolls -- the kernel of the kernel around which all is built.<P>
+We now extend the layered model further, by incrementally turning on all its internal services using the kernel's main( ) procedure.  In other words, this next outer layer will be built by the kernel's main( ) procedure, which in turn initializes higher-level portions of the kernel.  This is the second major milestone of our UNIX port -- the halcyon point where most of the kernel services and data structures are initialized.<P>
+At this stage, we'll review key elements of the BSD kernel which will be invoked in future articles.  We'll briefly examine the interrelationships between some of these elements, in order to delineate the broader picture a bit more and illuminate some important ideas in UNIX system design.<P>
+<a href="#01c8_0010">More Details.</A><P>
+<h3><a name="01c8_0003">Layered Modeling: Achieving a Well-Stacked System<a name="01c8_0003"></h3><P>
+A basic understanding of the entire system demands a return to the layered model described last month.  In brief, the kernel is a program which runs in supervisor mode on the 386 (or &quot;Ring 0&quot; -- for a review on rings, see &quot;The Standalone System&quot; DDJ March 1991).  The kernel implements the primitives, called &quot;system calls,&quot; of UNIX and manages the environment and other characteristics of the many user &quot;processes&quot; run to provide functionality to the system.  (Each user process runs in a separate &quot;Ring 3&quot; address space.)  Only processes running in their protected address spaces are truly visible to the UNIX user, as they provide the requested functionality (a command processor or &quot;shell,&quot; a compiler, an editor, and so on). These processes constitute the outermost layer of our layered operating system model.  System calls and various processor exceptions (page fault, device interrupt, overflow , and so on) are methods by which a process either directly or indirectly enters the UNIX kernel to request services.  In this way, the kernel acts as a transparent (not statically-linked) subroutine library that functions as a kind of virtual machine.  It's as if the microprocessor hardware itself actually did a whole read( ) system call request in the single lcall instruction used to signal a system call.  (For further information, see Leffler, et al, The Design and Implementation of the 4.3BSD UNIX Operation System, Chapter 3: Kernel Services, page 43-45, Addison-Wesley, 1989.)<P>
+Layers within the kernel are split into the (mostly) machine-independent &quot;top&quot; half, and the (mostly) machine-dependent &quot;bottom&quot; half.  The top half synchronously processes exceptions and system calls and blocks a currently executing process when an event causes a delay, such as a temporary memory shortage, or a device input/output operation.  Blocking a process permits the kernel to run another delayed process, allowing multiple processes to appear to run concurrently on a single processor.  The bottom half, in contrast, asynchronously processes device interrupts that are never allowed to be blocked.  Device interrupts can be viewed, therefore, as high-priority, real-time tasks brought to life by a hardware interrupt to render the necessary effect and then exit the stage.  They then return the kernel from the interrupt back to whatever code was running before the interrupt occurred.  In a way, device interrupts are practically stateless and serve primarily to signal the occurrence of an external event to the synchronous &quot;top&quot; layers.  Note, however, that such notifications will only take effect when the top layers allow preemption -- in the UNIX model, this is only allowed at certain points when operating in the &quot;top&quot; layers (generally, when returning to the user process from the kernel, or when blocking for an event).<P>
+The impact of the layered model on our 386BSD port cannot be understated.  Our 386BSD system can be broken up into modular subsystems that have neat boundaries and work by a handful of simple rules.  One rule which we live by is the aforementioned low-level asynchronous, top-level synchronous arrangement.  For example, if we describe some code that must block for a resource, we are already restricted to a discussion of the top layer.  Likewise, if we describe an event that occurs as a result of a peripheral completing an operation, rest assured it resides within the lower layers.  This organization allows us to break the whole into parts we can handle; otherwise we quickly become mired in complexity.<P>
+Understanding and following the rules inherent in our layered model greatly simplifies UNIX kernel design.  Without these rules, we would need a lot more &quot;critical region&quot; code dealing with arbitrary preemption.  These same rules, however, also limit our ability to easily implement UNIX in real-time environments.  (For example, Ethernet delays are sometimes unpredictable.)  Some versions of UNIX attempt to improve real-time performance by minimizing worst-case delays through the judicious addition of blocks to allow high-priority processes to run, but this is not a simple fix.<P>
+There is reason to believe that the synchronous design of UNIX limits its performance with disk file writes.  In a paper presented at the Summer 1990 USENIX Technical Conference, &quot;Why Aren't Operating Systems Getting Faster as Fast as Hardware?&quot;  (USENIX Technical Proceedings, page 247) John Osterhout of the University of California at Berkeley discusses the need to &quot;decouple filesystem...operations that modify files,&quot; as synchronous writes are required for filesystem stability, consistency, and crash recovery.  This is currently not a great problem, because filesystem reads (the majority of operations) can be elegantly cached and anticipated.  Still, this raises questions about the current UNIX model and may result in its revision.<P>
+<h3><a name="01c8_0004">Top-Level Layers<a name="01c8_0004"></h3><P>
+Last month, we discussed bottom-level initialization, where the Interrupt Descriptor Table (IDT), a 386 hardware interface to interrupts and exceptions, was wired into code entry points (IDTVEC (XXX)).  This is how 386BSD glues the hardware interrupts onto the bottom layer.  In addition, some of the top-layer interfaces were also established.  Now we need to build and initialize the other top-layer kernel functions in our BSD kernel main( ).  With the kernel initialized, we must get the ball rolling by bootstrapping user processes to add functionality in the form of services (such as a command processor that will allow useful work to be done with our 386BSD system).<P>
+To implement the UNIX model, we refer to many items -- all of which are managed by the top layers and referenced by lower layers.  These include processes, address spaces, files, filesystems, buffers, messages, signals, credentials, and others.  They are grouped into a global set managed by the kernel on behalf of all processes, and a private set managed by the process for the benefit of the program running within the process.<P>
+<h3><a name="01c8_0005">The Global Kernel Set<a name="01c8_0005"></h3><P>
+The global set of objects is split into a shared database (proc, inode, buffer cache, and file structures), as well as a group of consumable resources (memory pages, data buffers, and heap storage).  The shared database objects use methods for which items are searched, contended, modified, allocated, deleted, and linked together; all in a preemptible fashion, since many processes may attempt simultaneous access to these objects during multitasking operation. These databases must be initialized, allocated the appropriate minimum requirements for operation, and linked as the system requires.<P>
+The UNIX paradigm is &quot;process-centric,&quot; that is, most of the activity is built around the current running process.  With the exception of necessary functions such as scheduling or interprocess communications (which require knowledge of multiple processes), most of the kernel is written without any explicit knowledge of any process save the running one.  Thus, an understanding of how a process is provided services tells you the bulk of what the kernel does.  Very little of the code and data structures are explicitly aimed at this &quot;global&quot; view.<P>
+The focus of kernel activity is the list of processes (the &quot;proc table&quot;).  Processes are linked into various lists so they can locate other processes through various relationships. As the kernel operates, processes migrate onto and off of different lists.  While the process structure is not globally allocated, the list of entries is itself a global resource.  Each system call and exception is directed to operate on a given process.  As such, the BSD kernel uses the struct proc entry of each process as the key data structure that indexes all related kernel entities of a process.<P>
+<h3><a name="01c8_0006">Process Private Set<a name="01c8_0006"></h3><P>
+Each process possesses a number of data structures which can be leveraged to properly implement the UNIX model.  So many of these are required that we reduce them, for simplicities sake, to a given set from which we draw upon in our discussions.  All these properties of the process are rooted in the &quot;per-process data structure,&quot; also known as struct proc or &quot;proc slot&quot; (see <a href="#01c8_0012">Listing One</A>, page 126).  This is just one element of the previously mentioned list of processes which defines just what a process is.<P>
+<h3><a name="01c8_0007">The Proc Slot<a name="01c8_0007"></h3><P>
+In <a href="199101ca.htm">Figure 1</A>, 386BSD uses a proc slot as the nexus of information for a process.  Many different structures, most of them dynamically allocated, hang off this single proc entry (see <a href="199101cb.htm">Figure 2</A>).  These may be, in different cases, shared by processes, dynamically grown, or externalized to special applications.  Among the auxiliary structures are:<P>
+p_cred This structure is the process's credentials, that is, the information (such as user ID number and group membership) used to regulate access to system resources by the process.  This information is managed in a generic fashion by most of the kernel and is consulted by a tiny, centralized portion of the kernel (so that additional security control mechanisms can be added or substituted).  It is shared by sibling processes of like ownership.<P>
+p_fd Each process has a private file descriptor table: a dynamically allocated, growable structure used to store information on files currently open by the process.  (Older versions of UNIX had a static limit on the number of open files, usually 20.)<P>
+p_stats Statistics on the use of various resources consumed by the process.  For example, the amount of time the processor used, the memory used, and various other details are tallied by this structure.<P>
+p_limits Analogous to statistic recording on the process, this auxiliary structure is used to put administrative limits on resource utilization.<P>
+p_vmspace Another critical resource for the process is contained in the virtual address space, details of which can be found within each process's p_vmspace data structure.  Among the data available is the virtual memory system's address map (vm_map) which heads a table of address map entries.  Each entry, in turn, manages allocated regions of virtual address space.  Also, each process contains a physical map (vm_pmap) structure, managed by the pmap layer, containing current address translation state information (discussed later in the &quot;Virtual Memory Subsystem&quot; section).<P>
+p_sigacts POSIX process signals, a kind of software interrupt for user processes, are implemented with the signal action state information in this structure.<P>
+p_pgrp POSIX provides for the concept of &quot;sessions&quot; as a method of organizing process groups. Process groups are a set of processes operating together (for example, a pipeline such as &quot;foo | bar | bletch&quot;).  Sessions utilize a session leader (usually a command processor or shell) that manages process groups.  It has the ability to suspend or resume process groups run connected to a terminal (in the &quot;foreground&quot;) or detached from the terminal (in the &quot;background&quot;).  The data structures used to manage this feature reside in this shared data structure.<P>
+The proc structure in 386BSD highlights the modularity of function present in the BSD design.  Although BSD is currently implemented as a monolithic kernel, it can be arranged so that multithreaded distributed kernel operation can be achieved.  In general, BSD kernel development has been focused around the revision and examination of the monolithic operating system kernel prior to implementation in a multithreaded kernel.  This approach seeks to avoid putting the cart before the horse, so to speak, and avoids vacuous &quot;modularity&quot; modifications which purport to work only in a multiprocessor environment.  This is not reticence in design -- merely caution.<P>
+Multiprocessor systems are desirable, so the pent up enthusiasm to take advantage of them can overwhelm the many research directions available and result in the canonization of inappropriate or short-sighted standards.  Current standards efforts are making headway, although the overall multiprocessor architecture is still unknown.  (For example, some POSIX groups are attempting to define a standard for thread programming, and currently the most popular standard is one contrary to UNIX primitives, because the group touting this standard would rather ignore UNIX.  This will result in another pointless standard taking its place alongside the dodo and other dead-end events of history.)<P>
+Due to the way this arrangement results in &quot;data hiding,&quot; the facilities of filesystems, accounting, administration, virtual memory, and POSIX signal processing are each separated from the inner part of the operating systems kernel.  Each can be evolved separately or redefined with minimal interaction, as befits a modular design.<P>
+<h3><a name="01c8_0008">Kernel Events<a name="01c8_0008"></h3><P>
+Processes operate synchronously, processing a system call item by item.  If they need to wait for either a resource or an external event, they must block with a sleep( ) function call to await changes and give up the processor.  Elsewhere in the kernel, a corresponding wakeup( ) function call will awaken the snoozing process, preparing the process to run when next possible.  While sleep gives up the processor, wakeup schedules processes to run -- it does not transfer to processes nor even insure that the process will ever run.  Wakeup calls are idempotent.  Many can occur before the process actually starts to run.<P>
+A process can only wait on a single event at a time, and is usually uniquely identified by the kernel address of the object for which it waits.  This event is stored in the p_wchan field of the process's proc slot.  Events themselves don't require additional space when active, so secondary or recursive effects (as might happen in the case of a block on memory starvation) don't occur.<P>
+As the 386BSD system and its drivers are all written with these event mechanisms in place, we are potentially multitasking from the start, although until we replicate (or &quot;fork&quot;) to create multiple processes, no actual context switches occur to different processes.  (There are no other processes to switch to.)  Instead, the processor is allowed to idle, waiting for events.  In the UNIX perspective, we always try to organize the general case so that it functions seamlessly on initialization, in order to leverage it early.  An example of this approach can be observed in the mechanisms that provide diskless operation, where we must provide a root filesystem over a network connection before we have a filesystem to run the programs that normally initialize the network and locate the filesystem on the network.  (Got it?  Good.)<P>
+<h3><a name="01c8_0009">Machine-Independent Initialization<a name="01c8_0009"></h3><P>
+Machine-independent initialization is begun by wiring up a &quot;process zero.&quot;  In the previous article, we took care in the assembly language initialization to craft a separate region for the kernel stack -- this will be our &quot;Oth&quot; process kernel stack.  We then commence the creation and attachment of the necessary auxiliary data structures that process 0 will use during the lifetime of our system.  No process is specially considered, so all must have these structures present and consistent with other structures in the kernel.  To avoid recursive problems with the &quot;virgin&quot; birth, the first process must be hand-wired with the barest of necessities, and space for the auxiliary structures must be allocated statically.  In fact, we will find that process 0 will attempt to become eternal, so it's actually more costly to dynamically allocate space for it than to do so statically!<P>
+Having made a 0th process, we now must create a process list to which the system can refer in a global fashion, to locate, add, delete, and modify processes.  This is not really complicated, because at this point all of the queue pointers point either at our just-born process O or at &quot;nil.&quot;  At this stage, all process-related operations can now be activated, although only for statically-allocated processes (which is not very interesting -- we need to turn on the virtual memory and storage allocation functions for something more useful).<P>
+UNIX likes to have access to herds of processes, many appearing to run simultaneously,to do its bidding.  As a result, we need to rapidly flit between processes running for a brief slice of time before blocking.  To make this a low-cost operation, we use a priority-ordered run queue of process pointers to rapidly select the next process to run when it's time to switch. This is now initialized to permit the context switch code to be run (as it will be called when we block for I/O operations).<P>
+<h3><a name="01c8_000a">Virtual Memory Subsystem<a name="01c8_000a"></h3><P>
+As mentioned in the previous article, 386BSD has been rewritten to use a new virtual memory system with greater capabilities.  This new package, derived from MACH version 2, possesses generalized mechanisms which allow management of multiple regions of virtual memory within the user processes and kernel itself, thus avoiding the arbitrary and idiosyncratic methods used in earlier Berkeley UNIX virtual memory systems.  This &quot;new vm&quot; is composed of machine-dependent (physical map) and machine-independent (virtual map) portions.<P>
+This new virtual memory system was originally conceived in 1985 at Carnegie-Mellon University by Avadis Tevanian (now at Next) and Michael Wayne Young to provide an easily retargettable virtual memory system with the modern functionality required by the MACH operating system implementation.  It serves as the basis for virtual memory systems in current MACH implementations, OSF/1, and Berkeley UNIX.<P>
+To initialize the virtual memory system, all remaining pages of physical memory (not occupied by the kernel program itself) are each first allocated a resident page data structure (vm_page).  Queues of free pages are created so that pages can be allocated from them.<P>
+Next, virtual memory objects are created to provide an abstraction on which to hang collections of physical pages.  To allocate virtual address space, virtual memory maps are also created to identify valid regions of virtual memory and the characteristics of these regions.  The virtual memory system will associate virtual memory objects containing physical pages of memory with portions of address space mapped by a virtual memory map, as needed.<P>
+We then initialize the kernel's virtual address map and provide a mechanism to allocate portions of &quot;wired down&quot; memory to the kernel's address space with a function called kmem_alloc.  This function, the most primitive of storage allocators, allows us to allocate pages of memory dynamically in the granularity of pages at a time.<P>
+With a memory allocator present, the initialization of the physical map (pmap) portion of the system is completed, allocating tables that will be used by the physical map module to track the association of physical pages of memory with the hardware address translation mechanisms data structures (Page Directory Table and Page Table Pages on the 386).  At this point, the virtual memory system can allocate multiple address spaces and on-fault physical pages to legitimate references to previously mapped virtual map regions.<P>
+In designing a virtual memory system, the common drawback is the inherent complexity required.  Not only does the system have to allocate virtual address space, but it also needs to allocate pages of memory to &quot;back up&quot; the virtual space.  On some systems, the virtual memory system allocates space, grabs some pages, and manually wires them into the address translation map.  With the new 386BSD virtual memory system, when you ask for memory from a memory allocator, both virtual and physical memory are allocated.  In other words, you always get the memory in an address space.<P>
+Another point to consider when designing virtual memory systems: Suppose we share the same pages in different processes.  We may wish to &quot;back up&quot; shared pages that might be modified incrementally -- thus, unique pages need be created only when the contents of a page change. This mechanism, called &quot;copy on write,&quot; allows us to postpone or avoid entirely modifying a process's memory.  Only a mechanism to track changes is required.  This is accomplished by copying virtual memory objects that shadow the original object.<P>
+To complete the initialization of the virtual memory system, we must now initialize and activate &quot;pagers,&quot; the software that reads in the contents of pages from the filesystem and stages pages in and out of processor memory to disk when we run short of &quot;fast&quot; storage. Pagers interface with external forms of information, such as local filesystems, disk swap partitions, disk drives, network filesystems, and the like.<P>
+<h3><a name="01c8_000b">Kernel Memory Allocator<a name="01c8_000b"></h3><P>
+Besides allocating pages of memory from the virtual memory system, we need a means of allocating smaller granularity objects.  Many data structures, possessing short and long lifetime and generally in the order of 32 bytes in size, are allocated by the kernel on an &quot;as needed&quot; basis.  UNIX provides user processes with a malloc( ) memory allocator for general-purpose memory allocation; the same type of function resides in the BSD kernel.  This provides for a global heap store -- so called because everything is kept in a heap, all piled together!<P>
+Kernel malloc( ) uses the virtual memory system to obtain actual storage to manage (called an &quot;arena&quot;).  This storage area encompasses the heap itself.  After the vm system has been activated, we initialize our allocator.  From this point on, we can dynamically allocate data structures.  Older versions of BSD used statically allocated tables that minimally required the system to be patched and rebooted if a resource was overutilized -- sometimes the system even had to be recompiled from its source code.  With dynamic allocation, the configuration can be changed on a live system and the effect observed immediately.<P>
+<h3><a name="01c8_000c">Device Startup<a name="01c8_000c"></h3><P>
+Once enough of the system services are established, we can proceed to scale and configure tables appropriate for operation, among them the buffer cache and character list (clist) structures.  While these are usually similar on most systems, a few have private buffer memory pools associated with devices (such as a disk array with onboard RAM) that should be specially arranged prior to system operation.  Currently, the amount of disk buffering memory is chosen as a fixed percentage of memory at boot time, but work is underway to allow a more dynamic allocation scheme.<P>
+Next, we configure( ) devices in the system by walking a table of devices -- calling each device driver's probe routine with the parameters for each device and testing for the presence of each recorded device.  Not all devices need be present.  In fact, alternative addresses may be recorded for the same device.  If the device is present, a probe routine will return true, with a subsequent call to the corresponding attach( ) routine to allocate resources (memory, interrupts, and so on) for the device and wire it into 386BSD.  (In future articles, we will discuss how 386BSD dynamically structures the interrupt control devices on-the-fly.)<P>
+After cpu_startup( ), the system begins to schedule processes.  We allow for this by enabling the rescheduling clock.  This clock periodically interrupts the kernel and adjusts the priority of other processes that might compete for use of the processor.<P>
+<h3><a name="01c8_000d">Mounting the Root<a name="01c8_000d"></h3><P>
+We next initialize the virtual filesystem layer.  We make our first reference to it by mounting the root filesystem and marking it as the top-level point from which to resolve filename references.  The root filesystem, like other filesystems, can be of many different types.  However, as this request is honored by code that calls successively lower-layer functions, we ultimately get to the bottom layers in the form of a device driver that extracts from the disk or network the external information of the filesystem on which all files are stored.  If the root filesystem cannot be located, 386-BSD abruptly terminates.<P>
+<h3><a name="01c8_000e">Final Machine Initialization<a name="01c8_000e"></h3><P>
+Our final machine initialization step is to split process 0 into three processes (see <a href="199101cc.htm">Figure 1</A>).  This is done by creating separate copies of initial process 0 with the fork1( ) kernel service.  fork1( ) implements the &quot;replicate process&quot; functionality used by the UNIX fork( ) system call.  After being copied twice (creating process 1 and 2 -- both blocked), process 0 will call the scheduling function sched( ), which endlessly selects processes to shuttle in and out of secondary storage.  In essence, it also manages to enforce a &quot;fairness&quot; policy on running executable processes present in RAM memory. If sched( ) finds nothing to do (as it will at this stage of the system's life), it will block, waiting to wake up when things need to be shuffled again.<P>
+When process 0 blocks, process 1, which has been patiently waiting since fork1( ) was invoked, can be run.  Process 1 is then furnished a user address space with a tiny user program inserted into it.  The user process is then transferred.  The first instruction is to execute a file on the root filesystem (/sbin/init).  Thus, our tiny bootstrap program, wired into the kernel, pulls in a much larger UNIX program located in the root.  Even better, the init program is created with the same tools, operates in the same protected fashion, and functions with the same system calls as any UNIX program.  This means we can use the richness of the program environment to build a more elaborate degree of functionality as the system boots itself up.  At some point, however, process 1 will block (perhaps waiting for the disk to find a block of data for init).  At this point, another process can be run.<P>
+Process 2, yet another copy of process 0, is given the chance to run at this point.  It will immediately call the pageout( ) function, the sole purpose of which is to scout out pages of underutilized memory (that is, held by some process, but not being used).  This compulsive little function varies its activity depending on the amount of unused memory available.  If little memory is available, it rapidly bails water, forcing pages of processes out to secondary storage (swap space) to prevent the system from becoming constipated due to lack of memory.  If plenty of memory exists (as does at the start of system boot up), it blocks waiting for a more desperate time.<P>
+Processes 0 and 2 are system processes that only run in the kernel -- as endlessly looping functions, they provide a special service when awakened.  Process 1, on the other hand, is an ordinary user process running code loaded from the root filesystem.  Among other niceties that our init program provides, it offers a command interpreter through the use of the UNIX fork( ) and exec( ) primitives.  In <a href="199101cd.htm">Figure 2</A>, for example, fork( ) and execve( ) system calls are successively used to replicate a new process (process 3) and execute the default command interpreter (or shell) /bin/sh.  In turn, the shell will follow the same mechanism to create more processes and fill them with programs the user requests. The thick grey line in <a href="199101ce.htm">Figure 2</A> delineates the state of the world by the end of main( ) in the kernel.  The asterisk represents the point where the first user instruction is executed, while below the line all remaining initialization, done by user processes, occurs.<P>
+The two system processes provide a synchronous mechanism (remember, the high layers are synchronous) to rectify resource imbalances.  By possessing the complete resources of a process, each can use the kernel's versatility, including blocking operations that the asynchronous lower layer routines are forbidden to use (such as requesting disk I/O).<P>
+<h3><a name="01c8_000f">Summary<a name="01c8_000f"></h3><P>
+In this article, we have just touched on the layout of our generic 386BSD system (4.3 &gt; x &lt; 4.4), and introduced many of the mechanisms, data structures, and relationships between them. Our point is not to provide exhaustive descriptions of the operation of BSD in general, but to provide enough background to understand the operation of 386-related code, as well as design choices.<P>
+To accomplish this task, we've purposely not described much of the detail of the various BSD subsystems; it is sufficient at this point if you have obtained some notion of what they are and why we need to turn them on in the order that we do.  In conducting a port, one actually makes it through this body of code pretty quickly.  It is the ticklish operations of fork, exec, and process context switching that get the first shakedown journey and surprises.  Also, when the kernel design has been refined, and much of this code revised, this area continues to present challenges.<P>
+In the next article, we will leave the hand-waving descriptions of process switching behind and dig into some actual code.  In particular, we shall examine sleep( ), wakeup( ), and swtch( ), and how the three of these bring off the illusion of multiple simultaneous process execution on a sole processor.  We will also delve into why the UNIX paradigm shifts comparatively easily when it comes to multitasking, and why it's been such a long uphill climb to move others (notably MS-DOS and Finder) into preemptible multitasking.  Finally, we will discuss some of the requirements for the extensions needed to support multiprocessor and multithreaded operation in the monolithic 386BSD kernel.<P>
+<h3><a name="01c8_0010"><a name="01c8_0011">386BSD Availability<a name="01c8_0011"></h3><P>
+The Computer Systems Research Group at the University of California Berkeley has announced that the BSD Networking Software Release 2--which includes 386BSD--is now available for licensing.  The distribution is a source distribution only, and does not contain program binaries for any architecture.  Thus it is not possible to compile or run this software without a preexisting system that is installed and running.  In addition, the distribution does not include sources for a complete system.  It includes source code and manual pages for the C library and approximately three-fourth of the utilities distributed as part of 4.3BSD-Reno.  The software distribution is provided on 1/2-inch 9-track tape and 8mm cassette only.  For specific information, contact the Distribution Coordinator, CSRG, Computer Science Division, EECS, University of California, Berkeley, CA 94720 or bsd-dist@CS.Berkeley.EDU or uunet!bsd-dist@CS.Berkeley.EDU.<P>
+
+<PRE>
+
+_PORTING UNIX TO THE 386: THE BASIC KERNEL_
+by William Frederick Jolitz and Lynne Greer Jolitz
+
+<a name="01c8_0012">
+<a name="01c8_0013"></pre><B>[LISTING ONE]</B><pre><a name="01c8_0013">
+
+/* Copyright (c) 1986, 1989, 1991 The Regents of the University of California.
+ * All rights reserved.
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *  This product includes software developed by the University of
+ *  California, Berkeley and its contributors.
+ * 4. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ *  @(#)proc.h  7.28 (Berkeley) 5/30/91
+ */
+
+#ifndef _PROC_H_
+#define _PROC_H_
+
+#include &lt;machine/proc.h&gt;       /* machine-dependent proc substruct */
+
+/* One structure allocated per session. */
+struct  session {
+    int s_count;        /* ref cnt; pgrps in session */
+    struct  proc *s_leader;     /* session leader */
+    struct  vnode *s_ttyvp;     /* vnode of controlling terminal */
+    struct  tty *s_ttyp;        /* controlling terminal */
+    char    s_login[MAXLOGNAME];    /* setlogin() name */
+};
+/* One structure allocated per process group. */
+struct  pgrp {
+    struct  pgrp *pg_hforw;     /* forward link in hash bucket */
+    struct  proc *pg_mem;       /* pointer to pgrp members */
+    struct  session *pg_session;    /* pointer to session */
+    pid_t   pg_id;          /* pgrp id */
+    int pg_jobc;    /* # procs qualifying pgrp for job control */
+};
+/* Description of a process. This structure contains information needed to
+ * manage a thread of control, known in UNIX as a process; it has references
+ * to substructures containing descriptions of things that process uses, but
+ * may share with related processes. Process structure and substructures are
+ * always addressible except for those marked &quot;(PROC ONLY)&quot; below, which might
+ * be addressible only on a processor on which the process is running. */
+struct  proc {
+    struct  proc *p_link;       /* doubly-linked run/sleep queue */
+    struct  proc *p_rlink;
+    struct  proc *p_nxt;        /* linked list of active procs */
+    struct  proc **p_prev;      /*    and zombies */
+    /* substructures: */
+    struct  pcred *p_cred;      /* process owner's identity */
+    struct  filedesc *p_fd;     /* ptr to open files structure */
+    struct  pstats *p_stats;    /* accounting/statistics (PROC ONLY) */
+    struct  plimit *p_limit;    /* process limits */
+    struct  vmspace *p_vmspace; /* address space */
+    struct  sigacts *p_sigacts; /* signal actions, state (PROC ONLY) */
+#define p_ucred     p_cred-&gt;pc_ucred
+#define p_rlimit    p_limit-&gt;pl_rlimit
+    int p_flag;
+    char    p_stat;
+    pid_t   p_pid;      /* unique process id */
+    struct  proc *p_hash;   /* hashed based on p_pid for kill+exit+... */
+    struct  proc *p_pgrpnxt; /* pointer to next process in process group */
+    struct  proc *p_pptr;   /* pointer to process structure of parent */
+    struct  proc *p_osptr;  /* pointer to older sibling processes */
+/* The following fields are all zeroed upon creation in fork */
+#define p_startzero p_ysptr
+    struct  proc *p_ysptr;  /* pointer to younger siblings */
+    struct  proc *p_cptr;   /* pointer to youngest living child */
+    /* scheduling */
+    u_int   p_cpu;      /* cpu usage for scheduling */
+    int p_cpticks;  /* ticks of cpu time */
+    fixpt_t p_pctcpu;   /* %cpu for this process during p_time */
+    caddr_t p_wchan;    /* event process is awaiting */
+    u_int   p_time;     /* resident/nonresident time for swapping */
+    u_int   p_slptime;  /* time since last block */
+    struct  itimerval p_realtimer;  /* alarm timer */
+    struct  timeval p_utime;    /* user time */
+    struct  timeval p_stime;    /* system time */
+    int p_traceflag;    /* kernel trace points */
+    struct  vnode *p_tracep;/* trace to vnode */
+    int p_sig;      /* signals pending to this process */
+/* end area that is zeroed on creation */
+#define p_endzero   p_startcopy
+/* The following fields are all copied upon creation in fork */
+    sigset_t p_sigmask; /* current signal mask */
+#define p_startcopy p_sigmask
+    sigset_t p_sigignore;   /* signals being ignored */
+    sigset_t p_sigcatch;    /* signals being caught by user */
+    u_char  p_pri;      /* priority, negative is high */
+    u_char  p_usrpri;   /* user-priority based on p_cpu and p_nice */
+    char    p_nice;     /* nice for cpu usage */
+    struct  pgrp *p_pgrp;   /* pointer to process group */
+    char    p_comm[MAXCOMLEN+1];
+/* end area that is copied on creation */
+#define p_endcopy   p_wmesg
+    char    *p_wmesg;   /* reason for sleep */
+    struct  user *p_addr;   /* kernel virtual addr of u-area (PROC ONLY) */
+    swblk_t p_swaddr;   /* disk address of u area when swapped */
+    int *p_regs;    /* saved registers during syscall/trap */
+    struct  mdproc p_md;    /* any machine-dependent fields */
+    u_short p_xstat;    /* Exit status for wait; also stop signal */
+    u_short p_acflag;   /* accounting flags */
+};
+#define p_session   p_pgrp-&gt;pg_session
+#define p_pgid      p_pgrp-&gt;pg_id
+/* Shareable process credentials (always resident). Includes a reference to
+ * current user credentials as well as real and saved ids that may be used to
+ * change ids. */
+struct  pcred {
+    struct  ucred *pc_ucred;    /* current credentials */
+    uid_t   p_ruid;         /* real user id */
+    uid_t   p_svuid;        /* saved effective user id */
+    gid_t   p_rgid;         /* real group id */
+    gid_t   p_svgid;        /* saved effective group id */
+    int p_refcnt;       /* number of references */
+};
+/* stat codes */
+#define SSLEEP  1       /* awaiting an event */
+#define SWAIT   2       /* (abandoned state) */
+#define SRUN    3       /* running */
+#define SIDL    4       /* intermediate state in process creation */
+#define SZOMB   5       /* intermediate state in process termination */
+#define SSTOP   6       /* process being traced */
+/* flag codes */
+#define SLOAD   0x0000001   /* in core */
+#define SSYS    0x0000002   /* swapper or pager process */
+#define SSINTR  0x0000004   /* sleep is interruptible */
+#define SCTTY   0x0000008   /* has a controlling terminal */
+#define SPPWAIT 0x0000010   /* parent is waiting for child to exec/exit */
+#define SEXEC   0x0000020   /* process called exec */
+#define STIMO   0x0000040   /* timing out during sleep */
+#define SSEL    0x0000080   /* selecting; wakeup/waiting danger */
+#define SWEXIT  0x0000100   /* working on exiting */
+#define SNOCLDSTOP 0x0000200    /* no SIGCHLD when children stop */
+#define STRC    0x0004000   /* process is being traced */
+#define SWTED   0x0008000   /* another tracing flag */
+#define SADVLCK 0x0040000   /* process may hold a POSIX advisory lock */
+
+#ifdef KERNEL
+/* We use process IDs &lt;= PID_MAX; PID_MAX + 1 must also fit in a pid_t
+ * (used to represent &quot;no process group&quot;).  */
+#define PID_MAX     30000
+#define NO_PID      30001
+#define PIDHASH(pid)    ((pid) &amp; pidhashmask)
+#define SESS_LEADER(p)  ((p)-&gt;p_session-&gt;s_leader == (p))
+#define SESSHOLD(s) ((s)-&gt;s_count++)
+#define SESSRELE(s) { \
+        if (--(s)-&gt;s_count == 0) \
+            FREE(s, M_SESSION); \
+    }
+extern  int pidhashmask;        /* in param.c */
+extern  struct proc *pidhash[];     /* in param.c */
+struct  proc *pfind();          /* find process by id */
+extern  struct pgrp *pgrphash[];    /* in param.c */
+struct  pgrp *pgfind();         /* find process group by id */
+struct  proc *zombproc, *allproc;   /* lists of procs in various states */
+extern  struct proc proc0;      /* process slot for swapper */
+struct  proc *initproc, *pageproc;  /* process slots for init, pager */
+extern  struct proc *curproc;       /* current running proc */
+extern  int nprocs, maxproc;        /* current and max number of procs */
+
+#define NQS 32      /* 32 run queues */
+struct  prochd {
+    struct  proc *ph_link;  /* linked list of running processes */
+    struct  proc *ph_rlink;
+} qs[NQS];
+int whichqs;        /* bit mask summarizing non-empty qs's */
+#endif  /* KERNEL */
+#endif  /* !_PROC_H_ */
+</pre>
+
+<HR><P>Copyright &copy; 1991, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

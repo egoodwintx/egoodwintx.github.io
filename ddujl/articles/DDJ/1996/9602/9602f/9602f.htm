@@ -1,0 +1,475 @@
+<HTML>
+<META NAME="year" CONTENT="1996">
+<HEAD>
+<!-- This document was built using HyperWriter Professional by NTERGAID Inc. -->
+<TITLE>FEB96: Implementing Multilevel Undo/Redo</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>Implementing Multilevel Undo/Redo<a name="00bc_0033"><a name="00bc_0033"><a name="00bc_0031"><a name="00bc_0000"></h1><P>
+
+<h2>Never having to say you're sorry</h2><P>
+
+<h3>Jim Beveridge</h3><P>
+
+<P>
+<i><a name="00bc_0032"><a name="00bc_0000">Jim, a software developer at Turning Point Software, can be contacted at jimb@turningpoint.com.</i></p><hr><P>
+
+A must-have feature in document-based applications is undo and redo. Most Windows-based word processors, for instance, will faithfully undo every command you have entered for the past 20 minutes, then perfectly redo all of them. The benefit to users is enormous. No matter what users do, there is a safety net to fall back on. Beginners can forge ahead without fear, while advanced users can play &quot;what-if&quot; and test the result of various changes.<P>
+
+In this article, I'll present a generalized undo/redo mechanism with a history length limited only by available memory. This undo/redo mechanism will be built on top of Spiral, a sample application written under Microsoft Visual C++ and the Microsoft Foundation Class library (MFC). Note that the code listings cannot be compiled by themselves; they need additional files, which are provided electronically; see &quot;Availability,&quot; page 3. I've tested the Spiral code with both Visual C++ 1.52 and Visual C++ 2.2, in 16 and 32 bit. The executable version of Spiral (also available electronically) is a 16-bit application.<P>
+
+To use Spiral, click with the left mouse button anywhere in the window, then drag out to define a circle. Let up, and the circle will be filled with a spiral determined by the span angle in the menu option Spiral:Angle. Changing the span angle will give radically different results. You can also click on the line of an existing spiral to select it. You can then move the spiral or delete it by selecting Clear from the Edit menu. After any of these operations, you can select Undo or Redo from the Edit menu.<P>
+
+<h3><a name="00bc_0034">To Undo or Not to Undo <a name="00bc_0034"></h3><P>
+
+One of the first questions you must ask before implementing undo is, &quot;What kinds of things can be undone?&quot; It doesn't make sense, for instance, to undo commands such as Open or Print. It is necessary to identify every action that the user can make in an application before answering this question. Commands in Spiral can be grouped into a variety of categories:<P>
+<ul>
+<li>File operations (File New, Open, Save, Save As, Close Print, Print Setup).</li>
+<li>View (View Toolbar, Status Bar Window New, Cascade, Tile).</li>
+<li>Application state (preferences, options). </li>
+<li>Document actions (Edit, Clear, Clear All, draw spiral, click to select, move the selection).</li>
+</ul>
+File and Print operations are clearly not undoable. Although undoing changes to the view or application state might be desirable, most applications only implement undo for actions that change the document. To keep the UI consistent, many applications restore the application state as a side-effect of undoing document changes. For example, changing the span angle of the pattern in Spiral affects the internal state, but it does not make a visible change to the document. Therefore, a decision must be made to ignore the span angle during undo, or to restore span angle changes as part of an undo to the document. I take the former approach in this article.<P>
+
+Document actions are clearly eligible for undo processing, but even here a careful check is needed. Making a selection does not change the document, so Undo Selection should never appear on the user's menu. Moving a selection does change the document, so it must be undoable. To decide what to do, ask yourself, &quot;What would I, as a user, want to happen?&quot; In the case of the move, it would probably be best to restore the selection's location, then select it again.<P>
+
+The decision must also be made about undo's scope. Undo should never extend across documents. Each document must have its own undo history, otherwise it would be necessary to undo any window-focus commands so that the proper window would have the focus for each undo task. For the same reason, commands such as Cascade Windows should also not be part of the normal undo mechanism.<P>
+
+Other decisions are not so obvious. If the user undoes a Cut, should the clipboard be restored to its previous state, if possible? Similarly, if the user saves a file using an existing name, should undo restore the previous file? No application I've seen implements either of these, but from the user's perspective it may be desirable to implement this behavior.<P>
+
+Avoid saving the undo history, particularly in your master save file. Persistent undo histories tend to be confusing to users. The undo history can also turn into a maintenance headache when the application is revised.<P>
+
+<h3><a name="00bc_0035">Assigning Tasks<a name="00bc_0035"></h3><P>
+
+The approach I took to creating a set of C++ classes to implement undo/redo is similar to building construction. A construction crew has specialized workers, each of whom performs one particular task. Each worker is told what to do by a foreman. The foreman may not know how to do any of these tasks, but he does know how to manage the construction effort.<P>
+
+For undo/redo, the job is to put together a document  instead of a building. Workers will be needed to move selections, create spirals, clear spirals, and so on. Each task will be represented by a class derived from a base class <I>CTask</I>. The <I>CTask</I> objects will be worker objects that perform certain tasks. Each worker class will also know how to undo its task.<P>
+
+The class <I>CTask</I> (see <a href="9602f.htm#00bc_003d">Listing One</A>), is defined as an abstract base class: It represents what every task should look like but is not itself a real task. Each class derived from <I>CTask</I> has a constructor to describe it and a destructor to clean up any private data. Every time the user does something that could be undone, a new instance of a class derived from <I>CTask</I> will be created. For example, suppose that the user draws a new spiral. The <I>CCreateSpiralTask </I>class (see <a href="9602f.htm#00bc_003f">Listing Two</A>) knows how to add a new spiral to the document. When the user releases the button and the spiral is finished, a new task is created. The only thing interesting about a new spiral is the spiral's data, so this information is passed to the task in the constructor: <P>
+
+<pre>CCreateSpiralTask pCreateSpiralTask
+=new CCreateSpiralTask(pSpiral);.</pre>
+
+The newly created task stores this information in private member data. Each instance of the class will have its own data. Note that <I>CCreateSpiralTask</I>, like all tasks, has no default constructor. It is not possible to create a task without knowing all the details of the task. <P>
+
+Who should start this task? Only the foreman can do that. The foreman manages all tasks. <a href="9602f.htm#00bc_0041">Listing Three</A> presents the <I>CForeman</I> class. The foreman is responsible for executing tasks and keeping track of the task history. The foreman is the heart of the undo/redo mechanism. To request that a task be executed, <I>SubmitTask()</I> in <I>CForeman</I> is called: <I>m_Foreman.SubmitTask(pCreateSpiralTask);</I>. <P>
+
+To execute the submitted task, <I>CForeman</I> calls the task's <I>Do()</I> member function. <I>CForeman</I> should be the only object that calls any task's member functions. The foreman has sole responsibility for keeping the undo/redo history consistent with the document. If any changes are made to the document without the foreman having a corresponding task, then the tasks in the history can become confused and crash the application. In <I>SubmitTask()</I>, <I>CForeman</I> immediately executes the task by calling: <I>pCreateSpiralTask</I>--&gt;<I>Do(m_pSpiralView);</I>. If the task succeeds, <I>CForeman</I> adds the task to the end of its history list. The foreman implements the command history simply by keeping track of which tasks were called. <P>
+
+<h3><a name="00bc_0036">Managing the Command History<a name="00bc_0036"></h3><P>
+
+The command history is maintained as a linked list of tasks that is managed somewhat like a stack. The MFC collection class <I>CObList</I> with the template <I>CTypedPtrList</I> quickly provides the needed implementation. (I've &quot;faked&quot; the template <I>CTypedPtrList</I> in the Spiral source for Visual C++ 1.5x.) <I>CForeman</I> also keeps a pointer to the last task executed. Undo moves the pointer backwards in the list, and redo moves the pointer forward; see <a href="9602f.htm#00bc_0043">Listing Four</A>. <P>
+
+Let's take an example in which the user draws two spirals, makes a selection, then selects Clear from the Edit menu. At this point the task list looks like this (remember, making a selection is not undoable by itself):<P>
+
+<ol>1.     <I>CreateSpiralTask</I> #1.</ol><P>
+
+<ol>2.     <I>CreateSpiralTask</I> #2.</ol><P>
+
+<ol>3.     <I>ClearSpiralTask</I>.</ol><P>
+
+The last task executed is task 3. Now the user selects Undo. <I>CForeman</I> handles the undo by calling the <I>Undo()</I> member function of the last executed task with a pointer to the current document: <I>pTas</I><I>k</I><I></I>--&gt;<I></I>Undo(m_pSpiralDoc)<I></I>;<I></I> // pTask points at task #3<I>.</I><P>
+
+Now that task 3 has been undone, the last task executed is task 2. The user selects Undo again. <I>CForeman</I> calls the <I>Undo()</I> member function of task 2. The last-task-executed pointer is moved back to task 1: <I>pTas</I><I>k</I><I></I>--&gt;<I>Undo(m_pSpiralDoc); // pTask points at task #2.</I><P>
+
+Next the user hits Redo. <I>CForeman</I> calls the <I>Do()</I> member function of task 2 again and advances the pointer for last task executed back to task 2: <I>pTas</I><I>k</I><I></I>--&gt;<I>Do(m_pSpiralDoc); // pTask points at task #2</I>.<P>
+
+Finally, the user creates another spiral. <I>CForeman</I> handles the new task by throwing away every task that is waiting to be redone. In this case, only task 3 is thrown away. The task is removed from the linked list of tasks and discarded with the C++ <I>delete </I>operator. Because the destructor for <I>CTasks</I> is virtual, the object pointed at by <I>pClearSpiralTask</I> will have the opportunity to properly clean up.<P>
+
+The undo/redo mechanism is now basically functioning. What's left is to write a lot more tasks and to properly update the user interface.<P>
+
+<h3><a name="00bc_0037">Inside a Task<a name="00bc_0037"></h3><P>
+
+The class for each task must keep track of enough data to be able to complete the task without querying to the current view and, preferably, without querying the application state. The current view may not be queried because the user could select Redo from within any view. By not querying the application state, Redo can be executed without producing a different result if the application state changes.<P>
+
+All of the information required to complete a task should be part of the constructor for the task. For example, <I>CCreateSpiralTask</I> takes a completed spiral as its argument. The completed spiral contains information about the center, radius, and span angle. If <I>CCreateSpiralTask</I>'s constructor did not include the span angle, then the spiral would change if the user chose the Spiral:Angle menu option between the Undo and the Redo.<P>
+
+The class for each task must also keep track of enough data to be able to undo the task. In the case of <I>CCreateSpiralTask</I>, <I>Undo()</I> can retrieve the last spiral from the spiral list because the last spiral created is always at the end of the spiral list. <I>CClearSpiralTask</I> is the opposite of <I>CCreateSpiralTask</I>. After <I>Do()</I>, the task remembers the deleted spiral and its position in the class's data area.<P>
+
+A task can be deleted at any time, so it is important to keep track of whether a task actually owns any objects it points at. If <I>CCreateSpiralTask</I> tries to delete its spiral after inserting the spiral into the document, the application will crash. Spiral solves this problem by making each task modal. The modes are &quot;able to Do()&quot; and &quot;able to Undo()&quot;. After <I>CForeman</I> calls <I>Do()</I>, it must call <I>Undo()</I> before calling <I>Do()</I> again. In <I>CCreateSpiralTask</I>, after placing the spiral object back in the document in <I>Do()</I>, the task's pointer to the spiral is set to NULL. If the pointer is not set to NULL in the task, then <I>CCreateSpiralTas</I><I>k</I>'s destructor and the document's destructor will both try to free the spiral object. <a href="9602f.htm#00bc_003d">Listing One</A> shows, for each member variable, whether the member variable is needed for <I>Do()</I> or for <I>Undo()</I>.<P>
+
+<h3><a name="00bc_0038">Updating the Menus<a name="00bc_0038"></h3><P>
+
+I was always impressed by applications that were able to give descriptions of the actions on the undo and redo history. With the implementation of undo/redo described in this article, this functionality is easy to implement.<P>
+
+All of the code necessary in the view to update Undo and Redo in the Edit menu is in <a href="9602f.htm#00bc_0045">Listing Five</A>. The corresponding code in <I>CForeman</I> is shown in <a href="9602f.htm#00bc_0043">Listing Four</A> in the member functions <I>GetUndoDescription()</I> and <I>GetRedoDescription()</I>. <I>CForeman</I> uses its last-task-executed pointer to get a pointer to the next task to be undone or redone. Each task has a virtual function called <I>GetDescription()</I> that returns a short description of the task. <I>CForeman</I> returns this result from <I>GetDescription()</I>, or the empty string if no task is waiting.<P>
+
+<h3><a name="00bc_0039">Managing Multiple Documents and Views<a name="00bc_0039"></h3><P>
+
+In an application that supports multiple documents and/or multiple views, one problem is how to maintain separate undo histories. <I>CForeman</I> uses no global variables, so multiple instances of <I>CForeman</I> can be created. To implement multiple histories, <I>CForeman</I> is placed as a member of the <I>CSpiralDoc</I> document class. This way there will be a separate undo history for each document, and multiple views of the same document will share a single undo history. Functions that need to call <I>CForeman</I> will be able to access the class through a pointer to the document. In as much as I've already defined undoable operations to be those that affect the document, I can guarantee that a pointer to the current document's foreman will always be available when I need it.<P>
+
+Spiral supports multiple views of the same data, so any time the document is changed, all views must be updated. MFC provides a function called <I>UpdateAll-Views()</I> as part of the document class. Hints are used in Spiral to describe specific spirals or rectangles to be updated. These hints optimize the redraw handling and prevent excess redraws across the views.<P>
+
+Tasks are called by <I>CForeman</I> with a pointer to the document because undo/redo tasks work on the document, not the view. Views are only convenient representations of that document. With one exception, tasks must completely ignore any view information because the current view could be closed or modified the next time the task executes a <I>Do()</I> or an <I>Undo()</I>. The exception is that the current view should automatically scroll to make whatever was undone or redone visible to the user.<P>
+
+<h3><a name="00bc_003a">Updating the Modified Flag<a name="00bc_003a"></h3><P>
+
+Very few Windows apps recognize when a document has been returned to the original state. With the undo history presented here, it is possible to determine that the user has undone all changes and to reset the modified flag to False. This prevents the user from typing a key accidentally, pressing Undo, and still having the application ask if it should save the changes.<P>
+
+This feature can be implemented safely by throwing away the undo history when the user saves. This is the way that Visual C++ 2.x and most other applications are implemented. Word for Windows, on the other hand, keeps the undo history after the document is saved but cannot detect that the user has undone all changes since the last save.<P>
+
+<h3><a name="00bc_003b">Adding Undo/Redo to Existing Apps<a name="00bc_003b"></h3><P>
+
+Many existing MFC applications can easily be modified to support this mechanism. User actions are typically implemented as part of the view. The view ends up having numerous member functions, each of which takes care of one user-interface action. To implement an undo/ redo history, each of these member functions is pulled out of the view and made into a task class. The key to success is making sure that anything the user can do that modifies the document is made into an undo/redo task.<P>
+
+<P>
+
+<h4><a name="00bc_003c"><a name="00bc_003d">Listing One<a name="00bc_003d"></h4><pre>
+// task.h - Definitions of Undo/Redo Tasks
+// NOTES: 1. Strings should be in resources, but leaving them here makes the 
+//    examples clearer.
+// 2. The virtual functions are not really inline, but they are so short that 
+//    it makes it easier to read.
+/////////////////////////////////////////////////////////////////////////////
+class CTask : public CObject {
+public:
+    CTask()                         { /* empty */ }
+    virtual ~CTask()                { /* empty */ }
+    virtual void Do(CSpiralDoc*) = 0;
+    virtual void Undo(CSpiralDoc*) = 0;
+    virtual LPCSTR GetDescription() = 0;
+private:
+    CTask(const CTask&amp;);            // Disable copy constructor
+    CTask&amp; operator=(const CTask&amp;); // Disable assignment operator
+};
+class CCreateSpiralTask : public CTask {
+public:
+    CCreateSpiralTask(CSpiral* pSpiral) { m_pSpiral = pSpiral; }
+    virtual ~CCreateSpiralTask()        { delete m_pSpiral; }
+    virtual void Do(CSpiralDoc*);
+    virtual void Undo(CSpiralDoc*);
+    virtual LPCSTR GetDescription()     { return &quot;Draw&quot;; }
+private:
+    CSpiral*    m_pSpiral;          // Needed for Do()
+};
+class CMoveSpiralTask : public CTask {
+public:
+    CMoveSpiralTask(CSpiral* pSpiral, const CSize&amp; size)
+                                        : m_Size(size) { m_pSpiral = pSpiral; }
+    virtual ~CMoveSpiralTask()          { }
+    virtual void Do(CSpiralDoc*);
+    virtual void Undo(CSpiralDoc*);
+    virtual LPCSTR GetDescription()     { return &quot;Move&quot;; }
+private:
+    CSpiral*    m_pSpiral;          // Needed for Do() and Undo()
+    CSize       m_Size;             // Needed for Do() and Undo()
+};
+class CClearSpiralTask : public CTask {
+public:
+    CClearSpiralTask(POSITION pos)      { m_Pos = pos; m_pSpiral=NULL; }
+    virtual ~CClearSpiralTask()         { delete m_pSpiral; }
+    virtual void Do(CSpiralDoc*);
+    virtual void Undo(CSpiralDoc*);
+    virtual LPCSTR GetDescription()     { return &quot;Clear&quot;; }
+private:
+    POSITION    m_Pos;              // Needed for Do()
+    CSpiral*    m_pSpiral;          // Needed for Undo()
+};
+class CClearAllTask : public CTask {
+public:
+    CClearAllTask()                     { }
+    virtual ~CClearAllTask();
+    virtual void Do(CSpiralDoc*);
+    virtual void Undo(CSpiralDoc*);
+    virtual LPCSTR GetDescription() { return &quot;Clear All&quot;; }
+private:
+    CSpiralList     m_SpiralList;   // Needed for Undo()
+};
+</pre>
+<h4><a name="00bc_003e"><a name="00bc_003f">Listing Two<a name="00bc_003f"></h4><pre>
+/* task.cpp - Implementation of undo/redo tasks  */
+#include &quot;stdafx.h&quot;
+#include &quot;Spiral.h&quot;
+#include &quot;Foreman.h&quot;
+#include &quot;SpiraDoc.h&quot;
+#include &quot;SpiraVw.h&quot;
+#include &quot;Task.h&quot;
+#ifdef _DEBUG
+#undef THIS_FILE
+static char BASED_CODE THIS_FILE[] = __FILE__;
+#endif
+/* Undo/Redo Actions */
+#define INVALIDATE_SPIRAL() pSpiralDoc-&gt;UpdateAllViews(NULL, 0, m_pSpiral); \
+                          pSpiralDoc-&gt;m_updateRect = m_pSpiral-&gt;m_rectBounding;
+/////////////////////////////////////
+void CCreateSpiralTask::Do(CSpiralDoc* pSpiralDoc)
+{
+    // Before Do(), we own the spiral. After Do(), the doc owns the spiral.
+    pSpiralDoc-&gt;m_SpiralList.AddTail(m_pSpiral);
+    INVALIDATE_SPIRAL();
+    m_pSpiral = NULL;
+}
+void CCreateSpiralTask::Undo(CSpiralDoc* pSpiralDoc)
+{
+    m_pSpiral = pSpiralDoc-&gt;m_SpiralList.RemoveTail();
+    INVALIDATE_SPIRAL();
+}
+/////////////////////////////////////
+void CMoveSpiralTask::Do(CSpiralDoc* pSpiralDoc)
+{
+    INVALIDATE_SPIRAL();
+    m_pSpiral-&gt;Move(m_Size);
+    INVALIDATE_SPIRAL();
+}
+void CMoveSpiralTask::Undo(CSpiralDoc* pSpiralDoc)
+{
+    INVALIDATE_SPIRAL();
+    CSize size(-m_Size.cx, -m_Size.cy);
+    m_pSpiral-&gt;Move(size);
+    INVALIDATE_SPIRAL();
+}
+/////////////////////////////////////
+void CClearSpiralTask::Do(CSpiralDoc* pSpiralDoc)
+{
+    // Need to remember the spiral preceding the one being deleted so if 
+        // the user does an undo, we know where to put it back.
+    CSpiralList&amp; SpiralList = pSpiralDoc-&gt;m_SpiralList;
+    POSITION prevPos = m_Pos;
+    SpiralList.GetPrev(prevPos);
+    m_pSpiral = SpiralList.GetAt(m_Pos);
+    SpiralList.RemoveAt(m_Pos);
+    INVALIDATE_SPIRAL();
+    m_Pos = prevPos;
+}
+void CClearSpiralTask::Undo(CSpiralDoc* pSpiralDoc)
+{
+    CSpiralList&amp; SpiralList = pSpiralDoc-&gt;m_SpiralList;
+    m_Pos = SpiralList.InsertAfter(m_Pos, m_pSpiral);
+    INVALIDATE_SPIRAL();
+    m_pSpiral = NULL;
+}
+/////////////////////////////////////
+CClearAllTask::~CClearAllTask()
+{
+    while (!m_SpiralList.IsEmpty())
+        delete m_SpiralList.RemoveHead();
+}
+void CClearAllTask::Do(CSpiralDoc* pSpiralDoc)
+{
+    CSpiralList&amp; documentSpiralList = pSpiralDoc-&gt;m_SpiralList;
+    while (!documentSpiralList.IsEmpty())
+        m_SpiralList.AddTail(documentSpiralList.RemoveHead());
+    pSpiralDoc-&gt;UpdateAllViews(NULL);
+}
+void CClearAllTask::Undo(CSpiralDoc* pSpiralDoc)
+{
+    CSpiralList&amp; documentSpiralList = pSpiralDoc-&gt;m_SpiralList;
+    while (!m_SpiralList.IsEmpty())
+        documentSpiralList.AddTail(m_SpiralList.RemoveHead());
+    pSpiralDoc-&gt;UpdateAllViews(NULL);
+}
+</pre>
+<h4><a name="00bc_0040"><a name="00bc_0041">Listing Three<a name="00bc_0041"></h4><pre>
+/* foreman.h - Class definition of undo history manager */
+// Forward Declarations. By having these, we do not have to load 
+// other include files.
+class CSpiralDoc;
+class CTask;
+class CSpiral;
+// Type definitions
+#ifdef WIN32
+typedef CTypedPtrList&lt;CObList,CSpiral*&gt; CSpiralList;
+typedef CTypedPtrList&lt;CObList,CTask*&gt; CTaskList;
+typedef CArray&lt;CPoint,CPoint&gt;  CPointArray;
+#else
+#include &quot;template.h&quot;
+#endif  // WIN32
+// CForeman Class Definition
+class CForeman
+{
+public:
+    CForeman();
+    ~CForeman();
+    void SubmitTask(CTask*);
+    void Undo();
+    void Redo();
+    // The &quot;Can&quot; functions are used by OnCommandUpdate
+    // to figure out when to grey out the menu option.
+    BOOL CanRedo();
+    BOOL CanUndo();
+    // The &quot;GetDescription&quot; functions are used by OnCommand
+    // to describe the actions waiting to be redone and undone.
+    LPCSTR GetRedoDescription();
+    LPCSTR GetUndoDescription();
+    // The foreman is an aggregate member of the document. SetDocument is 
+    // called by the document's ctor to provide a pointer back to the doc.
+    void SetDocument(CSpiralDoc* pSpiralDoc);
+    // After a do or undo, make sure the user can see it.
+    void MakeLastTaskVisible(CSpiralDoc* pSpiralDoc);
+private:
+    // Linked list of tasks.
+    CTaskList   m_taskList;
+    // The position and the index both indicate the next
+    // task to undo, but in slightly different forms.
+    POSITION    m_DoUndoPosition;
+    int         m_iDoUndoIndex;
+    // Remember which document this foreman is related to.
+    CSpiralDoc* m_pSpiralDoc;
+};
+inline BOOL CForeman::CanRedo(){return m_iDoUndoIndex &lt; m_taskList.GetCount();}
+inline BOOL CForeman::CanUndo(){return m_iDoUndoIndex &gt; 0; }
+inline void CForeman::SetDocument(CSpiralDoc* pSpiralDoc) 
+                                                 { m_pSpiralDoc = pSpiralDoc; }
+</pre>
+<h4><a name="00bc_0042"><a name="00bc_0043">Listing Four<a name="00bc_0043"></h4><pre>
+/* foreman.cpp - Implementation of undo history manager */
+#include &quot;stdafx.h&quot;
+#include &quot;Spiral.h&quot;
+#include &quot;Foreman.h&quot;
+#include &quot;Spiradoc.h&quot;
+#include &quot;SpiraVw.h&quot;
+#include &quot;Task.h&quot;
+#ifdef _DEBUG
+#undef THIS_FILE
+static char BASED_CODE THIS_FILE[] = __FILE__;
+#endif
+/* Foreman */
+CForeman::CForeman()
+{
+    m_iDoUndoIndex = 0;
+}
+CForeman::~CForeman()
+{
+    while (m_taskList.GetCount() &gt; 0)
+        delete m_taskList.RemoveTail();
+}
+void CForeman::SubmitTask(CTask* task)
+{
+    while (m_iDoUndoIndex &lt; m_taskList.GetCount())
+        delete m_taskList.RemoveTail();
+    m_DoUndoPosition = m_taskList.AddTail(task);
+    m_iDoUndoIndex++;
+    task-&gt;Do(m_pSpiralDoc);
+    m_pSpiralDoc-&gt;SetModifiedFlag();
+}
+void CForeman::Undo()
+{
+    m_pSpiralDoc-&gt;m_updateRect.SetRectEmpty();
+    if (CanUndo()) {
+        // Undo the current entry, then backup in the list.
+        // GetPrev returns the object at the *current* position
+        // indicated by m_DoUndoPosition, then sets m_DoUndoPosition
+        // back one link.  A better name is &quot;GetCurrentAndMoveBackPosition&quot;
+        CTask* pTask = m_taskList.GetPrev(m_DoUndoPosition);
+        --m_iDoUndoIndex;
+        pTask-&gt;Undo(m_pSpiralDoc);
+    }
+    // If the user undid everything, then the document is unchanged
+    // relative to how it started.  Clear the &quot;modified&quot; flag to show this.
+    // Small bug: we do not account for File:Save properly in this example.
+    if (m_taskList.GetCount() == 0)
+        m_pSpiralDoc-&gt;SetModifiedFlag(FALSE);
+    if (!m_pSpiralDoc-&gt;m_updateRect.IsRectEmpty())
+        MakeLastTaskVisible(m_pSpiralDoc);
+}
+void CForeman::Redo()
+{
+    m_pSpiralDoc-&gt;m_updateRect.SetRectEmpty();
+    if (CanRedo()) {
+        // Advance to the next entry and execute it.
+        m_iDoUndoIndex++;
+        if (!m_DoUndoPosition)
+            m_DoUndoPosition = m_taskList.GetHeadPosition();
+        else
+            m_taskList.GetNext(m_DoUndoPosition);
+        CTask* pTask = m_taskList.GetAt(m_DoUndoPosition);
+        pTask-&gt;Do(m_pSpiralDoc);
+        m_pSpiralDoc-&gt;SetModifiedFlag();
+    }
+    if (!m_pSpiralDoc-&gt;m_updateRect.IsRectEmpty())
+        MakeLastTaskVisible(m_pSpiralDoc);
+}
+LPCSTR CForeman::GetRedoDescription()
+{
+    if (CanRedo()) {
+        POSITION nextPos = m_DoUndoPosition;
+        if (!nextPos)
+            nextPos = m_taskList.GetHeadPosition();
+        else
+            m_taskList.GetNext(nextPos);
+        return m_taskList.GetAt(nextPos)-&gt;GetDescription();
+    }
+    return &quot;&quot;;
+}
+LPCSTR CForeman::GetUndoDescription()
+{
+    if (CanUndo()) {
+        return m_taskList.GetAt(m_DoUndoPosition)-&gt;GetDescription();
+    }
+    return &quot;&quot;;
+}
+// Find the currently active view and scroll it so that the
+// last rect invalidated by a task is visible.
+void CForeman::MakeLastTaskVisible(CSpiralDoc* pSpiralDoc)
+{
+    // Get the active view so it can be updated.
+    CMDIChildWnd * pChild =
+    ((CMDIFrameWnd*)(AfxGetApp()-&gt;m_pMainWnd))-&gt;MDIGetActive();
+    if ( !pChild )
+        return;
+    CView * pView = pChild-&gt;GetActiveView();
+    if ( !pView || !pView-&gt;IsKindOf( RUNTIME_CLASS(CSpiralView) ))
+        return;
+    // Compare the window rect to the update rect and act appropriately.
+    CSpiralView* pSpiralView = (CSpiralView*) pView;
+    CClientDC dc(pView);
+    pView-&gt;OnPrepareDC(&amp;dc);
+    CRect clientRect;
+    pView-&gt;GetClientRect(&amp;clientRect);
+    if (!dc.PtVisible(pSpiralDoc-&gt;m_updateRect.TopLeft())
+                || !dc.PtVisible(pSpiralDoc-&gt;m_updateRect.BottomRight()) ) {
+        // Try to center the spiral of interest in the current view.
+        CPoint ptCenter = pSpiralDoc-&gt;m_updateRect.TopLeft();
+        int xDesired = ptCenter.x - clientRect.Width() / 2;
+        int yDesired = ptCenter.y - clientRect.Height() / 2;
+        pSpiralView-&gt;ScrollToPosition(CPoint(xDesired, yDesired));
+        // This next line is required for proper updates with splitters
+        pSpiralView-&gt;GetDocument()-&gt;UpdateAllViews(NULL, 0, NULL);
+    }
+}
+</pre>
+<h4><a name="00bc_0044"><a name="00bc_0045">Listing Five<a name="00bc_0045"></h4><pre>
+// Excerpts from SpiraVw.CPP
+void CSpiralView::OnUpdateEditUndo(CCmdUI* pCmdUI) 
+{
+    CString str(&quot;Undo &quot;);
+    str = str + GetDocument()-&gt;m_Foreman.GetUndoDescription() + &quot;\tCtrl+Z&quot;;
+    pCmdUI-&gt;SetText(str);
+    pCmdUI-&gt;Enable(GetDocument()-&gt;m_Foreman.CanUndo());
+}
+void CSpiralView::OnEditUndo() 
+{
+    GetDocument()-&gt;m_Foreman.Undo();
+}
+void CSpiralView::OnUpdateEditRedo(CCmdUI* pCmdUI) 
+{
+    CString str(&quot;Redo &quot;);
+    str = str + GetDocument()-&gt;m_Foreman.GetRedoDescription() + &quot;\tCtrl+A&quot;;
+    pCmdUI-&gt;SetText(str);
+    pCmdUI-&gt;Enable(GetDocument()-&gt;m_Foreman.CanRedo());
+}
+void CSpiralView::OnEditRedo() 
+{
+    GetDocument()-&gt;m_Foreman.Redo();
+}
+</pre>
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+<P>
+
+</BODY></HTML>

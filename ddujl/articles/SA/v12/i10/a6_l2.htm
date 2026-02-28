@@ -1,0 +1,478 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i10: Listing 2 Mail::Archive::Account</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a6.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a6_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink">Listing 2</span></td>
+		<td><span class="navbarLink"><a href="a6_l3.htm">Listing 3</a></span></td>
+		<td><a href="../../../../source/SA/2003/oct2003.tar"><b class=codeListing>oct2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b>Listing 2 </b><i>Mail::Archive::Account</i></h1>
+            <p> 
+            <pre>
+package Mail::Archive::Account;
+
+use File::Basename;
+use File::Path;
+use File::Spec;
+use Mail::Audit;
+use Mail::Address;
+use Mail::POP3Client;
+
+
+sub new(@) {
+    my $class = shift;
+    my %params = @_;
+    my $self = {};
+
+    map {
+        die "Cannot create account without $_" unless (exists($params{$_}));
+    } qw/user password host address/;
+
+    map {
+    $self-&gt;{$_} = $params{$_};
+    } keys %params;
+
+    $self-&gt;{maildir}    = File::Spec-&gt;catfile("$ENV{HOME}", "mail")
+    unless $self-&gt;{maildir};
+
+    $self-&gt;{auth_mode}  = "PASS"              unless $self-&gt;{auth_mode};
+    $self-&gt;{log}        = "log"               unless $self-&gt;{log};
+    $self-&gt;{archive}    = "Archive"           unless $self-&gt;{archive};
+    $self-&gt;{inbox}      = "Inbox"             unless $self-&gt;{inbox}; 
+    $self-&gt;{junk}       = "Junk"              unless $self-&gt;{junk};
+    $self-&gt;{filter}     = \&amp;filter            unless $self-&gt;{filter};
+    $self-&gt;{safe}       = 0                   unless $self-&gt;{safe};
+    $self-&gt;{mode}       = 0700                unless $self-&gt;{mode}; 
+
+    (my $username, my $domain) = split(/\@/, $self-&gt;{address});
+    $self-&gt;{maildir} .= "/$domain" if $opts{f};
+    $self-&gt;{domain} = $domain;
+
+    for (qw(archive log junk inbox)) { 
+    $self-&gt;{$_} = File::Spec-&gt;catfile($self-&gt;{maildir}, $self-&gt;{$_})
+        unless ($self-&gt;{$_} =~ /^\//);
+    }
+
+    $self-&gt;{spam} = File::Spec-&gt;catfile($self-&gt;{maildir}, $self-&gt;{spam})
+        if ($self-&gt;{spam} &amp;&amp; $self-&gt;{spam} !~ /^\//);
+
+    bless($self, $class);
+
+    return $self;
+}
+
+
+sub fetch($;) {
+    my $self = shift;
+    my $filter = shift;
+
+    do {print "Skipping $self-&gt;{address}\n"; return;} if ($self-&gt;{skip});
+
+    $self-&gt;_m_mkpath($self-&gt;{maildir}) unless -d $self-&gt;{maildir};
+    $self-&gt;_popread($filter);
+}
+
+
+sub _popread($;) {
+    my $self = shift;
+    my $filter = shift || $self-&gt;{filter};
+    my %account = {};
+    my %midcache;
+    my $cache = File::Spec-&gt;catfile($ENV{HOME}, ".msgidcache");
+
+    if (-f $cache) {%midcache = map {chomp; $_ =&gt; 1} `tail -50 $cache`};
+
+    print "Connecting to $self-&gt;{host}...";
+
+    for (user, password, host, auth_mode) {
+        (my $upper = $_) =~ tr/a-z/A-Z/;
+        $account{$upper} = $self-&gt;{$_};
+    }
+
+    my $pop = new Mail::POP3Client(%account);
+    unless ($pop) { warn "Couldn't connect\n"; next; }
+
+    my $count = $pop-&gt;Count;
+    if ($count &lt;0) { warn "Authorization failed ($$_{host})"; next; }
+    print "\n";
+    print "New messages: $count\n";
+
+    my %down = map {$_ =&gt; 1} (1..$count); 
+    my @mails;
+    for my $num (1..$count) {
+    print "\n";
+    my @head = $pop-&gt;Head($num);
+    for (@head) {
+         /^(From|Subject):\s+(.*)/i and do {
+        print "$1\t$2\n";
+        $mails[$num]-&gt;{$1} = $2;
+         };
+         /^Message-Id:\s+(\S+)/i and do {
+        if (exists $midcache{$1}) {
+            print "(Duplicate)\n";
+            delete $down{$num};
+            $mails[$num]-&gt;{mid} = $1;
+            $pop-&gt;Delete($num) unless $self-&gt;{safe};
+        }
+        $midcache{$1}++;
+         }
+    }
+    }
+
+    next unless keys %down;
+
+    my @tocome = sort {$a &lt;=&gt; $b} keys %down;
+    print "Downloading: @tocome\n";
+    for my $num (@tocome) {
+    print "Downloading message $num (", $mails[$num]-&gt;{From}, ":",
+        $mails[$num]-&gt;{Subject}, ")...";
+
+    my @mail = $pop-&gt;Retrieve($num);
+    $_ .= "\n" for @mail;
+    my $now = scalar localtime;
+    $mail[0] =~ s/Return-Path:\s+&lt;([^&gt;]+)&gt;/From $1 $now/;
+
+    print "\n";
+
+    if (!@mail) { 
+        print "Ugh, something went wrong!\n"; 
+        delete $midcache{$mails[$num]-&gt;{mid}};
+        next;
+    }
+
+    my $item = Mail::Audit-&gt;new(
+        data      =&gt; \@mail, 
+        emergency =&gt; $self-&gt;{junk},
+        log       =&gt; $self-&gt;{log},
+        loglevel  =&gt; 2,
+        noexit    =&gt; 1,   
+        nomime    =&gt; 1,   
+    ); 
+
+        next unless $item;
+
+        print "From: ", $item-&gt;from, "\nTo: ", $item-&gt;to, "\n";
+
+        $self-&gt;deliver($item, $self-&gt;{junk}) 
+        unless &amp;$filter($self, $item);
+
+    $pop-&gt;Delete($num) 
+        unless $self-&gt;{safe};
+    }
+
+    $pop-&gt;Close;
+
+    open OUT, "&gt;$cache" or die $!;
+    print OUT "$_\n" for keys %midcache;
+    close OUT;
+}
+
+
+sub filter($$) {
+    my $self = shift;
+    my $item = shift;
+
+    my $spamtest= $self-&gt;{spamtest};
+    my $address    = $self-&gt;{address};
+    my $domain     = $self-&gt;{domain};
+    my $inbox     = $self-&gt;{inbox};
+    my $maildir = $self-&gt;{maildir};
+    my $archive = $self-&gt;{archive};
+    my $spam     = $self-&gt;{spam};
+    my $junk    = $self-&gt;{junk};
+
+    my $to = $item-&gt;to;
+    my $cc = $item-&gt;cc;
+    my $from = $item-&gt;from;
+    
+    my $isspam = 0;
+     
+    if ($spam &amp;&amp; $spamtest) {
+    my $status = $spamtest-&gt;check($item);
+    if ($status) {
+        $isspam = $status-&gt;is_spam();
+        $status-&gt;finish();
+    }
+    }
+
+    return eval {
+    if ($from =~ /$address/i) {             # mail from me? 
+        if ($spamtest) {
+        my $learner = $spamtest-&gt;learn($item);
+        $learner-&gt;finish();
+        }
+
+        # if i am cc'd at the same address, deliver it, too
+        $self-&gt;deliver($item, $inbox) 
+        if ($to =~ /$address/i || $cc =~ /$address/i);
+        $self-&gt;file($item, $archive, Mail::Address-&gt;parse($to, $cc)); 
+    } 
+    elsif ($to =~ /$address/i || $cc =~ /$address/i) {# directly to me, either to or cc 
+        if ($isspam) {
+        $self-&gt;deliver($item, $spam); 
+        } else {
+        $self-&gt;file($item, $archive, Mail::Address-&gt;parse($from));
+        $self-&gt;deliver($item, $inbox);
+        }
+    } 
+    elsif (($to =~ /$domain/ || $cc =~ /$domain/)) {# mail not directly to me... 
+        # check if email originated from within my domain
+        if ($from =~ /$domain/) {  
+        $self-&gt;file($item, $archive, Mail::Address-&gt;parse($from));
+        $self-&gt;deliver($item, $inbox);
+        } elsif ($isspam) {
+        $self-&gt;deliver($item, $spam); 
+        } else {
+        $self-&gt;deliver($item, $junk);
+        }
+    } 
+    elsif ($isspam) {            # spam
+        $self-&gt;deliver($item, $spam);
+    } 
+    else {
+        0;                       # something else
+    }
+    };
+}
+
+
+sub inbox($;)     {$self = shift; $self-&gt;get("inbox", @_)};
+sub junk($;)      {$self = shift; $self-&gt;get("junk", @_)};
+sub spam($;)      {$self = shift; $self-&gt;get("spam", @_)};
+sub maildir($;)   {$self = shift; $self-&gt;get("maildir", @_)};
+sub archive($;)   {$self = shift; $self-&gt;get("archive", @_)};
+sub host($;)      {$self = shift; $self-&gt;get("host", @_)};
+sub address($;)   {$self = shift; $self-&gt;get("address", @_)};
+sub auth_mode($;) {$self = shift; $self-&gt;get("auth_mode", @_)};
+sub password($;)  {$self = shift; $self-&gt;get("password", @_)};
+sub user($;)      {$self = shift; $self-&gt;get("user", @_)};
+sub safe($;)      {$self = shift; $self-&gt;get("safe", @_)};
+sub code($;)      {$self = shift; $self-&gt;get("code", @_)};
+sub mode($;)      {$self = shift; $self-&gt;get("mode", @_)};
+
+
+sub get($$;) {
+    my $self = shift;
+    my $parameter = shift;
+    my $setting = shift;
+
+    my $string = $self-&gt;{$parameter}; 
+
+    chomp($string=(defined $string &amp;&amp; length $string) ? $string : "") 
+        unless ($parameter =~ /(c|m)ode/);     # don't convert mode or code
+
+    $self-&gt;{$parameter} = $setting if ($setting); 
+
+    return $string; 
+}
+
+
+sub isspam($) {
+    my $self = shift;
+    my $item = shift;
+
+    return 0 unless (exists $self-&gt;{spamtest} &amp;&amp; exists $self-&gt;{spam});
+
+    my $status = $self-&gt;{spamtest}-&gt;check($item);
+    if ($status) {
+    my $isspam = $status-&gt;is_spam();
+    $status-&gt;finish();
+    return $isspam;
+    }
+
+    return 0;
+}
+
+
+sub deliver($$;$;) {
+    my $self = shift;
+    (my $item, my $folder, my $mbox) = @_;
+
+    return unless $item;
+
+    $folder = $self-&gt;{inbox} unless $folder;
+
+    my $to = $item-&gt;to;
+    my $cc = $item-&gt;cc;
+    my $from = $item-&gt;from;
+
+    my $drop = eval {
+    if ($mbox) {
+        $self-&gt;_m_mkpath($folder) unless -d $folder; 
+        $mbox = File::Spec-&gt;catfile($folder, $mbox);
+    } 
+    elsif (-f $folder || -d $folder) {
+        $folder;
+    } 
+    else {
+        my $dirname = dirname($folder);
+        $self-&gt;_m_mkpath($dirname) unless (-f $dirname || -d $dirname);
+        $folder;
+    } 
+    };
+
+    print "Delivering to mailbox: $drop\n";
+
+    return $item-&gt;accept($drop);
+}
+
+
+sub file($$@) {
+    my $self = shift;
+    my ($item, $subfolder) = (shift, shift);
+    my @names = map {_explode($_);} @_;
+    my $filed = 0;
+
+    for my $ref (@names) {
+    my $box = ''; my $username = ${$ref}{username};
+    my $firstname = ${$ref}{firstname};
+    my $lastname = ${$ref}{lastname};
+    my $fullname = ${$ref}{fullname};
+    my $domain = ${$ref}{domain};
+
+        next if ($username =~ /-(help|subscribe)$/);
+
+        if ($opts{s} &amp;&amp; $lastname) {
+        $box = $lastname;
+        do {
+            $box .= "_$firstname";
+        } if $firstname; 
+    } elsif ($firstname) {
+        $box = $firstname;
+        $box .= "_$lastname" if $lastname; 
+    } elsif ($fullname) {
+        $box =$fullname;
+    } elsif ($username) {
+        $box = $username;
+    } else {
+        print "... exception ... \n";
+        $self-&gt;deliver($item, $self-&gt;{junk});
+        $filed++;
+        next;
+    }
+
+    $box = $1 if ($box =~ /(.*)@/); 
+    $box =~ s/\s+/_/g;
+    my ($letter) = split(//, $box);
+    next if ($letter !~ /[a-z0-9_-]/);
+
+        $filed += $self-&gt;deliver($item, $subfolder, 
+        File::Spec-&gt;catfile($letter, $box));
+    }
+
+    return $filed;
+}
+
+
+use constant esc        =&gt; '\\\\';               
+use constant Period     =&gt; '\.';
+use constant space      =&gt; '\040';               
+use constant tab        =&gt; '\t';
+use constant OpenBR     =&gt; '\[';                 
+use constant CloseBR    =&gt; '\]';
+use constant OpenParen  =&gt; '\(';                 
+use constant CloseParen =&gt; '\)';
+use constant NonASCII   =&gt; '\x80-\xff';          
+use constant ctrl       =&gt; '\000-\037';
+use constant CRlist     =&gt; '\n\015'; 
+use constant atom_char  =&gt; qq/[^&lt;&gt;()spacetab\@,;:\"escOpenBRCloseBRctrlNonASCII]/;
+
+sub _explode {
+    my $address = shift;
+    return undef if (!defined($address));
+
+
+    my @subdomains = split(Period, $address-&gt;host);
+    my $fdomain = pop @subdomains;
+
+    if ($fdomain =~ /atom_char{3}/) {
+    $fdomain = pop @subdomains;
+    } elsif ($fdomain =~ /atom_char{2}/) {
+    $fdomain = pop @subdomains;
+    $fdomain = pop @subdomains if ($fdomain =~ /^atom_char{2}$/);
+    } 
+
+    my $username = $address-&gt;user;
+    my $fullname = $address-&gt;name;
+    my $lastname = my $firstname = '';
+
+    if ($fullname =~ /
+                       ^(atom_char+) [spacetab]
+                (atom_char+ [spacetab])* 
+            (atom_char+)$
+             /x) {
+    $firstname = $1;
+    $lastname = $3;
+    }
+
+    tr/A-Z/a-z/ for ($username, $fullname, $firstname, $lastname, $fdomain);
+
+    return {
+    username =&gt; $username,
+    domain =&gt; $fdomain,
+    fullname =&gt; $fullname,
+    firstname =&gt; $firstname,
+    lastname =&gt; $lastname,
+    };
+}
+
+sub _exception($) {
+    my $self = shift;
+    my $item = shift;
+
+    return unless ($item);
+
+    $item-&gt;accept($self-&gt;{junk});
+}
+
+
+sub _m_mkpath($$;$;) {
+    my $self = shift;
+    (my $paths, my $echo, my $mode) = @_;
+
+    mkpath($paths, $echo || 0, $mode || $self-&gt;{mode});
+}
+
+1;</pre>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

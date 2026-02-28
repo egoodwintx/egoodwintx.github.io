@@ -1,0 +1,369 @@
+<html>
+<head>
+<title>Kernel-Mode Databases</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> May 2008</p>
+
+<h1>Kernel-Mode Databases</h1>
+<h2>A DBMS technology for high-performance applications</h2>
+
+
+<h3>By Andrei Gorine and Alexander Krivolapo</h3>
+
+
+<I>Andrei is Chief Technology Officer and Alexander a software  engineer at McObject. They can be reached at <a href="mailto:gor@mcobject.com">gor@mcobject.com</a> and <a href="mailto:kid@mcobject.com">kid@mcobject.com</a>, respectively.</I>
+
+<hr>
+
+
+
+
+<p>The evolution of database management systems has been driven by the goal of eliminating latency and increasing the prioritization of data management tasks. New physical database structures&#151;ISAM, VSAM, clustered indexes, and column-based databases&#151;are responses to the need for faster data retrieval. Innovations in storage modality have also played a role: Caching was introduced as a means to keep selected data in memory for faster access, while in-memory database systems (IMDS) offered the ability to store entire databases in main memory, eliminating the overhead and unpredictability of disk I/O and caching logic.</p>
+
+<p>More than any other software component, operating system kernels embody the kind of high-priority, zero-latency responsiveness sought by database system developers. Typically viewed as the lowest-level software abstraction layer, the kernel is responsible for resource allocation, scheduling, low-level hardware interfaces, network, security, and other integral tasks. Security applications (access-control systems, firewalls, and the like) and operating-system monitors commonly place their functions in the operating-system kernel and have a need for local, high-performance data sorting, storage, and retrieval. In typical access-control application scenarios, for instance, the data structures and queries are inherently complex, yet the lookups and updates must be nearly instantaneous.</p>
+
+<p>However, the kernel has generally been off-limits for database management systems because DBMS overhead (file and disk I/O, locking, cache management, and related logic) could overwhelm kernel resources and disrupt OS-critical tasks. Kernel module developers have been left to either reinvent the wheel of fundamental database capabilities for use in the kernel (albeit in a limited, lightweight fashion), or deploy a complete DBMS in user-mode space and rely on expensive (in performance terms) context switches whenever kernel-mode processes require data lookup.</p>
+
+<p>The advent of ultra-small footprint and resource-conserving embedded in-memory databases presents an efficient alternative, making it possible to integrate database engines with the operating-system kernel. McObject (the company we work for) has developed the eXtremeDB Kernel Mode Edition that, to the best of our knowledge, is the first commercial off-the-shelf database-management system designed for such deployment. The tool consists of the standard eXtremeDB in-memory embedded database runtime adjusted for kernel usage. The adjustments are relatively minor: Database locking is implemented via kernel-mode spinlocks rather than through synchronization primitives available in the user space, such as semaphores and spinlocks, and the database runtime does not use the C runtime. To facilitate the implementation of user-mode applications accessing the kernel-mode database, eXtremeDB-KM provides a simple interface compiler utility that is conceptually similar to the well-known Remote Procedure Call Interface Definition Language compilers (RPC IDL).</p>
+
+<p>To illustrate its use, the eXtremeDB-KM distribution includes a sample application that creates a kernel-mode database to enforce access rules as part of an access-control system. The reference design includes another kernel module that intercepts filesystem calls and provides a file access authorization mechanism to the system. This "filter module" exports two types of interfaces: the "direct" API available to other kernel modules and drivers, and the "indirect" API that implements the <i>ioctl</i> interface to the database module. </p>
+
+
+
+
+
+
+
+
+
+<h3>The Challenge</h3>
+
+<p>Data-management code that operates inside the kernel faces considerable challenges, whether this module is custom-made or off-the-shelf. Kernel-mode drivers or application components have to be nonintrusive to the system. Therefore, the integrated data management cannot write data to a hard disk, even on systems where a large filesystem cache is present, because the transition commit on disk I/O would cause too much impact on the system. Data management can't monopolize or extensively use any of the system's resources, increase interrupt latencies, or noticeably affect overall system responsiveness to outside events. It has to provide simultaneous access to data for all parts of the system, including from multiple user-mode processes and kernel threads. Further, this data access must include both write/read access and be efficient enough to avoid stalling the kernel. </p>
+
+<p>The kernel-mode database is made available to user-mode applications through a set of public interfaces implemented via system calls; see Figure 1.</p>
+
+<div>
+    
+<!--  -->    
+<img class="illowide" src="080401ag01_f1.gif" style="width:273">
+
+<div class="caption" style="width:275">
+Figure 1: Public interfaces.
+</div>
+</div>
+
+<p>For the kernel-mode database integration in Figure 1 to work, the kernel-based database runtime must address many of the same challenges as kernel-based programs and embedded systems generally. The issues and solutions involved in deploying a database in kernel space are also highly applicable to device drivers, filesystems, and other kernel modules:</p>
+
+<ul>
+    <li>To provide multithreaded, simultaneous data access, the database runtime must use synchronization mechanisms. Nearly every driver requires synchronization mechanisms as well, because this function is needed for any shared data to be accessed by multiple threads, unless this access is read-only. Synchronization is also required when a set of operations must be performed atomically, inside a transaction. OS synchronization mechanisms can cause performance bottlenecks. To improve locking performance, the kernel-mode database uses locks based on the atomic exchange instructions provided by many CPU architectures. When the nature of the resource requires mutual exclusion between threads, the database runtime claims resources only for a short time. Thus the database locks use a low-overhead spinlock-based mechanism that protects the resource. </li>
+  <li>Efficient memory use is often a key to application performance, especially in the kernel where the nonpaged memory pool is limited and frequent paging could increase kernel latencies. To address this, in-memory databases often use a number of custom allocation algorithms to take advantage of problem-specific allocation patterns, such as infrastructure for the data layout, internal database runtime heap management, and so on.</li>
+  <li>The kernel-mode stack is a limited storage area that is often used for information that is passed between functions, as well as for local variable storage. Running out of stack space causes the OS to crash. Therefore, the database runtime integrated with the kernel module and other drivers must watch stack usage. It must never allocate large aggregate structures on the stack, and avoid deeply nested or recursive calls. If recursion must be used, the number of recursive calls must be strictly limited.</li>
+  <li>Not all of the standard libraries (C and especially C++) are present in kernel mode. Moreover, versions of standard libraries for use in kernel mode are not necessarily the same as those in user mode, as they are written to conform to kernel-mode requirements. Kernel-mode implementations of standard libraries usually have limited functionality and are constrained by other properties of kernel mode. (The eXtremeDB-KM database runtime does not use the C runtime. For instance, instead of relying on the C runtime for memory management, the database replaces those functions with custom allocators.) </li>
+  </ul>
+  
+  
+  
+  
+  
+  
+  
+  
+<h3>Sample Application</h3>
+
+<p>To illustrate, the sample application we present here implements a basic access-control system, using eXtremeDB-KM to create and maintain the access-control database in the kernel space. The database maintains file-access rules, and the runtime provides drivers and user-level applications with high-performance access to the storage. The example code uses UNIX-like notations. </p>
+
+<p>The application in Figure 2 contains three major components:</p>
+
+<ul>
+    <li>The database kernel module, responsible for storage, maintains database access logic.</li>
+  <li>A user-mode application that utilizes a user-mode database API.</li>
+  <li>The "filter" or kernel module that intercepts filesystem calls and provides a file access authorization mechanism to the system.</li>
+</ul>
+
+
+
+<p>The database kernel module implements kernel-mode data storage and provides the API to manipulate the data. The module is integrated with the eXtremeDB database runtime, which is responsible for providing "standard" database functionality such as transaction control, data access coordination and locking, lookup algorithms, and the like. Example 1 presents the data layout using eXtremeDB Data Definition Language syntax.</p>
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080401ag01_f2.gif" style="width:435">
+
+<div class="caption" style="width:437">
+Figure 2: Sample app components.
+</div>
+</div>
+
+
+
+<p>The class <i>File</i> describes a file object that is identified by the file's name, and the inode and device on which it is located. The rest of the fields (<i>owner</i>, <i>defaccess</i>, and <i>acl</i> <i>vector</i>) define file-access rules. The database maintains two hash-based indices that facilitate fast data access.</p>
+
+
+<div>
+
+<pre class="code">
+struct ACL
+{
+  uint4   uid;       // user id
+  uint4   access;    // access allowed for some user id
+};
+class File
+{
+  char&lt;100&gt; name;   // file name
+  uint4  inode;     // file inode
+  uint4  device;    // device    
+  uint4  owner;     // owner of the File
+  uint4  defaccess;  
+  vector&lt; ACL &gt; acls; // access control lists
+
+  hash &lt; name &gt;          hname[4096];
+  hash &lt; inode ,device &gt; hfile[4096];
+};
+</pre>
+
+<div class="caption">
+Example 1: Database schema.
+</div>
+</div>
+
+
+<p>Because the database could grow large, the database pool is allocated in virtual memory. To use the allocated memory pool, it is mapped to the physical page (Examples 2 and 3). Once memory is allocated, the in-memory database is created and supports connections using standard database runtime functions.</p>
+
+
+<div>
+
+<pre class="code">
+/* allocate the database memory pool */
+mem_ua_ptr = (char*)vmalloc( arg+PAGE_SIZE*2 );
+if ( mem_ua_ptr == 0 ) {
+     return -ENOMEM; /* error allocating memory */
+}
+</pre>
+
+<div class="caption">
+Example 2: Allocating virtual memory for the database pool.
+</div>
+</div>
+
+
+<div>
+
+<pre class="code">
+/* calculate page aligned address */
+mem_ptr = (char*) ( ((unsigned long)mem_ua_ptr+PAGE_SIZE-1) &amp; PAGE_MASK );
+    /* lock pages */
+    for ( va=(unsigned long)mem_ptr;
+           va&lt;(unsigned long)(&amp;(mem_ptr[mem_size/sizeof(int)]));
+           va+=PAGE_SIZE) {
+     SetPageReserved(vmalloc_to_page((void *)(((unsigned long)va))));
+    }
+</pre>
+
+<div class="caption">
+Example 3: Locking virtual memory pages.
+</div>
+</div>
+
+
+<p>The module exports two types of interface: the "direct" API available to other kernel modules and drivers, and the "indirect" API that implements eXtremeDB-KM's <i>ioctl</i> interface to the database module. The direct API is not available for user-mode processes, but is efficient because it maintains only kernel-space references and eliminates expensive (in performance terms) translations from kernel-address space to user-address space. The <i>ioctl</i> interface provides user-mode applications with access to the kernel-mode database.</p>
+
+<p>The user-level application creates a user-level database access API exposed by the database module via the <i>ioctl</i> interface. This API lets user-mode processes (such as administrative applications) interact with eXtremeDB-KM. </p>
+
+<p>To facilitate the implementation of the "indirect" system call API, eXtremeDB-KM provides a simple "interface compiler" utility. This utility is similar to that of a standard remote procedure call compiler, except it generates the user/kernel mode interface files instead of remote access stubs. Developers define the API for C functions that the user-mode applications use to access the kernel-mode database. The eXtremeDB-KM interface compiler generates interface files that implement the user-to-kernel-mode interface through the generic <i>ioctl</i> function. In particular, the interface compiler generates stub files that should be linked with the user-mode applications and the kernel-mode stubs that are included into the kernel module (Figure 3). The generated files encapsulate the user-to-kernel-mode transition and hide <i>ioctl</i>-based implementation details from kernel modules and user-mode applications.</p>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2008/08/ -->    
+<img class="illowide" src="080401ag01_f3.gif" style="width:350">
+
+<div class="caption" style="width:352">
+Figure 3: eXtremeDB-KM interface compiler.
+</div>
+</div>
+
+
+<p>In contrast to other IDL implementations, the eXtremeDB-KM interface compiler accepts standard C header files to declare user-mode database access interfaces. The compiler recognizes a number of keywords in the form of comments to declare <i>string</i>, <i>union</i>, and <i>array</i> data types used as a part of the interface declaration. The IDL in Example 4 illustrates the concept.</p>
+
+
+<div>
+
+<pre class="code">
+#ifndef __EX_DB_API_H
+#define __EX_DB_API_H
+
+typedef struct tagFile {
+        unsigned char result;
+        char     name[100];
+        unsigned int  inode;
+        unsigned int  device;
+        unsigned int  owner;
+        unsigned int  defaccess;
+}File_t, *File_h;
+
+typedef char* zstring    /*sero-terminated string*/;
+typedef unsigned int* pint;
+int exdb_init_database ( unsigned long mem_size );
+int exdb_shutdown_database( );
+int exdb_add_file
+        (zstring file_name, unsigned int inode,
+         unsigned int device, unsigned int owner,
+         unsigned int defaccess );
+
+int exdb_remove_file( zstring file_name );
+int exdb_find_file( zstring file_name,
+                   /*out*/ pint pinode,
+                   /*out*/ pint pdevice,
+                   /*out*/ pint powner,
+                   /*out*/ pint pdefaccess );
+int exdb_authorize_file( zstring file_name, unsigned int uid, unsigned int access );
+#endif /* __EX_DB_API_H */
+</pre>
+
+<div class="caption">
+Example 4: Interface definition header file.
+</div>
+</div>
+
+
+<p>The interface compiler approach simplifies access to databases created in the context of a kernel module. The user-mode application code that implements database access is almost undistinguishable from that used by the kernel-mode application, with the exception of a simple initialization step (Example 5). There is no need for the user-mode application to serialize/deserialize function parameters, and similar technicalities. The application only needs to define and implement its database access interface, regardless of whether the interface is used inside or outside the kernel.</p>
+
+
+<div>
+
+<pre class="code">
+(a)
+if ( 0 != (i = exdb_find_file( name, &amp;inode, &amp;device, &amp;owner, &amp;access ))) {
+         printf("exdb_find_file(\"%s\")==%d\n", name, i );
+         return (0);
+ };
+
+(b)
+if ( 0 != (i = exdb_find_file( name,&amp;inode,&amp;device,&amp;owner,&amp;access ))) {
+         pr_info(DEV_NAME" exdb_find_file(\"%s\")==%d\n", name, i );
+         return (0);
+ };
+</pre>
+
+<div class="caption">
+Example 5: Initialization. (a) User mode; (b) Kernel mode.
+</div>
+</div>
+
+
+<p>The third component of our sample application&#151;the filter module&#151;intercepts calls to the filesystem and replaces standard file-access functions with its own, providing the user application with authorization to obtain the sought-after system resource. The implementation involves registering the custom module's file-access functions upon module initialization (Examples 6 and 7). In turn, these custom functions provide authentication. This is a standard technique used in numerous applications. However, the filter we present here benefits from using the database access API exposed by the eXtremeDB-KM-based database module to authenticate file access; see Example 8.</p>
+
+
+<div>
+
+<pre class="code">
+static int __init eACmod_init( void )
+{
+  if (!sys_call_table)
+  {
+    return -1;
+  }
+  if ( (major = register_chrdev( 0, DEV_NAME, &amp;eACmod_fops )) &lt; 0 )
+  {
+    return -EIO;
+  };
+  eACm_api_Init();
+  intercept_syscalls();
+  return 0;
+};
+</pre>
+
+<div class="caption">
+Example 6: Registering file access. 
+</div>
+</div>
+
+
+<div>
+
+<pre class="code">
+extern void *sys_call_table[];
+typedef int (*syscall_t)();
+
+extern int my_open();
+extern int my_creat();
+extern int my_chmod();
+extern int my_chown();
+extern int my_unlink();
+extern int my_execve();
+
+struct replace_syscall replace_syscall[]={
+     {INDEX_NR_open,     __NR_open,     (int(*)())0,   my_open},
+     {INDEX_NR_creat,    __NR_creat,    (int(*)())0,   my_creat},
+     {INDEX_NR_chmod,    __NR_chmod,    (int(*)())0,   my_chmod},
+     {INDEX_NR_chown,    __NR_chown,    (int(*)())0,   my_chown},
+     {INDEX_NR_unlink,   __NR_unlink,   (int(*)())0,   my_unlink},
+     {INDEX_NR_execve,   __NR_execve,   (int(*)())0,   my_execve},
+     {-1,           -1,       (int(*)())0,   (int(*)())0}
+};
+int nreplace_syscall = sizeof(replace_syscall)/sizeof(*replace_syscall)-1; 
+void intercept_syscalls()
+{
+  int i, f;
+  for(i = 0; i &lt; nreplace_syscall; i++)
+  {
+    f = replace_syscall[i].index;
+    replace_syscall[i].original = sys_call_table[f];
+    sys_call_table[f] = replace_syscall[i].seos_syscall;
+  }
+}
+</pre>
+
+<div class="caption">
+Example 7: intercept_syscalls.
+</div>
+</div>
+
+
+<div>
+
+<pre class="code">
+asmlinkage int my_open(const char* fname, int fmode, int mode)
+{
+  int access, rv;
+  /* some processing */
+  rv = replace_syscall[INDEX_NR_open].original(fname, fmode, mode);
+  return rv;
+}
+</pre>
+
+<div class="caption">
+Example 8: my_open() example.
+</div>
+</div>
+
+
+
+
+
+
+
+
+
+
+
+<h3>Considerations</h3>
+
+<p>Of course, not every application requiring high performance needs a kernel-mode database. There are potential drawbacks to the concept that should be balanced against the advantages of performance and predictability. One is portability. Although the bulk of eXtremeDB-KM's code remains portable across platforms, it is less portable than the standard eXtremeDB. The particulars of kernel implementation differ from one UNIX platform to another, between Windows and Linux, and even from one OS kernel version to another, requiring different versions of the DBMS. </p>
+
+<p>Another concern is fault protection. There is less room for error in the OS kernel, compared to the user-mode environment, and database systems are complex. Most kernel applications, with the possible exception of filesystems, are simpler and less error-prone. Faults caused by improper use of the database engine could render the kernel unusable and lead to system crashes. This should be weighed when considering kernel-mode databases. However, in our experience, applications like the access-control system we present here do implement data management logic in the OS kernel, and it seems advantageous to rely on a proven off-the-shelf kernel-mode database, rather than writing code from scratch.</p>
+
+
+<h3>Conclusion</h3>
+
+<p>Kernel-mode database systems meet the data management needs of applications that must run at least partially in the OS kernel to accelerate overall system performance, yet need sophisticated data management functions. With the approach we've presented here, applications can take advantage of a full set of database features&#151;including transaction processing, multithreaded data access, complicated querying using built-in indexing, data access API, and a high-level data definition language&#151;while still providing the near-zero latency of a kernel-based software component.</p>
+
+
+</body>
+</html>

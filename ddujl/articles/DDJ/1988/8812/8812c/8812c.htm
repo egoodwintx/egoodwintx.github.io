@@ -1,0 +1,248 @@
+<HTML>
+<META NAME="year" CONTENT="1988">
+<HEAD>
+
+<TITLE>DEC88: WRITING OS/2 APPLICATIONS WITH I/O PRIVILEGES</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>WRITING OS/2 APPLICATIONS WITH I/O PRIVILEGES<a name="0222_0003"><a name="0222_0003"></h1><P>
+<h2><a name="0222_0001"><a name="0222_0000">Segregating hardware-dependent code into IOPL modules lets you bypass OS/2 to take control of peripheral devices</h2><P>
+<h3>Ray Duncan</h3><P>
+<p><i><a name="0222_0002"><a name="0222_0000">Ray Duncan is a software developer in Los Angeles, Calif. You can reach him at P.O. Box 10420, Marina Del Rey, CA 90295.</i></p><hr><P>
+The advent of OS/2, Microsoft's new protected-mode, multitasking, virtual-memory operating system for 80286 based microcomputers, has been accompanied by epic amounts of confusion, misinformation, and disinformation among programmers and computer journalists. A particularly popular misconception is that the existence of the Unix system makes OS/2 unnecessary, a notion that is vigorously promoted by the Unix partisans who sense that yet another opportunity to conquer the desktop is slipping from their grasp. In reality, Unix and OS/2 should not be viewed as competitors at all: They are systems with completely different goals, characteristics, and market niches.<P>
+The Unix system was designed to support multiuser applications, and its enforcement of interprocess and interuser protection is strict. Users' access to files, directories, and programs is restricted with an elaborate set of passwords, permissions, and administrative controls --all of which have a sizable memory and disk overhead. Direct manipulation of the hardware by application programs is strictly forbidden because this would wreak havoc in a multiuser environment; only device drivers may access peripheral devices, and a new device driver cannot be installed without relinking the operating system kernel. Even the programming environment is remarkably inflexible: writing Unix applications in anything but C or a language that was in turn written in C is nearly impossible because the C run-time library is inextricably interwoven with Unix kernel services. In most Unix systems, the actual interface to the kernel is usually documented only sketchily or not at all.<P>
+OS/2, on the other hand, was designed as a single-user operating system, so its philosophy of protection is vastly different. OS/2 is a completely &quot;open&quot; system; there are no passwords and permission schemes, the interface to the kernel services is clean and well documented, and custom device drivers are easily installed by copying them to the boot disk and adding a line to the system configuration file. Because users are expected to be responsible for both the programs they install into their system and (if necessary) for securing physical access to the system, OS/2 allows applications a degree of freedom that would be unthinkable in a multiuser system such as Unix. Programs can, for example, generate machine code dynamically in a data segment and then execute it, manipulate device adapters directly without resorting to a device driver, and filter the raw data stream of the keyboard, mouse, and printer drivers.<P>
+The ability to bypass OS/2 and take control of a peripheral device is particularly important for graphics applications that are not written to run in a Presentation Manager window or that rely on video display modes or capabilities that are not supported by OS/ 2's built-in video drivers. OS/2 places only three constraints on such programs: They may not service interrupts (control of the interrupt system is reserved to the kernel and true device drivers), they must cooperate with OS/2 to save and restore the screen and adapter state across session switches, and the hardware dependent code must be segregated into special modules called I/O privilege level (IOPL) segments --which I will explain in this article.<P>
+<h3><a name="0222_0004">80286 Protection Mechanisms<a name="0222_0004"></h3><P>
+In order to understand IOPL segments, we first need to make a small digression into the architecture of the Intel 8Ox86 family of processors. The 80286's protection facilities are based on two key concepts: segment selectors and privilege levels.<P>
+All the CPUs in the Intel 80x86 family generate memory addresses by combining the contents of segment registers ( which may be thought of as base pointers) with an offset or displacement from the machine instruction and/or one or more index registers. In the case of the 80286, the hardware's interpretation of a value in a segment register depends on whether the processor is running in real mode or protected mode.&lt;fn1&gt;<P>
+In real mode, which is essentially an 8086/88 emulation mode, the hardware provides no protection mechanisms; any program can read or write any memory address or access any I/O port. The values in segment registers are paragraph addresses (20-bit physical addresses divided by 16); to form a complete memory address, the CPU shifts the contents of a segment register left 4 bits and adds it to a 16-bit offset (see <a href="19880224.htm">Figure 1</A>, page 37). MS-DOS and its applications execute in real mode, regardless of the type of processor.<P>
+In protected mode, a level of addressing indirection is added. Segment registers do not point directly to the base of an area of memory; instead, they contain values called selectors. A selector is an index to an entry in a descriptor table; the entry contains a memory segment's base address, length, and other characteristics. Each time a program references memory, the hardware uses information from the descriptor table to generate the physical address and simultaneously validates the memory access (see <a href="19880225.htm">Figure 2</A>, this page).<P>
+Because only the operating system can manipulate descriptor tables, and these tables govern the addressable memory space of all programs, a protected-mode operating system can completely isolate programs from one another. If a program attempts to read or write memory that does not belong to it, or call a routine to which it has not been given access, a CPU fault (similar to a hardware interrupt) occurs and the operating system regains control --this is the meaning of the term memory protection.<P>
+The behavior of programs in protected mode is also constrained by the 80286's support for four privilege levels, called ring 0, ring 1, ring 2, and ring 3. Programs running at ring 0 have unrestricted access to the hardware, including the ability to execute any instruction, read or write any I/O port, and manipulate the special registers and tables that control memory protection and virtual memory.<P>
+Rings 1 to 3 are intended for the execution of progressively &quot;less trusted&quot; programs. Transitions from one ring to another are strictly controlled by means of &quot;call gates,&quot; which can only be set up by a program running at ring 0. Programs in rings 1 and above cannot execute certain instructions that would compromise memory protection or touch memory segments for which they are not qualified (one of the characteristics in a memory segment's descriptor is the privilege level required for access to the segment).<P>
+Programs in rings 1, 2, or 3, however, may gain restricted access to the hardware depending on the value of the IOPL field in the CPU flags register. Whenever a program is running in a ring whose number is less than or equal to the contents of the IOPL field, it can use the six instructions IN, OUT, INS, OUTS, STI, and CLI without causing a protection fault. Needless to say, the IOPL field itself can only be modified by a program running at ring 0.<P>
+Under OS/2, ring 0 is reserved for the operating system kernel and its device drivers. Ring 1 is not used at all, and normal application code runs at ring 3. The operating system sets the IOPL level to 2 and uses ring 2 only for the execution of code within application IOPL segments (see <a href="19880226.htm">Figure 3</A>, this page). The names of the IOPL segments, along with the names of the routines within them that will be accessible to the rest of the application, must be declared at link time.<P>
+When an application containing an IOPL segment is loaded, OS/2 sets up call gates for each &quot;exported&quot; routine in that segment and resolves the references to those routines throughout the program to point to the call gate. When the program's mainline code, which is running at ring 3, calls a routine in an IOPL segment, the hardware traps the reference to the call gate. The CPU then changes the privilege level to ring 2, switches to a new stack, copies parameters from the old stack to the new one, and enters the IOPL routine. When the IOPL routine exits with a far return, the original privilege level and stack are restored, the parameters are cleared from the caller's stack, and execution continues at ring 3.<P>
+Application programs with IOPL, like real-mode MS-DOS programs running in OS/2's DOS compatibility environment, are a weak point in system security. It is easy to imagine, for example, an OS/2 protected-mode &quot;virus&quot; program that would masquerade as a public-domain utility but would use an IOPL segment to take over the disk controller and scribble all over the disk directories and file allocation table. To prevent such disasters, OS/2 can be configured so that it will not allow execution of MS-DOS programs and/or protected-mode programs requiring IOPL. If the CONFIG.SYS file contains the directive PROTECTONLY=YES, MS-DOS applications are not supported; if the directive IOPL=NO is present, applications with IOPL segments will not be loaded.<P>
+<h3><a name="0222_0005">Using IOPL in OS/2 Applications<a name="0222_0005"></h3><P>
+Designing and coding an OS/2 application that uses IOPL segments is straightforward, if you follow just a few simple rules.<P>
+All code that needs to enable or disable interrupts or access I/O ports must be segregated from the rest of the application code into a distinct segment that will become the IOPL segment. Calls to OS/2 application program interface (API) functions from within the IOPL segment should be avoided. For compatibility with Microsoft C, the segment should have the WORD and PUBLIC attributes and be assigned to class code. Be sure to pick a segment name that won't conflict with the standard Microsoft segment and group names (_TEXT, _DATA, DGROUP, and so forth).<P>
+To make the procedures in the IOPL segment usable from a high-level language, they should follow the OS/2 API conventions of accepting their parameters on the stack and return their results in register ax or in variables whose addresses were passed in the original call. The procedures that contain the hardware dependent code must be declared PUBLIC and given the far attribute because they will be entered through a call gate and must exit with a far return. The parameter to the RET instruction must be the number of bytes (not words) to be cleared from the caller's stack.<P>
+If you are writing the body of your application in C, you should supply extern far pascal prototypes for the external IOPL routines. This tells the C compiler that parameters are pushed left to right, the called routine clears the stack, a leading underscore should not be added to the external name, and case in the external name can be ignored. If you are writing the application with MASM, you simply declare the IOPL routines as extrn far in the normal manner.<P>
+Second, the initialization portion of your application should include a call to one of the kernel API functions DosPortAccess or DosCLIAccess. DosCLIAccess informs the operating system that the application will be using the CLI and STI instructions to disable and enable interrupts. DosPortAccess notifies the operating system of a range of I/O ports to be used by the application; DosPortAccess also implicitly grants CLI and STI access, and an additional call to DosCLIAccess is not required.<P>
+In the current versions of OS/2, DosPortAccess and DosCLIAccess do nothing; an application with IOPL can read or write I/O ports and execute CLI or STI whether it calls these functions or not. DosPortAccess and DosCLIAccess are present for upward compatibility with future, 80386-specific versions of the operating system. The 80386 allows access to individual I/O ports to be controlled on a per-process basis with an I/O permissions bitmap associated with each task state segment (TSS).<P>
+Third, when you build the executable application, you must provide the linker with a module definition (.DEF) file. Module definition files describe application type, segment behavior, and imported or exported routines, among other things. If you are writing your program in C, you will need to compile and link as separate operations because the C compiler does not know how to pass the name of a module definition file through to the linker.<P>
+In the case of an IOPL application, the .DEF file must contain a SEGMENTS directive that applies the IOPL attribute to the appropriate segment name. It must also contain an EXPORTS statement that declares the name and number of stack parameters for each routine in the IOPL segment that will be called from outside the segment. This information is built into the .EXE file and is later used by the OS/2 loader to set up the necessary call gates.<P>
+If you fall to provide the EXPORTS declaration, the IOPL routines are entered directly instead of through a call gate that changes the privilege level, and the program is terminated with a protection fault when it first executes an IN, INS, OUT; OUTS, CLI or STI instruction. If the EXPORTS statement is present but too few parameters are specified for an IOPL routine, the program will likely run into a protect fault when it tries to access a stack parameter that isn't there. If too many parameters are specified, no harm is done unless the parameter to the RET instruction in the IOPL routine is also wrong; in that case, too many words will be cleared from the caller's stack when the IOPL routine exits, usually resulting in a protection fault at some later point in the program's execution.<P>
+<h3><a name="0222_0006">An Example IOPL Application<a name="0222_0006"></h3><P>
+To provide a practical demonstration of an OS/2 application that uses direct hardware access, I have written a simple program called PORTS.EXE that reads and displays the first 256 I/O ports.  PORTS.EXE is built from three modules: PORTIO.ASM, PORTS.C, and PORTS.DEF.<P>
+PORTIO.ASM (<a href="8812c.htm#0222_0007">Example 1</A>, page 42) is the program's IOPL segment. It contains only two routines: rport and wport. rport accepts a port address, reads the port, and returns the port data register ax with the upper 8 bits zeroed. wport accepts a port address and a word of data, writes the low 8 bits of the data to the port, and returns nothing. These routines both use the OS/2 API conventions and can be called from either MASM or C. Notice that the code segment in this file is called IO_TEXT to differentiate it from the code segment produced by the C compiler (which has the default name _TEXT).<P>
+<h4><a name="0222_0007"><a name="0222_0007"><B>Example 1:</B> PORTIO.ASM, the source code for the IOPL segment that contains the routines to read and write I/O ports</h4><P>
+<pre>
+       title PORTIO.ASM read/write I/O ports
+       page 55,132
+       .286
+  ; PORTIO.ASM -- general purpose port read/write
+  ;              routines for C or MASM programs
+  ; Copyright (C) 1988 Ray Duncan
+  ;
+  ; When this module is linked into a program, the
+  ; following lines must be present in the program's
+  ; module definition (.DEF) file:
+  ;
+  ; SEGMENTS
+  ;          IO_TEXT IOPL
+  ;
+  ; EXPORTS
+  ;          rport 1
+  ;          wport 2
+  ;
+  ; The SEGMENT and EXPORT directives are recognized by
+  ; the Linker and cause information to be built into
+  ; the .EXE file header for the OS/2 program loader.
+  ; The loader is signalled to give I/O privilege to
+  ; code executing in the segment IO_TEXT, and to build
+  ; Call gates for the routines 'rport' and 'wport'.
+
+  IO_TEXT segment word public 'CODE'
+
+                  assume cs:IO_TEXT
+
+  ; RPORT: read t-bit data from I/O port.        Port address
+  ; is passed on staCk, data is returned in register AX
+  ; with AN zeroed. Other registers are unchanged.
+  ;
+  ; C syntax:     unsigned port, data;
+                  data = rport(port);
+
+          public  rport
+  rport   proc    far
+
+          push    bp              ; save registers and
+          mov     bp,sp           ; set up stack frame
+          push    dx
+
+          mov     dx, [bp+6]      ; get port number
+          in      al,dx           ; read the port
+          xor     ah,ah           ; clear upper 8 bits
+
+          pop     dx              ; restore registers
+          pop     bp
+
+          ret     2               ; discard parameters,
+                                  ; return port data in AX
+
+  rport     endp
+
+  ; NPORT:  write 8-bit data to I/O port. Port address and
+  ; data are passed on stack. All registers are unchanged.
+  ;
+  ; C syntax:unsigned port, data;
+  ;      wport(port, data);
+
+          public  wport
+  wport   proc    far
+
+          push    bp              ; save registers and
+          mov     bp,sp           ; set up stack frame
+          push    ax
+          push    dx
+
+          mov     ax, [bp+6]      ; get data to write
+          mov     dx, [bp+8]      ; get port number
+          out     dx,al           ; write the port
+
+          pop     dx              ; restore registers
+          pop     ax
+          pop     bp
+
+          ret     4               ; discard parameters,
+                                  ; return nothing
+
+  wport   endp
+
+  IO_TEXT ends
+          end
+</pre><P>
+<P>
+PORTS.C (<a href="8812c.htm#0222_0008">Example 2</A>, page 43) is the body of the application. It invokes DosPortAccess to request access to a range of I/O ports and then calls rport to read each port, formatting the data for display with printf. Before terminating, the program again calls DosPortAccess to release the I/O ports requested earlier.<P>
+<h4><a name="0222_0008"><a name="0222_0008"><B>Example 2:</B> PORTS.C, the source code for the body of the PORTS.EXE example program</h4><P>
+<pre>
+ /*
+
+     PORTS.C:  Demonstration program with IOPL.
+               Reads and displays the first 256 I/O ports.
+               Requires separate module PORTIO.ASM.
+
+     (C)1988 Ray Duncan
+
+     To build: MASM /Mx PORTIO;
+               CL /c PORTS.C
+               LINK PORTS+PORTIO,PORTS,,,PORTS.DEF
+
+     Usage:    PORTS
+ */
+
+ #include &lt;stdio.h&gt;
+
+ #define API extern far pascal
+
+ unsigned  API rport(unsigned);               /* function prototypes */
+ void      API wport(unsigned, unsigned);
+ void      API DosSleep(unsigned long);
+ unsigned  API DosPortAccess (unsigned, unsigned, unsigned, unsigned);
+
+                                   /* parameters for DosPortAccess */
+     #define REQUEST 0                  /* request port */
+     #define RELEASE 1                  /* release port */
+     #define BPORT   0                  /* beginning port */
+     #define EPORT   255                /* ending port */
+
+     main(int argc, char *argv[])
+     {
+          int i;                   /* scratch variable */
+
+                                   /* request port access */
+          if (DosPortAccess (O, REQUEST, BPORT, EPORT))
+          {
+                    printf(&quot;\nDosPortAccess failed.\n&quot;);
+                    exit(1);
+          }
+
+          printf(&quot;\n      &quot;);                 /* print title line */
+          for(i=0; i&lt;16; i++) printf(&quot; %2x&quot;, i);
+
+          for(i=BPORT; i&lt;=EPORT; i++)     /* loop through all ports */
+          {
+               if((i &amp; 0x0f)==0)
+               {
+                    printf(&quot;\n%04x &quot;, i);    /* new line needed */
+               }
+
+               printf(&quot; %02x&quot;, rport(i));    /* read &amp; display port */
+     }
+                                        /* release port access */
+     DosPortAccess(0, RELEASE, BPORT, EPORT);
+  }
+</pre><P>
+<P>
+PORTS.DEF (<a href="8812c.htm#0222_0009">Example 3</A>, page 43) is the module definition file. The NAME statement causes the linker to build an executable program rather than an OS/2 dynamic link library or device driver and also states (with the WINDOWCOMPAT option) that the program can run in a Presentation Manager window. The SEGMENTS directive marks IO_TXT as an IOPL segment. The EXPORTS directive defines the number of stack parameters for RPORT and wPORT and that they are callable from outside the IOPL segment.<P>
+<h4><a name="0222_0009"><a name="0222_0009"><B>Example 3:</B> PORTS.DEF, the module definition file for the PORTS.EXE demonstration program.</h4><P>
+<pre>
+        NAME PORTS WINDOWCOMPAT
+
+        PROTMODE
+
+        SEGMENTS
+          IO_TEXT IOPL
+        EXPORTS
+          rport 1
+          wport 2
+</pre><P>
+<P>
+To build the executable program PORTS.EXE from the source files PORTS.C, PORTIO.ASM, and PORTS.DEF, enter the following sequence of commands:<P>
+<pre>[C:\] CL /c PORTS.C [C:\] MASM /Mx PORTIO; [C:\] LINK PORTS+PORTIO,
+PORTS,,,PORTS.DEF;</pre><P>
+You need not specify any libraries in the LINK command because they are taken care of by &quot;default library&quot; records embedded in the PORTS.OBJ file, but make sure that the reference library OS2.LIB is available in one of the directories specified in the environment HB= string. You can also automate the construction of PORTS.EXE with the MAKE utility; the MAKE file is shown in <a href="8812c.htm#0222_000a">Example 4</A>, page 43.<P>
+<h4><a name="0222_000a"><a name="0222_000a"><B>Example 4:</B> The MAKE file for PORTS.EXE</h4><P>
+<pre>
+        ports.obj : ports.c
+          cl /c ports.c
+
+        portio.obj : portio.asm
+          masm /Mx portio;
+
+        ports.exe : ports.obj portio.obj ports.def
+          link ports+portio,ports,,,ports.def
+</pre><P>
+<P>
+When you run PORTS.EXE, you should see output in the form shown in <a href="8812c.htm#0222_000b"> Example 5</A>, this page. If you get the error message &quot;OS/2 is not configured to run this application,&quot; add the statement IOPL=YES to your CONFIG.SYS file and reboot the system.<P>
+<h4><a name="0222_000b"><a name="0222_000b"><B>Example 5:</B> Example of the output of PORTS.EXE</h4><P>
+<pre>
+     [C:] PORTS &lt;Enter&gt;
+
+          0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F
+
+     0000 00 00 00 00 AC FF 00 00 00 FF FF FF FF 00 FF FF
+     0010 00 00 00 00 AC FF 00 00 00 FF FF FF FF 00 FF FF
+     0020 00 AS 00 A9 00 A9 00 A9 00 A9 00 A9 00 A9 00 A9
+     0030 00 A9 00 A9 00 A9 00 A9 00 A9 00 A9 00 A9 00 A9
+     0040 50 06 7C FF 96 07 00 FF 06 FF RA FF 21 FF 76 FF
+     0050 C0 0C 7C FF 41 0C 00 FF 98 FF C4 FF 9B FF 6D FF
+     0060 9C 20 SC 30 1C 20 1C 30 FF FF FF FF FF FF FF FF
+     0070 FF 00 FF 00 FF 00 FF 00 FF FF FF FF FF FF FF FF
+     0090 00 13 0F 0F BC 00 62 0F FF 0F 0F 0F 00 FF 00 00
+     0090 00 13 0F 0F SC 00 62 0F FF 0F 0F 0F 00 FF 00 00
+     00A0 00 DC 00 DC 00 DC 00 DC 00 DC 00 DC 00 DC 00 DC
+     00B0 00 DC 00 DC 00 DC 00 DC 00 DC 00 DC 00 DC 00 DC
+     00C0 1C CB E4 34 00 00 00 00 00 00 00 00 00 00 00 00
+     00D0 00 00 FF FF FF FF FF FF FF FF 00 00 FF FF FF FF
+     00E0 FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+     00F0 FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF FF
+</pre><P>
+<P>
+<h3><a name="0222_000c">Note<a name="0222_000c"></h3><P>
+<ol>1.     The 80386 has three different protected modes, but the current versions of OS/2 run on the 80386 as though it were a 80286.</ol><P>
+
+<a name="0222_000d"><a name="0222_000d">
+</BODY></HTML>

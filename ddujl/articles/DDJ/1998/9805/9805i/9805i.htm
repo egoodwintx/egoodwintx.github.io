@@ -1,0 +1,218 @@
+<html>
+<META NAME="year" CONTENT="1998">
+<head>
+<title>Fast Memory Allocation</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Fast Memory Allocation</h1>
+
+<p><i>Dr. Dobb's Journal</i> May 1998
+</p>
+<h2>Power-of-two for the PowerPC 403 </h2>
+
+<h3>By H. Thomas Richter</h3>
+
+<I>Thomas, an engineer for IBM Entwicklung GmbH, can be contacted at richter@ vnet.ibm.com.</I>
+
+<hr>
+
+<p>Power-of-two memory allocators waste a substantial amount of memory -- up to 50 percent in the worst case. In embedded-controller projects with execution-time constraints, however, it's okay to sacrifice memory for speed. The power-of-two Fast Memory Allocator (FMA) I present here is used in just such a project.</p>
+
+<p>I developed the FMA as part of a hardware/software project that controlled digital and analog I/O lines between an IBM PowerPC 403-based coprocessor card and machines. (The PowerPC 403 is a family of 32-bit general-purpose embedded processors with data and instruction cache, MMU, DMA, fast interrupt latency, and low-power consumption; for details, see http://www.chips.ibm.com/products/embedded/.) We used the COP403 coprocessor card to run OS Open, an IBM internal POSIX-compliant real-time operating system. (Object code for OS Open is freely available at http://www.chips.ibm.com/products/ppc/documents/.) Attached to the coprocessor card was an InterBus<sub></sub>S field bus to read and write digital and analog I/O lines. The coprocessor card communicates via TCP/IP over an ISA bus with the Windows-NT host. Machine control programs were developed on Windows NT (using tools from a third party, which ported its tools to the coprocessor card and OS Open) and downloaded to the coprocessor card for execution. We were able to run complete machines, such as the FESTO MPS, with this card and software. (The FESTO MPS, manufactured by FESTO Inc., is a machine that uses analog and digital I/O for manufacturing metal parts.)</p>
+
+<p>The applications that we developed needed:</p>
+
+<ul>
+  <li>A fast, dynamic memory-allocation scheme to cope with burst requests and releases of equal-sized memory blocks. 
+  <li>Many processes to share C++ objects with virtual functions. (Classes containing virtual functions maintain a virtual function table that had to reside on the same address location for all processes.) 
+</ul>
+
+<p>To meet with these requirements, I tweaked the McKusic-Karels algorithm (also known as the "BSD 4.4 allocator") to optimize memory management for blocks fitting on a single page. (Requests spawning multiple pages are rounded up to the next page boundary. I don't currently support them, but support can easily be added using bitmaps.) Every memory request lower than or equal to the underlying operating system's page size is rounded up to the next integer <i>y</i> with <i>y</i>=2<sup><i>x</sup>,<sup> </sup>x</i>&gt;=4, <i>y</i>&lt;=<i>page size of OS</i>. This policy is used, for example, in the buddy-storage allocator (described by Donald Knuth in<b> </b><i>The Art of Computer Programming, Volume 1)</i>, UNIX BSD 4.4 kernel heap system, and AIX operating system.</p>
+
+<p>The disadvantage of the BSD and AIX implementations, however, is that the buddy-storage allocator is time intensive,  making it less suitable for real-time applications. Also, the UNIX BSD 4.4 memory allocator does not unite returned memory blocks, which leads to fragmentation.</p>
+
+<p>The FMA algorithm presented here overcomes these disadvantages. Unused and returned memory chunks are united when possible, thus avoiding fragmentation. This is accomplished with very little overhead, so it is suitable for real-time applications. The complete source code for the FMA (for AIX) is available electronically; see "Resource Center," page 3.</p>
+
+<h3>The Algorithm</h3>
+
+<p>The FMA and McKusic-Karel algorithms use several structures:</p>
+
+<ul>
+  <li>A continuous region of memory. The region is divided into pages and starts on a page boundary, which is four KB. Memory requests from applications, which must fit on a single page for the FMA to be handled, are rounded up to the lowest power-of-two number (16 bytes minimum). Thus, a four-KB page can be divided into chunks of 16, 32, 64, 128, 256, 512, 1024, or 2048 bytes without waste. Full pages are also possible.
+  <li>A page table. It has as many entries as there are pages in the memory region.
+  <li>The freelist. For each allocatable size possible, there is an entry in the freelist. It chains together blocks of the same size. The freelist is an array of eight elements.
+  <li>Pointers and counters for internal housekeeping. Last-used pointers indicate the last-used page in the region; anchor pointers indicate a released page in the region. And semaphores are employed to synchronize shared-access and maintain shared-memory descriptors.
+</ul>
+
+<p>When an application starts, it creates a memory region via a call. The application specifies the size of the region (if it has to be created) and whether it is sharable or private. </p>
+
+<p>Memory is requested and released with subroutine calls identical to the <i>malloc</i> and <i>free</i> interface. The size of memory needed is specified in requests, and a pointer to a block of at least that size is returned. This address is used when the block is returned to the system.</p>
+
+<h3>McKusic-Karels </h3>
+
+<p>In the McKusic-Karels allocator algorithm, memory requests are satisfied from the corresponding freelist entry after the correct size has been determined. Each entry in the freelist is a pointer to a chain of free memory blocks of the same size. A null pointer indicates an empty list. If a request hits an empty list, a new page is obtained from the memory region. The page is divided into blocks that form a single linked list with the freelist entry as an anchor. The page-table entry for each page contains the size of the memory blocks the page was divided into. <a name="rf1"><a href="9805if1.htm">Figure 1</A> illustrates the situation after the first memory request of 32 bytes. The start address of the block is returned to the application.</p>
+
+<p>When the block is later released, the base address of the memory region is subtracted from the current address, and the result is divided by the page size. The result is the index to the page table that contains the size of the memory block when it was originally allocated; see <a name="rf2"><a href="9805if2.htm">Figure 2</A>. The block is then inserted into the corresponding freelist. Since the page size is usually a power-of-two number, the division can be replaced by a right-shift operation.</p>
+
+<p>Assume the memory region was allocated at address 0x30000000. With a page size of four KB, this first page is mapped at address 0x30000000, the second at address 0x30001000, and so on. Further assume that the application requested a 32-byte block and received a pointer to address 0x30000FE0. If this pointer is now returned to the memory system, the address is subtracted from the base address of the memory region; see <a name="rf3"><a href="9805if3.htm">Figure 3</A>. The page-table entry for page zero has a value of 32, so the block is inserted in the freelist array at element number one.</p>
+
+<p>With many memory allocations and frees, each chain contains pieces from different pages. Memory is never united to form bigger blocks. A burst of requests for 16-bytes memory blocks renders a large area of the memory region useless for bigger requests even after all blocks have been returned.</p>
+
+<h3>FMA </h3>
+
+<p>The FMA stores additional information in the page-table entries and unallocated memory blocks:</p>
+
+<ul>
+  <li>Three bits are used to identify the block size into which a page has been divided. The bits represent the index into the freelist array and indirectly reveal the block size of each element in the list.
+  <li>With the minimum block size set to 16 bytes per request, all blocks are aligned on a 16-byte boundary (or multiples thereof). The last four bits of any block's start address are zeros, and can be used for other purposes; see <a name="rf4"><a href="9805if4.htm">Figure 4</A>. Each page-table entry is 32 bits wide, the same size for a pointer on a 32-bit processor. The <i>size </i>field of a page-table entry contains the index to the freelist array. With eight different sizes possible, four bits are sufficient. The address part contains the high-order 28 bits of the entry block start address (see next item). To form usable addresses, it must be multiplied by 16.
+  <li>Returned memory blocks can be used to store additional internal information. When a page is divided into blocks of a particular size, the corresponding freelist is empty. The first block of a page, called the "entry" block, contains the number of remaining blocks in the chain (including itself, a pointer to its successor, and two pointers for a double-linked list). The pointers for the double-linked list are used to chain entry blocks of the same size. Entry blocks are referenced from the freelist and from the page-table entry.
+</ul>
+
+<p>Now assume the application requests a 32-byte block. The system allocates the first page and divides it into 128 blocks. The first 127 blocks are chained together to form a single-linked list. The entry block contains the number of blocks on this chain. The address of the entry block is stored in the freelist array at element one. The high-order 28 bits of the entry block's address are also stored in the page-table entry, as is the index into the freelist array. The last block on the page is returned to the application. <a name="rf5"><a href="9805if5.htm">Figure 5</A> shows the state of the system at this point.</p>
+
+<p>If another 32-byte block is requested, the system finds a valid pointer on the freelist array at element one, and returns the block following the entry block. The block count in the entry block is decremented to reflect this.</p>
+
+<p>If the block count drops to zero, the entry block itself is returned to the application. In this case, the freelist array element and the address part of the corresponding page-table entry must be updated. They will both be set to zero. The index of the page-table entry is calculated with the formula <a href="9805if2.htm">Figure 2</A>.</p>
+
+<p>If the application requests further 32-byte blocks now, a new page is allocated and the same scenario repeats. The freelist entry points to an entry block; this time, however, it is located on a different page (see <a name="rf6"><a href="9805if6.htm">Figure 6</A>).</p>
+
+<h3>Release of Memory</h3>
+
+<p>If a memory block is released from the application, the page-table index is calculated using the formula in <a href="9805if2.htm">Figure 2</A>. The address part of the page-table entry can behave in two ways:</p>
+
+<ul>
+  <li>If it is not zero, it contains the high-order 28 address bits of an entry block for this page. The new block is appended after the entry block and the block count is incremented. If all blocks of a page have been released, the page can be reused. 
+  <li>If it is zero, the first block of a page in use has been returned (this can be any block from that page). It will be the new  entry block for that page. The page-table entry for this page refers to that entry block, and the block count is set to one. If no freelist entry for this block size exists, then the block is the only one available and the freelist entry refers to it.
+</ul>
+
+
+<p>If the freelist entry is already pointing to an entry block, the new entry block is the new head of the double-linked list.</p>
+
+<p>Assume the application returns its first requested block (which resides on the first page). The page-table entry for this page indicates a block size of 32 bytes with zero for the address part, making this block the entry block. The freelist entry for 32-byte blocks is valid, so the entry blocks must be chained into a double-linked list, as in <a name="rf8"><a href="9805if8.htm">Figure 8</A>. If another block from the first page is released, the address part of the page-table entry points to a valid entry block, and the newly released block is simply appended. The block count in the entry block is incremented.</p>
+
+<h3>Reuse of Pages</h3>
+
+<p>If all the blocks residing on a single page have been returned, the page can be reused (there is no need to unite adjacent pages since memory requests spanning multiple pages are not currently supported). All blocks have been returned when the block count in the entry block is the same as the page size divided by the block size; see <a name="rf7"><a href="9805if7.htm">Figure 7</A>.</p>
+
+<p>Since page size and block size can be expressed as power-of-two integers, the division can be replaced by subtraction. If the page is not used anymore:</p>
+
+<ul>
+  <li>The entry block must be removed from the double-linked list of entry blocks. If the freelist element refers to this entry block, it is updated to point to a successor (or is set to null if no more entry blocks are on the list).
+  <li>The corresponding page-table entry is no longer referred to and can be reused to form a single-linked list of free pages.
+</ul>
+
+<p>The system maintains an anchor to the first free element in the page-table entry (named <i>anchor</i>), and a pointer to the last page allocated from the memory region (called <i>lastused</i>); see <a href="9805if7.htm">Figure 7</A>. <i>lastused</i> points to the last page allocated in the region. If a new page is requested and <i>anchor</i> is null, <i>lastused</i> is incremented to the next page boundary until the end of the region is reached. If <i>anchor</i> is not null, it points to the page-table entry of a reusable page. The page-table entry contains a successor (if any), or -1 (which terminates the linked list).</p>
+
+<p>For example, assume that the application has issued more memory requests and several pages have been allocated. Now assume memory is released so that pages numbered zero, four, and two can be reused (in that order). First, the current value of the anchor is written into page-table entry zero, and the anchor points to page-table entry zero. Then page four is released. This is the last page of the region, pointed to by <i>lastused</i>, so <i>lastused</i> is simply decremented by page size. Page two is released, and this page-table entry is the new head of the linked list of free pages; see <a name="rf9"><a href="9805if9.htm">Figures 9</A> and <a name="rf10"><a href="9805if10.htm">10</A>.</p>
+
+<p>If the number of used pages in the region drops to zero, all pages have been released. <i>lastused</i> points to the beginning of the region, and the anchor is set to zero. In other words, the region is reinitialized.</p>
+
+<h3>Full Page Requests</h3>
+
+<p>If a memory request is rounded up to a full page, a free page is obtained from the region as previously described. The size field of the page-table entry is set to eight, indicating that the page hasn't been divided into blocks. If the page is later released, its size indicates that it can be returned to the memory region immediately.</p>
+
+<h3>Overhead</h3>
+
+<p>The space overhead is very low. The page table consists of four bytes per entry. For a 256-MB region, 65,536 page-table entries are needed, assuming the page size is four KB. This equals 256 KB or 0.00098 percent. The size for the freelist and the other internal counters and pointers can be neglected. This amounts to less overhead than you get with heaps maintained by traditional linked lists. </p>
+
+<h3>Performance and Memory Utilization</h3>
+
+<p>I conducted performance tests for the BSD 4.4 algorithm, the FMA, and the AIX 4.1.4 system heap. The sequence of memory requests and releases and the sizes allocated per request differ from application to application. There is no pattern that is valid for all possible scenarios. The test program (available electronically), therefore, randomly requests and releases previously allocated blocks. The requested size is also determined randomly, within the following limits:</p>
+
+<ul>
+  <li>A block is never larger than the page size.
+  <li>Block requests of a particular size may not exceed the boundaries shown in <a name="rt1"><a href="9805it1.htm">Table 1</A>.
+</ul>
+
+<p>Ten percent of all calls request a block size of 16 bytes, 30 percent request a block size of 32 bytes, and so on. The test program keeps track of up to 5000 allocated blocks. If the table overflows instead of randomly releasing blocks (which can happen due to the way blocks are selected for release), all allocated blocks are freed before the next block is allocated. This reflects the behavior of many applications that allocate memory blocks to build tree or list structures and never release them. They rely on the operating system to release the requested memory when the program terminates. I ran the test program on an IBM Thinkpad 850 with a PowerPC 603e processor running at 166 MHz and 96 MB of memory. The operating system AIX 4.1.4 was in single-user mode.</p>
+
+<p><a name="rt2"><a href="9805it2.htm">Table 2</A> lists the difference in run time when a heap-memory management system is active. First, a sequence of memory requests (including size) and releases is calculated. This sequence is executed twice -- first, without actually issuing memory-heap calls; and second, executing memory-heap calls. <a href="9805it2.htm">Table 2</A> shows the time difference (in milliseconds) between both executions. Table overflow indicates how often the application has freed all allocated blocks before requesting a new one.</p>
+
+<p>As <a name="rt3"><a href="9805it3.htm">Table 3</A> shows, the FMA achieves far better memory utilization than the BSD 4.4 allocator. The FMA saves about 49.5 percent of memory when allocating up to 60,000 memory blocks. The percentage of memory savings decreases as the number of blocks allocated increases. This is due to the fact that the test program only keeps track of 5000 allocated blocks.</p>
+
+<h3>Interfaces</h3>
+
+<p>I haven't altered the traditional C interfaces <i>malloc</i> and <i>free,</i> or the C++ interfaces <i>new</i> and <i>delete,</i> for dynamic memory allocation. Applications can be developed and tested with standard tools and debuggers, and some vendors offer special heap debuggers. When finished, the operators for <i>new</i> and <i>delete</i> or the functions <i>malloc</i> and <i>free</i> are simply replaced. </p>
+
+<p>The C interface consists of the following function calls:</p>
+
+<ul>
+<li><i>int fmainit(size_t, int, char); </i>creates and initializes the region. The first parameter specifies the size in bytes. The second parameter determines the characteristics of the heap. The region can be allocated in shared memory or in the process's private data segment. Shared memory is mandatory if the heap is to be shared between processes. Information on whether access is private or shared is located in a shared-memory segment. If access is shared, memory requests are serialized (to protect internal data) using semaphores. The region can be pinned in memory. However, certain restrictions apply, such as permissions (root user) and real memory restraints. The third parameter indicates that the region has to be created (if it doesn't already exist).  <li><i>int fmadown();</i> removes access to the heap. No further requests can be made after this call. Pointers into the memory region may be invalid and could cause core dumps. If the last process sharing the heap calls <i>fmadown</i>, the shared segment is removed from the system. 
+  <li><i>void *fmaalloc(unsigned long);</i> requests a block of memory of a particular size. The address of the block is returned (or null is returned if no more memory is available).
+  <li><i>void fmafree(void *);</i> returns a block. The parameter is the address of the block as returned from <i>fmaalloc</i>.
+</ul>
+
+<p>C++ interfaces use a structure that must be defined before the first call to <i>new</i>; see <a name="rl1"><a href="9805i.htm#l1">Listing One</A>. </p>
+
+<p>The first call to <i>new</i> creates the memory segment according to the values defined in the structure. The members <i>size</i>, <i>flags</i>, and <i>key</i> have exactly the same meaning as in the <i>fmainit</i> call.</p>
+
+<p>While the first call to <i>new</i> creates a memory region (or attaches to an existing one), the last <i>delete </i>should delete or detach from it. Since automatic detection of the last <i>delete </i>is not possible, a little help from the application is needed. When the member <i>remove_now</i> is set to True, the next <i>delete</i> call will detach from the region and destroy it if the application was the last one using it; see <a name="rl2"><a href="9805i.htm#l2">Listing Two</A>.</p>
+
+<p>If the program is compiled with the "define FMA" set, it will use the FMA, and must be linked with the FMA version of operators <i>new</i> and <i>delete</i>. Otherwise, it will use the standard C++ operators supplied by the vendor's library.</p>
+
+<h3>Conclusion</h3>
+
+<p>The FMA is about 40 percent slower (on average) than the BSD 4.4 allocator, but offers the advantage of uniting released memory blocks and reusing pages, resulting in memory savings of nearly 50 percent. The AIX 4.1.4 heap allocator is listed as reference only. It is a general-purpose allocator that sacrifices speed for space optimization. Real-time applications need deterministic behavior, so the upperbound for memory allocation (FMA:4300ns, BSD4.4:3400ns, as shown in <a href="9805it3.htm">Table 3</A>) is of particular interest. </p>
+
+<p>As it turned out, in my example, there was no need to implement support for memory requests spawning several pages.</p>
+
+<h3>References</h3>
+
+<p>Kelly, David A. <i>AIX/6000 Internals and Architecture</i>. New York, NY: McGraw Hill, 1996. </p>
+
+<p>Kernighan, B.W. and D.M. Ritchie. <i>C Programming Language</i>. Upper Saddle River, NJ: Prentice Hall, 1978.</p>
+
+<p>Knuth, Donald E. <i>The Art of Computer Programming, Volume 1</i>. Reading, MA: Addison-Wesley, 1973.</p>
+
+<p>Leffler, Samuel J., Marshall Kirk McKusick, and John S. Quarterman. <i>The Design and Implementation of the 4.3 BSD UNIX Operating System</i>. Reading, MA: Addison-Wesley, 1988.</p>
+
+<p>Vahalia, Uresh. <i>UNIX Internals: The New Frontier</i>. Upper Saddle River, NJ: Prentice Hall, 1996.</p>
+
+<p><b>DDJ</b></p>
+
+<P>
+<a href="#rl-1">Back to Article</A>
+</P>
+<H4><a name="l">EMBEDDED SYSTEMS</H4>
+
+<pre></pre>
+<H4><a name="l1">Listing One</H4>
+
+<pre>struct t_heappolicy {    unsigned long size;
+    int flags;
+    char key;
+    int remove_now;
+};
+<p></p>
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>int main(int argv, char **argv){
+#ifdef FMA
+    t_heappolicy policy = { 1 &lt;&lt; 20, 0, 1 };
+#endif
+    int *ip = new int;  // Create a private heap of 1 MB
+    .....
+#ifdef FMA
+    policy.remove_now =  1;
+#endif
+    delete ip;
+}
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<p><b>DDJ</b></p>
+
+
+
+
+<HR><I>Copyright &copy; 1998, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

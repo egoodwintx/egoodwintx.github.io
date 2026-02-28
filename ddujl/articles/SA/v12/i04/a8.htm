@@ -1,0 +1,421 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i04: Amanda Backup Enhanced with SolarisTM Snapshots</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a8_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink"><a href="a8_l2.htm">Listing 2</a></span></td>
+		<td><span class="navbarLink"><a href="a8_l3.htm">Listing 3</a></span></td>
+		<td><span class="navbarLink"><a href="a8_l4.htm">Listing 4</a></span></td>
+		<td><a href="../../../../source/SA/2003/apr2003.tar"><b class=codeListing>apr2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b><img src="a8.gif" width="200" height="167" align="right">Amanda 
+              Backup Enhanced with Solaris</b><sup>TM</sup><b> Snapshots</b></h1>
+            <p> <i>Julian Briggs</i>
+            <p> This article discusses the development of a system to improve 
+              the reliability of backups, using Amanda backup software (see "Configuring 
+              Amanda", Sys Admin, April 2002, <b>http://www.samag.com/documents/s=7033/sam0204a/sam0204a.htm</b>), 
+              enhanced with Solaris filesystem snapshots (see "Free Snapshots?", 
+              <i>Sys Admin</i>, January 2002, <b>http://www.samag.com/documents/s=1824/sam0201j/0201j.htm</b>).
+            <p> In my group, we manage a medium-sized (about 400 hosts), heterogeneous 
+              (Linux, Solaris, Windows), academic network. Four Solaris servers 
+              provide central compute power, data storage, and network services. 
+              We back up about 400 Gb of data on a 7-day cycle to an LTO 200 tape 
+              drive (nominally 200 Gb using hardware compression, as we do) using 
+              Amanda (<b>http://www.amanda.org</b>), an excellent, mature, free-software 
+              backup utility, with about a 150-Gb holding disk. We suffered from 
+              increasing dump errors and restore failures on our large (more than 
+              50 Gb), filesystems used overnight by write-intensive research applications.
+            <p> Backing up active filesystems is dangerous because inodes may 
+              change during the dump. This makes restores unreliable because the 
+              restored filesystem may be corrupt, or the restore may fail, typically 
+              with this error:
+            <p> 
+            <p> changing volumes on pipe input
+            <p> abort? [yn]
+            <p> 
+            <p> This problem is exacerbated by <b>ufsdump</b> dumping all the 
+              directories first, then (perhaps several hours later on a large 
+              filesystem) dumping the last of the files. Meanwhile, some of those 
+              files may have been deleted so the directory inode on tape has entries 
+              for non-existent files.
+            <p> The standard recommendation to avoid this is to unmount the filesystem, 
+              or to do the backup in single-user mode. Neither method is practical 
+              on a large, heavily used server. Many sites simply run backups at 
+              quiet times (overnight or weekends) and tolerate occasional dump 
+              errors and restore failures.
+            <p> <b>The Solution</b>
+            <p> The solution we adopted was to create a snapshot of the filesystem, 
+              which preserves a static view that we can then dump reliably. Sun 
+              introduced a snapshot utility, <b>fssnap</b>, as a patch in Solaris 
+              8, integrated into Solaris 9. The challenge is to make this work 
+              with Amanda. We tried three approaches:
+            <p> 
+            <p> 1. Create snapshots of all filesystems, run Amanda, then delete 
+              the snapshots.<br>
+              2. Use an executable automount map to create snapshots on demand.<br>
+              3. Use a wrapper to ufsdump to create, dump, and delete snapshots.
+            <p> 
+            <p> In this article, I'll describe each of these approaches, addressing 
+              both issues arising during implementation and issues remaining unresolved. 
+              I'll discuss these as they emerge, so issues in an early approach 
+              are relevant to later ones, and I'll show the code for each approach.
+            <p> <b>Create Snapshots, then Run Amanda</b>
+            <p> This is a simple approach. We start our Amanda run at midnight, 
+              so prior to that, we run a cron job on each server to create snapshots 
+              of all filesystems and mount these under <b>/snap/</b> (e.g., <b>/snap/_var_mail</b>). 
+              We found the following issues arising during implementation.
+            <p> <b>Bugs</b>
+            <p> There are several known bugs in <b>fssnap</b>. <b>/usr/sbin/fssnap</b> 
+              behaves very differently from the man page description (in Solaris 
+              8 and Solaris 9). A workaround is to use <b>/usr/lib/fs/ufs/fssnap</b> 
+              (Sun Bug ID: 4446301. 17 Apr 2001).
+            <p> <b>fssnap</b> fails to create snapshots of <b>/</b> and <b>/var</b> 
+              if <b>xntpd</b> (NTP stands for Network Time Protocol) is running. 
+              The problems are that <b>xntpd</b> runs in real-time mode and uses 
+              <b>/</b> and <b>/var</b> filesystems; <b>fssnap</b> temporarily 
+              locks a filesystem with <b>fslock</b> when creating a snapshot; 
+              and filesystems used by real-time processes cannot be locked. A 
+              workaround is to stop <b>xntpd</b>, run <b>fssnap</b>, then start 
+              <b>xntpd</b> (Sun Bug ID: 4699740. 12 Jun 2002). (<b>fssnap</b> 
+              can happily delete snapshots while <b>xntpd</b> is running.)
+            <p> <b>fssnap</b> errors from snapshots in use in <b>/var/adm/messages: 
+              ... fssnap: [ID 964769 kern.warning] WARNING: snap_strategy: error 
+              calling snap_getchunk, chunk = 611890, offset = 24576, len = 196, 
+              resid = 196, error = 5.. "File offset of /dev/fssnap too large from 
+              ufsdump read causes panic."</b> (Sun Bug ID: 4769472. 27 Nov 2002.) 
+              There is no workaround, but Sun advises, "Only use the block device, 
+              not the raw device (<b>/dev/fssnap/* vs /dev/rfssnap/*</b>)." Unfortunately, 
+              <b>ufsdump</b> dumps the raw device even if given the block device.
+            <p> <b>Backing Store</b>
+            <p> The backing store for a snapshot must be on a separate filesystem, 
+              which cannot be "snapshotted", but can be NFS-mounted. We use an 
+              automounted directory <b>/share/backingstore/&lt;hostname&gt;</b>. 
+              We manually create and share the hostname directory using a netgroup 
+              of our servers, <b>servers</b>:
+            <p> 
+            <pre>
+mkdir /share/backingstore/ivy
+share -F nfs -o rw=servers,root=servers /export0/backingstore
+</pre>
+            We use the <b>fssnap unlink</b> option, which creates a backing store 
+            file (e.g., <b>/share/backingstore/ivy/0</b>), opens it, then unlinks 
+            it, so the backing store is deleted when the snapshot is deleted.
+            <p> <b>Mount Points and Path to Snapshot</b>
+            <p> We create a snapshot of a front filesystem (e.g., <b>/var/mail</b>), 
+              which gives a snapshot device (e.g., <b>/dev/fssnap/3</b>), which 
+              we mount under <b>/snap/</b> (e.g., <b>/snap/_var_mail</b>). Amanda 
+              lists filesystems to dump, by host, in a file (<b>disklist</b>). 
+              We cannot populate <b>disklist</b> with snapshot devices because 
+              the snapshot device for a given front filesystem may change. For 
+              example, today:
+            <p> 
+            <pre>
+fssnap -o bs=/share/backingstore/ivy,unlink /export0
+/dev/fssnap/<b>0</b>
+</pre>
+            <p> Tomorrow:
+            <p> 
+            <pre>
+fssnap -o bs=/share/backingstore/ivy,unlink /export0
+/dev/fssnap/<b>1</b>
+</pre>
+            We "flatten" the mount point paths by replacing <b>/</b> with <b>_</b>, 
+            (e.g., <b>/var/mail</b> by <b>_var_mail</b>), to avoid hierarchical 
+            mount point issues (e.g., having to create snapshots of (and mount) 
+            <b>/</b> before <b>/var</b> before <b>/var/mail</b>). We then populate 
+            disklist with snapshot mount points corresponding to the front filesystems 
+            to be dumped:
+            <p> 
+            <pre>
+ivy  /snap/_
+ivy  /snap/_export0
+ivy  /snap/_var
+ivy  /snap/_var_mail
+</pre>
+            <b>Delete Old Snapshots</b>
+            <p> Snapshots degrade performance so we really only want them around 
+              while dumping, especially with write-intensive filesystems. Every 
+              write to the front filesystem entails reading a block (from the 
+              front filesystem), writing it (to backing store), then writing the 
+              new block (to front filesystem). Furthermore, before creating a 
+              snapshot, we check for and delete any existing snapshot for a front 
+              filesystem. Otherwise, the create fails and we might back up an 
+              old snapshot of the front filesystem.
+            <p> <b>Implementation</b>
+            <p> The prototype script, <b>fssnap.sh</b> (Listing 1), creates snapshots 
+              of all ufs filesystems on a host (excluding those we never back 
+              up) and mounts them. Running <b>fssnap.sh</b> on a host with two 
+              snap-able filesystems (we exclude <b>/export/swap</b>):
+            <p> 
+            <pre>
+ivy# df -k
+/dev/dsk/c1t0d0s0   4133838 1781118 2311382     44%  /
+/dev/dsk/c1t0d0s6   41311843 3397124 37501601    9%  /export
+/dev/dsk/c1t0d0s7   16526762 2245857 14115638   14%  /export/swap
+</pre>
+            creates two snapshots and mounts them:
+            <p> 
+            <pre>
+ivy# df -k
+/dev/dsk/c1t0d0s0   4133838 1781118 2311382     44%  /
+/dev/dsk/c1t0d0s6   41311843 3397124 37501601    9%  /export
+/dev/dsk/c1t0d0s7   16526762 2245857 14115638   14%  /export/swap
+<b>/dev/fssnap/1</b>       4133838 1781108 2311392     44%  <b>/snap/_</b>
+<b>/dev/fssnap/0</b>       41311843 3397124 37501601    9%  <b>/snap/_export</b>
+</pre>
+            We delete snapshots on each host after the Amanda run by running <b>fssnap.sh 
+            -d</b>. We considered several options for launching this:
+            <p> 
+            <p> 
+            <ul>
+              <li> Ssh from dumphost to dumpclient -- This introduces a security 
+                risk because the dumphost runs a command as root on each dumpclient. 
+              <li> Run a single cron job on each dumpclient -- But when to run 
+                it? We have conflicting requirements. We want to delete snapshots 
+                as soon as the Amanda dump run is finished, typically 4-8am, but 
+                occasionally much later as Amanda overruns, perhaps until noon. 
+                So we must run it late.
+            </ul>
+            <b>Unresolved Issues</b>
+            <p> When using <b>amrestore</b>, the operator must use a filesystem 
+              name of the form <b>/snap/_var_mail</b>, not the expected <b>/var/mail</b>. 
+              This implementation works, but snapshots exist for much longer than 
+              needed. To avoid this drawback, we next tried using an executable 
+              automount map.
+            <p> <b>Executable automount Map</b>
+            <p> Here the automounter manages the mounts under <b>/snap/</b> using 
+              an executable, indirect map, <b>auto_fssnap</b>. When we access 
+              a directory here (e.g., <b>/snap/_var_mail</b>), the executable 
+              map creates a snapshot and the automounter mounts it. Thus, a snapshot 
+              is only created when it is needed. However, as with the first approach, 
+              we still have difficulty deleting snapshots promptly after use. 
+              Several issues arose during implementation.
+            <p> Amanda runs <b>ufsdump S</b> on each filesystem to estimate the 
+              size of the dump. Usually it does this several times to get estimates 
+              for several dump levels. This triggers creation and mounting of 
+              snapshots early in an Amanda run.
+            <p> Knowing when we can delete a snapshot is the main difficulty. 
+              Some options we have explored are:
+            <p> 
+            <p> 
+            <ul>
+              <li> Use the automounter to delete the snapshot after <b>umount</b>ing 
+                it. Unfortunately, the automounter does not support this, and 
+                executable maps are not run when a filesystem is umounted. 
+              <li> Find recently unmounted snapshots by watching automounter (in 
+                verbose mode) logs for umounts of snapshot mounts, or using a 
+                recurrent cron job and delete them. This fails because Amanda 
+                accesses a filesystem by mount point (e.g., <b>/snap/_var_mail</b> 
+                (given in disklist) only for the first size estimate). This access 
+                triggers the automounter. Thereafter, Amanda directly accesses 
+                the raw device associated with that mount point (e.g., <b>/dev/rdsk/c0t0d0s4</b> 
+                for size estimates and dumps). These later Amanda accesses do 
+                not trigger the automounter. Thus, we may prematurely delete snapshots 
+                before (or while) they are <b>ufsdumped</b>, causing the dump 
+                to fail. 
+              <li> Watch Amanda logs for <b>ufsdump</b> "DUMP DONE" entries using 
+                a cron job. This works but is superseded by the next method. 
+              <li> Launch a single, background process (<b>fssnapdel</b>, Listing 
+                2) from the automount map for each snapshot to watch the Amanda 
+                log files (every five minutes) and delete the snapshot when the 
+                dump is done.
+            </ul>
+            <b>Implementation</b>
+            <p> We create an executable automount map <b>auto_fssnap</b> (Listing 
+              3) referenced from the NIS auto.master map:
+            <p> 
+            <pre>
+/snap -ro /usr/local/etc/auto_fssnap
+</pre>
+            <b>Unresolved Issues</b>
+            <p> If several <b>fssnap</b> commands run concurrently, only one succeeds. 
+              (I have logged an RFE with Sun on this.) One of our hosts has 12 
+              filesystems to dump, so occasionally we saw failures as Amanda triggered 
+              the automounter to run several instances of <b>auto_fssnap</b>, 
+              and hence <b>fssnap</b>, concurrently.
+            <p> <b>fssnapdel</b> could conceivably delete a snapshot just created 
+              by the automount map, before it is mounted. The <b>fssnapdel</b> 
+              processes are vulnerable to being killed, in which case, a snapshot 
+              may not be deleted.
+            <p> <b>Use a Wrapper to ufsdump</b>
+            <p> We also explored the use of a wrapper to <b>ufsdump</b> (Listing 
+              4) to create, dump, and delete a snapshot of the front filesystem. 
+              (Early concerns about signal and stream handling turned out to be 
+              largely unfounded.) We encountered the following issues during implementation.
+            <p> We built Amanda (<b>amadmin amandad amgetconf amrecover amverify</b>) 
+              with the <b>ufsdump</b> wrapper (<b>amusfsdump</b>), by making global 
+              substitutions in Amanda source between <b>configure</b> and <b>make</b>:
+            <p> 
+            <pre>
+./configure ...
+perl -pi.bak -e 's!/usr/sbin/ufsdump!/usr/local/etc/amufsdump!g' \
+  config/config.h Makefile */Makefile */*.sh
+make ...
+</pre>
+            The wrapper is suid root because <b>fssnap</b> must be run as root, 
+            which introduces potential security vulnerabilities. To reduce vulnerabilities, 
+            the script does the following:
+            <p> 
+            <p> 
+            <ul>
+              <li> Runs under Solaris. This fixes a generic vulnerability of suid 
+                scripts due to a race condition in which a script may change between 
+                the time the kernel opens the script to identify which interpreter 
+                to run, then reopens the script to interpret it. 
+              <li> Is executable only by root and users in group <b>sys</b>:
+            </ul>
+            <pre>
+ls -l amufsdump
+-rwsr-x--- 1 root sys 2822 Oct 30 11:01 amufsdump
+</pre>
+            <ul>
+              <li> Dies unless it is run by the backup user <b>dumpman</b>. 
+              <li> Runs with the lower privileges of the calling user, <b>dumpman</b>, 
+                except where it must run as root (calling <b>/etc/init.d/xntpd</b>, 
+                <b>fssnap</b>, <b>ufsdump</b>). 
+              <li> Uses <i>taint perl</i> to check all input to the script. In 
+                regard to environment, it sets a null PATH and sets IFS to a space. 
+                It ensures the script is called with four appropriate arguments, 
+                thus:
+            </ul>
+            <pre>
+($OPTS, $SIZE, $TAPEDEV, $RAWDEV) =
+    ("@ARGV" =~ m!^(\w+) (\d+) (-) (/dev/rdsk/c\d+t\d+d\d+s\d+)$!) or
+    die "@ARGV.  Usage eg: amufsdump 0usf 1048576 - /dev/rdsk/c0t0d0s0";
+</pre>
+            It checks that external commands are referenced by absolute pathnames 
+            and checks input from the matches.
+            <p> 
+            <ul>
+              <li> Avoid creating a snapshot if we are just getting an estimate 
+                of dump size, calling <b>amufsdump</b> with the <b>S</b> option 
+                :
+            </ul>
+            <pre>
+amufsdump 0Ssf 1048576 -  /dev/rdsk/c0t0d0s3
+</pre>
+            <ul>
+              <li> Use locking to avoid running several instances of <b>fssnap</b> 
+                together, otherwise all but one will fail. 
+              <li> Ensure <b>xntpd</b> is stopped while creating snapshots of 
+                <b>/</b> and <b>/var</b>. Earlier approaches started <b>xntpd</b> 
+                after a snapshot, now we only restart it if it was already running. 
+              <li> Delete the snapshot immediately after the dump is done. 
+              <li> Ensure that <b>ufsdump</b> records the front filesystem raw 
+                device (<b>/dev/rdsk/c0t0d0s0</b>) in <b>/etc/dumpdates</b>, rather 
+                than the snapshot device (e.g., <b>/dev/fssnap/3</b>). We use 
+                the flag <b>N</b> to <b>ufsdump</b> (a feature introduced in Solaris 
+                8) to specify the device to record in <b>/etc/dumpdates</b>. <b>amandad</b> 
+                calls <b>amufsdump</b>, as follows:
+            </ul>
+            <pre>
+amufsdump 0usf 1048576 - /dev/rdsk/c0t0d0s0
+</pre>
+            <b>amufsdump</b> calls <b>ufsdump</b>:
+            <p> 
+            <pre>
+ufsdump N0usf /dev/rdsk/c0t0d0s0 1048576 - /dev/fssnap/0
+</pre>
+            <b>fssnap</b> ignores <b>kill -15</b>, but a <b>kill -9</b>, which 
+            it cannot ignore, hangs the operating system with locked <b>/</b> 
+            and <b>/var</b>. <b>amufsdump</b> terminates on <b>kill -15</b>, leaving 
+            <b>fssnap</b> to complete. Killing <b>amufsdump</b> with <b>kill -9</b>, 
+            which cannot be trapped, passes this kill to <b>fssnap</b> with the 
+            risk of hanging the system. <b>/etc/init.d/xntpd</b> needs <b>/usr/bin</b> 
+            in its PATH to call sleep. 
+			<p><b>Overall Evaluation</b>
+            <p> Using Amanda with a <b>ufsdump</b> wrapper to create, dump, and 
+              delete snapshots works excellently. Dumps written by <b>amufsdump</b>-enhanced 
+              Amanda cannot be read by vanilla Amanda, and vice versa, because 
+              <b>amdump</b> encodes the UNIX dump program used (<b>ufsdump</b>, 
+              <b>amufsdump</b>, or <b>tar</b>) in the header of the dumpfile on 
+              tape). Both <b>amrestore</b> and <b>amrecover</b> look for this 
+              and "error" if they do not find one they recognize. This could be 
+              fixed if support for snapshots were integrated into Amanda. The 
+              performance impact is low. The snapshot-backing store of our most 
+              write-intensive filesystem grows to only about 1 Gb during a full 
+              dump (about three hours). This represents reading, writing over 
+              NFS, and writing locally 1-Gb data, a small overhead on a 50-Gb 
+              dump. To see the size of the backing store, run <b>fssnap -i -o 
+              backing-store-len</b>.
+            <p> We now have a very reliable backup system. We dump and restore 
+              without errors. We found no scalability issues in integrating snapshots 
+              into Amanda. The system introduces three new potential vulnerabilities:
+            <p> 
+            <p> 1. The suid, taint perl script <b>amufsdump</b>.<br>
+              2. The snapshot devices themselves. <b>fssnap</b> creates these 
+              with permissions:
+            <p> 
+            <pre>
+brw-r----- 1 root sys 199, 0 Oct 9 15:05 /devices/pseudo/fssnap@0:0
+</pre>
+            Thus, they are no more vulnerable than their corresponding raw devices.
+            <p> 3. The snapshot-backing store is NFS shared, and read-write with 
+              root access to each dump client. <b>fssnap</b> unlinks this file 
+              immediately after creating it, which reduces the risk of cracking. 
+              For tighter security, you can modify <b>amufsdump</b> to use local 
+              backing store, which requires a dedicated local file system.
+            <p> 
+            <p> The enhanced system is transparent to the operator. However, if 
+              an <b>amufsdump</b> process dies, it may leave an unwanted snapshot.
+            <p> To maintain confidence in our backups, we evaluated several methods 
+              for verifying them. We run <b>amverify</b> after each dump. This 
+              lists the contents of each dump file on tape and gives some confidence 
+              about the readability of the tape. It takes several hours to do 
+              this, and it doesn't identify bad dumps files (written before we 
+              introduced snapshots). We prefer to restore a full or partial dump 
+              regularly and find that this works well and is often covered by 
+              the steady trickle of requests from users to recover lost files.
+            <p> <b>Conclusion</b>
+            <p> Amanda enhanced with Solaris <b>fssnap</b> snapshots provides 
+              an excellent backup system. The system should port simply to other 
+              OSes that support filesystem snapshots. Built-in support for snapshots 
+              in Amanda would further enhance transparency. These developments 
+              are left as an exercise for the reader.
+            <p> <i>Julian Briggs is Director of IT, Department of Computer Science, 
+              University of Sheffield, UK. He has practiced UNIX systems administration 
+              since the mid 1990s and Buddhist meditation (exploring, debugging, 
+              and enhancing the OS of his "neck-top" computer) since the early 
+              1980s. He enjoys hill walking and is single with no children. </i>
+            <p>&nbsp; 
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

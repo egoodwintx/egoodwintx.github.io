@@ -1,0 +1,262 @@
+<HTML>   
+     <HEAD>
+<TITLE>December 2002/Common Knowledge</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocdec.htm"></A><FONT COLOR="#FF0000">   C/C++ Contributing Editors</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Common Knowledge: A Bitwise typeof Operator, Part 3</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Steve Dewhurst</FONT></H3>
+
+<BLOCKQUOTE>
+<p>As Steve finishes his singular implementation of a typeof operator, you&#146;ll see why the C++ language needs this feature. It&#146;s too hard to get right!</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+<p>This is the third and final installment describing a mechanism for implementing a portable <B>typeof</B> operator. In Part 1, we described an approach for implementing <B>typeof</B> with a &#147;round-trip&#148; mapping from a type to a structured integer encoding of the type and back again at compile time. In Part 2, we showed one way to implement compile-time bitwise operations on integers of unbounded length and showed how these multipart bitwise operations could be used to perform the encoding from type to integer. In this final part of the <B>typeof</B> series, we&#146;ll decode the integer to restore the original type. The round trip from type to integer to type will provide us with a portable <B>typeof</B> facility <a href="#1">[1]</a>.</p>
+
+<H3><FONT COLOR="#000080">Peeling Integers</FONT></H3>
+
+<p>In the previous installment, we converted a type into an integer through the use of partial specialization of the <B>GN</B> (G&ouml;del number) template. An integer representing the type was built up by recursively shifting the integer left and appending additional modifiers. For example, the representation of a simple pointer type (say, <B>Type *</B>) would consist of the code for the base type shifted left and appended with the code for a pointer modifier:</p>
+
+<IMG SRC="fig1.gif">
+
+<p>The representation of a pointer to a member of that pointer type (say, <B>Type * Class::*</B>) would shift the previous representation left the appropriate number of bits and append the code for the class type followed by the code for the pointer-to-member modifier:</p>
+
+<IMG SRC="fig2.gif">
+
+<p>Our job is now to recursively peel away these structured layers of the integer in order to recreate the original type. In the case of a pointer type, as in the first example above, we&#146;ll shift the integer right in order to peel off the pointer modifier code and then recursively decode the remainder of the integer to produce the dereferenced type. Finally, we&#146;ll append a pointer modifier to restore the original type. In the case of our second example, we&#146;ll peel off both the pointer-to-member modifier code and the code for the class type, before recursively decoding the remainder of the integer. Finally, we&#146;ll append the pointer-to-member modifier to the resulting type.</p>
+<p>Last time we decided to limit ourselves to four-part integers, though we would probably increase this in a production <B>typeof</B> implementation. The <B>GenType</B> template is, therefore, instantiated with four integral codes that constitute the encoding of the type.</p>
+
+<pre>
+template &lt;Code,Code,Code,Code&gt;
+struct GenType;
+</pre>
+
+<H3><FONT COLOR="#000080">Compile Time Control Structures</FONT></H3>
+
+<p>The <B>GenType</B> template performs a compile-time if statement, instantiating either the <B>GenBaseType</B> or <B>GenModType</B> templates depending on whether the multipart integer used to instantiate it encodes a simple type or a modified type:</p>
+
+<pre>
+template &lt;Code code4, Code code3,
+  Code code2, Code code1&gt;
+struct GenType {
+  typedef typename GenTypeImpl
+    &lt;ISBASECODE(code1),
+    code4, code3, code2,
+    code1&gt;::Result GTR;
+};
+</pre>
+
+<p>The implementations of the branches of the compile-time if statement are implemented as the primary and partially specialized versions of <B>GenTypeImpl</B>.</p>
+
+<pre>
+template &lt;bool cond, Code code4,
+  Code code3, Code code2, Code code1&gt;
+struct GenTypeImpl {
+  typedef typename
+    GenBaseType&lt;code1&gt;::R Result;
+};
+
+template &lt;Code code4, Code code3,
+  Code code2, Code code1&gt;
+struct GenTypeImpl&lt;false,code4,
+  code3,code2,code1&gt; {
+  typedef typename
+    GenModType&lt;code4,code3,code2,
+      code1&gt;::MR Result;
+};
+</pre>
+
+<p>Note that it was necessary to break out the implementation of <B>GenType</B> into a separate class. An alternative implementation might attempt to use a mechanism like Loki&#146;s <B>Select</B> <a href="#2">[2]</a> to perform the compile-time conditional:</p>
+
+<pre>
+template &lt;Code code4, Code code3,
+  Code code2, Code code1&gt;
+struct GenType {
+  typedef typename Select&lt;
+    ISBASECODE(code1),
+    typename GenBaseType&lt;code1&gt;::R,
+    typename GenModType&lt;code4,
+      code3,code2,code1&gt;::MR
+  &gt;::Result GTR;
+};
+</pre>
+
+<p>Unfortunately, this has the effect of instantiating both branches of the compile-time if statement, no matter what the value of the <B>ISBASECODE(code1)</B> conditional. Often this will result in an error if one of the branches is not legal C++ for a particular set of template arguments. Recall that all computation is being performed at compile time and (essentially) in parallel. Even though only one branch will be used as the result of <B>Select</B>, both will be compiled. Moving each branch to a separate template ensures that only one will be.</p>
+<p>Implementation of <B>GenBaseType</B> is trivial:</p>
+
+<pre>
+template &lt;Code code&gt;
+struct GenBaseType {
+  enum {
+  base = code &amp; BaseMask,
+  isconst = code &amp; ConstBaseQual,
+  isvol = code &amp; VolBaseQual
+  };
+  // decode base type
+  typedef typename DeCode&lt;base&gt;::R B;
+  // qualify it, if necessary
+  typedef typename
+    Select&lt;isconst, const B, B&gt;::Result CB;
+  typedef typename
+    Select&lt;isvol, volatile CB, CB&gt;::Result VCB;
+  typedef VCB R;
+};
+</pre>
+
+<p>The base code is extracted and stripped of any cv-qualifiers (<B>const</B> and/or <B>volatile</B>) and then decoded using the registration mechanism described in the first part of this series <a href="#3">[3]</a>. Any cv-qualifiers are then reapplied.</p>
+
+<H3><FONT COLOR="#000080">Switches and Nested Switches</FONT></H3>
+
+<p>Type modifiers are handled by peeling off the code for the modifier and executing a compile-time switch statement on the code:</p>
+
+<pre>
+template &lt;Code code4, Code code3, Code code2, Code code1&gt;
+struct GenModType {
+  enum {
+  mod = code1 &amp; ModMask, // get modifier
+  // shift modifier off
+  c1 = ShiftRight&lt;code4,code3,code2,code1,ModLen&gt;::code1,
+  c2 = ShiftRight&lt;code4,code3,code2,code1,ModLen&gt;::code2,
+  c3 = ShiftRight&lt;code4,code3,code2,code1,ModLen&gt;::code3,
+  c4 = ShiftRight&lt;code4,code3,code2,code1,ModLen&gt;::code4
+  };
+  // switch on modifier code
+  typedef typename ModSwitch&lt;mod,c4,c3,c2,c1&gt;::MSR MR;
+};
+</pre>
+
+<p>The switch statement is implemented as a set of partial specializations of the <B>ModSwitch</B> template. There is no need for an implementation of the primary <B>ModSwitch</B> template, though it must be declared before we can define partial specializations of it.</p>
+
+<pre>
+template &lt;Code mod,
+  Code code4, Code code3, Code code2, Code code1&gt;
+struct ModSwitch;
+</pre>
+
+<p>The implementations for most modifiers are straightforward. The case for pointer modifier code is handled by recursively decoding the remainder of the type then appending the pointer modifier to the resulting type:</p>
+
+<pre>
+template &lt;Code code4, Code code3, Code code2, Code code1&gt;
+struct ModSwitch&lt;Ptr,code4,code3,code2,code1&gt; { // *
+  typedef typename
+    GenType&lt;code4,code3,code2,code1&gt;::GTR *MSR;
+};
+</pre>
+
+<p>Pointers to class members are somewhat more complex:</p>
+
+<pre>
+template &lt;Code code4, Code code3, Code code2, Code code1&gt;
+struct ModSwitch&lt;Pcm,code4,code3,code2,code1&gt; { // C::*
+  enum {
+  // get registered code for class
+  classtype = code1 &amp; BaseMask,
+  // shift off the class code
+  c1 = ShiftRight&lt;code4,code3,code2,code1,BaseLen&gt;::code1,
+  c2 = ShiftRight&lt;code4,code3,code2,code1,BaseLen&gt;::code2,
+  c3 = ShiftRight&lt;code4,code3,code2,code1,BaseLen&gt;::code3,
+  c4 = ShiftRight&lt;code4,code3,code2,code1,BaseLen&gt;::code4
+  };
+  // get type of data member we&#146;re pointing to
+  typedef typename GenType&lt;c4,c3,c2,c1&gt;::GTR MemType;
+  // get class type
+  typedef typename DeCode&lt;classtype&gt;::R ClassType;
+  // append pointer to member modifier to member type
+  typedef MemType ClassType::*MSR;
+};
+</pre>
+
+<p>After extracting the registered type code for the class to which the pointer to member refers, the multipart integer is shifted right to remove the type code and leave the encoding for the type to which the pointer to member refers. This is recursively decoded (producing <B>MemType</B> in the code above), the class type is recovered from the registered type code extracted previously (<B>ClassType</B>), and the result is constructed by &#147;pasting together&#148; <B>MemType</B> and <B>ClassType</B> with a <B>typedef</B>.</p>
+<p>Recall that the function modifier may indicate a function of zero, one, or more arguments. The encoding records the number of arguments, as well as the length, in bits, of each argument type. Encodings for functions taking zero, one, and two arguments are shown below:</p>
+
+<IMG SRC="fig3.gif">
+
+<p><a href="list1.htm">Listing 1</a> shows the implementation for the function modifier. The implementation of <B>ModSwitch</B> for the function modifier code extracts the argument count and performs a nested switch statement to the appropriate implementation of <B>FunSwitch</B>. Implementations for zero and one argument are shown.</p>
+
+<H3><FONT COLOR="#000080">typeof</FONT></H3>
+
+<p>Finally, we must connect the part of our implementation that generates a G&ouml;del number from a type to the part that generates a type from a G&ouml;del number. Last time, we used the following functions to generate the encoding from the type:</p>
+
+<pre>
+template &lt;typename T&gt;
+char (*genGN1( T &amp; ))[GN&lt;T&gt;::code1+1]; // no definition
+template &lt;typename T&gt;
+char (*genGN2( T &amp; ))[GN&lt;T&gt;::code2+1];
+template &lt;typename T&gt;
+char (*genGN3( T &amp; ))[GN&lt;T&gt;::code3+1];
+template &lt;typename T&gt;
+char (*genGN4( T &amp; ))[GN&lt;T&gt;::code4+1];
+</pre>
+
+<p>Note that we have incremented the value of each code by one in order to avoid the possibility of an illegal zero array index. This incremented value is later decremented to restore the correct value.</p>
+<p>All we have to do is instantiate <B>GenType</B> with these integral values. Although they are generally to be avoided, a preprocessor macro is probably the best way to implement this:</p>
+
+<pre>
+#define NT_TYPEOF( e ) GenType&lt; \
+  sizeof(*genGN4(e))-1, \
+  sizeof(*genGN3(e))-1, \
+  sizeof(*genGN2(e))-1, \
+  sizeof(*genGN1(e))-1  \
+  &gt;::GTR
+#define TYPEOF( e ) typename NT_TYPEOF(e)
+</pre>
+
+<p>Unfortunately, the <B>typename</B> keyword may be used only within a template, so we are forced to provide two versions of <B>typeof</B>. In most cases, the facility will be used within templates (since that&#146;s the only place we really have to ask what an expression&#146;s type is), so the more mnemonic name <B>TYPEOF</B> is used there. The name <B>NT_TYPEOF</B> is for use in non-template contexts.</p>
+<p>Now that we have a fairly functional, portable <B>typeof</B> facility, we can solve the original problem that motivated this <B>typeof</B> implementation; we can extract the type of an expression of (otherwise) unknown type. In the code below, we know the type of the container <B>cont</B> (it&#146;s <B>Cont</B>), but without <B>typeof</B> we wouldn&#146;t be able to uncover the type of its elements.</p>
+
+<pre>
+template &lt;typename Cont&gt;
+void process( Cont &amp;cont ) {
+  TYPEOF(cont[0]) value( cont[0] ); // works!
+  const int elemSize1 = sizeof( TYPEOF(cont[0]) ); // error!
+  typedef TYPEOF( cont[0] ) Elem; // workaround...
+  const int elemSize2 = sizeof( Elem ); // OK
+  const int elemSize3 = sizeof( cont[0] ); // OK
+  //...
+</pre>
+
+<p>The primary drawback of this implementation of <B>typeof</B> is the need to register user-defined types explicitly. For instance, if the element type of the container type <B>Cont</B> in the example above is (or is constructed with) an unregistered user-defined type, the use of <B>TYPEOF</B> will fail. Additionally, it may sometimes be necessary to work around syntactic difficulties incurred by a facility that is not a built-in operator, as shown above by the interaction of <B>TYPEOF</B> and <B>sizeof</B>. It would still be very useful to have a standard, built-in <B>typeof</B> operator in C++.</p>
+<p>However, our implementation of <B>typeof</B> illustrates some important techniques in template metaprogramming and also illustrates the occasional utility of moving a difficult problem to a different solution domain. The <B>typeof</B> implementation moves between the domains of type manipulation and integer manipulation. In a future article, we&#146;ll examine a mechanism for implementing arbitrary-precision compile-time arithmetic by convincing the compiler to perform arithmetic operations on types.</p>
+
+<H3><FONT COLOR="#000080">Nolo Contendere</FONT></H3>
+
+<p>Alert reader and critic-at-large Terje Sletteb&oslash; has identified an error in Part 1 of this series of columns, pointing out that the simple code used to demonstrate the &#147;round-trip&#148; approach to the <B>typeof</B> implementation was illegal:</p>
+
+<pre>
+const int DoubleVal = 12; // code for double
+//...
+Int2Int&lt;DoubleVal&gt; typeCode(double &amp;);
+//...
+template &lt;int typecode&gt; struct DeCode;
+template &lt;&gt; struct DeCode&lt;DoubleVal&gt;
+  { typedef double R;};
+//...
+DeCode&lt;typeCode(cont[0]).value&gt;::R // illegal!
+  value( cont[0] );
+</pre>
+
+<p>The argument used to instantiate the <B>DeCode</B> template must be an integer constant expression, and a constant expression may not contain, directly, a function call. My compilers (and, admittedly, I) had a more liberal and non-standard view of the matter, however, and allowed the expansion because it was possible in this case to determine the value of the expression at compile time. In situations like this, we usually reach for <B>sizeof</B>:</p>
+
+<pre>
+char (*typeCode(double &amp;))[DoubleVal];
+//...
+typename DeCode&lt;sizeof(*typeCode(cont[0]))&gt;::R // OK
+  value( cont[0] );
+</pre>
+
+<p>In this modified version, the <B>typeCode</B> functions return a pointer to an array of characters, where the array bound is a compile-time constant equal to the code of interest. It is legal to employ <B>sizeof</B> in an integer constant expression, even if the <B>sizeof</B> expression contains a function call. Therefore we can extract the code as the <B>sizeof</B> of the dereferenced return type of the function. This was the approach we took in the implementation of the <B>genGN</B> functions in Part 2 of this series.</p>
+
+<H3><FONT COLOR="#000080">Notes</FONT></H3>
+
+<p><a name="1"></a>[1]  We will, unfortunately, not have space to include the entire implementation of the <B>typeof</B> facility. The interested reader may find source code for the complete implementation at &lt;www.semantics.org/code.html&gt;. In particular, many details of the handling of the <B>void</B> type and implementation of pointers to cv-qualified member functions have had to be omitted here.</p>
+<p><a name="2"></a>[2]  Andrei Alexandrescu. <I>Modern C++ Design</I> (Addison Wesley, 2001), p. 33.</p>
+<p><a name="3"></a>[3]  S. C. Dewhurst. &#147;Common Knowledge: A Bitwise <B>typeof</B>, Part 1,&#148; <I>C/C++ Users Journal</I>, August 2002.</p>
+
+<p><i><B>Stephen C. Dewhurst</B> (&lt;www.semantics.org&gt;) is the president of Semantics Consulting, Inc., located among the cranberry bogs of southeastern Massachusetts. He specializes in C++ consulting, and training in advanced C++ programming, STL, and design patterns. Steve is also one of the featured instructors of The C++ Seminar (&lt;www.gotw.ca/cpp_seminar&gt;).</i></p>
+
+<h4><a href="../../../source/2002/dec02/dewhurst.zip"></a></h4>
+</blockquote></body></html>

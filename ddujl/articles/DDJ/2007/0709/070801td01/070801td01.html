@@ -1,0 +1,216 @@
+<html>
+<head>
+<title>Multithreaded Asynchronous I/O &amp; I/O Completion Ports</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> September 2007</p>
+
+<h1>Multithreaded Asynchronous I/O &amp; I/O Completion Ports</h1>
+<h2>Facilitating efficient handling of multiple asynchronous I/O requests </h2>
+
+
+<h3>By Tom R. Dial</h3>
+
+
+<I>Tom is a  development team leader for Hyland Software. He can be contacted at tdial@kavaga.com.</I>
+
+<hr>
+
+
+
+
+<p>When developing server applications, it is important to consider scalability, which usually boils down to two issues. First, work must be distributed across threads or processes to take advantage of today's multiprocessor hosts. Second, I/O operations must be scheduled efficiently to maximize responsiveness and throughput. In this article, I examine I/O completion ports&#151;an elegant innovation available on Windows that helps you accomplish both of these goals. </p>
+
+<p>I/O completion ports provide a mechanism that facilitates efficient handling of multiple asynchronous I/O requests in a program. The basic steps for using them are:</p>
+
+<ul>
+  </ul>
+
+<ol>
+  <li>Create a new I/O completion port object.</li>
+  <li>Associate one or more file descriptors with the port.</li>
+  <li>Issue asynchronous read/write operations on the file descriptor(s).</li>
+  <li>Retrieve completion notifications from the port and handle accordingly.</li>
+</ol>
+
+<ul>
+  </ul>
+
+<p>Multiple threads may monitor a single I/O completion port and retrieve completion events&#151;the operating system effectively manages the thread pool, ensuring that the completion events are distributed efficiently across threads in the pool.</p>
+
+<p>A new I/O completion port is created with the <i>CreateIoCompletionPort</i> API. The same function, when called in a slightly different way, is used to associate file descriptors with an existing completion port. The prototype for the function looks like this:</p>
+
+<pre class="code">
+
+HANDLE CreateIoCompletionPort(
+   HANDLE FileHandle,
+   HANDLEExistingCompletionPort,
+   ULONG_PTR  CompletionKey,
+   DWORD NumberOfConcurrentThreads
+   );
+
+</pre>
+<p>When creating a new port object, the caller simply passes INVALID_HANDLE_VALUE for the first parameter, NULL for the second and third parameters, and either zero or a positive number for the <i>ConcurrentThreads</i> parameter. The last parameter specifies the maximum number of threads Windows schedules to concurrently process I/O completion events. Passing zero tells the operating system to allow at least as many threads as processors, which is a reasonable default. For a discussion of why you might want to schedule more threads than available processors, see <i>Programming Server-Side Applications for Windows 2000</i>  by Jeffrey Richter and Jason D. Clark.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Associating File Descriptors with a Port</h3>
+
+<p>Once a port has been created, file descriptors opened with the FILE_FLAG_OVERLAPPED (or WSA_FLAG_OVERLAPPED for sockets) may be associated with the port via another call to the same function. To associate an open file descriptor (or socket) with an I/O completion port, the caller passes the descriptor as the first parameter, the handle of the existing completion port as the second parameter, and a value to be used as the "completion key" for the third parameter. The completion key value is passed back when removing completed I/O requests from the port. The fourth parameter is ignored when associating files to completion ports; a good idea is to set this to zero.</p>
+
+
+<h3>Initiating Asynchronous I/O Requests: OVERLAPPED Explained</h3>
+
+<p>Once a descriptor is associated with a port, (and you may associate many file descriptors with a single I/O Completion Port), an asynchronous I/O operation on any of the descriptor(s) results in a completion event being posted to the port by the operating system. The same Windows APIs that let callers perform standard synchronous I/O have a provision for issuing asynchronous I/O requests. This is accomplished by passing a valid OVERLAPPED pointer to one of the standard functions. For example, take a look at <i>ReadFile</i>:</p>
+
+<pre class="code">
+
+BOOL ReadFile(
+  HANDLE    File,
+  LPVOID    pBuffer,
+  DWORD     NumberOfBytesToRead,
+  LPDWORD   pNumberOfBytesRead,
+  LPOVERLAPPED  pOverlapped
+  );
+
+</pre>
+<p>For typical (synchronous) I/O operations, you've always passed NULL for the last parameter, but when doing asynchronous I/O, you need to pass the address of an OVERLAPPED structure in order to specify certain parameters as well as to receive the results of the operation. Asynchronous calls to <i>ReadFile</i> are likely to return FALSE, but <i>GetLastError</i> returns ERROR_IO_PENDING, indicating to the caller that the operation is expected to complete in the future.</p>
+
+<p>A common mistake when using OVERLAPPED structures is to pass the address of an OVERLAPPED structure declared on the stack:</p>
+
+<pre class="code">
+
+OVERLAPPED Gone;
+// Set up 'Gone'..
+ReadFile ( hFile, pBuf, Count,
+          &amp;NumRead, &amp;Gone );
+
+</pre>
+<p>This just won't work because <i>ReadFile</i> returns immediately, and when the function containing the call to <i>ReadFile</i> exits, the stack will be unwound and the data pointed to by &amp;<i>Gone</i> will become invalid. Thus, you should ensure that your program manages its OVERLAPPED structures (and any buffers you're using) carefully. The example employs a fairly common strategy that involves having a C++ class representing a connection derive from OVERLAPPED&#151;which may offend some C++ purists, but is a practical solution to the problem. The connections are allocated on the heap, and when I/O operations are initiated, the connections' pointer is passed as the pointer to OVERLAPPED.</p>
+
+
+
+
+
+
+
+
+
+<h3>Retrieving Completed I/O Events from the Port</h3>
+
+<p>Now that we know how to create a completion port, associate descriptors to it, and initiate asynchronous I/O operations on the descriptors, it's on to retrieving completion events from the port. A thread removes an event from the port's queue by calling the <i>GetQueuedCompletionStatus</i> function:</p>
+
+<pre class="code">
+
+BOOL GetQueuedCompletionStatus(
+  HANDLE   CompletionPort,
+  LPDWORD   pNumberOfBytes,
+  PULONG_PTR   pCompletionKey,
+  LPOVERLAPPED*   ppOverlapped,
+  DWORD   Timeout
+  );
+
+</pre>
+<p>Obviously, the first parameter to this function is the handle to the <i>port</i> object, followed by several pointers and a <i>Timeout</i> value. Once an operation has completed successfully, the variable pointed to by <i>pNumberOfBytes</i> contains the number of bytes written or read during the I/O completion, the <i>pCompletionKey</i> value contains the value of the completion key passed when associating the file descriptor to the port, and the <i>ppOverlapped</i> variable points to the OVERLAPPED pointer passed as the parameter to the asynchronous I/O function. The <i>timeout</i> value, which is specified in milliseconds, works just like other Windows functions in that the special value INFINITE may be passed to specify "wait forever."  </p>
+
+
+<h3>Sending Your Own Events: PostQueuedCompletionStatus</h3>
+
+<p>Before we move on to a practical example, there's one more function to discuss:</p>
+
+<pre class="code">
+
+BOOL PostQueuedCompletionStatus(
+  HANDLE       CompletionPort,
+  DWORD   NumberOfBytesTransferred,
+  ULONG_PTR    CompletionKey,
+  LPOVERLAPPED pOverlapped
+  );
+
+</pre>
+<p>This function lets you post completion events to the port. Typically, this function is used to send implementation-specific messages to the port. When you post a completion event to a port, one of the threads blocking on the port successfully returns from its call to <i>GetQueuedCompletionStatus</i> with copies of the parameters as they were posted.</p>
+
+<p>This function is often used to notify worker threads of some global or application-wide event. Along those lines, the sample program presented in this article posts completion events with a special completion key value of COMPLETION_KEY_SHUTDOWN in order to tell the worker threads that the server is shutting down.  </p>
+
+
+
+
+
+
+
+
+<h3>A Practical Example: The Fire Web Server</h3>
+
+<p>When I first sat down to write this article, I recalled that my own learning experience was made somewhat difficult by the relative dearth of real-world examples. The same was true of my experience learning about some of the more esoteric Windows Sockets APIs. As these are both important Windows innovations, I decided to develop a simple, multithreaded web server that demonstrates the use of both. It is named in honor of my friend and colleague Ray Schraff, who often tells our customers that mankind has adopted the World Wide Web faster than any technology since the invention of fire. The Fire web server (available at <a href="http://www.ddj.com/code/">www.ddj.com/code/</a>) exploits I/O completion ports and the best features of Windows Sockets to deliver respectable performance in about 500 lines of C++ code.  </p>
+
+
+<h3>The main() Event</h3>
+
+<p>All important initialization occurs in the <i>main</i> function, including the initialization of the Windows socket library, registration of an event handler to capture the user's request to stop the server via CTRL-C, and creation of the listener socket.</p>
+
+<p>Next, a single I/O completion port is created, followed by the creation of a small pool of worker threads. Finally, a fixed number of <i>Connection</i> objects (each of which manages one socket) are created.</p>
+
+
+<h3>The Connection Class</h3>
+
+<p>The real meat of the program lies within the implementation of the <i>Connection</i> class. Its constructor creates a socket, associates it with the I/O completion port previously created in the <i>main</i> function, and finally, issues an asynchronous request to accept a client connection.</p>
+
+<p>People familiar with the standard accept API may be confused by the fact that a client socket is created prior to the call to <i>AcceptEx</i>, so let me explain. <i>AcceptEx</i> requires that the client socket be created up-front, but this minor annoyance has a payoff in the end: It lets a socket descriptor be reused for a new connection via a special call to <i>TransmitFile</i>. This means that a server that deals with many short-lived connections can utilize a pool of allocated sockets without incurring the cost of creating new descriptors all the time.</p>
+
+<p>The rest of the <i>Connection</i> class is a simple state machine; any given connection may be in any of four states:</p>
+
+<ul>
+    <li>WAIT_ACCEPT. Waiting for <i>AcceptEx</i> to complete.</li>
+  <li>WAIT_REQUEST. Waiting for the client request to be complete.</li>
+  <li>WAIT_TRANSMIT. Waiting for the response to be sent.</li>
+  <li>WAIT_RESET. Waiting for the client socket to be reset.</li>
+</ul>
+
+<p>Here's how things get rolling: When the <i>Connection</i> objects are allocated in the <i>main</i> function, they all issue asynchronous accept calls on their sockets. This means that shortly after startup, all connection objects are in the WAIT_ACCEPT state, until a client actually connects and the operating system wakes one of the worker threads.</p>
+
+<p>The handling worker thread takes advantage of the fact that the <i>Connection</i> class is derived from OVERLAPPED, casts the OVERLAPPED pointer into a connection object, and assuming the pointer checks out, calls the <i>Connection</i>'s <i>OnIoComplete</i> function.</p>
+
+<p><i>OnIoComplete</i> implements the <i>Connection</i> class's state machine&#151;essentially transitioning from one waiting state to another by calling the appropriate <i>CompleteXxx</i> function. For example, when a new client connects, the <i>CompleteAccept</i> method is called to perform the necessary steps to prepare the socket for actual use.  </p>
+
+<p>Likewise, each <i>CompleteXxx</i> function's last move is to issue another asynchronous I/O request, whether to read more data from the client, transmit a response, or ask that the socket be reset and ready to accept a new client.</p>
+
+<p>At this point, several items merit mention when designing around I/O completion ports and asynchronous I/O. First, as has already been mentioned, because asynchronous I/O functions typically return immediately, you must ensure that any buffers passed to the calls remain valid at least until the completion event is handled. This implies heap allocation, since buffers allocated on the stack in a function get junked on exit.</p>
+
+<p>Second, in a server application such as Fire, any thread could handle any connection at any time. As soon as an asynchronous file operation is issued on a descriptor, it is up to the operating system to pick a thread to run the completion routine. Put differently, there is no guaranteed affinity between the thread issuing an asynchronous I/O call and the thread receiving the completion notification. For this reason, you must design your data structures carefully in order to ensure that threads don't tromp all over each other when trying to handle a request.</p>
+
+<p>Last, you must be extremely careful to design your application to avoid races and the other classes of problems that arise when writing multithreaded programs. For example, when designing Fire, I spent a considerable portion of my development time convincing myself which states were necessary to consider. I was also careful to make sure that the various asynchronous I/O requests (read data, write data, reset the socket, and so on) were always the last operations performed in any of the completion handlers. </p>
+
+<p>The reason is subtle, but clear: Were I to perform any other types of work in a handler function after issuing an I/O request, I would have a race condition&#151;it would be possible for more than one thread to be operating on a connection object concurrently.  </p>
+
+<p>The benefit of all this careful planning, however, is that Fire does not require any mutual exclusion mechanism in its implementation. </p>
+
+<p>The result should be that Fire scales well on multicore machines, since individual worker threads are never competing for resources.</p>
+
+
+<h3>Conclusion</h3>
+
+<p>I/O completion ports provide an elegant solution to the problem of writing scalable server applications that use multithreading and asynchronous I/O. While it is important to design such applications carefully to avoid certain types of problems such as race conditions or excessive resource contention, the benefits of doing so far outweigh the costs, especially considering the world of multicore, multiprocessor servers in which we now reside. </p>
+
+
+<h3>Acknowledgments</h3>
+
+<p>Thanks to Dave Cutler, Len Holgate, Paul Lloyd, and especially Dad for his detailed review.</p>
+
+
+
+
+</body>
+</html>

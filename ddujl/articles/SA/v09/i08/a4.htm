@@ -1,0 +1,203 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v09, i08: Storage Area Networks</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink>Article</a></span></td>
+		<td><span class=navbarLink><a href="a4_f1.htm">Figure 1</a></span></td>
+		<td><span class=navbarLink><a href="a4_t1.htm">Table 1</a></span></td>
+		<td><a href="../../../../source/SA/2000/aug2000.tar"><b class=codeListing>aug2000.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<! -- Insert Content ------ >
+
+<H1>Storage Area Networks</H1><p>
+<P>David Sultzman
+<P>
+I recently had the opportunity to certify and roll out a Storage Area Network (SAN) within a large corporation. We had some great successes, but we also had to maneuver around some pitfalls. I hope that by showing the setup of a simple SAN, I can illustrate techniques that worked for me and guide you around some obstacles.<P>
+<B>Brief Background</b><p>Consider this problem: you have undergone a server consolidation project, moving from 20-30 small UNIX servers to 5 large servers. Each project team previously controlled their server and attached disk space. When the project teams estimated the amount of disk space required on the new consolidation server, some underestimated their storage growth and some asked for more space than they needed. Because the storage on the consolidation servers was direct-attached and was on server-by-server (not project-by-project) lease terms, there was no economical way to move excess storage from those hosts that had too much to those that had too little. As a result, money was wasted, and some project teams were unhappy.<P>
+Now consider how this scenario would have been different with a storage infrastructure in place that provided project teams the exact amount of storage they needed in the short-term, and gave your IT staff the flexibility to add or remove storage as project requirements changed over time. Storage could be leased in bulk from the vendor, and you could charge project teams for the storage allocated to their projects.<P>
+Basically, a SAN allows you to attach servers to storage devices in a many-to-many relationship. Sixteen Fibre ports on a large storage array used to allow only 16 host connections to the storage. If you wanted to access storage available on a separate storage device, you had to install additional SCSI or Fibre Channel (FC) Host Bus Adapters (HBAs) in the host and provide a direct connection to the storage. In a SAN, you may have multiple storage devices serving data to multiple hosts.<P>
+I had the opportunity to implement a SAN using Sun Solaris servers, Jaycor Networks Inc. (JNI) Fibre Channel HBAs, Brocade Fibre Channel switches, and EMC Symmetrix storage. Although some of what I will cover is specific to these products, the concepts are somewhat generic and you can gain useful information no matter who your vendors are. Once you have worked out the subtleties, setting up a SAN is straightforward.<P>
+I will assume you have already installed your host operating system, recent patches, HBAs and related drivers, and placed your hosts on the SAN by connecting your hosts and storage to Fibre Channel switches. See Figure 1 for a diagram of the simple SAN considered in this article. If you can master the techniques for one host attached to the SAN, adding multiple hosts and storage devices shouldn&#146;t be difficult. I will only address the case in which each port on the SAN is &#147;fabric aware&#148;. Although it is possible to place arbitrated-loop devices into a SAN, I did not experience this first-hand. Fully fabric-aware devices are becoming more common, and I expect the industry will move entirely in this direction.<P>
+Each fabric node on a full fabric SAN will have a hardware address known as the World Wide Number (WWN). From the host perspective, this allows you to specify the specific storage port on which you expect to find any given logical unit number (LUN). Each HBA, storage port, and switch will have a WWN that uniquely identifies that device on the SAN. A WWN is very much like the hard-coded MAC address found in all Ethernet devices and is either burned into firmware or, in the case of the Symmetrix, is configurable.<P>
+Like a MAC address, the WWN is not hierarchical and does not indicate how traffic may be routed from one switch to another through the fabric. Just as the IP addressing scheme overcomes this limitation of ethernet, the Fibre Channel switch uses an internal hierarchical 24-bit address to allow efficient routing of frames through the fabric. Discussion of this addressing scheme is beyond the scope of this article. The 24-bit address was transparent to me as I set up both the simple SAN described here, and the much larger production SAN at my customer&#146;s site.<P>
+Each port on the Symmetrix has a port WWN. This allows you to specify exactly where on the SAN you expect your server to discover the LUNs that have been allocated to it. Each storage port may present multiple LUNs to the fabric. A LUN is a logical unit of storage that the Symmetrix presents as if it were a physical disk. After it has been mounted by the operating system, each LUN may be treated as if it were a SCSI-attached hard drive.<P>
+When the fabric-aware HBA initializes at boot time, it will log into the fabric and discover all the LUNs available to it on the fabric. When a reconfiguration reboot is performed on the Sun server, the Solaris operating system and JNI device driver will then configure only the SCSI disks specified in the <B>/kernel/drv/sd.conf</B> file, explained below.<P>
+I used the following technique to reveal the WWNs of the HBAs:<P>
+<pre>
+awk '/Fibre Channel WWN/{print $6, $10}'  \
+   /var/adm/messages* | sort -u
+fca-pci0: 200000e069c00d52
+fca-pci1: 200000e069c00d4d
+</pre>
+When the adaptor initializes at boot time, it places entries into the <B>/var/adm/messages</B> file. The preceding command simply searches for all log entries pertaining to the &#147;Fibre Channel WWN&#148;, prints out only columns 6 and 10 (the information we are concerned about), and discards any duplicate entries (<B>sort -u</B>).<P>
+Double-check your network using the WWN information supplied by the SwitchShow command, below, and the WWN information supplied by the HBA driver on the host. We will use this information later when we assign a relationship between the HBA and the storage port by explicitly specifying both the HBA and storage-port WWN in the <B>/kernel/drv/sd.conf</B> file.<P>
+The SwitchShow command causes the switch to report the devices it can communicate with on each of its ports. In this case, we are using a 16 port switch (ports 0-15) and have two ISL connections, indicated by the <B>E-port</B> (expansion port) designation. Also shown are the <B>F-ports</B> (fabric ports) of the host and the storage. Those ports that do not have any connection are indicated as having <B>No_Light</B>. I recommend obtaining WWNs of the storage ports from your vendor and double-checking this information against the SwitchShow command:<P>
+<pre>
+SwitchShow
+</pre>
+This will allow you to verify your work and ensure that the physical network matches the network that you have sketched out on paper. The <B>SwitchShow</B> command will also show the WWNs of the host-bus adapters.<P>
+SwitchShow output from the two switches in the SAN in Figure 1 includes the following information:<P>
+<pre>
+san1:user&gt; SwitchShow
+switchName:     san1
+...
+switchWwn:      10:00:00:60:69:10:13:1b
+port  0: id  Online     E-Port  \
+   10:00:00:60:69:10:12:f6 "san2"
+port  1: id  No_Light
+port  2: id  Online     E-Port  \
+   10:00:00:60:69:10:12:f6 "san2" \
+   (upstream)
+port  3: id  No_Light
+port  4: id  Online     F-Port  \
+   50:06:04:82:b8:91:7f:12
+port  5: id  Online     F-Port  \
+   50:06:04:82:b8:91:7f:1d
+port  6: id  No_Light
+port  7: id  No_Light
+port  8: id  Online     \
+   F-Port  20:00:00:e0:69:c0:0d:52
+port  9: id  No_Light
+port 10: id  No_Light
+port 11: id  No_Light
+port 12: id  No_Light
+port 13: id  No_Light
+port 14: id  No_Light
+port 15: id  No_Light
+
+san2:user&gt; SwitchShow
+switchName:     san2
+...
+switchWwn:      10:00:00:60:69:10:12:f6
+port  0: id  Online     E-Port  \
+   10:00:00:60:69:10:13:1b "san1"
+port  1: id  Online     E-Port  \
+   10:00:00:60:69:10:13:1b "san1" \
+   downstream)
+port  2: id  No_Light
+port  3: id  No_Light
+port  4: id  Online     \
+   F-Port  50:06:04:82:b8:91:7f:0d
+port  5: id  Online     \
+   F-Port  50:06:04:82:b8:91:7f:02
+port  6: id  No_Light
+port  7: id  No_Light
+port  8: id  Online    \ 
+   F-Port  20:00:00:e0:69:c0:0d:4d
+port  9: id  No_Light
+port 10: id  No_Light
+port 11: id  No_Light
+port 12: id  No_Light
+port 13: id  No_Light
+port 14: id  No_Light
+port 15: id  No_Light
+</pre>
+You can see from this output that the fca-pci0 HBA, with the WWN ending in 0d:52, may communicate directly with storage ports with WWNs ending in 7f:12 and 7f:1d, because it resides on the same switch as those Symmetrix ports. Likewise, the fca-pci1 HBA, with the WWN ending in 0d:4d, communicates directly with storage ports ending in 7f:0d and 7f:02. This is important information because I always try to ensure there is little or no traffic travelling from one switch to another over the Inter-Switch Link (ISL). An ISL is a switch-to-switch connection that allows traffic to move over the fabric to a final destination. In this case, there are two ISLs between the switches.<P>
+There is no need to specify the routes that the fabric traffic should take through this SAN. Although the switches are intelligent enough to get all traffic to the right place, pre-planning and good design techniques are required to achieve a high-performance and robust SAN. During the setup phase, I gather all WWNs on the SAN. This makes troubleshooting much easier if the SAN does not perform exactly the way I expect.<P>
+The SAN I propose is simple, with a single layer of switches between the hosts and the storage. With the small size typical of contemporary storage networks, I prefer this simple architecture. As the SAN grows, additional servers, switches, and storage devices may be added as needed. It will accommodate a relatively large number of hosts and storage devices and, if properly configured, will maximize performance because it simulates a point-to-point connection between hosts and storage. Of course, you must pay close attention to how much host-to-switch traffic is routed through the switch-to-storage paths. There are typically many more host-to-switch than switch-to-storage connections. Examine the I/O requirements of each server and be careful not to create a bottleneck.<P>
+In the future, as more hosts and storage devices are placed in a SAN environment, it may be desirable to move to a multi-layer fabric, perhaps incorporating a SAN backbone of faster switches with more ports, faster backplanes, and faster ISLs than today&#146;s switches provide. At this point, I see inter-switch links as a means to temporarily ease a storage crisis on a storage-starved server. I prefer not to use ISLs as a path for normal host-to-disk activity.<P>
+<B>Configuration of the FC Adapter</b><p>Next, you will need to configure your FC HBA drivers for operation over a fabric. With the JNI adapters, the <B>/kernel/drv/fca-pci.conf</B> file on PCI-based hosts, or <B>/kernel/drv/fcaw.conf</B> for SBus-based hosts, controls the behavior of the adapter. Based on vendor recommendations, I changed the following values:<P>
+<pre>
+failover = 60;
+fca_nport = 1;
+fca_verbose = 1;
+link_recovery_delay = 1000;
+</pre>
+And I added the following parameter:<P>
+<pre>
+login_retry_max = 5;
+</pre>
+By setting the <B>fca_nport</B> parameter to 1, I am specifying that the HBA initializes as an <B>n_port</B> (network port) device with fabric operation enabled. The <B>failover</B> parameter determines the number of seconds before an offline target is declared failed. A failed target will cause all queued commands to be passed back to the application. If you set this parameter too low, you may get undesirable results in a network environment because many servers may be competing for limited storage resources at peak usage hours. If this value is set too high, however, the server may wait too long before marking the path as failed. Use your best judgement when setting this value, but keep in mind that this is the value recommended by EMC for a Symmetrix in a SAN environment. The <B>link_recovery_delay</B> variable determines how many milliseconds the host-bus adapter waits after bringing up a link and doing a login recovery. If you set this value too low, you may get a link that fluctuates too rapidly and may cause an unstable connection. The <B>login_retry_max</B> parameter sets the number of times the adapter will attempt to log back into the fabric before the entire adapter is marked as failed.<P>
+<B>Configuration of sd.conf</b><p>In the SAN, unlike a typical SCSI environment, you may specify whatever SCSI target numbers you wish in the <B>/kernel/drv/sd.conf</B> file. Each port on the Symmetrix has a port identifier such as FA 3a and a WWN such as 50060482b8917f12. I decided to assign each port its own target number. Pairing target numbers with port numbers ensures that a LUN on one host, such as c1t1d0, will keep the same name if it is migrated to another host, and all LUNs on the SAN will have unique names. If you add additional storage devices to the SAN, use a new set of target numbers for ports on that device.<P>
+Table 1 is a list of the WWNs on our SAN. I have assigned arbitrary SCSI target numbers to the Symmetrix fibre ports.<P>
+The <B>/kernel/drv/sd.conf</B> file provides LUN masking on the host level. It is necessary to configure this file for each host on the SAN and it requires some administrative effort to ensure that any given LUN is mounted on only a single host. On each host, it is necessary to set up the <B>sd.conf</B> file to allow the operating system to build devices for the LUNs at a reconfiguration reboot. It is also necessary to explicitly specify the HBA for the SCSI attached disk, or else the Fibre Channel driver may attempt to bind to all disks. I set up the <B>sd.conf</B> file as follows:<P>
+<pre>
+name="sd" class="scsi" target=0 lun=0 hba="fas";
+name="sd" class="scsi" target=1 lun=0 hba="fas";
+name="sd" class="scsi" target=2 lun=0 hba="fas";
+name="sd" class="scsi" target=3 lun=0 hba="fas";
+name="sd" class="scsi" target=4 lun=0 hba="fas";
+name="sd" class="scsi" target=5 lun=0 hba="fas";
+name="sd" class="scsi" target=6 lun=0 hba="fas";
+name="sd" class="scsi" target=8 lun=0 hba="fas";
+name="sd" class="scsi" target=9 lun=0 hba="fas";
+name="sd" class="scsi" target=10 lun=0 hba="fas";
+name="sd" class="scsi" target=11 lun=0 hba="fas";
+name="sd" class="scsi" target=12 lun=0 hba="fas";
+name="sd" class="scsi" target=13 lun=0 hba="fas";
+name="sd" class="scsi" target=14 lun=0 hba="fas";
+name="sd" class="scsi" target=15 lun=0 hba="fas";
+
+name="sd" class="scsi" target=23 lun=2  \
+   hba="fca-pci0"  wwn="50060482b8917f1d";
+name="sd" class="scsi" target=23 lun=3  \
+   hba="fca-pci0"  wwn="50060482b8917f1d";
+name="sd" class="scsi" target=21 lun=4  \ 
+   hba="fca-pci0"  wwn="50060482b8917f12";
+name="sd" class="scsi" target=21 lun=5  \   
+   hba="fca-pci0"  wwn="50060482b8917f12";
+name="sd" class="scsi" target=21 lun=6  \
+   hba="fca-pci0"  wwn="50060482b8917f12";
+name="sd" class="scsi" target=22 lun=2  \
+   hba="fca-pci1"  wwn="50060482b8917f02";
+name="sd" class="scsi" target=22 lun=3  \
+   hba="fca-pci1"  wwn="50060482b8917f02";
+name="sd" class="scsi" target=24 lun=4  \
+   hba="fca-pci1"  wwn="50060482b8917f0d";
+name="sd" class="scsi" target=24 lun=5  \
+   hba="fca-pci1"  wwn="50060482b8917f0d";
+name="sd" class="scsi" target=24 lun=6  \
+   hba="fca-pci1"  wwn="50060482b8917f0d";
+</pre>
+Notice that I added hba=&#147;fas&#148; to the default <B>sd.conf</B> entries, to ensure they will be associated with the internal SCSI HBA. This is required because the Fibre Channel driver may attempt to bind to all LUNs that do not have a specific HBA assigned. This is controlled by the <B>def_hba_binding</B> setting in the <B>fca-pci.conf</B> or <B>fcaw.conf</B> file.<P>
+Once the above setup is complete, perform a reconfiguration reboot on the host:<P>
+<pre>
+touch /reconfigure
+shutdown -y -i6 -g0
+</pre>
+These <B>sd.conf</B> entries allow the host to accomplish what is known as &#147;persistent binding&#148;. Basically, we are specifying the LUN the host will bind to as it creates SCSI devices in the device tree, the host bus adapter that should find it, and the WWN of the storage port on which the LUN resides. By specifying this level of detail, we are ensuring that the SCSI devices will be created the same way each time we reboot the server. Without specifying this level of detail, I found the server sometimes responded in an unpredictable fashion after successive reconfiguration reboots.<P>
+When the host-bus adapter logs into the fabric at boot time, it will be able to see all the LUNs on the storage network, unless some type of switch-based or storage-based LUN masking is used. It is up to you to ensure that your hosts play well on the SAN and you must manage your <B>sd.conf</B> files accordingly.<P>
+<B>Check the Configuration</b><p>Use the format command to check your configuration after the host reboots. I saw the following devices: c1t21d4, c1t21d5, c1t21d6, c1t23d2, c1t23d3, c2t22d2, c2t22d3, c2t24d4, c2t24d5, and c2t24d6. If you do not see the devices you expect, first check the <B>/kernel/drv/sd.conf</B> file for syntax and logic errors. If you really need to get into the details of how this file is parsed, see the technical note included with the JNI driver located in <B>/opt/JNIfcaPCI/technote.txt</B> for PCI-based hosts, and <B>/opt/JNIfcaw/technote.txt</B> for SBus machines. Configuration information may also be found in the fca-pci and fcaw man pages.<P>
+Next, try this test: either physically disconnect the ISLs, or execute the Brocade <B>PortDisable</B> command to bring down the ISLs. Can you still see your storage? If not, you have inadvertently created inter-switch traffic. You may correct this condition by changing the LUN binding configuration in the <B>/kernel/drv/sd.conf</B> file to match your physical network. As your storage network grows, inter-switch traffic may be desirable but, whenever possible, you should perform simple tests like this to ensure the network is performing as expected. Inter-switch traffic may not impact performance on a small SAN but, as more hosts are added, poorly planned ISL traffic is sure to become a bottleneck.<P>
+You have now mounted each LUN twice to the host through two host-bus adapters. You may utilize Veritas DMP or EMC PowerPath to accomplish load balancing and failover to your LUNs.<P>
+<B>Conclusion</b><p>I have demonstrated the basics of configuring a host to recognize LUNs in a SAN environment. This procedure is simple but it should give you a starting place for configuring your own Solaris hosts. The major complicating factor in larger SAN environments is keeping good documentation, not the mechanics of individual host configuration. The SAN will demand cooperation from system, storage, and network administrators due to the higher level of complexity. But in the long run, a SAN is likely to lower your storage infrastructure costs while providing tremendous flexibility and the ability to quickly reallocate storage resources as project needs change over time. <P>
+<p>
+<h1>About the Author</h1><p>
+David is a UNIX Systems Analyst in Michigan. When he wrote this article, he was working on a contract basis for a large Detroit-area corporation. 
+
+
+
+<! -- Begin Content ------ >
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

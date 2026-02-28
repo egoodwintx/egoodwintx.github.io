@@ -1,0 +1,449 @@
+<html>
+<head>
+<title>December 03: Exception Safety Analysis </title>
+</head>
+
+<body>
+<h2>Exception Safety Analysis</h2>
+<h3>By Andrei Alexandrescu</h3>
+
+<p>This installment of Generic&lt;Programming&gt;, coauthored with Dave Held, takes a short break from the "Smart Pointers Reloaded" miniseries to discuss how to analyze the exception safety of a function. Although my book <i><i>Modern C++ Design</i></i> [1] pioneered policy-based smart pointers, it glossed over the details of figuring out behavior in the presence of exceptions thrown by various policy implementations. To, ahem, its author's pride, two years after publication, the only known bug of <b>SmartPtr</b> (now under the undercover name <b>smart_ptr</b>) was that it incorrectly managed resources during construction in the presence of exceptions. Dave took care of fixing this bug, with much help (in the form of ideas, suggestions, criticisms, and code) from the Boost community. </p>
+<p>After having a little fun with macros, we discuss how to analyze a function for exception safety. We'll resume the miniseries in the future, when we'll apply the exception-safety analysis to <b>smart_ptr</b>. </p>
+
+
+
+<h3>Mailcontainer</h3>
+
+
+<p>Rob Mann sent in a nice idea that applies to the assertions framework described in Generic&lt;Programming&gt; [2,3]. The idea is more general though, so it might be of interest to many people who enjoy defining new and improved macros.</p>
+
+
+<p>Macros and C++ have always been in a codependent relationship &#151; C++ did a lot to rid itself of macros, yet it still depends on them in a few key ways. Rob's macro trick, when generalized, lets you define a macro that injects a variable in a yet-to-be-entered scope. For example: </p>
+
+<pre>
+INJECT_VARIABLE(string, x)
+{
+   ... use string variable x here ...
+}   // x's scope ends here
+// if there's an outer x defined, its 
+// scope resumes here
+</pre>
+
+<p>This trick is quite powerful because it lets macros define variables without the fear of name clashes. My article on assertions [2] uses a complicated scheme that generates variable names by (ab)using <b>__LINE__</b>, with the caveat that you can't use the macro twice on the same line &#151; an unusual requirement even for seasoned programmers.</p>
+
+<p>The workings of <b>INJECT_VARIABLE</b> are simple, and many people have "discovered" it before. There are two to inject a variable &#151; you can abuse the <b>if</b> statement, or you can abuse the <b>for</b> statement.</p>
+
+<p>The first way of injecting a variable via a macro (see [4]) is to use the relatively recent ability to define a variable in an <b>if</b> test expression:</p>
+
+<pre>
+if (int x = Fun())
+{
+  ... x is defined here ...
+}
+else
+{
+  ... x is defined here (and amounts to 
+      0 upon entering) ...
+}
+// if there's an outer x defined, its 
+// scope resumes here
+</pre>
+
+<p>The <b>x</b> variable exists through the True and False branches of the <b>if</b> statement. There are two drawbacks to this trick: </p>
+
+<ul>
+
+  <li>You can't define static variables.
+
+  <li><b>x</b> must be testable and, as such, it must define an operator <b>bool() </b>or something similar. If you do define for your type <b>MyType</b> an operator <b>bool()</b> that always returns False, then you can inject a variable of your type with a macro such as:
+
+<pre>
+#define INJECT_VARIABLE(name) \
+   if (MyType name) ; else
+</pre>
+</ul>
+
+<p>Or, you simply define your macro to start a <b>for</b> statement that defines the needed variable. For example:</p>
+
+<pre>
+#define INJECT_VARIABLE(type, name) \
+   for (type name; ; )
+</pre>
+
+<p>Of course, if you use <b>INJECT_VARIABLE</b> in this form, you'll forever execute the statement that follows it. To make sure you execute the statement only once, you'd need to wrap the <b>for</b> loop in an <b>if</b> statement, which defines a variable to help with execution control:</p>
+
+<pre>
+#define INJECT_VARIABLE(type, name) \
+   if (bool obfuscatedName = false) ; else \
+      for (type name; !obfuscatedName; 
+           obfuscatedName = true) 
+</pre>
+
+<p>Everything works fine now, with two requirements on client code. One is that clients don't try to use the name <b>obfuscatedName</b> themselves. (As its name implies, you can obfuscate that name in any way you wish, perhaps by using the<b> __LINE__</b>-based trick in [2]). The other issue is that, by design, the <b>break</b> and <b>continue</b> statements inside an <b>INJECT_VARIABLE</b> block terminate the block's execution, which might be confusing to the macro's users. On the efficiency front, fortunately, your compiler can most likely optimize-away the two <b>obfuscatedName</b> tests.</p>
+
+<p>An interesting application of <b>INJECT_VARIABLE</b> is to emulate Java's <b>synchronized</b> keyword, which prescribes serial execution for a piece of code or a function. We assume that we have a class <b>Mutex</b> that implements, well, a mutex, and a class <b>Lock</b> that automates the locking and unlocking of a <b>Mutex</b> in a "resource acquisition is initialization" manner. Then, you can define the following macro:</p>
+
+<pre>
+#define SYNCHRONIZED \
+   INJECT_VARIABLE(static Mutex, obfuscatedMutexName) \
+   INJECT_VARIABLE(Lock, obfuscatedLockName (obfuscatedMutexName))
+</pre>
+
+<p>Now you can write:</p>
+
+<pre>
+void Foo()
+{
+   ... reentrant code ...
+   SYNCHRONIZED
+   {
+      ... nonreentrant code ... 
+   }
+   ... reentrant code ...
+}
+</pre>
+
+<p>and be sure that the nonreentrant portion of the code is always executed in only one thread at a time. The job of initializing the static <b>Mutex</b> in a thread-safe manner is left as an exercise to the reader. (Yes, it is doable; and no, it isn't trivial.)</p>
+
+
+<p>Java also provides a one-argument version of <b>synchronized</b>, which synchronizes operation on a certain object. You can emulate that Java construct by defining <b>SYNCHRONIZED_OBJ</b>: </p>
+
+<pre>
+#define SYNCHRONIZED_OBJ(obj) \
+   INJECT_VARIABLE(Lock, obfuscatedLockName((obj).GetMutex())) 
+</pre>
+
+<p>and by using it as follows:</p>
+
+<pre>
+class Widget
+{
+   Mutex myMutex_;
+public:
+   Mutex&amp; GetMutex() { return myMutex; }
+   ...
+};
+void Foo()
+{
+   Widget widget;
+   ... reentrant code ...
+   SYNCHRONIZED_OBJ(widget)
+   {
+      ... widget-synchronized code ... 
+   }
+   ... reentrant code ...
+}
+</pre>
+
+<p>Pretty neat. In a more involved implementation, you might want to protect <b>Mutex</b>'s functions so that only <b>Lock</b>s can access your <b>Mutex</b>.</p>
+
+<p>Finally, Java's <b>synchronized</b> keyword is applicable to entire methods, such as:</p>
+
+<pre>
+// Java code follows
+class Javanilla
+{
+   public void DoSomething() synchronized
+   {
+      ... this is a nice thread-safe function ... 
+   }
+   ...
+}
+</pre>
+
+<p>You might think that emulating this usage of the <b>synchronized</b> keyword isn't possible in C++. You might even think &#151; and rightly so &#151; that you don't even need that keyword and that you can satisfy all of your scoped locking needs with the <b>SYNCHRONIZED</b> and <b>SYNCHRONIZED_OBJ</b> macros. However, as the Greeks might say, the cup of disgrace has no bottom; people without honor can drink from it without ever emptying it. You did not hear from me about the following macro:</p>
+
+<pre>
+#define SYNCHRONIZED_METHOD \
+    try { throw Lock(this-&gt;getMutex()); } catch (Lock&amp;)
+</pre>
+
+<p>Now, if you used it like this (but, of course, you'd never use it):</p>
+
+<pre>
+class Widget
+{
+public:
+    void DoSomething() SYNCHRONIZED_METHOD
+    {
+        ... this is a thread-safe function ... 
+    }
+}
+</pre>
+
+<p>The <b>SYNCHRONIZED_METHOD</b> macro causes the function to look like (reformatted):</p>
+
+
+<pre>
+        void DoSomething() 
+        try
+        {
+            throw Lock(this-&gt;getMutex());
+        }
+        catch (Lock&amp;)
+        {
+            ... this is a nice thread-safe function ... 
+        }
+</pre>
+
+<p>This form is a valid "function-try-block." It is legal to have a <b>try</b> statement as the body of the function, without having to include it inside brackets. This concession is unique to the <b>try</b> statement &#151; there's no "function-for-block" or anything similar. That's why the only way to inject code into the body of a function from the outside is to abuse the <b>try</b> statement as shown. </p>
+
+<p>The long and short of <b>SYNCRHONIZED_METHOD</b> is, don't do it. It's here as a curiosity. The good thing to do is to simply synchronize inside the function by using<b>SYNCHRONIZED_OBJ(*this)</b>.</p>
+
+
+
+<h3>Purity and Exception Safety</h3>
+
+
+<p>Whenever you write a function, you need to have an understanding of its behavior on exceptional paths and make a statement about that function's behavior in the presence of exceptions [5]. That summary is relevant to your function's callers. To briefly recap the canonical exception-safety guarantees, from weakest to strongest [8]:</p>
+
+
+<ul>
+
+  <li>The basic guarantee: The invariants of the function's arguments are preserved and no resources are leaked.
+
+  <li>The strong guarantee: The operation has either completed successfully or thrown an exception, leaving the program state exactly as it was before the operation started.
+
+  <li>The nothrow guarantee: The operation will not throw an exception.
+
+
+</ul>
+
+<p>You should, of course, strive for the strongest guarantee that's possible and affordable. There could also be "the wacky guarantee," which means that the system is in an undefined state in which you have no idea what might happen next, so you better call <b>abort</b> ASAP. In spite of the popularity of the wacky guarantee, we don't discuss it in depth here. </p>
+
+<p>We felt in need of another characterization of functions: A function is pure when it doesn't engender any side effects. Pure functions (not to be confused with pure virtual functions) are well-known concepts; in functional languages such as Haskell or ML, all functions are pure, leading to a stateless model of computation. </p>
+
+<p>Put another way, a pure function does not depend on program state and does not change the program state in any way. A simple example is<b> int operator+(int, int)</b>. Two <b>int</b>s go in, one <b>int</b> comes out &#151; and nothing had better change!</p>
+
+<p>Now consider a function <b>Fun</b> that simply calls two other functions in a row:</p>
+
+<pre>
+void Fun()
+{
+   Gun();
+   Hun();
+}
+</pre>
+
+<p>We set out to analyze the exception-safety level (basic, strong, or nothrow) of <b>Fun</b>, assuming we already know the exception-safety level of <b>Gun</b> and <b>Hun</b>. </p>
+
+<p>If both <b>Gun</b> and <b>Hun</b> are nothrow, <b>Fun</b> is nothrow and we're home free. If <b>Gun</b> is strong and <b>Hun</b> is nothrow, then <b>Fun</b> is strong. This is because we have an operation with transactional behavior followed by an operation that never fails. So if <b>Gun</b> fails, then <b>Fun</b> fails in a "nothing happened" manner; and if <b>Gun</b> doesn't fail, <b>Hun</b> never fails and thus successfully concludes <b>Fun</b>'s execution. This is strong behavior.</p>
+
+<p>Now, what if both <b>Gun</b> and <b>Hun</b> are strong? Well, if <b>Gun</b> succeeds and <b>Hun</b> throws, then we have a problem. What if <b>Gun</b> already modified the program state? That would be a state of partial success for <b>Fun</b>, and so<b> Fun</b>'s exception-safety level decays to...</p>
+
+<p>To what? Basic or wacky? It could be either, really. If <b>Gun</b> and <b>Hun</b> alter subobjects of a larger object, the intermediate state between <b>Gun</b>'s success and <b>Hun</b>'s failure might be undefined as far as the larger object's invariant is concerned.</p>
+
+<p>However &#151; and here's where purity comes into play &#151; if <b>Gun</b> is strong and pure, then <b>Fun</b> stays strong. This is because if <b>Hun</b> fails, there's no change in the program state whatsoever, so <b>Fun</b> behaves in a strong manner just as <b>Hun</b> does.</p>
+
+<p>It's clear that analyzing the exception safety of a function involves the purity of the functions that that function calls. But beware; purity is not absolute (just like in real life, Machiavelli would hasten to add). Even if impure by construction, <b>Gun</b> can be pure as far as <b>Fun</b>'s analysis is concerned, as long as it only modifies local automatic variables of <b>Fun</b>. During execution, <b>Fun</b> can freely modify, directly or via other function calls, its own automatic variables, without putting its purity in jeopardy. Here's an example:</p>
+
+<pre>
+int Sum(int i1, int i2) // silly, but pure
+{
+    std::vector&lt;char&gt; v; // automatic variable
+    v.push_back(i1);  // impure function call
+    v.push_back(i2);  // impure function call
+    return std::sum(v.begin(), v.end());
+}
+</pre>
+
+<p>Note that said function-local data must be automatic &#151; that is, not preserve state between calls. If you make <b>v</b> in the aforementioned example static, <b>Sum</b>'s return value depends on previous calls to itself, which violates the notion of purity.</p>
+
+<p>The important conclusion to drive home from this discussion is that, to make a sequence of function calls strong, you need to structure it as a pure subsequence (possibly altering local automatic data), followed by no more than one strong call, followed by a nothrow subsequence. This is exactly what the "assignment-through-swap idiom" [6] does (actually, Dave proved that all strong functions have this form, but the proof does not fit in the margin of this text).</p>
+
+
+
+<h3>Gaining Strength</h3>
+
+
+<p>Back to <b>Fun</b>, <b>Gun</b>, and <b>Hun</b>. In certain situations, structuring code in pure plus nothrow subsequences is difficult due to the way <b>Gun</b> and <b>Hun</b> are implemented. For example, <b>Gun</b> might always manipulate global state, and you cannot redirect it to write to<b> Fun</b>'s local automatic data.</p>
+
+
+<p>In that case, the <b>try/catch</b> statement can be used to restore strength:</p>
+
+<pre>
+void Fun()
+{
+    Gun();
+    try
+    {
+        Hun();
+    }
+    catch (...)
+    {
+        ... undo Gun's effects ... 
+        throw;
+    }
+}
+</pre>
+
+<p>If there's no way of undoing <b>Gun</b>, you cannot make <b>Fun</b> strong no matter how hard you try. If <b>Gun</b> throws, <b>Fun</b>'s purity cannot be restored, and as such, <b>Fun</b> doesn't have transactional behavior anymore. Moreover, the undoing code must be nothrow. </p>
+
+<p>This idiom is a workable alternative to sequencing calls, but you should use it only when you cannot sequence your code as prescribed in the previous section. It has three drawbacks:</p>
+
+<ul>
+
+  <li>It is more verbose and does not scale well. You need to add a lot of code per function call in the sequence.
+
+  <li>It is harder to check, either by hand or automatically. This is because it's usually not easy to make sure that the <b>undo</b> operations actually undo whatever <b>Gun</b> did. 
+
+  <li>The generated code might be less efficient with many of today's compilers (such as Microsoft Visual C++) than code that has no <b>try/catch</b> in sight.
+
+
+</ul>
+
+<p>For a solution that does not have the first and third drawbacks, you may want to refer to the already well-established ScopeGuard [7].</p>
+
+
+
+<h3>Restoring Invariants</h3>
+
+
+<p>Consider this simple function:</p>
+
+
+<pre>
+    void ReNew(char*&amp; buffer, size_t s)
+    {
+        delete [] buffer;
+        buffer = new char[s];
+    }
+</pre>
+
+<p>Besides resizing <b>buffer</b>, we promise the caller that <b>buffer</b> will always return valid or <b>null</b>. If you applied what you know so far, you'd conclude that <b>ReNew</b> offers the basic guarantee.  It calls an impure nothrow function, then a strong function.</p>
+
+<p>However, this is not the case. If <b>new</b> fails by throwing an exception, then <b>ReNew</b> breaks its promise and leaves <b>buffer</b> with a singular value.  So in reality, you're dealing with the wacky guarantee.</p>
+
+<p>Thus, when invariants are temporarily broken, you should always use nothrow calls to restore them. Here are two possible rewrites of <b>ReNew</b>:</p>
+
+<pre>
+    // basic guarantee
+    void ReNew(char*&amp; buffer, size_t s)
+    {
+        delete[] buffer;
+        buffer = 0;
+        buffer = new char[s];
+    }
+    // strong guarantee: uses an automatic local variable
+    void ReNew(char*&amp; buffer, size_t s)
+    {
+        char* temp = new char[s];
+        delete[] buffer;
+        buffer = temp;
+    }
+</pre>
+
+<p>Both versions perform a nothrow operation (in the first case, <b>buffer = 0</b>; in the second case, <b>buffer = temp</b>) that restores our invariant after the <b>delete[]</b> operation.</p>
+
+<p>Sheesh! Writing exception-safe code is hard (but so is error handling in general). You can learn a lot just by staring at two function calls. Now, we'll apply our newly found insights to devise a general algorithm that analyzes the exception safety of any function.</p>
+
+
+
+<h3>Exception-Safety Analysis</h3>
+
+
+<p>We want to create an algorithm that, given a function <b>Fun</b>, returns basic, strong, or nothrow. This is as hairy as you'd expect &#151; hey, with only two functions, there was already plenty to think about! We need to apologize in advance for the dryness and laboriousness of this section, but we do believe that such an algorithm is useful. We mainly intend it for "hand-execution," meaning that it is an aid to a human reader to figure out the exception safety of a function. A more rigorously defined version of this algorithm could be devised for automated execution.</p>
+
+
+<p>This algorithm operates step-by-step on each operation inside <b>Fun</b> (in the order that a compiler would evaluate them), incrementally computing its exception-safety level. This means that we need to handle every statement, including expressions, <b>if</b>s, <b>for</b>s, <b>switch</b>es, <b>try</b>s, and so on.</p>
+
+<p>The algorithm needs to keep some state during execution:</p>
+
+<ul>
+
+  <li><b>safety</b>. The current safety level. We initialize that to nothrow, because a function that hasn't done anything can't throw, either.
+
+  <li><b>purity</b>. The current purity level. That is initially "pure," because in any democratic analysis, a function is considered pure unless proven to do something impure.
+
+  <li><b>exception_set</b>. The set of exceptions that <b>Fun</b> might throw (we'll see in a moment why that's needed). We initialize that to the empty set.
+
+  <li><b>caught_set</b>. The set of expressions that <b>Fun</b> can catch. This set will grow/shrink as <b>try</b> statements are entered/exited. Initially <b>caught_set</b> is empty.
+</ul>
+
+<p>The "worst state" would be defined as impure and basic. As soon as we reach this state, the analysis can stop. The "bliss state" is the initial state, pure and nothrow. 
+
+<p>We also define a <b>meet</b> operation, which is the union of two tuples containing <b>safety</b>, <b>purity</b>, <b>exception_set</b>, <b>caught_set</b>. A meet is performed whenever you merge two branches of code, such as the True and False branches of an <b>if</b> statement. The <b>meet</b> operation of two such tuples consists of: 1. taking the worst purity and safety of the two tuples; 2. computing the union of the two <b>exception_sets</b>; and 3. computing the intersection of the two <b>caught_sets</b>.
+
+<p>Let's proceed with the algorithm, written in pseudoC++:
+
+<ul>
+
+  <li>If the next statement is an <b>if</b>, then recursively apply the algorithm to analyze the True/False branches. Then merge the results on the two branches as we just explained.
+
+  <li>If the next statement is a <b>switch</b>, then perform analysis on all branches of the <b>switch</b>, then merge all results.
+
+  <li>If the next statement is a loop (<b>while</b> or <b>for</b>), apply the algorithm iteratively to the body of the loop until there is no change in the three state variables. Usually, this fixed point is reached in one to two iterations. Any break continues the loop analysis to where that statement passes control.
+
+  <li>If the next statement is a call to a function <b>Gun</b>, then: 1. You need to see if <b>caught_set</b> catches all of <b>Gun</b>'s exceptions &#151; if that's the case, you can consider <b>Gun</b> a nothrow function followed by a series of conditional jumps to the catch handlers; 2. if <b>purity == pure</b> and <b>safety == nothrow </b>and <b>Gun()</b> is the last expression in <b>Fun</b>, then assign <b>purity = Purity(Gun) </b>and <b>safety = Safety(Gun)</b>, then return; 3. else, if <b>Purity(Gun) == pure</b> and <b>Safety(Gun) == nothrow</b>, then continue; 4. else, if <b>Purity(Gun) == impure</b> and <b>Safety(Gun) == nothrow</b>, then assign<b> purity = impure</b>; 5. else, if <b>Safety(Gun) == strong</b>, then: 
+
+ <ul>
+  <li>	If <b>purity == pure</b> then assign <b>safety = min(strong, safety) </b>and 	<b>purity = Purity(Gun)</b>.
+
+  <li>	Else, assign <b>safety = basic</b>: 1. <b>else</b>,<b> if Safety(Gun) == basic</b>, then assign <b>purity = Purity(Gun) </b>and<b> safety = basic</b>; 2. in any case, if the current <b>caught_set</b> catches any of <b>Gun</b>'s exceptions, you need to meet the result obtained above with the result obtained on all possible <b>catch</b> blocks inside <b>Fun</b> that<b> Gun</b>'s call might transfer control to.
+</ul>
+  <li>If the next statement is a throw, then: 1. if <b>caught_set</b> catches it, then continue analysis with the appropriate catch handler; 2. else, if <b>purity == pure</b>, assign <b>safety = strong</b>; otherwise, assign <b>safety = basic</b>. Also, add whatever exception is thrown to <b>exception_set</b>. 
+
+  <li>If the next statement is a <b>try/catch</b> block, then: 1. add all catch handlers to <b>caught_set</b>; 2. analyze the <b>try</b> block &#151; the catch blocks will be automatically analyzed as a consequence of possible exceptions being thrown from inside the block; 3. on top of this analysis, use heuristics to see if the <b>catch</b> block(s) restore purity by means of undoing.
+
+  <li>Whatever the statement is, if it writes to variables other than local automatic variables, assign<b> purity = impure</b>.
+
+  <li>At the exit of each block, check whether destructors are restoring purity.
+
+
+</ul>
+
+<p>There would be more to add if the algorithm were to be rigorous, but for now we wanted to give a good feel for how to perform the analysis by hand. In essence, you analyze each statement of the function, progressively changing the current state of the analysis as you make progress. The algorithm might go down recursively into blocks for compound statements, such as <b>if</b>, <b>while</b>, or <b>try/catch</b>. For simplification purposes, we analyze each function in isolation; you analyze complex expressions by imaginarily calling one function at a time and storing intermediate results in temporary variables. </p>
+
+<p>Now, the astute reader might notice that our algorithm gives no way to stumble onto the wacky guarantee. To do so would require even more state to track invariants and allocated resources in order to determine when the basic guarantee has been lost or regained. Because our space is limited, we're going to leave that exercise for the reader.</p>
+
+<p>At the end of the day, the algorithm returns a useful characterization of a function: whether it is pure, what its exception-safety level is, and what exceptions it might throw. </p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>Writing exception-safe code is hard. Analyzing the exception-safety level of a function is a highly nontrivial and heuristic task. Yet exception safety is a very important summary of a function, and making sure your code has defined behavior in the presence of exceptions is the only way to correctness. </p>
+
+
+<p>The important things to remember about analyzing exception safety are:</p>
+
+
+<ul>
+  <li>In a sequence of function calls, you obtain the strong guarantee if you write your code as a sequence of pure calls, followed by no more than one strong call, followed by a sequence of nothrow calls.
+  <li>Purity is context dependent; you can transform a strong function into a pure function by having it operate on local automatic data. Note that pure functions are always strong.
+
+  <li>Alternatively, you can use <b>try/catch</b> with purity restoration in the <b>catch</b> clause. A variant of that uses ScopeGuard [7] for automatically restoring purity in case of an exception.
+
+  <li>When the system has broken invariants, always restore them with nothrow calls.
+
+  <li>To determine a function's exception-safety behavior, analyze it with the algorithm in the previous section, having at hand the summaries of the functions that it invokes.
+
+</ul>
+
+<h3>References</h3>
+
+
+<p>[1]	Alexandrescu, Andrei.<i><i> Modern C++ Design</i></i>, Addison-Wesley, 2001.</p>
+
+<p>[2] Alexandrescu, Andrei. "Assertions." <i><i>CUJ Online Experts</i></i>, April 2003 (<a href="http://www.moderncppdesign.com/publications/cuj-04-2003.html">http://www.moderncppdesign.com/publications/cuj-04-2003.html</a>).</p>
+
+<p>[3]	Alexandrescu, Andrei and John Torjo. "Enhancing Assertions." <i><i>CUJ Online Experts</i></i>, August 2003 (<a href="http://www.moderncppdesign.com/publications/cuj-08-2003.html">http://www.moderncppdesign.com/publications/cuj-08-2003.html</a>).</p>
+
+<p>[4]	Niebler, Eric and Anson Tsao. "FOR_EACH and LOCK," <i><i>C/C++ Users Journal</i></i>, November 2003.</p>
+
+<p>[5]	Sutter, Herb. "Exception Safety and Exception Specifications: Are They Worth It?" <i><i>Guru of the Week #82 </i></i>(<a href="http://www.gotw.ca/gotw/082.htm">http://www.gotw.ca/gotw/082.htm</a>). </p>
+
+<p>[6]	Sutter, Herb. "Exception-Safe Class Design, Part 1: Copy Assignment." <i><i>Guru of the Week #59 </i></i>(<a href="http://www.gotw.ca/gotw/059.htm">http://www.gotw.ca/gotw/059.htm</a>).</p>
+
+<p>[7]	Alexandrescu, Andrei. "Change the Way You Write Exception-Safe Code &#151; Forever." <i><i>CUJ Online Experts</i></i>, December 2000 (<a href="http://www.moderncppdesign.com/publications/cuj-12-2000.html">http://www.moderncppdesign.com/publications/cuj-12-2000.html</a>).</p>
+
+<p>[8]	Abrahams, David. "Exception-Safety in Generic Components." Boost (<a href="http://www.boost.org/more/generic_exception_safety.html">http://www.boost.org/more/generic_exception_safety.html</a>). </p>
+
+<hr><I>
+<b>Andrei</b> is a graduate student in Computer Science at the University of Washington and author of <i>Modern C++ Design.</i> <b>David</b> is a consultant specializing in custom software development. They can be contacted at <a href="mailto:andrei@metalanguage.com">andrei@metalanguage.com</a> and <a href="dheld@codelogicconsulting.com">dheld@codelogicconsulting.com</a>, respectively.</I>
+
+<hr>
+
+</body>
+</html>

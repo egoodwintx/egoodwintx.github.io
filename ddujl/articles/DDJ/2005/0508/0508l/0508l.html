@@ -1,0 +1,203 @@
+
+<html>
+<head>
+<title>August, 2005: A Reusable  Duff Device</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>A Reusable  Duff Device</h1>
+<p><i>Dr. Dobb's Journal</i> August, 2005</p>
+<h2>Loop unrolling  made easy</h2>
+
+
+<h3>By Ralf Holly</h3>
+
+
+<I>Ralf is principal of PERA Software Solutions and can be contacted at rholly@ pera-software.com.</I>
+
+<hr>
+
+
+
+
+
+<p>In embedded programming, especially when developing device driver-level code, performance is often at a premium. One way to improve execution time is to reduce the overhead of looping through the use of an age-old technique known as "loop unrolling." </p>
+
+<p>Tom Duff invented a special kind of loop-unrolling mechanism, known as "Duff's Device," that makes loop unrolling much easier. In this article, I examine the idea behind loop unrolling and explain how to generalize loop unrolling such that it can be put in a reusable library.</p>
+<h3>Classic Loop  Unrolling</h3>
+
+<p>When implementing device drivers, you often have to access device registers a certain number of times from within a loop. Imagine a network I/O driver that sends characters to a port:</p>
+
+<blockquote>
+#define HAL_IO_PORT <br>
+           *(volatile char*)0xFFFF8000<br>
+for (i = 0; i &lt; len; ++i) {<br>
+    HAL_IO_PORT = *pSource++;<br>
+}<br>
+
+</blockquote>
+
+<p>For each pass through the loop (that is, for each character copied/sent to the port), three things happen:</p>
+
+
+
+<ul>
+  <li>There is a jump to the beginning of the loop.</li>
+  <li>Next <i>i</i>, the loop counter, is incremented.</li>
+  <li><i>i</i> is compared against <i>len</i>. </li>
+</ul>
+
+
+
+<p>If the output operation itself consumes very little time (as it is normally the case when accessing a device register), these three steps add significant overhead.</p>
+
+<p>Instead of copying the characters in a loop, you can transmit the characters "inline" and thereby save the jump, increment, and comparison:</p>
+
+<blockquote>
+HAL_IO_PORT = *pSource++;<br>
+HAL_IO_PORT = *pSource++;<br>
+HAL_IO_PORT = *pSource++;<br>
+HAL_IO_PORT = *pSource++;<br>
+HAL_IO_PORT = *pSource++;<br>
+HAL_IO_PORT = *pSource++;<br>
+ ... <br>
+
+</blockquote>
+
+<p>However, this approach suffers from two weaknesses. First, it is static, meaning you have to know exactly how many characters you want to transfer; second, it is wasteful in terms of code memory, because the same line of code is repeated <i>len</i> times.</p>
+
+<p>As a result, developers usually implement loop unrolling like this:</p>
+
+<blockquote>
+int n = len / 8;<br>
+for (i = 0; i &lt; n; ++i) {<br>
+    HAL_IO_PORT = *pSource++;<br>
+    HAL_IO_PORT = *pSource++;<br>
+    HAL_IO_PORT = *pSource++;<br>
+    HAL_IO_PORT = *pSource++;<br>
+    HAL_IO_PORT = *pSource++;<br>
+    HAL_IO_PORT = *pSource++;<br>
+    HAL_IO_PORT = *pSource++;<br>
+    HAL_IO_PORT = *pSource++;<br>
+}<br>
+
+</blockquote>
+
+<p>This approach processes eight operations in a row, which reduces the looping overhead to one-eighth. To handle cases were <i>len</i> is not evenly divisible by eight, a postprocessing loop is needed to execute the remaining copy operations:</p>
+
+<blockquote>
+n = len % 8;<br>
+for (i = 0; i &lt; n; ++i) {<br>
+    HAL_IO_PORT = *pSource++;<br>
+}<br>
+
+</blockquote>
+
+<p>Even though this scheme works well, it is quite "wordy" and definitely not easy to maintain. Further, it cannot be generalized and put in a library.</p>
+<h3>Duff's Device</h3>
+
+<p>In 1983, while working at Lucasfilm, Tom Duff invented some C magic that implements loop unrolling without the need for the second (that is, postprocessing) loop. If you haven't seen it before, you should fasten your seatbelts before reading on:</p>
+
+<blockquote>
+int n = (len + 8 - 1) / 8;<br>
+switch (len % 8) {<br>
+    case 0: do { HAL_IO_PORT = *pSource++;<br>
+    case 7:      HAL_IO_PORT = *pSource++;<br>
+    case 6:      HAL_IO_PORT = *pSource++;<br>
+    case 5:      HAL_IO_PORT = *pSource++;<br>
+    case 4:      HAL_IO_PORT = *pSource++;<br>
+    case 3:      HAL_IO_PORT = *pSource++;<br>
+    case 2:      HAL_IO_PORT = *pSource++;<br>
+    case 1:      HAL_IO_PORT = *pSource++;<br>
+    } while (--n &gt; 0);<br>
+}<br>
+
+</blockquote>
+
+<p>If your first reaction is "But this is not legal C code!", you are not alone. But rest assured, this is legal C/C++. For background information on how this piece of code came about and an historic e-mail by Tom Duff that he wrote to Dennis Ritchie, see http://www.lysator.liu.se/c/ duffs-device.html. </p>
+
+<p>Just as before, the device works by unrolling the loop eight times; that is, the copy operation is executed eight times in a row. The only exception is the first time through the <i>do-while</i> loop, where fewer copy operations may be executed, as there is no guarantee that the total number of copy operations (<i>len</i>) is evenly divisible by eight. The postprocessing loop has been effectively turned into an inlined preprocessing loop. </p>
+
+<p>As in the previously shown manual unrolling scheme, the loop overhead is effectively reduced to one-eighth (there is only one loop counter decrement and only one comparison against zero for every eight copy operations). If you think one-eighth is not enough, go ahead and increase the block size until you're happy, but make sure that you increase the number of cases in the switch statement accordingly.</p>
+<h3>A Reusable Duff Device</h3>
+
+<p>Tom Duff's Device is highly useful, technically interesting, but unfortunately, not a pleasant sight to see. This is probably the reason why my mind refuses to memorize it. Therefore, I decided to wrap the nitty-gritty details within a macro:</p>
+
+<blockquote>
+#define DUFF_DEVICE_8(aCount, aAction)	\<br>
+    do {	\<br>
+ 	int count_ = (aCount);	\<br>
+	int times_ = (count_ + 7) &gt;&gt; 3;	\<br>
+	switch (count_ &amp; 7){	\<br>
+	case 0: do { aAction;	\<br>
+	case 7:      aAction;	\<br>
+	case 6:      aAction;	\<br>
+	case 5:      aAction;	\<br>
+	case 4:      aAction;	\<br>
+	case 3:      aAction;	\<br>
+	case 2:      aAction;	\<br>
+	case 1:      aAction;	\<br>
+            } while (--times_ &gt; 0);	\<br>
+        }	\<br>
+    } while (0)<br>
+
+</blockquote>
+
+<p>Compared to the original device, I've changed a couple of minor things. First, I put the whole device in a dummy <i>do-while</i> block to get a local namespace to avoid variable name clashes and to enforce a trailing semicolon. Second, I've replaced the multiplication and modulo operations with right-shift and bit-wise AND operations. Even though most contemporary compilers would apply this optimization themselves, it certainly doesn't hurt to be explicit. Third, I've introduced another local variable, <i>count_</i>, to cater for cases where coders pass in complicated (expensive) expressions or function calls.</p>
+
+<p>With a macro like this, the transmitter loop is reduced to a single line of code:</p>
+
+<blockquote>
+DUFF_DEVICE_8(len, HAL_IO_PORT =                                     *pSource++);<br>
+
+</blockquote>
+
+<p>By the way, did you notice that there is a subtle difference between the original <i>for</i> loop and the Duff Device version? Answer: The Duff Device does the wrong thing in case <i>len</i> is zero, because it executes the operation eight&#151;not zero&#151;times. If you want, you can add support for this special case by adding an <i>if</i> check to the macro; however, I prefer to handle it outside the macro and add the check only if it is really needed:</p>
+
+<blockquote>
+if (len &gt; 0)<br>
+    DUFF_DEVICE_8<br>
+         (len, HAL_IO_PORT = *pSource++);<br>
+
+</blockquote>
+
+<p>As another example, consider this simplified version of an EEPROM driver routine that I recently implemented:</p>
+
+<blockquote>
+int CopyToEEPROM(const void* <br>
+      pSource, void* pDest, unsigned len) {<br>
+<br>
+    // Anything to copy?<br>
+    if (len &gt; 0) {<br>
+        const char* s = (const char*)pSource;<br>
+        char* d = (char*)pDest;<br>
+<br>
+        // First, need to copy data to page buffer<br>
+        DUFF_DEVICE_8(len, *d++ = *s++);<br>
+<br>
+        // Start EEPROM write cycle<br>
+        HAL_EEPROM_WRITE();<br>
+<br>
+        // Check if data was transferred correctly<br>
+        s = (const char*)pSource;<br>
+        d = (char*)pDest;<br>
+        DUFF_DEVICE_8(len, <br>
+            if (*d++ != *s++) return 1; /* Fail */);<br>
+    }<br>
+    return 0; // Success<br>
+}<br>
+
+</blockquote>
+
+<p>There used to be two slow, hand-coded loops in the original driver code: One copied the data to the EEPROM page buffer (as required by the EEPROM hardware), the second checked whether the data was successfully written. By replacing them with two Duff Devices, the code has become both faster and clearer.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+
+</body>
+</html>

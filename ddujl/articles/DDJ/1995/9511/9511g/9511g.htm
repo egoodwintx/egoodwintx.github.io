@@ -1,0 +1,344 @@
+<HTML>
+<META NAME="year" CONTENT="1995">
+
+<HEAD>
+<TITLE>NOV95: Portable Multitasking in C++</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Portable Multitasking in C++<a name="01ca_0090"><a name="01ca_008e"><a name="01ca_0000"></h1><P>
+<h2>A portable multitasking kernel with semaphores</h2><P>
+<h3>Stig Kofoed</h3><P>
+<p><i><a name="01ca_008f"><a name="01ca_0000">Stig holds an MSc from the Technical University of Denmark and specializes in real-time software and data communication. He can be contacted at fed@bcp.dk.</i></p><hr><P>
+Many applications (embedded and otherwise) need to handle multiple independent activities at the same time. It is convenient for this logical behavior to be reflected directly in the structure of the program. Since C++ has no direct support for multiprogramming, however, the services of the operating system (or of a multitasking kernel) are necessary to separate the program into several processes or threads that execute concurrently. Facilities exist for synchronization and communication between processes, using shared memory, semaphores, message queues, and the like.<P>
+The C++ standard library does, however define functions that provide a limited form of context switching. In this article, I'll present a small kernel that implements non-preemptive multitasking using the library functions <I>setjmp()</I> and <I>longjmp()</I>, and provides semaphores as a means of synchronizing processes (called &quot;tasks&quot; in this article). The implementation does not use any platform-dependent features and will run unmodified on most platforms (a C version of the kernel with the same functionality is available electronically; see &quot;Availability,&quot; page 3).<P>
+<h3><a name="01ca_0091">The Task Switch<a name="01ca_0091"></h3><P>
+When the operating system or loader begins executing a C++ program, it allocates a stack to be used by the program. The stack contains function-call parameters, return addresses, and local variables, indicating the state of all active function calls. This, together with the current point of execution and the values of the static and global variables, constitutes the overall state of the program.<P>
+When implementing multiple tasks in the same program, each task is given its own stack and current point of execution, but all share the static and global variables. Since a single-processor machine can execute only a single task at any time, the multitasking behavior is obtained by continuously switching from one task to another.<P>
+This kernel uses non-preemptive multitasking (that is, task switches only occur at known points in the code). Preemptive multitasking would require switching tasks at random times, typically using interrupts, and this is inherently nonportable. Besides, non-preemptive multitasking creates fewer problems with mutual exclusion and reentrancy of library functions.<P>
+In general, a task switch consists of saving the state of the currently running task and setting the state of the next task, using <I>setjmp()</I> and <I>longjmp()</I>, respectively. <I>setjmp()</I> saves the current state in a buffer and returns 0. <I>longjmp()</I> returns the processor to a previously saved state, as though <I>setjmp()</I> had returned a value other than 0. <a href="#01ca_0098">Example 1</A> shows the function <I>f()</I> saving its state in buffer <I>a</I> and jumping to a previously saved state in buffer <I>b</I>.<P>
+The <I>setjmp()</I> and <I>longjmp()</I> functions are typically used to escape out of a deeply nested function call in case of an error or exception. In this case, the program always jumps back to a previous state of the stack. The problem when implementing real multitasking is that <I>setjmp()</I> and <I>longjmp()</I> don't provide a way to allocate a stack for a new task, only to restore the stack to a previous state. One way around this is to copy the stack of the task in and out of the main stack area, as described in &quot;Lightweight Tasks in C&quot; by Jonathan Finger (<I>DDJ</I>, May 1995), and <I>The C++ Answer Book</I>, by Tony L. Hansen (Addison-Wesley, 1990). However, this approach also has disadvantages:<P>
+<UL>
+<li>On many platforms this excessive copying is inefficient and results in poor performance, especially since lightweight tasks are often tightly coupled, making task switches frequent.</li>
+<li>Objects in a stack cannot be shared between tasks. For instance, if a task passes a pointer to an object in its own stack to another task, that object will not be referenced correctly because the stack was moved when the other task was running. This effectively limits the use of shared memory to static and global variables only.</li>
+</UL>
+<h3><a name="01ca_0092">Allocating Stacks<a name="01ca_0092"></h3><P>
+An alternative is to let all stacks reside in the main stack area simultaneously and use recursive function calls to wind down the stack and mark off the allocated areas. This requires that the main stack area be large enough to accommodate all the stacks in the program. The size of the main stack can usually be set with a compiler or linker option or in some other way (Borland C++ for DOS uses a global variable; link in a module containing the declaration <I>unsigned _stklen=16384;</I> to set the stack to 16 KB. In Borland C++ for Windows, use a DEF file with the statement <I>STACKSIZE 16384</I>). <P>
+This method also requires that the implementation of <I>longjmp()</I> be nondestructive; that is, that it not destroy the stack when performing the jump, and that the stack not be used in any other special way.<P>
+Before the kernel is initialized, the run-time system and <I>main()</I> have already used some of the original main stack area; see <a href="199501cc.htm">Figure 1(a)</A>. There is no portable way of knowing exactly how much has been used, so the program must specify how much stack it assumes is left, and how much to reserve for the main task.<P>
+During initialization, the kernel saves the current state using <I>setjmp()</I> and calls a function that calls itself recursively until it has used enough stack to be reserved for the main task. It then saves its state in a local control block together with the size of the remaining free area, marks the area as free, and jumps to the previously saved state using <I>longjmp()</I>; see <a href="199501cd.htm">Figure 1(b)</A>. The new control block now serves as a potential starting point for allocating new stacks. All control blocks are linked together with pointers in a singly linked list.<P>
+When a new stack is to be allocated, the linked list is searched using a first-fit algorithm for a free area large enough. If the stack does not occupy the entire area and the remaining area is large enough to contain another stack of a predefined minimum size, the area is split using the recursive function mentioned previously, creating a new free area; see <a href="199501ce.htm">Figure 1(c)</A>. The original control block is then marked &quot;used&quot; and may be used to start executing the task. <P>
+When a stack is no longer needed, the control block is marked &quot;free&quot; and possibly merged with a following or preceding free block. Figures <a href="199501cf.htm">1(d), 1(e), and 1(f)</A> are examples of this. <P>
+<h3><a name="01ca_0093">The Implementation<a name="01ca_0093"></h3><P>
+The interface to the kernel is shown in <a href="#01ca_009a">Listing One</A> (task.h) and the implementation in <a href="#01ca_009c">Listing Two</A> (task.c). In the kernel, a task is simply a function that takes a void pointer as an argument and doesn't return anything; see the <I>typedef</I> for <I>TaskFnp</I>.<P>
+The recursive function <I>eat()</I> allocates the stacks and manages the control blocks (of type <I>Task</I>). It is called with a pointer to a control block, and a specified amount of stack to allocate. The control-block parameter must be a local variable of the calling function, since the control-block address is used to measure how much stack has been used so far. The measurement is performed by the function <I>dist()</I>, which returns the number of bytes between two control blocks. This function takes into account that the stack may grow up on some platforms and down on others. The <I>eat()</I> function calls itself recursively until the distance between the original control block and its own local control block equals or exceeds the requested size. The allocated area will therefore usually be slightly larger than requested, depending on the size of the control block. After this, <I>eat()</I> marks the area as free, inserts the control block in the global list of control blocks, adjusts the size of the calling control block, and makes a <I>longjmp()</I> (not a return) back to it. <P>
+The <I>eat()</I> function has now allocated a stack and is ready to execute a task using that stack. It first waits until a new task is started. When eat() continues , the control block contains the requested size of the stack, a pointer to the task function, and the task argument. <I>eat()</I> checks if the block is big enough to hold another stack; if so, it calls itself with a pointer to its local control block to split the area in two. It then waits for the task to be scheduled, after which the task function is called. If the task function returns, the task has finished and the stack area is released by marking the block as free. If the following or preceding block is also free, the newly freed block will be merged with them. Once again, <I>eat()</I> has a free stack area, and it loops back to wait for a new task to be started.<P>
+The kernel is initialized by calling <I>task_init()</I>. A control block is initialized with the assumed size of the entire remaining stack, and <I>eat()</I> is called to reserve an area for the main task. The control block is then copied into the global variable <I>main_task</I>, to avoid losing the information when <I>task_init()</I> returns. <I>main_task</I> now serves as the head of the linked list and will contain the state of the main task.<P>
+New tasks are started with <I>task_start()</I>. This function scans through the linked list of control blocks, looking to find a free block large enough for the requested stack size. If this succeeds, the control block is activated by setting the task parameters and jumping to it. When the <I>eat()</I> function has finished the initialization, the control block is scheduled for execution and <I>task_start()</I> returns True. If no free block is large enough, the function returns False.<P>
+As noted earlier, a task is a function that takes a void pointer as argument (<I>TaskFnp</I>). You can call <I>task_start()</I> with the same function pointer several times to start multiple instances of the same task, possibly with different parameters.<P>
+<h3><a name="01ca_0094">Scheduling Algorithm<a name="01ca_0094"></h3><P>
+This kernel uses a simple round-robin scheduling algorithm. A global &quot;ready&quot; queue contains a list of all the tasks currently ready to run. The scheduler always selects the first task in the ready queue as the next task to run when performing a task switch. If the ready queue ever becomes empty, a deadlock has occurred and the program is exited with an error message. The check is done in <I>schedule()</I>.<P>
+Class <I>Queue</I> maintains the singly linked list of tasks. A pointer <I>head </I>points to the first element in the list, and a pointer <I>tail</I>, to the last element. Each task in the queue contains a pointer <I>chain </I>to the next element; see <a href="199501d0.htm">Figure 2</A>. This structure makes it easy for the member functions <I>first()</I> and <I>append()</I> to remove elements from the beginning and add elements to the end. The constructor for <I>Queue</I> initializes the <I>head </I>and <I>tail </I>pointers to indicate an empty queue.<P>
+When a new task is started, it is inserted at the end of the ready queue. A task may allow other tasks to run by calling <I>task_next()</I>. The kernel will then save the state of the currently running task and call <I>schedule()</I> to switch to the next task. The currently running task is always pointed to by <I>cur_task</I>.<P>
+<h3><a name="01ca_0095">Semaphores<a name="01ca_0095"></h3><P>
+Semaphores synchronize the execution of tasks and typically control the access to system resources. A semaphore consists of a nonnegative counter and a &quot;wait&quot; queue similar to the ready queue. <a href="#01ca_009c">Listing Two</A> shows that class <I>Semaphore</I> is derived from <I>Queue</I> and has an integer count as member. The counter is initialized to 0 in the <I>Semaphore</I> constructor.<P>
+The two operations possible on a semaphore are implemented by two member functions. <I>wait()</I> decrements the counter if it is greater than 0; if not, the running task performing the <I>wait()</I> is appended to the semaphore's wait queue. The task is now blocked on the semaphore, and will not be released until another task performs a <I>signal()</I> operation on it. The <I>signal()</I> operation moves a task from the wait queue to the ready queue if the wait queue is nonempty; otherwise, the counter is incremented.<P>
+<h3><a name="01ca_0096">The Dining Philosophers<a name="01ca_0096"></h3><P>
+To demonstrate the kernel facilities, <a href="#01ca_009e">Listing Three</A> (philos.c) shows a solution to the &quot;dining philosophers,&quot; a classic synchronization problem. Five philosophers are seated at a round table. Between every two philosophers lies a fork. Each philosopher repeats the following cycle: He thinks and then he eats. To eat, he must acquire the forks on both sides of him. The problem is to synchronize access to the forks and avoid deadlock and livelock.<P>
+There are five independent activities in this program, one for each philosopher. The program thus starts up five instances of a philosopher task, each instance having a different ID as parameter. (The ID is an integer on the main stack, not a global variable. This would not be possible if the stack were changed by moving it.)<P>
+The time spent thinking and eating is nondeterministic. This is modeled by calling <I>task_next()</I> a random number of times. The access to each fork is conveniently controlled with a semaphore: A task waits on the semaphore to acquire the fork and signals on the semaphore to release the fork.<P>
+A simple solution, where each philosopher waits first for the left, then for the right fork, can lead to deadlock. If each philosopher in turn takes the left fork, the right fork will never become available because it has been taken by the philosopher to the right. The solution used here is taken from <I>Principles of Concurrent Programming</I>, by M. Ben-Ari (Prentice-Hall, 1982), and can be shown to be correct. The additional semaphore <I>room </I>ensures that deadlock will not occur. <P>
+<h3><a name="01ca_0097">Conclusion<a name="01ca_0097"></h3><P>
+I've tested the kernel presented here (along with the C version) without problems on a wide variety of platforms, including DOS, Windows, OS/2, and UNIX (Irix 5.2, UnixWare), and as an NLM on a Novell file server. It should run on any platform that lets you set the program's stack size appropriately and has a nondestructive implementation of <I>setjmp()</I> and <I>longjmp()</I>.<P>
+Because of the non-preemptive multitasking and because all stacks reside in the normal stack area, you can use most tools like debuggers and profilers. If the compiler implements some kind of stack check, this can be used to indicate that the total stack area is exceeded (that is, a stack was allocated, but there wasn't room for it). Setting the <I>total_stack</I> parameter in <I>task_init()</I> appropriately avoids this.<P>
+The kernel has intentionally been kept simple, but may easily be extended. I have used the same principles to implement a portable version of a more sophisticated C++-based multitasking kernel with more advanced facilities for synchronization and communication between tasks.<P>
+<B><a href="199501d1.htm">Figure 1</A>:</B> (a) Stack before initialization; (b) stack after initialization; (c) starting a new task a with stack size 5000; (d) starting a new task b with stack size 3000; (e) a has finished, leaving b between two free blocks; (f) a is started again with a smaller stack size.<P>
+<B><a href="199501d2.htm">Figure 2</A>:</B> Tasks in the ready queue are chained together. New tasks are inserted at the tail. <P>
+<a name="01ca_0098"><B>Example 1:</B> Saving the current state and jumping to state b.<a name="01ca_0098">
+<pre>
+#include &lt;setjmp.h&gt;
+jmp_buf a, b;
+void f()
+  {
+  // ...
+  if( setjmp( a ) == 0 )
+    {
+    longjmp( b, 1 );
+    }
+  // return here with longjmp( a, 1 )
+  }</pre><P>
+<P>
+<h4><a name="01ca_0099"><a name="01ca_009a">Listing One<a name="01ca_009a"></h4><pre>
+// task.h -- Portable Multitasking in C++.
+// Written by Stig Kofoed, 1995.
+#ifndef TASK_H
+#define TASK_H
+#include &lt;setjmp.h&gt;
+#define FALSE                   0
+#define TRUE                    1
+typedef void (*TaskFnp)( void *arg );           // task function pointer
+struct Task
+  {
+  jmp_buf jmpb;                 // jump state
+  int used;                     // used or free
+  unsigned size;                // size of block
+  Task *next;                   // pointer to next control block
+  TaskFnp fnp;                  // pointer to task function
+  void *arg;                    // argument to task function
+  unsigned stack_size;          // requested stack size
+  Task *chain;                  // next task in ready or semaphore queue
+  };
+class Queue
+  {
+  private:
+    Task *head, *tail;          // pointer to first and last element
+  public:
+    Queue();
+    Task *first();
+    void append( Task *p );
+  };
+class Semaphore : private Queue
+  {
+  private:
+    int count;                  // semaphore counter
+  public:
+    Semaphore();
+    void signal();
+    void wait();
+  };
+extern Task main_task, *cur_task;
+void task_init( unsigned total_stack, unsigned main_stack );
+int task_start( TaskFnp fnp, void *arg, unsigned stack_size );
+void task_next();
+#endif
+</pre>
+<h4><a name="01ca_009b"><a name="01ca_009c">Listing Two<a name="01ca_009c"></h4><pre>
+// task.c -- Portable Multitasking in C++.
+// Written by Stig Kofoed, 1995.
+#include &lt;setjmp.h&gt;
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &quot;task.h&quot;
+#define MIN_STACKSIZE           400     // minimum stack size
+Task main_task, *cur_task;              // main and current task
+static Queue ready;                     // ready queue
+static jmp_buf tmp_jmpb;                // temporary jump buffer
+static void schedule()                  // run next task
+  {
+  cur_task = ready.first();
+  if( cur_task == NULL )                // no task to run
+    {
+    puts( &quot;Deadlock!&quot; );
+    exit( 1 );
+    }
+  longjmp( cur_task-&gt;jmpb, 1 );         // restore state of next task
+  }
+static unsigned dist( Task *from, Task *to )
+  {
+    char *c1, *c2;
+  c1 = (char *) from;
+  c2 = (char *) to;
+  if( c1 &gt; c2 )                         // stack grows down
+    return( (unsigned) (c1 - c2) );
+  else                                  // stack grows up
+    return( (unsigned) (c2 - c1) );
+  }
+static void eat( Task *p, unsigned size )
+  {
+    unsigned d;
+    Task t;
+  d = dist( p, &amp;t );
+  if( d &lt; size )                        // eat stack
+    eat( p, size );
+  t.size = p-&gt;size - d;                 // set sizes
+  p-&gt;size = d;
+  t.used = FALSE;
+  t.next = p-&gt;next;                     // set link pointers
+  p-&gt;next = &amp;t;
+  if( setjmp( t.jmpb ) == 0 )           // wait
+    longjmp( p-&gt;jmpb, 1 );
+  for( ;; )
+    {
+    if( t.stack_size + MIN_STACKSIZE &lt;= t.size )        // test size
+      {
+      if( setjmp( t.jmpb ) == 0 )       // split block
+        eat( &amp;t, t.stack_size );
+      }
+    t.used = TRUE;                      // mark as used
+    if( setjmp( t.jmpb ) == 0 )         // wait
+      longjmp( tmp_jmpb, 1 );
+    (*t.fnp)( t.arg );                  // run task
+    t.used = FALSE;                     // mark as free
+    if( t.next != NULL &amp;&amp; !t.next-&gt;used )
+      {
+      t.size += t.next-&gt;size;           // merge with following block
+      t.next = t.next-&gt;next;
+      }
+    p = main_task.next;                 // loop through list
+    if( p != &amp;t )                       // if not first block
+      {
+      while( p-&gt;next != &amp;t )            // locate previous block
+        {
+        p = p-&gt;next;
+        }
+      if( !p-&gt;used )                    // if free
+        {
+        p-&gt;size += t.size;              // then merge
+        p-&gt;next = t.next;
+        }
+      }
+    if( setjmp( t.jmpb ) == 0 )         // save state
+      schedule();
+    }
+  }
+void task_init( unsigned total_stack, unsigned main_stack )
+  {
+    Task tmp;
+  tmp.size = total_stack;               // initialize total stack area
+  tmp.next = NULL;
+  if( setjmp( tmp.jmpb ) == 0 )         // reserve main stack
+    eat( &amp;tmp, main_stack );
+  main_task = tmp;                      // copy to global variable
+  main_task.used = TRUE;
+  cur_task = &amp;main_task;
+  }
+int task_start( TaskFnp fnp, void *arg, unsigned stack_size )
+  {
+    Task *p;
+  for( p = main_task.next; p != NULL; p = p-&gt;next )     // find free block
+    {
+    if( !p-&gt;used &amp;&amp; p-&gt;size &gt;= stack_size )
+      {
+      p-&gt;fnp = fnp;                     // set task parameters
+      p-&gt;arg = arg;
+      p-&gt;stack_size = stack_size;
+      if( setjmp( tmp_jmpb ) == 0 )     // activate control block
+        longjmp( p-&gt;jmpb, 1 );
+      ready.append( p );
+      return( TRUE );
+      }
+    }
+  return( FALSE );                      // not enough stack
+  }
+void task_next()
+  {
+  if( setjmp( cur_task-&gt;jmpb ) == 0  )  // save state
+    {
+    ready.append( cur_task );
+    schedule();                         // run next task
+    }
+  }
+Queue :: Queue()
+  {
+  head = NULL;
+  }
+Task *Queue :: first()                  // return first element in queue
+  {
+    Task *p;
+  if( (p = head) != NULL )
+    head = head-&gt;chain;
+  return( p );
+  }
+void Queue :: append( Task *p )         // append element to queue
+  {
+  if( head == NULL )
+    head = p;
+  else
+    tail-&gt;chain = p;
+  tail = p;
+  p-&gt;chain = NULL;
+  }
+Semaphore :: Semaphore()                // initialize semaphore
+  {
+  count = 0;
+  }
+void Semaphore :: signal()              // signal on semaphore
+  {
+    Task *p;
+  p = first();
+  if( p != NULL )                       // a task was waiting
+    ready.append( p );
+  else                                  // no task was waiting
+    count++;
+  }
+void Semaphore :: wait()                // wait on semaphore
+  {
+  if( count &gt; 0 )                       // don't block
+    count--;
+  else                                  // block on semaphore
+    {
+    if( setjmp( cur_task-&gt;jmpb ) == 0 )
+      {
+      append( cur_task );
+      schedule();
+      }
+    }
+  }
+</pre>
+<h4><a name="01ca_009d"><a name="01ca_009e">Listing Three<a name="01ca_009e"></h4><pre>
+// philos.c -- Portable Multitasking in C++.
+// Example: The Dining Philosophers.
+// Written by Stig Kofoed, 1995.
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &quot;task.h&quot;
+#define N               5               // number of philosophers
+Semaphore forks[N], room;
+void wait()
+  {
+    int i, n;
+  n = rand() % 10;                      // simulate random duration
+  for( i = 0; i &lt; n; i++ )              // by switching to other tasks
+    task_next();                        // a random number of times
+  }
+void think( int n )
+  {
+  printf( &quot;philosopher %d is thinking\n&quot;, n );
+  wait();
+  }
+void eat( int n )
+  {
+  printf( &quot;philosopher %d is eating\n&quot;, n );
+  wait();
+  }
+void philosopher( int *n )                      // philosopher task
+  {
+  for( ;; )
+    {
+    think( *n );
+    room.wait();                                // avoids deadlock
+    forks[ *n ].wait();                         // aquire forks
+    forks[ (*n + 1) % N ].wait();
+    eat( *n );
+    forks[ *n ].signal();                       // release forks
+    forks[ (*n + 1) % N ].signal();
+    room.signal();
+    }
+  }
+int main()
+  {
+    int i;
+    int id[5];
+  task_init( 13000, 2000 );             // initialise tasks and semaphores
+  for( i = 0; i &lt; N; i++ )
+    {
+    id[i] = i;                          // philosopher ID
+    task_start( (TaskFnp) philosopher, &amp;(id[i]), 2000 );
+    forks[i].signal();
+    }
+  for( i = 0; i &lt; N-1; i++ )
+    room.signal();
+  for( i = 0; i &lt; 1000; i++ )           // run the simulation for a while
+    task_next();
+  return( 0 );
+  }
+</pre>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<P>
+<HR><P>Copyright &copy; 1995, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

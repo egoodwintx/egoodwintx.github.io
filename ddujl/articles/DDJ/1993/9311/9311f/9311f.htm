@@ -1,0 +1,514 @@
+<HTML>
+<META NAME="year" CONTENT="1993">
+<HEAD>
+<TITLE>NOV93: A Netware Chat Utility</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>A Netware Chat Utility<a name="032f_0003"></h1><P>
+<h2><a name="032f_0001"><a name="032f_0000">Understanding IPX programming</h2><P>
+<h3>Eduardo M. Serrat</h3><P>
+<p><i><a name="032f_0002"><a name="032f_0000">Eduardo is a systems analyst with Galmes y Casale s.r.l. and can be contacted at Libertad 38, (5000) Cordoba, Argentina</i></p><hr><P>
+Multiuser operating systems like OpenVms on VAXs or TSX-32 on 386/486-based PCs provide a &quot;phone&quot; utility that let users chat interactively or across the network. Functionally, this utility resembles a real phone--you can call a user, accept or reject incoming calls, even set up a conference chat. The utility creates one viewport on the screen for each user engaged in conversation.<P>
+Unfortunately, Netware doesn't provide an interactive chat utility. Sure, network users can communicate via the Send command to transmit messages up to 45 characters long. But the message displays only on the last line of the target workstation, locks up the keyboard, and halts any running programs until the target user presses Ctrl-Enter. Alternatively, there are commercial applications like Direct Micro's LAN Intercom and Dave Frailey's shareware Chat utility. Like the Send command, however, LAN Intercom only displays messages a single line at a time (although it does have other add-on features) and you don't get the source code with either Frailey's Chat or LAN Intercom.<P>
+Because a Netware chat utility is indeed useful, I wrote a phone-like utility similar to those available on other operating systems--by using IPX programming and Netware services calls. With this utility, which I call &quot;Phone,&quot; you can carry on interactive dialogs across the network. Remote users can access the network via Novell Remote Access Server facilities, then use the phone utility. (Where I work, we use Phone for customer software support, coordinating maintenance activities on the fly.)<P>
+In the process of presenting the utility, I'll examine two Netware APIs--IPX services and INT 21h extensions. For IPX background information, see &quot;IPX: The Great Communicator&quot; by Rahner James (<I>DDJ</I>, May 1992).<P>
+<h3><a name="032f_0004">IPX, Addresses, and Sockets<a name="032f_0004"></h3><P>
+Netware IPX (Internetwork Packet Exchange), is a high-performance connectionless, datagram-oriented protocol. Because it has its roots in XNS (Xerox Network Standard protocol), IPX features a big-endian byte ordering instead of the low-endian approach used by Intel CPUs. To deal with this &quot;inverted&quot; byte order, you must swap byte values when filling in numeric values in the packet. Since IPX packets can arrive at their destination out of sequence, the application using IPX as its transport is responsible for ensuring correct packet delivery. (Netware Core Protocol, NCP, deals with this.) <a href="19930331.htm">Figure 1</A> and <a href="#032f_0009">Table 1</A> show the format of an IPX packet and a description of the fields contained on its header.<P>
+Each workstation connected to a Novell network is uniquely identified by an internetwork address consisting of a 4-byte network number, and a 6-byte node number related to the physical address of the network adapter. <a href="19930332.htm">Figure 2</A> shows internetwork addresses. Most of the work needed to transmit packets over the network involves determining internetwork addresses of the source and destination, and filling the IPX header correspondingly.<P>
+Sockets let several applications running on the same workstation distinguish the packets destined for them. Before a program can send or receive packets over the network, it must create a socket.<P>
+Netware reserves socket 0000h to 3FFFh and assigns socket numbers from 8000h to FFFFh to third-party developers. General-purpose sockets are from 4000h to 7FFFh. You can use these for your network programs. Alternately, you can simplify programming by choosing sockets 4141h, 4242h, 4443h, and so on to avoid swapping byte values when filling in sockets numbers in the packet. &quot;Temporary&quot; sockets remain active until deleted, or until the program finishes, whichever happens first. &quot;Permanent&quot; sockets (used by TSRs) remain active until explicitly deleted. Sockets must be unique in a single workstation, but the same socket number can be used by another workstation in the network.<P>
+<h3><a name="032f_0005">Novell Netware APIs<a name="032f_0005"></h3><P>
+Netware provides you with two APIs. The first provides IPX services (INT 7Ah) for sending and receiving packets from the network. The second API provides Netware services as an extension of the INT 21h (DOS interrupt). These are implemented by Netware's Workstation Shell that's normally made up of IPX.COM and NETX.COM (the redirector).<P>
+IPX services can be invoked by a FAR CALL or using INT 7Ah. When programming in a high-level language, calling IPX using FAR CALL requires some inline assembly code to save registers, execute a FAR CALL instruction, and restore registers.<P>
+Using INT 7Ah is preferred because you don't need to deal with inline assembly code. Furthermore, almost every high-level language provides procedures for generating interrupts. Before using IPX services, you must make sure IPX is loaded at your workstation. To do that, call the multiplexer to determine the presence of IPX. If you use the FAR CALL method of invocation, this call also provides you with the segmented address required.<P>
+To call the multiplexer, load register AX with 7A00h and issue INT 2Fh. Upon returning from this interrupt, register AL contains this status information: 00h, IPX not loaded (address not available); FFh, IPX loaded. In addition, register <I>ES</I> contains the segment of IPX services address; and register <I>DI</I> contains its offset.<P>
+If you issue an INT 7Ah and IPX isn't loaded, you'll crash the system, so it's important to detect the presence of IPX before proceeding with IPX requests; see <a href="#032f_000d">Example 1</A>. Before you can request IPX to send or receive packets, always create a socket for this purpose.<P>
+<h3><a name="032f_0006">Event-control Blocks<a name="032f_0006"></h3><P>
+Event-control blocks (ECBs) are a fundamental structure for send and receive packet requests; see <a href="#032f_000a">Table 2</A>. When receiving packets, IPX uses a &quot;no wait&quot; approach; that is, after submitting such a request, control returns to our program, and the corresponding ECB is queued as a outstanding request until a packet for the specified socket arrives. If a packet arrives and there aren't outstanding requests, the packet is dropped. You can then place any number of receive packet requests to avoid this situation. IPX doesn't guarantee that outstanding ECBs will be used in the order they were submitted, so you must check this in your program.<P>
+By filling in the event-service routine field of the ECB with the address of a FAR routine, you can specify that you want a routine to be called asynchronously upon completion of the ECB. Alternatively, you can zero this field and poll the status flag in the ECB to see if the request completed (see <a href="#032f_000e">Example 2</A>). The latter method is used when sending packets. In this case, you need to poll the status flag of the submitted ECB until IPX zeroes it, signaling that the request finished successfully. Tables 3 and 4 show the status flag values and the completion codes. When writing event-service routine conventions, all interrupt-services routine conventions must be considered. For example, to avoid DOS reentrancy problems, you can't call DOS services. When IPX transfers control to the event-service routine, <I>ES:SI</I> points to the address of the serviced ECB, other registers contents are undetermined. To let the ESR code address data, you need to copy ES into DS using inline assembly code. Finally, you must declare ESR as a far procedure to return properly with a FAR RETURN instruction. The ESR routine in <a href="#032f_000f">Example 3</A> shows how the contents of register ES are copied into DS to establish addressability for global variable <I>readflg</I>. (The Turbo Pascal directive <I>{$F+}</I> is used to define the ESR as a far procedure.)<P>
+When filling in the ECB, you must supply an immediate address value which IPX uses to fill the packet's DESTINATION field. This address can be the same target node address, or the address of a routing node in an internetwork. This address is obtained using the IPX's <I>GetLocalTarget</I> function (see <a href="#032f_0011">Listing One</A>, page 100).<P>
+Suppose, for example, your program runs on workstation #1 and intends to send packets to workstation #2 located on another segment and connected to yours via a router. Here, <I>GetLocalTarget</I> returns address 00001b401564 as the immediate address. On the other hand, if you're sending a packet to server #1, then the immediate address returned by this function would be the same as server #1--00001b307035 as in <a href="19930333.htm">Figure 2</A>.<P>
+You can divide the packet for transmission or reception using the ECB's fragment-count and fragment-descriptor fields. This provides an automatic way to split the packet into meaningful parts. The phone utility, for example, uses two fragments--the first contains the IPX header, the second the packet's data. You fill the fragment count with a value between 1 and 42, and the corresponding fragments addresses and lengths.<P>
+Netware services, which are invoked as extensions of the INT 21h (DOS interrupt), consist of functions for determining connection numbers, internet addresses, user information, message transmission, and so on. The necessary function codes and structures are in <a href="#032f_0011">Listing One</A>.<P>
+<h3><a name="032f_0007">Implementing and Using the Phone Utility<a name="032f_0007"></h3><P>
+I wrote the phone utility in Turbo Pascal 5.0. The IPX and Netware services routines are contained in the Turbo Pascal unit IPXUNIT.PAS (<a href="#032f_0011">Listing One</A>), and the main program in PHONE.PAS (available electronically; see &quot;Availability,&quot; page 3.) I recommend copying the PHONE.EXE executable to the PUBLIC directory so the utility is accessible network-wide.<P>
+When invoking the phone utility in dialing mode, you must provide in the command line the user name you're calling and (optionally) the connection number of this user. Netware's Userlist command can be used to view connected users and connection numbers.<P>
+In answer mode, the phone utility is invoked without parameters. The phone utility notifies the user being called, sending a message as does Send command. This message contains the name of the user generating the call, and its starting time. This notification is repeated at 30 second intervals, until the called user answers the call.<P>
+The sequence of procedures the phone utility uses to set up a dialogue is:<P>
+<OL>
+<LI>User #1 invokes a phone utility in dialing mode providing a Username.</LI>
+<LI>Phone utility calls <I>GetConnection</I> to obtain a connection number for this user. If more than one connection exists for this user, the program exits, and asks for a connection number to be specified.</LI>
+<LI>With this connection number, a program calls <I>GetInternetAddress</I> to get the internetwork address of the target.</LI>
+<LI>Program gets the immediate address to send a packet calling the <I>GetLocalTarget</I> procedure.</LI>
+<LI>Program creates socket for transmission and reception.</LI>
+<LI>Program requests IPX, a receive packet service for this socket, and specifies an ESR to be called upon completion.</LI>
+<LI>The program Sends message notifying the target that a call is in progress, and includes a packet which contains the connection number of the user originating the call.</LI>
+<LI>Repeats step #7 until the service requested in step #6 is completed or the call is canceled by the originating user. If the user is satisfied, processing resumes at step #13.</LI>
+<LI>User #2 invokes the utility in answering mode.</LI>
+<LI>The phone utility creates a socket for transmission and reception, and requests IPX for a receive packet service. The packet sent in step #7 is received.</LI>
+<LI>The connection number obtained from the received packet, is used as described in step #3 and #4 to obtain internetwork and immediate addresses.</LI>
+<LI>The procedure sends a packet that is received by the outstanding request of the originating workstation generated in step #6.</LI>
+<LI>The screen at both workstations present two viewports corresponding to the users involved in the conversation. Characters typed at one workstation, are echoed at the remote viewport and vice versa, until one of the users presses Esc to terminate the conversation.</LI>
+</OL>
+<h3><a name="032f_0008">Some Special Considerations<a name="032f_0008"></h3><P>
+The message sent by Phone to notify a user that a call is in progress produces the same effect as the Send command. Therefore, if you're running an application that can't be interrupted, you'll need to use the Castoff command to reject a phone's notification messages. (Alternatively, use Caston to enable the messages.)<P>
+Users connected to the network and running graphical applications won't receive the utility's notification messages when being called. Consequently, the phone utility can't be used to establish a dialogue with these users. However, anyone using Windows 3 can use Phone without any problem because Windows supports Novell Netware's broadcast messages. These users can create a PIF for the phone utility, and include it in their preferred applications group.<P>
+<h4> <a href="19930334.htm">Figure 1</A>: IPX packet fomat.</h4><P>
+<h4><a name="032f_0009">Table 1:<a name="032f_0009">IPX header format (* indicates filling is required).</h4><P>
+<pre>
+Name              Type               Description
+Checksum          Word               Obsolete field inherited from XNS           
+                                       protocol. Always contains FFFFh.
+Length            Word               Contains length of IPX header + data in packet.
+Transport-        Byte               Initial value of 00h and is incremented as the
+                                       Control packet passes one router. When packet 
+                                       reaches its destination, this field counts number of routers
+                                       packet passed through.
+Packet Type*      Byte               Describes packet type. For example 04h is used for
+                                       an IPX packet and 05h for a SPX packet.
+Destination Net*  Array [1..4] Byte  Destination network.
+Destination       Array [1..6] Byte  48-bit address of destination node.
+DSocket*          Word               Destination socket.
+Source Net*       Array [1..4] Byte  Source network.
+Source Node*      Array              48-bit address of source node.
+          
+SSocket*          Word               Source socket.
+</pre><P>     
+<h4><a name="032f_000a">Table 2:<a name="032f_000a">Event Control Block (* indicates filling is required).</h4><P>
+<pre>
+Field Name              Type               Description
+Link Address            Pointer            Used by IPX when queuing ECB.
+Event Service Routine*  Pointer            Address of routine to be called when a packet arrives.
+Status Flag             Byte               Provides status for ECB for each processing stage 
+                                             (see <a href="#032f_000b">Table 3</A>).
+Completion Code         Byte               Completion status code.  
+Socket*                 Word               Socket for send/receive.
+WorkSpace               Array [1..4] Byte  Reserved for IPX use.
+Drive Work Space        Array [1..12] Byte Reserved for IPX use.
+Immediate Address*      Array [1..6] Byte  Packet destination address. (It can be a routing node address.)
+Fragment Count*         Word               Number of fragments composing packet.
+Fragment Address*       Pointer            Address and Length of fragment.
+Fragment Length*        Word
+.
+.
+.
+Fragment Address
+Fragment Length</pre><P>
+<h4><a name="032f_000b">Table 3:<a name="032f_000b">ECB's status flag values.</h4><P>
+<pre>
+Value   Description
+00h     IPX finished processing ECB.
+FAh     ECB being processed by IPX.
+F8h     ECB is being queued by IPX.
+FBh     Send/receive being processed into ECB.
+FEh     Waiting for Incoming packets.
+FFh     ECB is in use for sending a packet.</pre><P>
+<h4><a name="032f_000c">Table 4:<a name="032f_000c">ECB completion codes.</h4><P>
+<pre>
+Value   Description
+00h     Success.
+FCh     Error, ECB was canceled.
+FDh     Error, packet overflow.
+FFh     Error, invalid socket in ECB.</pre><P>
+<h4><a name="032f_000d">Example 1: Detecting IPX presence.<a name="032f_000d"></h4><P>
+<pre>function IpxPresent;
+const
+     MULTIPLEXER  = $2F;
+     IPXINSTALLED = $FF;
+begin
+     regs.ax:=$7A00;
+     intr(MULTIPLEXER,regs);
+     if (regs.al = IPXINSTALLED) then IpxPresent:=TRUE
+                                 else IpxPresent:=FALSE;
+end;</pre><P>
+<h4><a name="032f_000e">Example 2: Polling ECB's status flag in send packet requests.<a name="032f_000e"></h4><P>
+<pre>Procedure IpxSendPacket;
+const
+     IPX_SendPacket = $03;
+begin
+     regs.bx:=IPX_SendPacket;
+     regs.es:=Seg(SendEcb);
+     regs.si:=Ofs(SendEcb);
+     IpxServicesCall;
+     while (SendEcb.StatusFlag &lt;&gt; 0) do ;
+end;</pre><P>
+<h4><a name="032f_000f">Example 3: ESR used by the Phone Utility<a name="032f_000f"></h4><P>
+<pre>{$F+$S-}                   {Far Proc, No Stack Check }
+Procedure EsrHandler;
+begin
+     inline($06            { push  es                }
+           /$1f            { pop   ds                }
+           );
+     readflg:=true;
+end;</pre><P>
+<h4> <a href="19930335.htm">Figure 2</A>: Internetwork addresses</h4><P>
+
+<PRE>
+
+
+<a name="032f_0010"><B>[LISTING ONE]</B><a name="032f_0011">
+
+
+_A NETWARE CHAT UTILITY_
+by Eduardo M. Serrat
+
+Unit IpxUnit;
+
+Interface
+
+uses dos;
+const
+     IPX_PACKET_TYPE    =   4;
+type
+    NetWrkAdr = record
+                  NetworkNumber      : array [1..4] of byte;
+                  NodeAddress        : array [1..6]    of byte;
+                end;
+
+    IpxHeader = record
+                  CheckSum           : word;
+                  Len                : word;
+                  TransportControl   : byte;
+                  PacketType         : byte;
+                  Destination        : NetWrkAdr;
+                  DestinationSocket  : word;
+                  Source             : NetWrkAdr;
+                  SourceSocket       : word;
+                end;
+    ConNbrArr = record
+                  Len                : word;
+                  Count              : byte;
+                  Connections        : array [1..250] of byte;
+                end;
+    ftype     = record
+                  Adr                : pointer;
+                  Len                : word;
+                end;
+    Ecb       = record
+                  LinkAddress        : pointer;
+                  EventServiceRoutine: pointer;
+                  StatusFlag         : byte;
+                  CompletionCode     : byte;
+                  SocketNumber       : word;
+                  WorkSpace          : array [1..4]  of byte;
+                  DriverWorkSpace    : array [1..12] of byte;
+                  ImmediateAddress   : array [1..6]   of byte;
+                  FragmentCount      : word;
+                  FragmentDescriptor : array [1..2] of ftype;
+                end;
+    ConnInfo  = record
+                  Len                : word;
+                  ObjectID           : array [1..4]  of byte;
+                  ObjectType         : word;
+                  ObjectName         : array [1..48] of byte;
+                  LoginTime          : array [1..7]  of byte;
+                  Reserved           : word;
+                end;
+    NetType   = array [1..4] of byte;
+    NodType   = array [1..6]    of byte;
+var
+   regs           : registers;
+   ipxrutofs,
+   ipxrutseg      : word;
+{--------------------------------------------------------------------------}
+function LeadingZero(w:word) : String;
+function Time : String;
+procedure WriteHexByte(b : byte);
+
+function  IpxPresent : boolean;
+procedure IpxServicesCall;
+function  IpxCreateSocket (Socket : word) : boolean;
+function  LocalConnectionNumber : byte;
+procedure IpxDeleteSocket (Socket : word);
+procedure GetInternetAddress (ConnectionNbr : byte; var NetNod : NetWrkAdr);
+procedure UserInfo (ConnectionNumber: byte; var ConnInfoRec : ConnInfo);
+procedure GetConnections (UserName: string; var ConNbrRec : ConNbrArr);
+procedure GetLocalTarget(DestNet : NetWrkAdr;
+                         DestSock : word; var LocalTarget : NodType );
+procedure SendMessage(ConnectionNumber : byte; Message : String);
+Procedure IpxSendPacket(var SendEcb : Ecb);
+Procedure IpxReadPacket(var ReadEcb : Ecb);
+
+Implementation
+
+{--------------------------------------------------------------------------}
+function LeadingZero;
+var
+   s : String;
+begin
+     Str(w:0,s);
+     if Length(s) = 1 then
+        s := '0' + s;
+        LeadingZero := s;
+end;
+{--------------------------------------------------------------------------}
+function Time;
+var
+    h, m, s, hund : Word;
+begin
+     GetTime(h,m,s,hund);
+     Time:=LeadingZero(h)+':'+LeadingZero(m)+':'+LeadingZero(s);
+end;
+{--------------------------------------------------------------------------}
+procedure WriteHexByte;
+const
+     hexChars : array [0..$F] of Char =
+                '0123456789ABCDEF';
+begin
+     Write(hexChars[b shr 4],
+           hexChars[b and $F]);
+end;
+
+{--------------------------------------------------------------------------}
+function IpxPresent;
+const
+     MULTIPLEXER  = $2F;
+     IPXINSTALLED = $FF;
+begin
+     regs.ax:=$7A00;
+     intr(MULTIPLEXER,regs);
+     if (regs.al = IPXINSTALLED) then IpxPresent:=TRUE
+                                 else IpxPresent:=FALSE;
+end;
+{--------------------------------------------------------------------------}
+procedure IpxServicesCall;
+begin
+     intr($7a,regs);
+end;
+{--------------------------------------------------------------------------}
+function IpxCreateSocket;
+const
+     IPX_CreateSocket = $00;
+     PermanentSocket  = $FF;
+     TemporarySocket  = $00;
+var
+   SwapSocket    : word;
+begin
+     SwapSocket:=swap(Socket);
+     regs.al:=TemporarySocket;
+     regs.bx:=IPX_CreateSocket;
+     regs.dx:=SwapSocket;
+     IpxServicesCall;
+     if (regs.al = $00) then IpxCreateSocket:=TRUE
+                        else IpxCreateSocket:=FALSE;
+                        {0FEh Full Socket Table
+                         0FFh Socket Already Opened}
+end;
+{--------------------------------------------------------------------------}
+procedure IpxDeleteSocket;
+const
+     IPX_DeleteSocket             = $01;
+var
+     SwapSocket    : word;
+begin
+     SwapSocket:=swap(Socket);
+     regs.bx:=IPX_DeleteSocket;
+     regs.dx:=SwapSocket;
+     IpxServicesCall;
+end;
+{--------------------------------------------------------------------------}
+function LocalConnectionNumber;
+const
+     GET_CONNECTION_NUMBER = $DC;
+begin
+     regs.ah:=GET_CONNECTION_NUMBER;
+     regs.al:=$00;
+     msdos(regs);
+     LocalConnectionNumber:=regs.al;
+end;
+{--------------------------------------------------------------------------}
+procedure  GetInternetAddress;
+const
+     GET_INTERNET_ADDRESS = $13;
+     NETWARE_SERVICE_E3   = $E3;
+
+var
+   ReqBlk   : record
+                Len       :  word;
+                ReqType   :  byte;
+                ConnNbr   :  byte;
+              end;
+   ResBlk   : record
+                Len       :  word;
+                NetNod    :  NetWrkAdr;
+                SrvSocket :  word;
+              end;
+begin
+     with ReqBlk do
+       begin
+            Len:=sizeof(ReqBlk) - sizeof(Len);
+            ReqType:=GET_INTERNET_ADDRESS;
+            ConnNbr:=ConnectionNbr;
+       end;
+
+     with ResBlk do Len:=sizeof(ResBlk) - sizeof(Len);
+
+     regs.ah:=NETWARE_SERVICE_E3;
+     regs.ds:=seg(ReqBlk); regs.si:=ofs(ReqBlk);
+     regs.es:=seg(ResBlk); regs.di:=ofs(ResBlk);
+     msdos(regs);
+     if regs.al &lt;&gt; $00 then writeln('Error GETINTERNETADDRESS...')
+     else
+       begin
+            NetNod.NetworkNumber:=ResBlk.NetNod.NetworkNumber;
+            NetNod.NodeAddress:=  ResBlk.NetNod.NodeAddress;
+       end;
+end;
+{--------------------------------------------------------------------------}
+procedure UserInfo;
+const
+     GET_CONNECTION_INFORMATION   = $16;
+     NETWARE_SERVICE_E3           = $E3;
+var
+   ReqBlk   :  record
+                Len    :  word;
+                ReqType   :  byte;
+                ConnNbr   :  byte;
+               end;
+begin
+     with ReqBlk do
+       begin
+            Len :=sizeof(ReqBlk) - sizeof(Len);
+            ReqType:=GET_CONNECTION_INFORMATION;
+            ConnNbr:=ConnectionNumber;
+       end;
+     with ConnInfoRec do Len:=sizeof(ConnInfoRec) - sizeof(Len);
+     regs.ah:=NETWARE_SERVICE_E3;
+     regs.ds:=seg(ReqBlk);       regs.si:=ofs(ReqBlk);
+     regs.es:=seg(ConnInfoRec);  regs.di:=ofs(ConnInfoRec);
+     msdos(regs);
+end;
+{--------------------------------------------------------------------------}
+procedure GetConnections;
+const
+     GET_OBJECT_CONNECTION_NUMBERS= $15;
+     USER_BINDERY_OBJECT_TYPE     = $0001;
+     NETWARE_SERVICE_E3           = $E3;
+var
+   ReqBlk    :  record
+                  Len          : word;
+                  RequestType     : byte;
+                  ObjectType      : word;
+                  NameLength      : byte;
+                  Name            : array [1..48] of byte;
+                end;
+   swapbind  :  word;
+   i         :  integer;
+begin
+     swapbind:=swap(USER_BINDERY_OBJECT_TYPE);
+     with ReqBlk do
+       begin
+            Len:=sizeof(ReqBlk) - sizeof(Len);
+            RequestType:=GET_OBJECT_CONNECTION_NUMBERS;
+            ObjectType:=SwapBind;
+       end;
+     ReqBlk.NameLength:=Length(UserName);
+     for i:=1 to ReqBlk.NameLength do ReqBlk.Name[i]:=ord(UserName[i]);
+
+     with ConNbrRec do Len:=sizeof(ConNbrRec) - sizeof(Len);
+     regs.ah:=NETWARE_SERVICE_E3;
+     regs.ds:=seg(ReqBlk);    regs.si:=ofs(ReqBlk);
+     regs.es:=seg(ConNbrRec); regs.di:=ofs(ConNbrRec);
+     msdos(regs);
+     if regs.al &lt;&gt; 0 then ConNbrRec.Count:=0;
+end;
+{--------------------------------------------------------------------------}
+procedure GetLocalTarget;
+const
+     IPX_GetLocalTarget           = $02;
+var
+   ReqBlk     :  record
+                  Dnetwork  : NetWrkAdr;
+                  DSocket   : word;
+                 end;
+   ResBlk     :  record
+                   Ltarget  : NodType;
+                 end;
+   swapsocket :  word;
+begin
+     swapsocket:=swap(DestSock);
+     ReqBlk.Dnetwork:=DestNet;
+     ReqBlk.DSocket :=swapsocket;
+
+     regs.bx:=IPX_GetLocalTarget;
+     regs.es:=seg(ReqBlk);
+     regs.si:=ofs(ReqBlk);
+     regs.di:=ofs(ResBlk);
+
+     IpxServicesCall;
+
+     if regs.al = $00 then LocalTarget:=ResBlk.Ltarget;
+                  {0FAh No path to Destination}
+end;
+{--------------------------------------------------------------------------}
+procedure SendMessage;
+const
+     USER_BINDERY_OBJECT_TYPE     = $0001;
+     NETWARE_SERVICE_E1           = $E1;
+var
+   ReqBlk     :  record
+                  Len       : word;
+                  Bindery   : word;
+                  ConnNbr   : byte;
+                  Mlen      : byte;
+                  Mens      : array [1..45] of byte;
+                 end;
+   ResBlk     :  record
+                   Len      : word;
+                   Filler   : array [1..100] of byte;
+                 end;
+   i          :  integer;
+begin
+     with ReqBlk do
+        begin
+          Bindery:=swap(USER_BINDERY_OBJECT_TYPE);
+          ConnNbr:=ConnectionNumber;
+          Mlen:=Length(Message);
+          Len:=Mlen + 4;
+          for i:=1 to Mlen do mens[i]:=ord(message[i]);
+        end;
+
+     ResBlk.Len:=$6400;
+
+     regs.ah:=NETWARE_SERVICE_E1;
+     regs.ds:=seg(ReqBlk);  regs.si:=ofs(ReqBlk);
+     regs.es:=seg(ResBlk);  regs.di:=ofs(ResBlk);
+     msdos(regs);
+end;
+
+{--------------------------------------------------------------------------}
+Procedure IpxSendPacket;
+const
+     IPX_SendPacket               = $03;
+begin
+     regs.bx:=IPX_SendPacket;
+     regs.es:=Seg(SendEcb);
+     regs.si:=Ofs(SendEcb);
+     IpxServicesCall;
+
+     while (SendEcb.StatusFlag &lt;&gt; 0) do ;
+end;
+{--------------------------------------------------------------------------}
+Procedure IpxReadPacket;
+const
+     IPX_ReceivePacket               = $04;
+begin
+     regs.bx:=IPX_ReceivePacket;
+     regs.es:=Seg(ReadEcb);
+     regs.si:=Ofs(ReadEcb);
+     IpxServicesCall;
+     if regs.al &lt;&gt; $00 then
+       begin
+          writeln('Error Read Packet ');
+          WriteHexByte(Regs.al);
+       end;
+                  {0ffh NonExistant socket}
+end;
+{--------------------------------------------------------------------------}
+{--------------------------------------------------------------------------}
+begin
+end.
+
+
+
+
+</pre><HR><P>Copyright &copy; 1993, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

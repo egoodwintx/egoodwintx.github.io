@@ -1,0 +1,225 @@
+
+<html>
+<head>
+<title>September, 2004: Optimizing Pixomatic For Modern x86 Processors: Part II</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Optimizing Pixomatic For Modern x86 Processors: Part II</h1>
+<p><i>Dr. Dobb's Journal</i> September, 2004</p>
+<h2>Challenging  assumptions about  optimization</h2>
+
+
+<h3>By Michael Abrash</h3>
+
+
+<I>Michael is a developer at RAD Games Tools and the author of several legendary programming books, including Graphics Programming Black Book. He can be contacted at mikeabradgametools.com.</I>
+
+<hr>
+
+
+
+
+
+<p>In the first installment of this three-part article, I introduced the optimization challenges we faced with Pixomatic, the 3D software rasterizer that Mike Sartain and I developed for RAD Games Tools. This month, I start by examining the "welder"&#151;a streamlined compiler custom designed to compile code very quickly&#151;and look at issues such as pixel pipeline code.</p>
+
+<p>That said, the welder doesn't exactly compile code. It might be better described as splicing together prewritten, hand-tuned segments of assembly language, performing fixups (like branch targeting), and conditional code generation (like selecting between texture wrapping and clamping) according to pseudocode commands embedded directly in the code stream. The bulk of the code is simply copied directly from the code stream to the execution buffer and no sophisticated analysis is performed&#151;at worst, a few pseudocode conditionals are executed&#151;so the process is very fast.</p>
+
+<p>In the end, the overhead of welding proved not to be a problem at all; we have yet to see a profile where it reaches even 1 percent of the total time. Once again, it turned out that we had overanalyzed and overoptimized up front, instead of just trying it out and seeing how it worked. We also use welding in some other key places, such as handling arbitrary vertex formats, but by far the biggest application of it is in the pixel pipeline.</p>
+
+<p>The welded pixel pipeline code is a good example of circumstances in which good assembly code can still beat high-level compiled code by a wide margin. In general, high-level compilers are quite good at general-purpose x86 code, especially given CPUs that can do out-of-order processing, such as the Pentium III and Pentium 4. For general-purpose code, it's hard to beat a high-level compiler by a significant amount, and I have had the experience a couple of times recently of rewriting C code in assembly and not getting any faster at all.</p>
+
+<p>I should mention, however, that we recently did a pass through the C code for the Miles Sound System for the PlayStation 2, hoisting invariants out of loops and otherwise compensating for relatively poor compiler optimization to the tune of a 30 percent speedup. When we propagated the changes back to Windows, we found we had gotten nearly a 10 percent speedup. Since there were a lot of changes, I'm not sure what the key was, but I suspect it was a combination of turning multidimensional array accesses into pointer accesses and using local pointers so the compiler could tell there was no potential for aliasing.</p>
+
+<p>Where assembly can win big&#151;by two to four times&#151;is with code that's amenable to MMX and SSE because of the four-way parallelism they support and because of the extra registers they make available. True, MMX and SSE can be accessed via compiler intrinsics, but in my experience, those intrinsics rarely generate good code and often actually result in worse performance than normal compiled code. All those complications go away with assembly, and the full power of MMX and SSE can be tapped.</p>
+
+<p>On top of four-way parallelism, SSE and MMX also triple the number of available registers, and each of the new registers can contain multiple values; that's a huge win for a processor as register constrained as the x86. In fact, the MMX register set is large enough so that no dynamic register allocation is needed in the Pixomatic pixel pipeline, and no spilling to memory is required, except in a few cases involving bilinear filtering or 24-bit <i>z</i> buffers with stencil. The ability to have a static register allocation not only improved performance but also greatly simplified the welder because all features can be turned on/off independently of one another with no register-allocation complications.</p>
+
+<p>The welded pixel pipeline code uses MMX but not SSE registers. This is partly because the pixel pipeline is entirely fixed point for performance reasons, and partly because integer SSE2 instructions are currently half the speed of MMX instructions. (In exchange, integer SSE2 can do twice as much work as MMX per instruction, but we couldn't figure out any way to take advantage of that in the pixel pipeline.) Mostly, though, we didn't use SSE registers in the pixel pipeline because we were able to do almost everything we wanted to without them, and it simplified things considerably to not have to support two different pipelines, one with SSE registers and one without. (We do, however, weld enhanced MMX instructions that were added as part of SSE&#151;especially <i>pshufw</i>&#151;into the pixel pipeline when they're supported, by using processor feature conditionals in the welder.) We would have liked to have supported three or more textures, which SSE2 integer registers would have helped with, but then we would have had the problem of how to support that feature on nonSSE2 platforms.</p>
+
+<p><a name="rt1"></a><a href="0409ft1.html">Table 1</a> shows the pixel pipeline register allocation. All scratch registers are used for various purposes. Not only are all eight MMX registers in use, but so too are all eight general-purpose registers&#151;including ESP, since the code requires no stack. Many people don't realize that under Windows it's safe to use ESP as a general-purpose register because the OS switches to a system stack when fielding interrupts and context switching. (Note, though, that the code is no longer multithread-safe unless thread-local storage is used because ESP must be stored somewhere other than the stack so it can be restored at the end of the routine.) Register allocation is one reason why we ended up supporting only two textures; as you can see, there were no more registers to hold additional <i>U</i> and <i>V</i> coordinates and texture pointers.</p>
+
+<p>I'm going to digress for a minute and move up one level to show even more intensive register use. The welded pixel processing code rasterizes a set of horizontal spans, each between 1 and 16 pixels in length. That set of spans comes from the span-generation code, which calculates all the parameters for each span, including the perspective-correct texture coordinates at each end. (The pixel pipeline itself just interpolates <i>U</i> and <i>V</i> linearly; while this introduces some error, in practice it's indistinguishable from perfect perspective correction, and, because it avoids having to do a divide per pixel, is much faster.)</p>
+
+<p>As I mentioned earlier, there are three versions of the span-generation code. The most interesting by far is the SSE version, which uses not 16 but 23 registers plus the stack pointer, as in <a name="rt2"></a><a href="0409ft2.html">Table 2</a>. And, while the span generation code isn't terribly register constrained, it could still have used a few more registers had they existed.</p>
+<h3>Pixel Pipeline  Performance Challenges</h3>
+
+<p>There were two key performance areas that we had to address in the pixel pipeline: pixel processing and texture mapping.</p>
+
+<p>Once we'd decided to use MMX, pixel processing fell out nicely because there aren't too many possible ways to use MMX to work with pixels. <a name="rf1"></a><a href="0409ff1.html">Figure 1</a> shows the pixel format Pixomatic uses. Each color component is stored as a 16-bit fixed-point value; the placement of the fixed point varies, depending on what the last and next operations are. (The variation is due to the alignment requirements of multiplication, which returns only the high or low 16 bits of the result, and also the need at times to perform saturating operations and to clamp results.) At all times, however, color values contain eight integral bits, so processing is always of 8-bit color components or better.</p>
+
+<p>MMX mapped quite well to pixel processing. It would have been nice to not have had to fiddle with bit placement to get multiplication to work, and it would have been even nicer to have been able to protect certain fields on any operation so that RGB could be modified without affecting alpha and vice versa. Still, those were minor inconveniences, and between the parallelism, clamping, faster multiplies, and additional, larger registers, I'd estimate that MMX enabled us to perform pixel processing something like five times faster than would have been possible otherwise.</p>
+
+<p>In fact, the pixel pipeline is the one part of Pixomatic for which there is no fallback C code. MMX, driven by welded code, is required because performance would otherwise be so poor as to make Pixomatic useless.</p>
+
+<p>The other big performance aspect of the pixel pipeline is texture mapping, and this was the toughest challenge. In texture mapping, <i>U</i> and <i>V</i> (the horizontal and vertical texture coordinates) each have to be linearly interpolated, with sufficient fractional bits to allow for subtexel precision, and then the integral parts of <i>U</i> and <i>V</i> (after scaling up to the texture dimensions), have to be butted together and gotten into a general-purpose register so they can be used to address the texture.</p>
+
+<p>The desire to process <i>U</i> and <i>V</i> in parallel makes texture mapping a natural for MMX, but the part about butting the integral parts together is not a good fit. MMX is good at doing parallel processing of independent components, but poor at shuffling data around. This is particularly true with any granularity less than 16 bits, and the granularity for texture mapping varies from 0 to 12 bits, depending on the texture size.</p>
+
+<p>I beat my head against this for a while, but wasn't able to come up with anything I was happy with. Finally, Jeff Roberts said that in cases like this on other chips, he'd found various generalized pack/shift/shuffle instructions to be the way to go, and he tended to think of the MMX pack, unpack, and especially <i>pshufw</i> instructions as limited versions of those. I'm not exactly sure why, but that immediately broke the logjam; <a name="rl1"></a><a href="#l1">Listing One</a> shows the entire sequence used to handle texture mapping, from start to finish, in just six instructions.</p>
+
+<p>The first instruction causes the texture coordinates to wrap. The second, third, and fourth instructions store the combined <i>U</i> and <i>V</i> in <i>eax</i>. The fifth instruction loads the texel into <i>mm7</i>, and the last instruction advances <i>U</i> and <i>V</i> to the next texel.</p>
+
+<p>The key here is storing <i>U</i> and <i>V</i> so that they have enough fractional bits for subtexel accuracy, yet can be butted together with just one instruction, then right justified with a shift. <a name="rf2"></a><a href="0409ff2.html">Figure 2</a> shows how that works. In <a name="rf2"></a><a href="0409ff2.html">Figure 2</a>, the code is working with a 256&times;256 texture, so the texture is addressed with 8-bit integer <i>U</i> and <i>V</i> values. <i>V</i> is stored so that its integral part is right justified to bit 48, and <i>U</i> is stored so that its integral part is left justified to bit 31. This allows a <i>pshufw</i> to butt the two integral parts together at bits 15 and 16, after which the combined <i>VU</i> can be right justified at bit 0 with a <i>psrld</i>; then it's a simple matter to copy the result out to a general-purpose register and use it to address the texture.</p>
+
+<p>This is using MMX as it was not intended to be used. In the past, I've written about the importance of having a flexible mind when optimizing, and this is an excellent example of that. It's also a good example of how you need to step back from your work and think about different approaches every so often&#151;or get someone else to do it for you, as Jeff did for me.</p>
+
+<p>Remember, the best optimizer is between your ears&#151;but you can't weigh it down with preconceptions if you want it to do its best work. </p>
+<h3>Pixel Pipeline Code</h3>
+
+<p>Keeping all that background in mind, <a name="rl2"></a><a href="#l2">Listing Two</a> shows the welded pixel pipeline for the case of one point-sampled texture modulated with Gouraud shading, with <i>z</i> buffering.</p>
+
+<p>The top part is the stepping of the interpolators; we jump into the middle of the loop for the initial iteration, to save doing a wasted stepping at the end of the last time through the loop. (This also makes it possible to align the top of the loop without executing any <i>nop</i> instructions.) This is followed by the <i>z</i> compare, then the texture mapping code, the Gouraud code, the packing and writing of the final pixel value, and the loop control. At 20 instructions per pixel, it's pretty compact for all it does, reflecting the good correspondence between MMX and this particular scenario.</p>
+
+<p>Next, <a name="rl3"></a><a href="#l3">Listing Three</a> shows the welded pixel pipeline for the case of one bilinear filtered texture, plus Gouraud shading. And here we see what happens when MMX doesn't correspond so well to a scenario. It would sure be nice to have a hardware module that did bilinear filtering because there's just no elegant way to do it in software, despite heavy optimization and some fairly clever tricks.</p>
+
+<p>That reminds me of an important lesson we learned while doing Pixomatic: It's almost impossible to know exactly what's going on with the performance of your code nowadays. The out-of-order processing of the Pentium 4 is so complex and the tools available for analyzing performance are so inadequate (alas, VTune has regressed in this respect), that to a large extent all you can do is try a lot of approaches and keep the one that runs fastest.</p>
+
+<p>I mention this in the context of the bilinear filter because that was where that lesson was driven home. You see, I came up with a way to remove a multiply from the filter code&#151;and the filter got slower. Given that multiplication is slower than other MMX instructions, especially in a long dependency chain such as the bilinear filter, and that I had flat-out reduced the instruction count by one multiply, I was completely baffled. In desperation, I contacted Dean Macri at Intel, and he ran processor-level traces on Intel's simulator and sent them to me.</p>
+
+<p>I can't show you those traces, which contain NDA information, but I wish I could because their complexity beautifully illustrates exactly how difficult it is to fully understand the performance of Pentium 4 code under the best of circumstances. Basically, the answer turned out to be that the sequence in which instructions got processed in the reduced multiply case caused a longer critical dependency path&#151;but there's no way you could have known that without having a processor-level simulator, which you can't get unless you work at Intel. Regardless, the simulator wouldn't usually help you anyway because this level of performance is very sensitive to the exact sequence in which instructions are assigned to execution units and executed, and that's highly dependent on the initial state (including caching and memory access) in which the code is entered, which can easily be altered by preceding code and usually varies over time.</p>
+
+<p>Back in the days of the Pentium, you could pretty much know exactly how your code would execute, down to the cycle. Nowadays, all you can do is try to reduce the instruction count, try to use MMX and SSE, use the cache wisely and try to minimize the effects of memory latency, then throw stuff at the wall and see what sticks.</p>
+<h3>Speedboy</h3>
+
+<p>We did come up with an interesting tool for dealing with the uncertainties of Pentium 4 optimization, which we nicknamed "Speedboy." You insert a segment of assembly code that you want to optimize into Speedboy's timing loop, add additional information to indicate which instructions are directly dependent on the results of which other instructions, and kick off the run. Speedboy then times all valid permutations of the code and lets you know which arrangement is fastest.</p>
+
+<p>Speedboy does in fact work as advertised but is not as useful as we'd hoped, particularly for our welded pixel processing code.</p>
+
+<p>The first problem is that it's tedious and error prone to manually determine and enter the dependencies. Often, it would turn out that Speedboy's choice for fastest code didn't actually work properly because we'd missed a dependency. That could be fixed by writing a code analyzer to determine dependencies, but that didn't seem worth doing once we came to understand the second and third problems.</p>
+
+<p>By way of introducing the second problem, let me tell you the story of the first BSP compiler I ever wrote. I got it working and then I thought, heck, computer time is free, why not have it optimize the BSP tree while I'm at it? So I added code to have it try all possible configurations and started a new compiler run.</p>
+
+<p>My polygon set was nothing like a real game level; it contained only 20 polygons, so I figured the run would finish in a few seconds at most. After half a minute, however, I started to wonder, and after half an hour or so, I decided to do a few calculations.</p>
+
+<p>It turns out that the order of a brute-force BSP optimizer is roughly <i>N!.</i> Even with only 20 polygons, that works out to about 2 times 10 to the 18th. If we assume that each tree takes one microsecond to analyze (in fact it took a good bit longer than that), then it would take more than 70,000 years to optimize my little toy level. Bump it up to a big level&#151;say, one with 30 polygons (real levels, of course, have thousands or even millions of polygons)&#151;and I'd have been waiting for my answer well into the heat death of the universe. And I mean that literally; we're talking 8 billion billion years here.</p>
+
+<p>I'd imagine you can guess where I'm going with this. Speedboy's order is somewhat less than <i>N!</i>&#151;but, unless there are a lot of dependencies, not all that much less. Sequences of 10-20 instructions work great; sequences of 40 or more tend to make you wish that either computers were a lot faster or that reincarnation was a viable option, depending on the number of dependencies in the code. Some of our critical code segments are short enough to run through Speedboy, but a lot of them aren't; for example, the code for one bilinear filtered texture with Gouraud shading would probably take longer to finish than my BSP optimizer running on a 30-polygon level.</p>
+
+<p>Worse still was the third problem. If you'll recall, I mentioned earlier that the performance of code on the Pentium 4 is highly sensitive to the exact sequence of instruction execution. Well, in welded code, the exact instruction sequence is different for every one of many trillions of pipeline configurations. Furthermore, because the loops iterate only 1 to 16 times, performance can be greatly affected by the exact state of the processor when the code is entered, which varies depending on the render state and the shape and size of the triangle. Consequently, the results reported by Speedboy tended to be extremely case specific. Often, Speedboy would find an optimization that would speed up a specific case by as much as 10 percent in the test bed, but when we put it into Pixomatic, the benefit would vanish completely or would show up in that one case, but not in similar cases.</p>
+
+<p>So, in the end, Speedboy wasn't much help with the welded pixel pipeline code. On the other hand, it was useful in non-welded, high-repetition cases like the 2D blit code. On balance, Speedboy was a cool idea and modestly useful, but not a big win for Pixomatic.</p>
+<h3>Next Month</h3>
+
+<p>I'll wrap up in next month's installment with an examination of out-of-order processing, branch prediction, and how HyperThreading technology fits into the mix.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>pand      mm0,[WrapUV0Mask]
+pshufw    mm5,mm0,0Dh
+psrld     mm5,[WrapUV0RightShift]
+movd      eax,mm5
+movd      mm7,[edx+eax]
+padd      mm0,[UV0Step]</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>LoopTop:
+    add        esp,dword ptr [_RotatedFixed16ZXStep] ; stepping
+    adc        esp,0
+    paddsw     mm2,mmword ptr [_argb7x_GouraudXStep]
+    paddd      mm0,mmword ptr _Spans+20h[esi]
+    cmp        sp,word ptr [ebx+ecx*2]               ; z buffering
+    ja         LoopBottom
+    mov        word ptr [ebx+ecx*2],sp
+    pand       mm0,mmword ptr [_TexMap]               ; texture mapping
+    pshufw     mm5,mm0,0Dh
+    psrld      mm5,mmword ptr [_TexMap+28h]
+    movd       eax,mm5
+    movd       mm7,dword ptr [edx+eax*4]
+    movq       mm6,mm2                                ; Gouraud shading
+    punpcklbw  mm7,dword ptr [_MMX_0]
+    psllw      mm7,1
+    pmulhw     mm7,mm6
+    packuswb   mm7,mm7                                ; pixel pack/write
+    movd       dword ptr [edi+ecx*4],mm7
+LoopBottom:
+    inc        ecx                                    ; loop control
+    jne        LoopTop</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>LoopTop:
+    add         esp,dword ptr [_RotatedFixed16ZXStep]
+    adc         esp,0
+    paddsw      mm2,mmword ptr [_argb7x_GouraudXStep]
+    paddd       mm0,mmword ptr _Spans+20h[esi]
+    cmp         sp,word ptr [ebx+ecx*2]
+    ja          LoopBottom
+    mov         word ptr [ebx+ecx*2],sp
+    pand        mm0,mmword ptr [_TexMap]
+    pshufw      mm6,mm0,0Dh
+    psrld       mm6,mmword ptr [_TexMap+28h]
+    movd        eax,mm6
+    movd        mm7,dword ptr [edx+eax*4]
+    pslld       mm6,mmword ptr [_TexMap+28h]
+    add         eax,dword ptr [_TexMap+0F4h]
+    and         eax,dword ptr [_TexMap+0F8h]
+    paddw       mm6,mmword ptr [_TexMap+40h]
+    psrld       mm6,mmword ptr [_TexMap+28h]
+    movq        mm4,mm0
+    psrld       mm4,mmword ptr [_TexMap+48h]
+    pand        mm4,mmword ptr [_MMX_0x003F003F003F003F]
+    movd        mm5,dword ptr [edx+eax*4]
+    movd        eax,mm6
+    punpcklbw   mm7,dword ptr [_MMX_0]
+    movd        mm6,dword ptr [edx+eax*4]
+    punpcklbw   mm5,dword ptr [_MMX_0]
+    pshufw      mm4,mm4,0
+    add         eax,dword ptr [_TexMap+0F4h]
+    and         eax,dword ptr [_TexMap+0F8h]
+    punpcklbw   mm6,dword ptr [_MMX_0]
+    movq        mmword ptr [_MMX_UFrac],mm4
+    movd        mm4,dword ptr [edx+eax*4]
+    punpcklbw   mm4,dword ptr [_MMX_0]
+    psubw       mm6,mm7
+    psubw       mm4,mm5
+    psubw       mm5,mm7
+    psubw       mm4,mm6
+    pmullw      mm6,mmword ptr [_MMX_UFrac]
+    psraw       mm6,6
+    pmullw      mm4,mmword ptr [_MMX_UFrac]
+    paddw       mm6,mm7
+    pshufw      mm7,mm0,0AAh
+    psrlw       mm7,6
+    psllw       mm5,6
+    pmulhw      mm4,mm7
+    pmulhw      mm7,mm5
+    paddw       mm6,mm4
+    paddw       mm7,mm6
+    packuswb    mm7,mm7
+    movq        mm6,mm2
+    punpcklbw   mm7,dword ptr [_MMX_0]
+    psllw       mm7,1
+    pmulhw      mm7,mm6
+    packuswb    mm7,mm7
+    movd        dword ptr [edi+ecx*4],mm7
+LoopBottom:
+    inc         ecx
+    jne         LoopTop</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

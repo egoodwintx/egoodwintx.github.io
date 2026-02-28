@@ -1,0 +1,83 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal March 1997: Dynamic Memory Allocation and Communication Protocols</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Dynamic Memory Allocation and Communication Protocols</h1>
+
+<p><i>Dr. Dobb's Journal</i> March 1997
+</p>
+<h2>Efficiency and flexibility are critical to success</h2>
+
+<h3>By Gregory Bollella</h3>
+
+<I>Gregory Bollella is an advisory software engineer working on increasing the amount of configuration information automatically provided to application programs by the network. He is currently completing research in real-time operating systems for his Ph.D. at the University of North Carolina at Chapel Hill. He can be reached at bollella@raleigh.ibm.com.</I>
+
+<hr>
+
+<p>In my work -- implementing communications protocols -- efficient and flexible dynamic memory-management implementation is critical to success. We usually cannot rely on library- or operating-system-provided memory allocators for three reasons: </p>
+
+<ul>
+  <li>They are generally not efficient enough. 
+  <li>We usually need the allocator to operate under conditions that the provided allocators do not allow.
+  <li>The implementation of a layered communications-protocol architecture is simplified if headers can be prepended to data buffers. Also, because of the high rate of buffer turnover, memory leaks show up quickly but are difficult to find (due to what are often highly concurrent implementations).
+</ul>
+
+<p>Most workstation environments and applications include some type of network access. For communications software to be considered successful, it should be transparent to both applications and users. Inefficient communications software becomes readily apparent. Hence, it is part of the communications-software developer's job to ensure that all functions, at least in the main path of the product, are blazingly fast. And since the primary purpose of communications software is to move data buffers from the network to applications and back, developers use dynamic memory allocators extensively. The allocators we use must be as efficient as possible. On a workstation, the communications software is shared among all processes and therefore operates under many of the same conditions as system software. </p>
+
+<p>In fact, many communications-protocol implementations are part of an operating system. In some cases, however, workstation operating systems do not include communications software, and the communications-protocol implementations are generally combinations of device drivers, user libraries, and user processes. The allocators available to these implementations were not constructed for use in system software. As data travels from an application through the library, protocol implementation, device driver, and network device, information is added at each layer to the buffer that the same layer on the receiver, or intermediate node, uses to correctly implement the protocol. </p>
+
+<p>Historically, the design specifies that each layer prepends its information to the beginning of the buffer. This requires a flexible allocator. Implementations of communications protocols are inherently concurrent. The code has to operate on behalf of a number of processes as well as wait on multiple interfaces to the network for incoming traffic. In addition, each process may have any number of threads using the communications subsystem.</p>
+
+<p>All these conditions require strict attention to the freeing of memory. Given one's own implementation of a memory allocator, you can add functions that help you find memory leaks, double frees, and the use of pointers to freed memory. In this article, I'll review memory allocators in general and discuss the allocator used in typical implementations of TCP/IP. I'll describe a number of allocator-implementation techniques that are helpful in debugging applications that use the allocator.</p>
+
+<h3>The Buddy System</h3>
+
+<p>In <i>The Art of Computer Programming: Fundamental Algorithms</i> (Addison-Wesley, 1973), Donald Knuth identifies two considerations for dynamic memory allocators: "How is this partitioning of available space to be represented inside the computer?" and "Given this representation of the available spaces, what is a good algorithm for finding a block of <i>n</i> consecutive free spaces and reserving them?" The solutions to these two requirements are fundamental to half of any memory allocator. The other half, of course, is the deallocation of blocks no longer in use.</p>
+
+<p>Additionally, you may consider using a technique known as "memory compaction," which coalesces consecutive blocks from the free list on deallocation. Alternatively, the choice of many communications-protocol implementations is not to compact memory but to keep <i>n</i> free lists for <i>n</i> different sizes of blocks allocated by the allocator. Once a particular size block is carved out of memory, allocated, and deallocated, it goes on the free list for its size. Subsequent allocations use the block from the free list. If the free list for a particular size is empty, then the block is created out of the available pool. This variation works well only when a large percentage of requests are for similarly sized blocks. For communications protocols, this assumption is generally valid.</p>
+
+<p>Knuth gives a number of algorithms for allocation and deallocation using lists as well as a description of the buddy system. One of the most interesting dynamic allocation schemes, the buddy system, excels in situations where requests are for widely varying block sizes because of the ease by which free blocks can be compacted. For every request of size <i>n,</i> the allocator reserves a block 2<sup><i>j</i></sup> where 2<sup><i>j-1</sup>&lt;n&lt;</i>2<sup><i>j</i></sup>. So each block, internally to the allocator, is a power of two, but externally appears as a block of the size requested. For a memory pool of size 2<i>m</i> there are <i>m</i> free lists, one for each power of two. For a request of size <i>n</i>, if there is no block on list <i>j</i>, then the allocator searches the lists up to <i>m</i> to find the smallest <i>k</i>&gt;<i>j</i> for which there is a free block. This block is then split in half until a block of size 2<sup><i>j</i></sup> is created. All other blocks, including the other half, the buddy, of the 2<sup><i>j</i></sup> block are added to the appropriate free list. The 2<sup><i>j</i></sup> block is marked "in use" and returned to the caller. Note that the address of each block of size 2<sup><i>j</i></sup> is a multiple of 2<sup><i>j</sup>,</i> so the lowest, at least, consecutive <i>j</i> bits are 0s. Finding the buddy of a block of size 2<sup><i>j</i></sup> whose address is <i>x</i> is shown in <a name="rf1"><a href="9703ff1.htm">Figure 1</A>. </p>
+
+<p>Each block has a flag indicating whether it is in use, so the coalescing function on deallocate is a simple test of the flag of the buddy block. If the buddy of the block being deallocated is not in use, then the two buddies are coalesced and added to the free list of 2<sup><i>j</i>+1</sup>. The buddy system fragments memory in a situation where many requests are slightly larger than a power of two.</p>
+
+<h3>Using Allocators</h3>
+
+<p>Most TCP/IP implementations use an allocator that dispenses blocks of memory in only two sizes, a small size of 128 bytes and a large size of 2000 bytes. In <i>The Design and Implementation of the 4.3BSD UNIX Operating System</i> (Addison-Wesley, 1989), Samuel J. Leffler, Marshall Kirk McKusick, Michael J. Karels, and John S. Quaterman make the statement that the implementation of the TCP/IP stack needs an allocator distinctly different from the other parts of the operating system. It has to be efficient and also very flexible, as requests are of widely varying sizes. They also mention the need to prepend protocol headers to the beginning of data buffers.</p>
+
+<p>The basic unit of memory allocation used by the TCP/IP implementation is an <i>m_buf</i>. The 128-byte <i>m_buf</i>s can contain 112 bytes of data. The other 16 bytes are used for a link pointer, the length of the data in the <i>m_buf</i>, a data offset from the beginning of the <i>m_buf</i>, a pointer used to chain lists of <i>m_buf</i>s, and a type field. Data is held in a number of chained <i>m_buf</i>s and copied to contiguous memory in only two places: into a buffer provided by an application for a receive and into a buffer used by the network device. The advantage of using <i>m_buf</i>s as the internal storage structure is that headers and trailers can be prepended and appended without copying the data. The operation to prepend a header simply writes the header into an <i>m_buf</i> and adds the <i>m_buf</i> to the beginning of the chain.</p>
+
+<p>Stripping headers, also a frequent operation, is accomplished by simply removing the <i>m_buf</i>s from the head of the chain. Note that each <i>m_buf</i> need not be completely full because each <i>m_buf</i> carries the length of the data and the offset to the start of the data in the <i>m_buf</i>. For example, if a header is 24 bytes long, one <i>m_buf</i> can be used with its length field set to 24 and offset to 12. For large data, the larger <i>m_buf</i>s are used. Flexibility is maintained with a reduction in the chain-traversal time.</p>
+
+<p>In implementations of other communications protocols, <i>m_buf</i>s are not used, but the requirements of prepending, efficiency, and flexibility still exist and are solved in other ways. One other solution to the prepend problem is to define the maximum amount of space needed for headers that would ever be prepended and add that amount to all requests, then return to the caller a pointer into the buffer, leaving the defined amount in front. Although some performance is gained because contiguous buffers are maintained and fewer data copies occur, this method is less flexible than using <i>m_buf</i>s. However, designers may be willing to trade flexibility for performance gain. The efficiency problem is almost always solved by keeping preallocated buffers of common sizes in a free list and not compacting memory. When the implementors gain experience with their product, they can accurately predict the size of buffers that will be requested and can hand tailor the operation of the allocator.</p>
+
+<p>Two important opportunities that become available once you decide to write your own allocator are:</p>
+
+<ul>
+  <li>The collection of performance data on the allocator itself during operation.
+  <li>Debugging hooks. 
+</ul>
+
+<p></p>
+
+<p>As the software is tested, lots of information can be gathered on the performance of the allocator, and the implementors can then optimize the allocator specifically for a particular implementation. A common problem when using certain programming languages is code that writes past the end or beginning of its allocated memory. A debug version of the allocator can be built to uncover these errors. Although often slower, a debug allocator can be invaluable. One technique developed by a number of my coworkers at IBM is to allocate memory in buffers defined by the operating system rather than allocating out of a single large block using either our own allocator or something like <i>malloc</i>. Then, when the code overwrites this operating-system-defined buffer, for which the operating system has data about length, ownership, and permission, the operating system will throw an exception that can be caught. Thus, the overwrite is discovered. Developers are generally very surprised at the number of latent bugs that are discovered when a debug allocator is used.</p>
+
+<h3>Conclusion</h3>
+
+<p>The implementations of communications protocols impose special requirements on dynamic-memory allocators. The usual variations of memory allocators reported in the literature do not suffice. They lack efficiency because they try to do too good a job with respect to compaction and try to support a general environment. The buddy system comes close but is still too inefficient, can cause too much fragmentation, and is not flexible enough to be easily modified as developers gain experience with their software.</p>
+
+<h3>Acknowledgments</h3>
+
+<p>My thanks to Mike Kawalec at IBM for permission to describe the debugging method he developed.</p>
+
+
+<p><b>DDJ</b></p>
+
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

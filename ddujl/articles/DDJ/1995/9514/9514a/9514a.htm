@@ -1,0 +1,446 @@
+<HTML>
+<META NAME="year" CONTENT="1995">
+
+<HEAD>
+<TITLE>SP95: Windows Apps and Exception Handlers</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Windows Apps and Exception Handlers<a name="02fe_00d8"></h1><P>
+<h2><a name="02fe_00d6"><a name="02fe_0000">Enhancing an already powerful debugging tool</h2><P>
+<h3>Joe Hlavaty</h3><P>
+<p><i><a name="02fe_00d7"><a name="02fe_0000">Joe is a programmer at a major hardware vendor. He is a graduate of Georgetown University and currently lives in the Washington, D.C. area. Joes can be contacted at jhlavaty@aol.com.</i></p><hr><P>
+In my article, &quot;Exception Handlers and Windows Applications&quot; (<I>Dr. Dobb's Sourcebook of Windows Programming</I>, Fall 1994), I discussed issues relative to Windows exception handlers, including the System VM, DPMI, and numerous protected-mode concepts such as selectors. In doing so, I presented TrapMan, a Windows debugging tool for analyzing exceptions in Windows applications. In this article, I'll enhance TrapMan by adding features to the trap handlers for displaying exception registers, dumping the exception stack, identifying the faulting application, and more.<P>
+A (usually) nonfatal exception is Interrupt 11 (Trap B) or Segment Not Present. The Windows kernel processes this message when demand loading segments of Windows applications. TrapMan watches these segments because it can be useful when you need to wait until a segment is loaded to set a breakpoint for debugging. It also gives you some idea of how often Windows environments are processing exceptions under the covers, even in small applications. Note that Interrupt 11 is very different from Interrupt 14 (Page Fault). Page Faults are handled by WIN386, while Segment Not Present faults are handled by KRNL386.EXE and friends. I will not discuss Page Faults here.<P>
+TrapMan is a Windows application that should run in any protected-mode version of the 16-bit Windows environment, including Win-OS/2 2.1 and 2.11. I've even run it under NT's WOW, the multithreaded DOS-box subsystem for 16-bit apps.<P>
+Additionally, if you wish to debug a currently faulting application caught in one of TrapMan's handlers, you will need to be running with a debugger capable of processing unowned Int 3hs in code, as Trapman uses the Intel INT3 instruction to return control to a waiting debugger. I prefer Nu-Mega's (Nashua, NH) Soft-Ice for Windows for debugging DOS-based versions of the Windows environment and the OS/2 kernel debugger for debugging OS/2-based versions (I use both on almost a daily basis). Unlike some debuggers, both of these can handle an Int 3h instruction that they themselves did not place in the code. <P>
+Intel documentation often refers to exceptions as &quot;interrupts,&quot; Windows refers to them as &quot;faults,&quot; and OS/2, as &quot;traps.&quot; Interrupt is followed by a decimal number, trap, by a hex number, and fault is usually preceded by the name of the exception. In other words, Interrupt 13, General Protection Fault, and Trap D are all the same thing when discussing exceptions. For this article, I'll generally use the Windows versions of these names to avoid questions about the base of numbers given. <P>
+<h3><a name="02fe_00d9">TrapMan Background<a name="02fe_00d9"></h3><P>
+I developed TrapMan with Microsoft C 6.x, the Windows 3.1 SDK, and a MASM 5.1-compatible assembler. It will run under Windows 3.0 but requires COMMDLG for its SAVEAS and OPEN dialogs. TrapMan will show you how to use DPMI calls to replace the default Windows and Win-OS/2 handlers in order to provide an application-specific level of depth in debugging information while running under retail Windows or Win-OS/2. All of the source code, including related files and executables, is available electronically; see &quot;Availability,&quot; page 3.<P>
+Fatal exceptions such as Stack Faults generally cause the operating system to terminate the task producing the exception. A nonfatal exception permits the task to continue at the instruction causing the fault after the operating system has processed the fault so that the current instruction will no longer cause an exception. An example would be a Segment Not Present fault. It is possible to write an exception handler in C, as in <a href="#02fe_00df">Listing One</A>. This handler simply calls the Windows API <I>DebugBreak()</I> to interrupt to a waiting debugger (if available), and then calls <I>FatalExit()</I> to exit the faulting task. Notice that the handler does not attempt any access to program data. You can see why by looking at the mixed listing file created by the compiler for the handler in <a href="#02fe_00e0">Listing Two</A>. Notice that no segment registers are set in this routine. While CS is set through the action of calling this handler, no other segment registers are valid. These segment registers are set during C initialization and are not normally changed during the &quot;life&quot; of a Windows program. If the handler attempted to access C data, the handler would very likely GPFault (as DS is a random, possibly completely invalid value), which would cause the handler to be called repeatedly. (For more details, see <I>Windows Internals,</I> by Matt Pietrek, Addison-Wesley, 1993.)<P>
+The HANDLER example in the Windows SDK shows one way to make sure DS is valid. HANDLER sets an interrupt handler and guarantees accessibility to DS by exporting the interrupt handler. You need to be sure that your C compiler is generating correct code for a Windows prolog so that the Windows loader will set DS correctly (or you may need to call <I>MakeProcInstance()</I> yourself to force DS to be correct). <P>
+The easier way to make sure DS is valid is simply not to use DS! This is the technique used in TrapMan's handlers, which store information that they need to access at exception time inside the handler code segments. In other words, TrapMan is self-modifying code (even though the changes are mostly data). As code segments are shared across multiple instances, any modifications made by the second or greater instances would modify the data for all instances, including the first; therefore, only one instance of TrapMan is permitted.<P>
+In order to make TrapMan's exception handlers as flexible as possible, I wrote the handlers in assembly language. The other modules (window functions and the like, the scaffolding of TrapMan) are written in C to make that code as uncomplicated as possible.<P>
+Lastly, TrapMan makes extensive use of 16-bit DPMI services to monitor exceptions, and will only work in those systems that supply a 16-bit DPMI host of at least the 0.90 level (as do all 16-bit versions of Windows and Win-OS/2). Of course, such techniques should also work in protected-mode DOS applications, provided a DPMI host meeting these requirements is available, but such applications will not be discussed in this article.<P>
+<h3><a name="02fe_00da">Why Exception Handlers?<a name="02fe_00da"></h3><P>
+While Windows (and Win-OS/2) already supply their own exception handlers, these handlers do not help you gather information on the fault. In many cases, only the address of the faulting instruction is available. While helpful, a raw address is not very useful when taken out of context. Wouldn't it be nice to have registers, flags, or a stack dump--even without a debugger? TrapMan will help you do this. Is it dangerous to set exception handlers directly from an executable? The <I>Windows 3.1 Guide to Programming</I> states:<P>
+<cite>Because interrupts can occur at any time, not just during the execution of the application that is using the device, device interrupt-handling code must be in a fixed segment.</cite><P>
+This also applies to exception handlers.<P>
+Likewise, the <I>Windows 3.1 Multimedia Programmer's Reference</I> notes that interrupt (and so, exception) handlers &quot;must reside in a DLL,&quot; and the handler data and code segments &quot;must be specified as FIXED.&quot; <P>
+The danger is that the code or data needed for the exception handler might have been discarded. While Windows 386 Enhanced mode and OS/2 both support paging, their underlying Windows systems do not. Windows and Win-OS/2 use segment-level linear memory; code and data are loaded on a per segment basis (via Interrupt 11, Segment Not Present fault).<P>
+The Intel documentation specifically states that any two Contributory Exceptions (Divide By Zero, Segment Not Present, Stack Fault, or GP Fault) will generate a Double Fault, and the processor will enter shutdown mode. (See the <I>i486 Processor Programmer's Manual</I>, Table 9-4.) In other words, if an application GPFaults and the processor attempts to demand load the handler segment, a double fault would result.<P>
+If it really worries you, put your exception handlers in a DLL with FIXED segments as Microsoft requires. Another possibility is to page lock the memory via <I>GlobalPageLock()</I>, but this function is only available in Windows Enhanced mode and is not available in all versions of the Windows operating environment. I have left TrapMan's handlers in an application instead of a library for simplicity's sake, with the code PRELOAD and NONDISCARDABLE. (For a very readable discussion on memory-segment attributes like PRELOAD, refer to Pietrek.) You'll see sections of TrapMan's handlers where the handlers check for code movement (because application code is always MOVEABLE), but this isn't too time-consuming.<P>
+Should you use exception handlers all the time?<P>
+No. It is probably best to leave the current Windows handlers alone, especially if you are shipping a retail version of your application. The Windows handlers, while not useful for debugging, are generic and work well with all Windows applications.<P>
+If you are writing a debugging tool such as TrapMan, you will probably want to replace the Windows handlers. TrapMan will (at the user's option) either replace the Windows handler or hook it. Replacing a Windows exception handler means that only TrapMan's handler will be active. Hooking the Windows handler means that TrapMan will call the original Windows handler after first preprocessing the Windows exception. Of course, replacing a Windows or Win-OS/2 handler does not remove the handler from memory; the DPMI host simply calls us instead of them.<P>
+If you write a regular (nondebug) application, you must be careful to only install your handlers by user choice. It should then be perfectly okay to ship exception handlers in your application (in testing TrapMan, I've run into at least one mainstream Windows application that did so). However, I would certainly not leave them in by default.<P>
+I envision the following scenario: A user calls your support line to report a problem; the support team has the customer turn on exception handling and reproduce the problem. The customer ships you a file with exception information. You fix the bug! Easy, huh? Exception handling is not something you'd want to leave on all the time. If everybody replaced the Windows handlers unnecessarily, who knows what would happen?<P>
+<h3><a name="02fe_00db">Setup for the Handlers<a name="02fe_00db"></h3><P>
+One of the first things TrapMan does at startup is set the default values for this debugging session (see <a href="#02fe_00e1">Listing Three</A>). This routine sets up handlers for the exceptions our user wishes to watch. These values are currently hard-coded, but the code could easily be changed to read defaults from an .INI file. The options are as follows:<P>
+<UL>
+<li>Save trap settings. Exiting TrapMan will cause this session's settings to become the default.</li>
+<li>Nuke app. Trapping applications will be terminated. Don't turn this option off unless you are calling the Windows handlers, or a faulting application will fault endlessly as the trap handlers aren't recovering from the trap.</li>
+<li>Call <I>PrevHandler</I>. Calls the handler of a fault that was active when TrapMan added its own handlers. This usually means the handlers in the Windows kernel will be called. Note that this is post-processing. TrapMan's handlers will have already processed the exception by the point at which we call the previous handler.</li>
+<li>Break on fault. TrapMan will attempt to break to a debugger via Int 3h at fault time. Application fault registers are preserved except for CS:IP and SS:SP (which are available on the DPMI exception frame).</li>
+<li>Beep on fault. Beeps to let you know that a fault has occurred. This reminds you to look at your debugger. If you're using the Break on Fault option, TrapMan will be unable to paint the edit control with the debug information until you've released your debugger with a GO command.</li>
+<li>Intercept <I>OutputDebugString()</I>. Allows TrapMan to avoid the need for a serial connection to write debug information with <I>OutputDebugString()</I>--no more CANNOT WRITE TO DEVICE AUX messages! Note that this is a replacement and not a hook; the original Windows kernel routine is not called (although the original call will be restored if you uncheck this option from the menu).</li>
+<li>Add CRLF to ODS() strings. Adding a carriage return/line feed to <I>OutputDebugString()</I> arguments improves readability in the edit control. If the arguments already have CRLFs, then this option is unnecessary and should not be used.</li>
+<li><I>DebugBreak()</I> on &lt;PrntScrn&gt;. This would be a nice hook into a debugger, but I haven't had time to implement it.</li>
+</UL>
+The handlers for exceptions that TrapMan will watch are also installed at this point. Set default handlers for GPFault, Stack Fault, Invalid Op Code Fault, and Divide By Zero. Additional exceptions can be handled at user request. All program options are set in standard fashion with <I>SendMessage()</I> using the appropriate WM_COMMAND for the option. TrapMan also sets two global variables here that are handles to the Trap and Options menus for use during WM_COMMAND processing, which requires access to TrapMan's menu to check and uncheck options. This WM_COMMAND processing is a standard method of simulating user menu input in Windows programs. It allows you to use the same logic to set internal variables from within the program as you use to process external user requests.<P>
+For debugging purposes, TrapMan also can launch a single application from the command line. For convenience, TrapMan uses standard C argument processing to extract these values (see <a href="#02fe_00e2">Listing Four</A>). This code may be specific to your C library startup source code. Please check your compiler for more information. The current implementation works with Microsoft C 6.x.<P>
+Using <I>SendMessage()</I> guarantees that our exception handlers are set before any application the user gave on the command line is launched (thus, any faults that occur on launch of the application are caught by TrapMan). You should do something similar in your application to ensure that your handlers are available as soon as needed. Remember that <I>SendMessage()</I> is processed through an immediate call to your window procedure, while <I>PostMessage()</I> messages are handled later.<P>
+As mentioned previously, handlers store information in their code segments that is needed during exception processing. You'll find TrapMan's <I>SetVars()</I> routine in <a href="#02fe_00e3">Listing Five</A>. Currently, TrapMan creates and stores a DS alias to our HANDLER code segment and also stores the DS value for TrapMan. Both of these values will be accessed via CS from within exception handlers.<P>
+<h3><a name="02fe_00dc">Handlers for Fatal Exceptions<a name="02fe_00dc"></h3><P>
+Fatal exceptions include GPFault, Stack Fault, Invalid Op Code fault, and Divide by Zero. Note that the code in TrapMan's fatal exception handlers could be rewritten to take up less space, if necessary. You could assign specific entry points to each fatal exception and have them display exception-specific information (a text string, for example). The specific entry points could then jump to a generic handler for the rest of the exception. TrapMan's handlers are small enough that I felt that optimizing them would make them harder to understand, and only slightly more efficient.<P>
+Fatal exception handlers begin with a call to the TELLDEBUGGER macro (see <a href="#02fe_00e6">Listing Eight</A>). This macro is responsible for the majority of information output to the user. For the moment, I'll discuss the Invalid OpCode exception handler found in <a href="#02fe_00e4">Listing Six</A>. The TELLDEBUGGER macro first saves the processor flags and calls the SAVEREGS macro, which saves all general 16-bit registers except the SP, IP, and CS registers. The SP register will be preserved through the normal maintenance of the stack in the handler; the CS and IP registers are not saved due to their nature--CS can only be changed through RET/ JMP/CALL instructions and the like. One reason for using the SAVEREGS macro is to save the registers in a more understandable format than the PUSHA instruction, which saves the general-purpose registers in the order of AX, CX, DX, BX according to the Intel i486 programmer's guide. This macro saves ten (decimal) words on the stack. The registers are restored by a call to the UNSAVEREGS macro.<P>
+Next, the TELLDEBUGGER macro checks to see if TrapMan is to call the Windows <I>MessageBeep()</I> function to notify the user of an error. If the <I>wBeepOnTrap</I> flag is set, then <I>MessageBeep()</I> is called. After this, the trap message is displayed in the edit control. (This is done by calling our replacement procedure for the Windows <I>OutputDebugString()</I> API, which can be called regardless of whether or not we are currently replacing the <I>OutputDebugString()</I> API.) In this case, the message is &quot;Trap 6!&quot;.<P>
+At this point, the TELLDEBUGGER macro isolates the exception to a task. This is done through a call to <I>GetCurrentTask()</I>. The <I>GetCurrentTask()</I> API returns a Task Data Base (TDB). We'll extract the Module Data Base (MDB) from the TDB and then extract the fully qualified path to the executable, which is then displayed in the edit control. (See <I>Undocumented Windows,</I> by Andrew Schulman et al.)<P>
+Next, the TELLDEBUGGER macro displays the DPMI exception frame in the edit control (through a call to <I>_PrintOutFaultFrame()</I>). Note that the argument to this procedure is a near pointer to the beginning of the fault frame (which is assumed to be on the stack and thus relative to SS).<P>
+At this point, the TELLDEBUGGER macro restores the application registers through a call to UNSAVEREGS in preparation for dumping the registers to the edit control. Of course, as the act of dumping the registers might destroy some of them, we do an immediate SAVEREGS before calling <I>_PrintOutPointerData()</I> to display the application stack. This procedure simply takes a far pointer (which must be valid!) that will be displayed in the edit control. We then call the UNSAVEREGS macro, restore the processor flags, and the TELLDEBUGGER macro is done.<P>
+This is the most complicated portion of the handler; at this point only a few things remain to be done. For starters, the macro BREAKIFUSERWANTS is called. This macro will result in an Int 3h instruction (to break to a waiting debugger) if the Break On Fault option is checked. Then the value of Call Prev Handler is tested; if checked, the previous handler is called and our processing of this exception ends. Finally, if we did not need to call the previous handler, then TrapMan is responsible for bringing down the faulting task. It does this by a call to the NUKEAPPCHECK macro, which checks the state of the <I>wNukeApp</I> variable. The NUKEAPPCHECK macro will call FORCEAPPEXIT to bring down the current task if the <I>wNukeApp</I> variable is set. It does this by resetting the Faulting CS and Faulting IP fields of the DPMI exception frame to point to the <I>ThisAppIsHistory()</I> procedure in TrapMan. The task will be terminated when control is returned to DPMI. <P>
+Be careful! TrapMan will permit you to disable faulting-application termination without calling a previous handler (in other words, both the Call Prev Handler and Nuke App settings are unchecked). If an application faults while these settings are in effect, the faulting application will fault continuously. Someone must always process the exception! GPFaults (and most other exceptions) are restartable. Upon your handler's return to DPMI, Windows will begin execution at the current CS:IP, which will be whatever instruction is faulting, unless a handler resets it.<P>
+<h3><a name="02fe_00dd">Handlers for Nonfatal Exceptions<a name="02fe_00dd"></h3><P>
+Nonfatal exceptions, which are normal in the course of program execution, can be thought of as &quot;requests for work&quot; by the operating system. Two normal requests for work would be Interrupt 14 (Page Fault) and Interrupt 11 (Segment Not Present). While 16-bit Windows doesn't really concern itself with page faults (which are the responsibility of a ring 0 VxD under DOS Windows or the OS/2 kernel under OS/2), Segment Not Present faults are frequent. Problems in demand loading segments lead to the infamous &quot;SEGMENT LOAD FAILURE&quot; message from the Windows kernel.<P>
+Nonfatal exceptions require different processing than fatal exceptions. TrapMan does not process these nonfatal exceptions itself. The hooks are only for informational purposes. The original (Windows or Win-OS/2) handler is always called, and all registers (including flags) must be preserved in our handlers for these exceptions.<P>
+As an example of how a nonfatal handler might be written, let's take a look at TrapMan's Segment Not Present fault (Trap B) handler (see <a href="#02fe_00e5">Listing Seven</A>). The first important section of code resets the base of the data alias to the HANDLER code segment. You ensure that the alias points to the same address (that is, has the same base address) as the HANDLER code segment by simply setting the base of the alias to that of the code segment. (This is only necessary because our code is in an executable and cannot be FIXED. If Windows decides to move the location of the HANDLER segment after <I>SetVars()</I> allocates the alias, then the alias will be out of sync with the original selector, and nothing good will result.)<P>
+Unlike other (fatal) fault handlers, this nonfatal fault handler does not begin with a call to the TELLDEBUGGER macro (<a href="#02fe_00e6">Listing Eight</A>). The TELLDEBUGGER macro dumps out information to the user such as fault location, stack, and DPMI-exception frame. In the case of a nonfatal exception, most of this information is not necessary, and only part of the TELLDEBUGGER function is used (in-line) in this procedure.<P>
+The most important portion of the handler is that it is responsible for copying the value of <I>_Prev11</I> (a variable in TrapMan's auto DS) to the variable <I>MyFarProc</I> in HANDLER's CS. This is necessary because only CS will be valid when you call the previous Windows handler to process the Segment Not Present fault. All other registers will be those of the application causing the fault. None of this would be necessary at fault time if <I>_Prev11</I> and other variables were CS variables and directly accessible to the handlers; see <a href="#02fe_00e7">Listing Nine</A>.<P>
+After all of this, TrapMan passes the nonfatal exception on to Windows by jumping to the contents of <I>MyFarProc</I> (which contains the address of the appropriate Windows or Win-OS/2 handler) with the <I>jmp dword ptr cs:MyFarProc</I> instruction. <P>
+There are two important points here: <P>
+<UL>
+<li>All registers at this point (except CS:IP, which will be set by the JMP instruction) must be set at the values they contained when DPMI called TrapMan.</li>
+<li>The stack pointer (SP) must point to the beginning of the exception frame from DPMI on entrance to the native handler (this is why you must JMP to the previous handler; a CALL FAR PTR would have pushed the return address of the handler onto the stack below the DPMI exception frame and the native handler would have failed).</li>
+</UL>
+<B>Where to Go from Here?</B><P>
+You'll probably notice that Windows parameter-validation faults are caught by TrapMan as straight GPFaults. By default, debug information is taken, and the application causing the parameter-validation fault is terminated. For now, if you need to bypass parameter-validation errors (by passing them on to the Windows kernels), simply make sure that Call Prev Handler is checked. Windows or Win-OS/2 will then process the parameter validation normally. <P>
+<h3><a name="02fe_00de">References<a name="02fe_00de"></h3><P>
+The DPMI Committee. <I>DOS Protected Mode Interface (DPMI) Specification, ver. 0.9</I>. Intel Corp., 1990.<P>
+Duncan, Ray. <I>Power Programming with Microsoft Macro Assembler.</I> Redmond, WA: Microsoft Press, 1992.<P>
+<I>Guide to Programming</I>. Microsoft Corp., 1992.<P>
+<I>i486 Processor Programmer's Reference Manual</I>. Intel Corp., 1990.<P>
+Lafore, Robert. <I>Assembly Language Primer for the IBM PC &amp; XT</I>. New York, NY:New American Library, 1984.<P>
+<I>Multimedia Programmer's Reference</I>. Microsoft Corp., 1992.<P>
+Pietrek, Matt. <I>Windows Internals</I>. Reading, MA: Addison-Wesley, 1993.<P>
+Schulman, A., D. Maxey, and M. Pietrek. <I>Undocumented Windows</I>. Reading, MA: Addison-Wesley, 1992.<P>
+Socha, John, and Peter Norton. <I>Assembly Language for the PC</I>, Third Edition. Carmel, IN: Brady, 1992.<P>
+Thielen, David, and Bryan Woodruff. <I>Writing Windows Virtual Device Drivers.</I> Reading, MA: Addison-Wesley, 1994.<P>
+<I>Virtual Device Adaptation Guide</I>. Microsoft Corp., 1992.<P>
+<P>
+<h4><a name="02fe_00df"><a name="02fe_00df">Listing One </h4><pre>
+
+#include &lt;windows.h&gt;
+void _far MyGPProc()      // handler for Trap D (13 decimal)
+{
+   DebugBreak() ;         // break to a waiting debugger
+                          //   Equivalent to _asm int 3h
+   FatalExit( 13 ) ;      // exit the faulting task
+}
+
+
+</pre>
+<h4><a name="02fe_00e0"><a name="02fe_00e0">Listing Two</h4><pre>
+
+;|*** #include &lt;windows.h&gt;
+; Line 1
+;|***
+;|*** void _far MyGPProc()      // handler for Trap D (13 decimal)
+;|*** {
+; Line 4
+    PUBLIC  _MyGPProc
+_MyGPProc   PROC FAR
+;|***    DebugBreak() ;         // break to a waiting debugger
+; Line 5
+    *** 000000  9a 00 00 00 00      call    FAR PTR DEBUGBREAK
+;|***                           //   Equivalent to _asm int 3h
+;|***    FatalExit( 13 ) ;      // exit the faulting task
+
+; Line 7
+    *** 000005  b8 0d 00        mov ax,13
+    *** 000008  50          push    ax
+    *** 000009  9a 00 00 00 00      call    FAR PTR FATALEXIT
+;|*** }
+; Line 8
+    *** 00000e  cb          ret 
+    *** 00000f  90          nop 
+_MyGPProc   ENDP
+
+
+</pre>
+<h4><a name="02fe_00e1"><a name="02fe_00e1">Listing Three</h4><pre>
+
+#define     OPTIONMENU   2 // the THIRD pull down
+#define     TRAPMENU     1 // the SECOND pull down (0 is first)
+
+hwndOptionMenu = GetSubMenu(GetMenu(hwnd), OPTIONMENU) ;
+hwndTrapMenu = GetSubMenu (GetMenu(hwnd), TRAPMENU);
+
+SetJumpToPrevHandler( 0 ) ; // DON'T jump to the previous fault handler
+
+SetVars ( hInstance ) ;
+SendMessage( hwnd, WM_COMMAND, IDM_NUKEAPP, 0L) ;    
+                                             // DO nuke faulting app
+SendMessage( hwnd, WM_COMMAND, IDM_BREAKONTRAP, 0L); 
+                                            // DO break to debugger
+SendMessage( hwnd, WM_COMMAND, IDM_BEEPONTRAP, 0L) ; 
+                                           // DO beep on faults
+SendMessage( hwnd, WM_COMMAND, IDM_DEFAULT, 0L) ; 
+                                          //  Watch default exceptions
+SendMessage( hwnd, WM_COMMAND, IDM_ODSCRLF, 0L) ;
+
+
+</pre>
+<h4><a name="02fe_00e2"><a name="02fe_00e2">Listing Four</h4><pre>
+
+// The following is for standard C main() args using MSC 6.  Please review
+//   your compiler startup source code to see what is the proper name for
+//   the argc/argv globals for your compiler
+    #define argc __argc
+    #define argv __argv
+    extern int     argc ;
+    extern char  **argv ;
+
+    if (argc &gt; 1) {
+       int rc ;
+
+
+       rc = WinExec(argv[1], SW_SHOW) ;
+       if (rc &lt; 0x20) {
+           /* WARNING:  As wsprintf is a vararg call, it cannot be
+           **   fully prototyped.  If you give an argument that should
+           **   be a far pointer, you must cast it (as we use LPSTR below)
+           **   to force the compiler to pass the argument as a far
+           **   pointer.  Otherwise you're likely to get garbage or trap
+           **   instead of the text in szBuffer that you wanted
+           */
+           wsprintf( szBuffer, &quot;Cannot load '%s', error code=%d&quot;,
+                       (LPSTR) argv[1], rc) ;
+           MessageBox(NULL, szBuffer, &quot;TrapMan&quot;, MB_ICONEXCLAMATION | MB_OK) ;
+          }
+       }
+
+
+</pre>
+<h4><a name="02fe_00e3"><a name="02fe_00e3">Listing Five</h4><pre>
+
+; RW == read/write, RE = read/execute
+
+_SetVars proc far
+   push es
+   cmp cs:wHandlerDS, 0       ; if (0 == wHandlerDS)
+   jnz @F
+   CREATEALIASDESCRIPTOR cs   ; then
+   jc   SV_done               ; allocate a data (RW) selector to our
+                              ;   code segment (RE) via DPMI call to
+   mov  es, ax                ;   CreateAliasDescriptor
+ assume es:handler
+   mov  ES:wHandlerDS, ax     ; save in CS variable wHandlerDS
+
+   jmp  SV_DSset
+ @@:                          ; else
+   mov  ax, cs:wHandlerDS
+   mov  es, ax
+ assume es:handler
+SV_DSset:                     ; endif
+   mov  ax, ds
+   mov  es:wTrapManDS, ax     ; save TrapMan DS in CS variable wTrapManDS
+SV_done:
+  assume es:nothing
+  pop   es
+  ret
+_SetVars endp
+
+
+</pre>
+<h4><a name="02fe_00e4"><a name="02fe_00e4">Listing Six</h4><pre>
+
+;int _far MyInvalidOpProc()
+_MyInvalidOpProc proc far
+   TELLDEBUGGER &lt;cs&gt;, &lt;msgTrap6&gt;
+
+   BREAKIFUSERWANTS
+   JmpPrevHandler &lt;_GetJumpToPrevHandler&gt;, &lt;_Prev6&gt;
+   NUKEAPPCHECK
+   ret
+_MyInvalidOpProc endp
+
+
+</pre>
+<h4><a name="02fe_00e5"><a name="02fe_00e5">Listing Seven<B></B></h4><pre>
+
+;void _far MySegNotPresentProc()
+_MySegNotPresentProc proc far
+   pushf                        ; save flags
+   SAVEREGS                     ; save registers of faulting process
+
+; the following is a modified version of the TELLDEBUGGER macro
+;   As SegNotPresent is a non-fatal exception, register and stack
+;   dumps are not necessary and will not be done
+   push ax
+   mov  ax, offset msgTrapB
+   push cs
+   push ax
+   call far ptr MyODS           ; inform user of SegNotPresent fault
+   pop  ax
+   call far ptr GetCurrentTask
+
+   ; AX now contains a task data block
+   push ds
+   push bx
+   mov  ds, ax
+   mov  bx, 1eh           ; offset of NE header for the current module
+   mov  ax, word ptr ds:[bx]
+   mov  ds, ax
+   mov  ax, word ptr ds:[0ah]   ; get offset to path
+   add  ax, 8h                  ; ... add 8 because we have to!
+   push ds
+   push ax
+   call far ptr MyODS           ; put in edit control
+
+   pop  bx
+   pop  ds
+   mov  ax, word ptr CS:wTrapManDS
+   mov  ds, ax             ; assume ds: data
+   mov  ax, sp             ; AX = current stack pointer
+   add  ax, 14h            ;   skip saved regs...
+   add  ax, 2h             ;   skip flags on stack
+   push ax                 ; SS:AX == far pointer to DPMI exception frame
+   call far ptr _PrintOutFaultFrame
+
+   UNSAVEREGS              ; we've now reset ALL REGS (except CS:IP/SS:SP)
+                           ;   to their values at the time of the fault
+                           ;  Flags are still on the stack
+
+   push ds                         ; save DS register
+
+   push bx
+   mov  bx, wTrapManDS             ; get access to our data segment
+   mov  ds, bx
+ assume ds: data
+   pop  bx
+
+   push ax
+   push bx
+   push cx
+   push dx
+
+   mov  bx, wHandlerDS                    ; is our CS alias set?
+   cmp  bx, 0                             ; 0 = NO, so skip this!
+   jz   @F
+                                          ; wHandlerDS is non-zero
+   GETSEGMENTBASEADDRESS &lt;cs&gt;             ; Get CS base address
+   SETSEGMENTBASEADDRESS &lt;bx&gt;, &lt;cx&gt;, &lt;dx&gt; ; make sure our alias points
+                                          ;   to CS base in case CS has
+                                    ;   moved.  Otherwise our data
+                                    ;   will be unaddressable.
+ @@:
+
+   mov  bx, offset _Prev11          ; dword (Windows Interrupt B handler)
+   mov  ax, word ptr DS:[bx][2]     ;   Sel of Windows handler
+   mov  bx, word ptr DS:[bx]        ;   Offset of Windows handler
+                                    ; AX:BX = windows handler
+
+
+   mov  cx, wHandlerDS
+   mov  ds, cx                      ; DS now our CS alias
+ assume ds: handler
+
+   push bx
+   pop  cx                          ; now AX:CX = Windows handler
+   mov  bx, offset MyFarProc        ; DS:BX now points to MyFarProc
+   mov  word ptr DS:[bx][2], ax     ;   save Sel of Windows handler
+   mov  word ptr DS:[bx], cx        ;   save Offset of Windows handler
+
+   pop  dx
+   pop  cx
+   pop  bx
+   pop  ax
+
+   pop  ds
+   popf
+
+   jmp dword ptr cs:MyFarProc  ; SP now points to the DPMI exception frame
+                               ;   that we had on entry
+   retf                        ; this retf will never get executed as
+                               ;   the Windows kernel RETF at the end of
+                               ;   the handler will return to DPMI for us
+_MySegNotPresentProc endp
+
+
+</pre>
+<h4><a name="02fe_00e6"><a name="02fe_00e6">Listing Eight</h4><pre>
+
+;  the major work of the handlers -- includes the following steps:  a) save
+;    registers of faulting process, b) call messagebeep(), c) display type of
+;    fault message, d) get faulting module, e) dump DPMI exception frame,
+;    f) dump registers, g) dump stack
+TELLDEBUGGER MACRO sel, var
+local around, arounddata, datalabel
+   pushf
+   SAVEREGS                     ; save registers of faulting process
+   push ax
+   call far ptr _GetMessageBeep ; see if user wants us to beep
+   cmp  ax, 0
+   pop  ax
+   jz  around                   ; if 0, then don't beep
+   push ax
+
+   xor  ax, ax
+   push ax
+   call far ptr MessageBeep
+   pop  ax
+around:
+;; Second, display message in edit control... remember to set DS
+   push ax
+   mov  ax, offset var     ; sel:var = far pointer of message to display
+   push sel
+   push ax
+   call far ptr MyODS           ; put in edit control...
+   pop  ax
+;; Thirdly, find a module to blame
+;;---------------------
+   call far ptr GetCurrentTask
+   ; AX now contains a task data block
+   push ds
+   push bx
+   mov  ds, ax
+   mov  bx, 1eh          ; offset of NE header for the current module
+   mov  ax, word ptr ds:[bx]
+   mov  ds, ax
+   mov  ax, word ptr ds:[0ah]   ; get offset to path
+   add  ax, 8h                  ; ... add 8 because we have to!
+   push ds
+   push ax
+   call far ptr MyODS           ; put in edit control
+
+   pop  bx
+   pop  ds
+;;---------------------
+;; Fourth, now dump the faulting frame...
+;;---------------------
+   mov  ax, word ptr CS:wTrapManDS
+   mov  ds, ax                  ; assume ds: data
+   mov  ax, sp                  ; AX = current stack pointer
+   add  ax, 14h                 ;   skip saved regs...
+   add  ax, 2h                  ;   skip flags on stack
+   push ax              ; SS:AX == far pointer to DPMI exception frame
+   call far ptr _PrintOutFaultFrame
+;;---------------------
+;; Fifth, print out the faulting regs...
+                           ;; the above call has destroyed app registers
+   UNSAVEREGS              ;;   so unsave regs of faulting process
+   SAVEREGS                ;; note that we must save them again in case
+                           ;;   the user wishes to break to a debugger
+   call far ptr _PrintOutFaultRegs ;; CS:IP, SS:SP are bad all other registers
+                                   ;;   are valid
+;;---------------------
+;; Sixth, dump stack of faulting app...
+   nop
+   mov  bx, sp           ; BX = stack pointer
+   add  bx, 14h          ; skip saved regs (pushed by the SAVEREGS macro)
+   add  bx, 2h           ;   skip flags on stack
+                         ; SS:BX now points to DPMI fault frame
+
+   mov  ax, ss:[bx][0Eh] ; [bx][0eh] = segment of faulting app's stack
+   push ax
+   mov  ax, ss:[bx][0Ch] ; [bx][0ch] = offset of faulting app's stack
+   push ax
+   call far ptr _PrintOutPointerData
+
+;; end default (retail and debug) processing
+;; Seventh, (DEBUG only), write to AUX device
+ifdef DEBUG
+   push ax
+   mov  ax, offset var
+   push sel
+   push ax
+   call OutputDebugString
+   pop  ax
+endif
+
+   UNSAVEREGS       ;; we've now reset ALL REGS (except CS:IP/SS:SP)
+                    ;;   to their values at the time of the fault
+                    ;;   in case our user wants to break
+   popf             ;;   and reset the flags!
+ENDM
+
+
+</pre>
+<h4><a name="02fe_00e7"><a name="02fe_00e7">Listing Nine</h4><pre>
+
+mov  bx, offset _Prev11        ; dword (Windows Interrupt B
+                               ;   handler)
+mov  ax, word ptr DS:[bx][2]   ; Sel of Windows handler
+mov  bx, word ptr DS:[bx]      ; Offset of Windows handler
+
+mov  cx, wHandlerDS
+mov  ds, cx                    ; DS now points to our DS alias 
+                               ;    assumes ds, handler of 
+                               ;    our HANDLER segment
+push bx
+pop  cx
+mov  bx, offset MyFarProc      ; Update MyFarProc -- a CS DWORD
+mov  word ptr DS:[bx][2], ax   ;   Sel of Windows handler
+mov  word ptr DS:[bx], cx      ;   Offset of Windows handler
+
+</pre>
+
+<HR><P>Copyright &copy; 1995, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

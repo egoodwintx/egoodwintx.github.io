@@ -1,0 +1,225 @@
+
+
+
+<html>
+<head>
+<title>December, 2005: Policy-Based Memory Allocation</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>Policy-Based Memory Allocation</h1>
+<p><i>C/C++ Users Journal</i> December, 2005</p>
+<h2>Fine-tuning your memory management</h2>
+
+
+<h3>By Andrei Alexandrescu and Emery Berger</h3>
+
+
+<I>Andrei Alexandrescu is a graduate student in Computer Science at the University of Washington and author of Modern C++ Design. He can be contacted at andrei@metalanguage.com.</I>
+
+<hr>
+
+
+
+
+
+<p>One of the perks of doing hard work for next to no money, an activity also known as being a graduate student, is that you get to rub shoulders with researchers working on interesting problems. I've had the pleasure of meeting in person both Emery Berger and Kathryn McKinley, two of the authors (with Benjamin Zorn) of "Composing High-Performance Memory Allocators" [6], a paper that I found highly interesting for "I can't believe I didn't think of that" reasons. But let's start at the beginning.</p>
+
+<p>One chapter of <i>Modern C++ Design</i> [2] is somewhat different than all the others. Actually, very different. While the book is dedicated to creating elegant, flexible, extensible designs, one chapter stands out like a sore thumb by actually describing one fixed, monolithic, rigid, awkward piece of software: Loki's small object allocator. Somehow, I thought that memory management was a low-level operation and, as such, didn't lend itself to the elegant exploits of policy-based design. At the same time, some of the compiler-provided <b>new</b>/<b>delete</b> implementations were pretty bad at dealing with small objects, so I felt there would be a need for something to fill the void. So I sat down and wrote an implementation that has portability as its only merit; other than that, it's not particularly performant, interesting, or original. The main problem with Loki's allocator, however, does not lie in its implementation (which, by the way, has been entirely rewritten by Rich Sposato, to the end of greatly improving its performance), but in its design, which is not configurable nor extensible&#151;just a few monolithic classes, much like what you'd expect in the bad ol' days.</p>
+
+<p>However, at about the same time, Emery Berger and others were experimenting with a mixin-based memory allocator for C++ that is at the same time highly efficient (rivaling the best general-purpose allocators out there), highly customizable (rivaling the best special-purpose allocators, too), and highly portable by virtue of its customizable design! As soon as I became acquainted with that research, I realized what the chapter on memory allocation in <i>Modern C++ Design</i> should have looked like.</p>
+
+<p>But before we delve into the fascinating topic of configurable memory allocation, let's tie a few knots with past comments received via e-mail.</p>
+<h3>Mailcontainer</h3>
+
+<p>I wrote the sidebar "Memory: More Than Just Any Resource" in the last Generic&lt;Programming&gt; installment with the serene resignation with which Galileo Galilei must have said his famous "Eppur si muove." "And yet, garbage is collectable," I mumbled into my three-days beard when submitting the article for publication. The expected outcome was that the opponents of garbage collection would exemplarily mortify me via an endless flow of angry e-mails. However, they must've chosen instead to boycott me, because I haven't gotten a single response in protest.</p>
+
+<p>Ivan Godard sent me an e-mail on the subject of Observers [3, 4]. That message was so smart, and had me look up words in the dictionary so often, that I've decided to quote it almost in entirety, at the risk of blowing up the size of this article:</p>
+
+<blockquote>
+Your difficulties with <b>attach</b> and <b>detach</b> while in the middle of notification are canonical concurrency problems, and can be dealt with in the usual way. The (only reasonable?) semantics for Observer is to see <b>subject</b>, <b>observer</b>, and <b>event</b> as three independent and asynchronous processes, with a time stream localized at <b>subject</b>. That is, an <b>observer</b> cannot directly determine the time relation between its attempt to attach and the occurrence of a particular event because the event is not within the observer's horizon. Only the <b>subject</b>, which receives both events and requests to <b>attach</b>, can time-order these.<br><br>
+    Consequently a putative observer will see some sequence of events that (in the subject's time frame) begins some time after the attempt to attach and ends some time after the attempt to detach. The sequence is guaranteed to be ordered (in subject time) and dense, but where it starts and where it ends is not known. Of course, if the observer is itself a source of events and the channel between observer and subject is order-preserving, then the observer can enforce somewhat more stringent bounds on how far the observed sequence extends into the subject's past or subject's future by injecting an event just before the attach or just after the detach.<br><br>
+    So much for relativity theory. In practice, this implements naturally by considering the attempt to attach and the attempt to detach as being themselves events. The subject enqueues an event (including an <b>attach</b>/ <b>detach</b>) on an action list, and walks the list of observers applying each event in turn to each observer. Both observers and events are timestamped; a simple counter will do. Events are discarded when there are no observers with lesser stamps. The observer list is preceded by an observer (the subject itself) that is watching for attach events and that adds the observer to the observer list. All observers are watching for their own detach events and remove themselves when the subject applies the corresponding detach event. [...]<br><br>
+    Most of the difficulties you encountered appear to be a consequence of the assumption that attach and detach were somehow global and absolute, rather than just another event in the sequence of events encountered by the subject. Remove that mistaken idea and your invalidated-iterators problems disappear.<br>
+
+</blockquote>
+
+<p>This view of attachment and detachment as simple events is very interesting. This generalization would, however, make it harder to define policies that lead to the simple implementations in the article. Let's admit, such simple solutions are widely used and have their place in spite of their risks and limitations. If anyone would like to embark on defining a policy-based design for such a "relativistic" Observer, and if the design does allow efficient simple implementations as well, I'd be highly interested. Contact Ivan at igodard@pacbell.net with questions.</p>
+
+<p>Brian Wood comments on the "Walking Down Memory Lane" article:</p>
+
+<blockquote>
+While you introduce <b>auto_vector</b>, you didn't mention either of the <b>ptr_vector</b> implementations. Thorsten Ottosen has written an interesting article about <b>ptr_vector</b> in the October 2005 issue of <i>Dr. Dobb's Journal</i>. <b>auto_vector</b> and the <b>ptr_vector</b> by Ottosen are obviously closely related, but also have differences. Some mention to <b>ptr_vector</b> and the differences would have been helpful, I think.<br><br>
+    Anyway, from my own experience, I agree with you that things like <b>auto_vector</b> and <b>ptr_vector</b> are often preferable to <b>vector&lt;shared_ptr&lt;T&gt; &gt;</b>.<br>
+
+</blockquote>
+
+<p>Great, thanks Brian&#151;and readership, consider yourself tipped on where to look for more material related to scoped memory management.</p>
+<h3>Memory Allocation:  One Size Doesn't Fit ll</h3>
+
+<p>Today's general-purpose memory allocators have reached reasonable speed and low fragmentation for a large category of programs. However, in the memory-allocation realm, a little information can go a long way. Application-specific information about allocation patterns helps to implement specialized memory allocators that heavily improve the bottom line of many high-performance applications. Sometimes, as little intel as "Blocks of size 80 are allocated more often than blocks of all other sizes," when properly used (as we'll discuss soon), can incredibly improve the bottom-line runtime of a program. (Caveat: Sometimes customized allocators are no better, and can be worse, than general-purpose allocators&#151;see the paper "Reconsidering Custom Memory Allocation" [7] for more details.) While general-purpose allocators have average overheads in the hundreds of cycles, a good customized memory allocator can require as few as half a dozen cycles.</p>
+
+<p>That's why many high-profile, high-performance applications (GCC, Apache, and Microsoft's SQL Server to name just a few) implement their own memory allocator. A good idea, then, is to generalize such good specialized allocators and put them in a library. But "generalization" and "specialization" are in tension: Your application might have different allocation patterns that would require yet another behavior from your allocator. What to do?</p>
+
+<p>But wait, there's more. If we do devise a method to easily create special-purpose memory allocators, we can go full-circle and define a general-purpose allocator as a combination of wisely chosen special-purpose allocators. If the resulting general-purpose allocator compares favorably with the existing monolithic general-purpose allocators, then the design is valid and useful.</p>
+
+<p>Emery's team worked towards that idea, leading to their library HeapLayers (http://heaplayers.org/). To define configurable allocators, they used mixins (also known as Coplien's curiously recurring pattern in the C++ community): defining classes with a parameterized base. Each layer defines only two member functions, <b>malloc</b> and <b>free</b>:</p>
+
+<pre>
+template &lt;class T&gt;
+struct Allocator : public T {
+  void * malloc(size_t sz);
+  void free(void* p);
+  // system-dependent value
+  enum { Alignment = sizeof(double) };
+  // optional interface
+  size_t getSize(const void* p);
+};
+
+</pre>
+
+<p>Each layer implementation would get a crack on allocation and deallocation, possibly (and likely) requesting memory from its base class. A self-contained allocator sits at the very top of the hierarchy&#151;one that forwards requests straight to the system's <b>new</b> and <b>delete</b> operators, <b>malloc</b> and <b>free</b> functions, and the such. In HeapLayers terminology, these are the top heaps. To exemplify (careful with the qualifications so we don't enter infinite recursion):</p>
+
+<pre>
+struct MallocHeap {
+  void * malloc(size_t sz) {
+    return std::malloc(sz);
+  }
+  void free(void* p) {
+    return std::free(p);
+  }
+};
+
+</pre>
+
+<p>Top heaps can also be implemented around system calls for getting memory, such as UNIX's <b>sbrk</b> or <b>mmap</b>. This is necessary when you're completely replacing <b>malloc</b> and friends.</p>
+
+<p>The <b>getSize</b> function has a special status. Not everybody is going to need it, so defining it is optional (if you combine the wrong layers, the compiler will tell you). If it does, all you have to do is insert a layer that stores the block size and offers the <b>getSize</b> primitive; see <a href="0512alexandrescul1.html" target="_BLANK">Listing 1</a>.</p>
+
+<p><b>SizeHeap</b> is the perfect illustration of how to implement a useful layer that hooks into its base's <b>malloc</b> and <b>free</b> functions, does something extra, and returns "doctored" results to the client. <b>SizeHeap</b> does its work by allocating extra memory to store the block size, with the appropriate cautions (the union) to stay as immune as possible to the alignment issue. The client gets access to the memory right next to that extra data. It's not hard to imagine building a debug heap that pads the memory block before and after with some bytes filled with a particular pattern, and then verify for overruns by checking whether the pattern has been preserved. In fact, that's exactly what HeapLayers' <b>DebugHeap</b> layer does. Pretty neat.</p>
+
+<p>But wait, something's suboptimal here. Some systems already offer a primitive to compute the size of a <b>malloc</b>ated block. On those systems, <b>SizeHeap</b> would actually waste space. In that case (for example, on Microsoft Visual C++), you wouldn't need <b>SizeHeap</b> in conjunction with <b>MallocHeap</b>, because <b>MallocHeap</b> would implement <b>getSize</b> out of the box:</p>
+
+<pre>
+struct MallocHeap {
+  ... as above ...
+  size_t getSize(void* p) {
+    return _msize(p);
+  }
+};
+
+</pre>
+
+<p>But wait, something's still suboptimal here. Remember, we're counting cycles. What if a system's <b>malloc</b> documentation states that the block size is stored in a word prior to the actual block? In that case, <b>SizeHeap</b> would still waste memory by storing yet another word next to the one already planted by the system. What's needed is a layer that implements <b>getSize</b> just the way <b>SizeHeap</b> does, but doesn't hook <b>malloc</b> and <b>free</b>. That's why <b>HeapLayers</b> segregates the previously shown <b>SizeHeap</b> in two; see <a href="0512alexandrescul2.html" target="_BLANK">Listing 2</a>.</p>
+
+<p>Now <b>SizeHeap</b> always (correctly) adds the <b>UseSizeHeap</b> layer and exploits its <b>getSize</b> implementation, while <b>UseSizeHeap</b> can also be used in other configurations&#151;a very elegant design.</p>
+<h3>A Useful Example: FreelistHeap</h3>
+
+<p>Let's face it, so far we have kind of set up the stage. We do have an architecture, but no clue on how to write an efficient specialized allocator using layers. A popular and "most bang for the buck" strategy is the following:</p>
+
+
+
+<ol>
+  <li>Collect stats about your application's allocation counts for each size.</li>
+  <li>For the most often asked size (call it <b>S</b>), maintain a private, singly linked list.</li>
+  <li>Memory allocations for <b>S</b> return memory from that list if possible, or else from the default allocator (in a layered architecture, from the superior layer).</li>
+  <li>Memory deallocations for blocks of size <b>S</b> push the block into the list.</li>
+</ol>
+
+
+
+<p>A refinement of the strategy would be to use the same free list for a range of sizes <b>S1</b> to <b>S2</b>, at the cost of some slack memory. The needed singly linked list operations are <b>O(1)</b> and actually only a few instructions. In addition, the pointer to the next item can be stored in the actual block (the block stores no useful data&#151;it's always a freed block!) so there's no extra memory required per block. Given that most applications' allocation size distribution is highly skewed, free lists are any allocator implementer's indispensable utensil.</p>
+
+<p>Let's implement a layer that implements a free list for a range of statically known sizes <b>S1</b> to <b>S2</b>; see <a href="0512alexandrescul3.html" target="_BLANK">Listing 3</a>.</p>
+
+<p>Now you can define a custom heap like this:</p>
+
+<pre>
+typedef FLHeap&lt;
+  SizeHeap&lt;MallocHeap&gt;,
+  24,
+  32&gt;
+SmartoHeapo;
+
+</pre>
+
+<p><b>SmartoHeapo</b> will be superfast for allocation sizes between 24 and 32, and pretty much the same for all other sizes.</p>
+<h3>In-Place Resizing</h3>
+
+<p>Many a C++ programmer has been dreaming for a standard primitive to reallocate memory in place. You see, C has <b>realloc</b>, which can do in-place reallocation if possible, or use <b>memcpy</b> when it comes about copying data around. But <b>memcpy</b> doesn't work for C++ objects, so <b>realloc</b> doesn't work for C++ objects,; therefore, any sort of renew primitive can't be implemented using the Standard C allocator. So C++ doesn't have renew [1].</p>
+
+<p>To give you an idea of the improvements that in-place reallocation can bring to C++ code, consider:</p>
+
+<pre>
+const int n = 10000;
+Vec v;
+for (int i = 0; i &lt; n; ++i)
+  v.push_back(0);
+
+</pre>
+
+<p>Howard Hinnant of Metrowerks has been working on implementing in-place expansion for CodeWarrior's Standard Library implementation. In Howard's own words:</p>
+
+<blockquote>
+I currently have a <b>vector&lt;T, malloc_allocator&lt;T&gt; &gt;</b> that does [...] expand-in-place based on N1085 [8]. It blows the doors off a built-in C-like array! :-) When <b>Vec</b> is a <b>vector&lt;int&gt;</b> without expand-in-place:
+	<pre>0.00095674 seconds</pre>
+
+    When <b>Vec</b> is a <b>vector&lt;int&gt;</b> with expand-in-place:
+	<pre>0.000416943 seconds</pre>
+    The timings should only be trusted to two significant digits. But rest assured, I've done the work to secure those two digits. We are not looking at an anomaly here.
+
+</blockquote>
+
+</pre>
+
+<p>Given the benefits of in-place resizing and that each heap layer has control over its own allocation algorithms and data structures, let's augment the heap-layer interface:</p>
+
+<pre>
+template &lt;class T&gt;
+struct Allocator : public T {
+  void * malloc(size_t sz);
+  void free(void* p);
+  size_t expand(void* p, size_t min, size_t max);
+};
+
+</pre>
+
+<p>The semantics of expand is, try to expand the block pointed to by <b>p</b> to the largest size possible between <b>min</b> and <b>max</b>. Then return whatever size you could expand the memory to, or zero if no expansion was possible. Fortunately, things can be arranged such that a layer doesn't have to fuss about the expand routine unless it wants to. That works if all top allocators inherit the following little class:</p>
+
+<pre>
+struct TopHeap {
+  size_t expand(void*, size_t, size_t) {
+    return 0;
+  }
+  // not intended for standalone usage
+protected:
+  ~TopHeap() {}
+};
+
+</pre>
+<h3>Conclusion</h3>
+
+<p>Configurable memory allocation is, as Emery's research has shown, a practical, all-in-one alternative to both specialized and general-purpose allocators. Emery's numbers (refer to the paper [6] for details) consistently show that allocators created with HeapLayers perform just as well as, or better than, monolithic allocators, be they general-purpose or specialized. Moreover, HeapLayers' layered architecture encourages easier experimentation, simpler debugging, and unparalleled extensibility. Instead of being an oddball chapter of <i>Modern C++ Design</i>, memory allocation should have been one of the best success stories of policy-based design.</p>
+
+<p><a href="0512alexandrescut1.html" target="_BLANK">Table 1</a> shows a relevant subset of the layers implemented in HeapLayers. There would be a lot of goodies to discuss, such as the locked heaps for multithreaded operations, the STL adapter, the various utility heaps, or how the layers can be combined to create a general-purpose allocator. But conventional wisdom warns us that "The mind can only enjoy what the butt can endure," so it's about time to shut down&#151;without forgetting to release the memory in destructors. Happy coding.</p>
+<h3>References</h3>
+
+<ol>
+  <li>Alexandrescu, Andrei. "Generic&lt;Programming&gt;: Typed Buffers (III)," <i>C++ Experts Online</i>, December 2001. Available at http://erdani.org/ publications/cuj-12-2001.html.</li>
+  <li>Alexandrescu, Andrei. <i>Modern C++ Design</i>, Addison-Wesley Longman, 2001.</li>
+  <li>Alexandrescu, Andrei. "Generic&lt;Programming&gt;: Prying Eyes: A Policy-Based Observer (I)," <i>C++ Users Journal</i>, April 2005.</li>
+  <li>Alexandrescu, Andrei. "Generic&lt;Programming&gt;: Prying Eyes: A Policy-Based Observer (II)," <i>C++ Users Journal</i>, June 2005.</li>
+  <li>Berger, Emery D., Kathryn S. McKinley, Robert D. Blumofe, and Paul R. Wilson. "Hoard: A scalable memory allocator for multithreaded applications. In International Conference on Architectural Support for Programming Languages and Operating Systems (ASPLOS-IX), pp. 117-128. Cambridge, MA, November 2000; http://citeseer.ist.psu.edu/berger00hoard.html.</li>
+  <li>Berger, Emery D., Benjamin G. Zorn, and Kathryn S. McKinley. "Composing High-Performance Memory Allocators," in SIGPLAN Conference on Programming Language Design and Implementation, pp. 114-124, 2001; http://citeseer.ist.psu.edu/berger01composing.html.</li>
+  <li>Berger, Emery D., Benjamin G. Zorn, and Kathryn S. McKinley. "Reconsidering custom memory allocation," in Proceedings of the Conference on Object-Oriented Programming Systems, Languages, and Applications (OOPSLA) 2002. Seattle, Washington, November 2002; http://citeseer.ist.psu.edu/berger02reconsidering.html.</li>
+  <li>Hinnant, Howard. Proposal to augment the interface of malloc/free/realloc/calloc. See http://www.open-std.org/jtc1/sc22/wg14/www/docs/n1085.htm.</li></ol>
+
+<h5>CUJ</h5>
+
+
+
+
+</body>
+</html>

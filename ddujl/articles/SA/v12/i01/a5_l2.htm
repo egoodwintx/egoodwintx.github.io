@@ -1,0 +1,225 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i01: Listing 2 autosniffd</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a5.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a5_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink">Listing 2</span></td>
+		<td><span class="navbarLink"><a href="a5_l3.htm">Listing 3</a></span></td>
+		<td><a href="../../../../source/SA/2003/jan2003.tar"><b class=codeListing>jan2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b>Listing 2 </b><i>autosniffd</i></h1>
+            <p> 
+            <pre>
+#!/bin/sh
+
+# Allow an unprivileged person (like a customer) trigger a sniff
+# tell the customer to "telnet problemhost &lt;bogus-port&gt;" and then
+# reproduce the problem they've been complaining about.
+
+# Written by Ed Ravin &lt;eravin@panix.com&gt;
+# Courtesy of PANIX, Public Access Networks Corporation, http://www.panix.com
+# License is GPL: see http://www.gnu.org/licenses/gpl.html
+
+set -u
+
+USAGE="usage: autosniff [--timeout=seconds] [--comment=xxxx] \
+  [--debug | --discard-output ] [ --testonly] jobname mail-address \
+  trigger-host trigger-port 'sniff filter'"
+
+############################# load configuration
+CONFIGFILE=/etc/autosniff.conf
+
+. $CONFIGFILE
+#############################
+
+COMMENT=""
+TESTONLY=false  # if true, test filter expressions and exit
+
+while true
+do
+    case ${1:?$USAGE} in
+    -*)
+        case $1 in
+        --comment=*) COMMENT="${1#*=}" ;;  # on Solaris, need ksh
+        --timeout=*) TIMEOUT="${1#*=}" ;;  # for this syntax
+        --discard-output) exec &gt;/dev/null 2&gt;&amp;1 ;; # for use with nohup
+        --debug) set -x ;;
+        --testonly) TESTONLY=true ;;
+        -*) echo "Unknown argument: $1"; echo $USAGE; exit 22 ;;
+        esac
+        shift
+    ;;
+    *) break ;;
+    esac
+done
+
+JOBNAME=${1:?$USAGE}
+MASTER=${2:?$USAGE}
+TRIGGERHOST=${3:?$USAGE}
+TRIGGERPORT=${4:?$USAGE}
+SNIFFTARGET="( ${5:?$USAGE} )"
+
+if [ ! -d $ARCHIVE ]
+then
+    mkdir $ARCHIVE
+    if [ ! -d $ARCHIVE ]
+    then
+        echo "$0: $ARCHIVE: cannot create."
+        exit 33
+    fi
+fi
+
+# protect security of sniffer output
+chown root $ARCHIVE
+chmod 700 $ARCHIVE
+umask 077
+
+
+CAPTUREFILE=$ARCHIVE/$JOBNAME.$$.$SUFFIX
+
+notify_master() {  # "subject" &lt; message
+    {
+        if [ "$COMMENT" ]
+        then
+            echo "Jobname: $JOBNAME ($COMMENT)"
+        else
+            echo "Jobname: $JOBNAME"
+        fi
+        echo "Host: $HOSTNAME"
+        echo
+        cat
+    } | $MAILER -s "Autosniff - $JOBNAME: $1" $MASTER
+}
+
+parse_trace() {  # extract source IP from first packet in tracefile
+set `egrep -e '[- ]&gt; ' $TMPFILE | head -1`
+eval "echo \${$IPARG} | cut -f1-4 -d." # remove any trailing port number
+}
+
+testsniff() {
+    if $SNIFF $SNIFFTEST $1 &gt;/dev/null
+    then :
+    else
+        echo "Expression '$1' was rejected by '$SNIFF $SNIFFTEST'"
+        exit 42
+    fi
+}
+
+TRIGGER="tcp and dst host $TRIGGERHOST and dst port $TRIGGERPORT"
+
+if $TESTONLY
+then
+    testsniff "$TRIGGER"
+    testsniff "host 0.0.0.0 and $SNIFFTARGET"
+    exit 0
+fi
+
+notify_master "waiting for trigger" &lt;&lt;-END
+    Host: $HOSTNAME
+    Waiting for this trigger:  $TRIGGER
+    After trigger, will sniff for $TIMEOUT seconds: host &lt;autodetect&gt; and $SNIFFTARGET
+
+    Instructions for the user:
+
+    1. "telnet $TRIGGERHOST $TRIGGERPORT" or "http://$TRIGGERHOST:$TRIGGERPORT"
+    2. You will see an error message - ignore it and proceed to step (3).
+    3. Reproduce the network-related problem.
+    END
+
+nohup $SNIFF $SNIFFCOUNT $TRIGGER &gt; $TMPFILE
+if [ -s $TMPFILE ]
+then : # OK, found something
+else
+    notify_master "trigger failure" &lt;&lt;-END
+        command: $SNIFF $SNIFFCOUNT $TRIGGER
+        returned status: $?
+        END
+    exit 1
+fi
+
+IP2SNIFF=`parse_trace`
+
+if [ `expr "$IP2SNIFF" : '[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*'` \
+  -lt 7 ]  # minimum match is n.n.n.n, 7 chars
+then
+    notify_master "trigger IP address failure" &lt;&lt;-END
+        Invalid IP address: $IP2SNIFF
+        Failed to properly parse field $IPARG in $TMPFILE
+        END
+    exit 2
+fi
+
+
+SNIFFEXPR="host $IP2SNIFF and $SNIFFTARGET"
+$SNIFFWRITE $CAPTUREFILE $SNIFFEXPR &amp;
+SNIFFPID=$!
+
+(sleep $TIMEOUT; kill $SNIFFPID) &amp;
+SLEEPPID=$!
+
+wait
+
+# snoop files are 12 bytes when empty, pcap files are 24 bytes when empty
+# 50 bytes should mean at least one packet is in there
+FILESIZE=`wc -c $CAPTUREFILE | awk '{print $1}'`
+if [  $FILESIZE -gt 50 ] # 
+then
+    notify_master "success" &lt;&lt;-END
+        Trigger was: $TRIGGER
+        Sniffed $TIMEOUT seconds for: $SNIFFEXPR
+        $FILESIZE bytes captured in $CAPTUREFILE
+        END
+else
+    {
+        echo "Sniff triggered, but no output in $CAPTUREFILE."
+        echo "Sniff filter was: $SNIFFEXPR"
+        echo "Trigger was: $TRIGGER"
+        echo "Trigger results shown below"
+        echo "---------------------------"
+        cat  $TMPFILE
+    } | notify_master "failure"
+fi
+
+rm -f $TMPFILE
+</pre>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

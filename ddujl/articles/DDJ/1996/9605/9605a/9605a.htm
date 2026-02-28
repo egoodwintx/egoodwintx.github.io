@@ -1,0 +1,771 @@
+<HTML> <HEAD> <!-- This document was built using HyperWriter Professional byNTERGAID Inc. --> <TITLE>MAY96: Direct Port I/O and Windows NT</TITLE></HEAD>
+<META NAME="year" CONTENT="1996">
+<body bgcolor="FFFFFF"> <h1>Direct Port I/O and Windows NT<a name="0195_0088"><a name="0195_0088"><a name="0195_0086"><a name="0195_0000"></h1><P>
+
+<h2>Undocumented features for direct control of hardware devices</h2><P>
+
+<h3>Dale Roberts</h3><P>
+
+<P> <i><a name="0195_0087"><a name="0195_0000">Dale works with data acquisition
+and control software at the Vestibular Laboratory of the Johns Hopkins University
+School of Medicine. He can be reached at roberts@
+ishtar.med.jhu.edu.</i></p><hr><P>
+
+Port I/O instructions allow all 80x86 CPUs to communicate with other hardware
+devices in the system. For low-level, direct control of a hardware device, the C
+functions <I>_inp()</I> and <I>_outp()</I> (implemented using the 80x86
+processor's IN and OUT instructions) let you read from or write to an I/O port.
+However, inserting <I>_inp()</I> or <I>_outp()</I> in a Windows NT application
+gives you a privileged-instruction exception message and the option of
+terminating or debugging the offending app. If you attempt port I/O from a 16-bit
+DOS app in an NT console window, the I/O is either ignored or emulated by NT's
+virtual device drivers--you don't get an exception, but you don't get the direct
+I/O either.<P>
+
+This isn't a bug; NT is supposed to work this way. The NT architects decided that
+it would be too risky to allow applications to directly access the system
+hardware. With unrestricted I/O access, an application could turn off all
+interrupts, take over the system, and trash the display or the hard drive. A
+buggy program could unintentionally do the same. NT's architecture requires that
+all hardware be accessed via kernel-mode device drivers--special, trusted pieces
+of software that essentially become part of the operating system when loaded.
+These device drivers have complete access to the entire system memory, all
+hardware devices, and all privileged processor instructions. In contrast,
+applications run in user mode, where they have restricted access to memory--and
+where the CPU can't execute certain privileged operating-system instructions,
+including I/O instructions.<P>
+
+The restriction on I/O port access is both a blessing and a curse. On one hand,
+it makes NT exceptionally stable. Generally, application programmers can write
+and crash and debug programs all day long without shaking NT. Several
+applications can run without adversely affecting one another. On the other hand,
+I/O restrictions prevent you from communicating directly and quickly with the
+hardware without taking the relatively large amount of time required for a call
+to a device driver. Whenever you want to communicate with a device driver, you
+must send a request through NT's I/O subsystem. This can take thousands of
+processor-clock cycles. A port I/O instruction would take about 30 clock
+cycles.<P>
+
+Why would you ever need to put I/O instructions in user-mode code? When writing a
+device driver, it might make things easier if you could write a quick program to
+interact with the device, sprinkling <I>printf(</I><I>)</I>s and
+<I>getchar(</I><I>)</I>s among port I/O instructions so that you could verify
+that you are driving the device correctly before you put the code into an actual
+device driver and chance a system lockup. Or you may want to write a portion of a
+driver in a user-mode DLL (as with video drivers, for instance) to achieve a
+desired level of performance. One of my favorite uses of I/O is for using an
+oscilloscope to debug programs and time sections of code. To do this, you need to
+set and clear a bit in a digital output port and monitor the voltage on a
+scope.<P>
+
+Since direct, user-mode port I/O in NT seems so useful, you'd think there would
+be an accepted way to achieve it. A quick look through the sample source code in
+the Windows NT Device Driver Kit (DDK) reveals a program called
+&quot;PORTIO.&quot; Initially, I thought this would provide direct port I/O from
+an app. However, PORTIO is merely an example showing how to use Win32
+<I>DeviceIoControl()</I> calls to a kernel-mode device driver, which implements
+the actual I/O. Using PORTIO, each I/O operation requires a costly,
+time-consuming call to the device driver. This was useless for my oscilloscope
+timings. I needed a better way.<P>
+
+<h3><a name="0195_0089">Accomplishing I/O Protection in NT<a name="0195_0089"></h3><P>
+
+To figure out how to grant I/O access to a user-mode app, you have to understand
+how I/O protection is implemented in Windows NT. NT does not actually implement
+the I/O protection on its own. Since the CPU can trap attempted I/O port
+accesses, NT depends on this 80x86 feature. The first mechanism that must be
+understood is the privilege-level system used by the 80x86 processors. Four
+privilege levels are defined by the processor--0, 1, 2, and 3--and the CPU always
+operates at one of these levels. The most privileged level is 0; the least
+privileged, 3. NT uses only levels 0 and 3. Privilege level 0 is used for the
+full-access kernel mode, and 3 for the more-restrictive user mode. The current
+privilege level (CPL) of the processor is stored in the two least-significant
+bits of the CS (code segment) register.<P>
+
+Rather than statically defining which privilege levels can have I/O access, the
+CPU defines an I/O privilege level (IOPL) value, which is compared against the
+CPL to determine if I/O instructions can be used freely. The IOPL is stored in
+two bits of the processor's EFLAGS register. Any process with a CPL that is
+numerically greater than the IOPL must go through the I/O protection mechanism
+when attempting port I/O access. Because the IOPL cannot be less than 0, programs
+running at privilege level 0 (like kernel-mode device drivers) will always have
+direct port I/O access. NT sets the IOPL to 0. User-mode code always has a CPL of
+3, which is larger than the IOPL. Therefore, user-mode port I/O access attempts
+must go through the protection mechanism.<P>
+
+Determining if CPL&gt;IOPL is the first step in the protection mechanism. I/O
+protection is not all-or-nothing. The processor uses a flexible mechanism that
+allows the operating system to grant direct access to any subset of I/O ports on
+a task-by-task basis.<P>
+
+The CPU accomplishes this by using a bitmask array, where each bit corresponds to
+an I/O port. If the bit is a 1, access is disallowed and an exception occurs
+whenever access to the corresponding port is attempted. If the bit is a 0, direct
+and unhampered access is granted to that particular port. The I/O address space
+of the 80x86 processors encompasses 65,536 8-bit ports. The bitmask array is 8192
+(0x2000) bytes long, since the bitmask array is packed so that each byte holds
+eight bits of the array. There is even flexibility in how much of the bitmask
+array must be provided. You can provide anywhere from 0 to the full 8192 bytes of
+the table. The table always starts from I/O address 0, but you can choose not to
+provide the bitmask for upper I/O addresses. Any part of the bitmask that you do
+not provide is assumed to be 1, and therefore access is not granted to those
+ports.<P>
+
+The bitmask array, called the I/O Permission bit Map (IOPM), is stored in the
+Task State Segment (TSS) structure in main memory, which is contained in a
+special segment referenced by the segment selector in the processor's Task
+Register (TR). The location of the IOPM within the TSS is flexible. The offset of
+the IOPM within the TSS is stored in a 2-byte integer at location 0x66 in the
+TSS; see <a href="9605a1f1.gif">Figure 1</A>.<P>
+
+<h3><a name="0195_008a">NT TSS Specifics<a name="0195_008a"></h3><P>
+
+The 80x86 TSS was designed so that each task in the system could have its own
+TSS. In NT, however, the TSS is not fully used. The TR, which points to the TSS
+segment descriptor, is never modified. Each process uses the same copy of the
+TSS, so each process uses the same copy of the IOPM.<P>
+
+In NT, the default IOPM offset points beyond the end of the TSS. This effectively
+denies access by user-mode processes to all I/O ports. To grant access to I/O
+ports for user-mode processes, you must modify the IOPM offset so that it is
+within the TSS, or extend the TSS so that the original default offset falls
+within the TSS.<P>
+
+<h3><a name="0195_008b">The Video-Port Routines<a name="0195_008b"></h3><P>
+
+Since I didn't want to reinvent the wheel, I looked through the NT DDK
+documentation to see if there was a facility to deal with user-mode I/O access.
+In the <I>Kernel Mode Driver Reference Manual</I>, I came across the video-driver
+support routines <I>VideoPortMapMemory()</I> and
+<I>VideoPortSetTrappedEmulatorPorts()</I>. The former grants direct access of
+memory and I/O ports to user-mode portions of video drivers, presumably for
+performance. Source-code examples in the DDK show user-mode portions of the VGA
+video drivers using the IN and OUT port I/O instructions. The latter video-port
+function grants full-screen DOS-mode programs direct access to a subset of the
+VGA I/O ports. The description given in the DDK documentation for this second
+routine even makes reference to the IOPM and notes that it is shared by all of
+the virtual DOS machines (more accurately, it is shared across all NT
+processes).<P>
+
+The video-port routines suggest that there is a mechanism within NT for allowing
+user-mode access to I/O ports. Initially, I tried to use the video routines in a
+kernel-mode driver to grant I/O access to my user-mode test program, but this
+turned out to be complicated. The kernel-mode device driver has to pretend that
+it is a video driver to use these routines. Video header files must be included,
+the video library must be linked to, and video initialization routines must be
+called.<P>
+
+The presence of these two routines demonstrates why user-mode I/O can be useful,
+and their descriptions in the DDK documentation are enlightening. But the
+functions are intended to be used only with video drivers. Using the video
+routines with a nonvideo driver was messy, so I dropped this as an option.<P>
+
+<h3><a name="0195_008c">Delving Further<a name="0195_008c"></h3><P>
+
+The video-port functions are the only documented method for enabling direct-port
+I/O. Since I found them difficult to use, I decided to create my own. I first
+tried increasing the size of the TSS so that the default IOPM offset would land
+within the TSS; see <a href="1996019b.htm">Figure 2</A>. I had to modify the TSS
+segment descriptor in the global descriptor table (GDT) directly and change the
+default segment size of 0x20AB to 0x20AB+0xF00 to allow access to the first 0xF00
+I/O ports. The processor's TR then had to be reloaded for the change in the TSS
+descriptor to take effect. It isn't a good idea to extend segments in a haphazard
+fashion, because all memory must be accounted for by the 80x86 paging system. A
+page fault could occur during a reference to the IOPM, which would crash the
+system. But because the physical page size is 4 KB and I did not extend the TSS
+beyond the end of a physical page, there was no trouble. Since there were only
+zeros beyond the original end of the TSS, increasing its size granted universal
+I/O access across all applications. The TOTALIO device driver in <a href="9605a.htm#0195_0095">Listing One</A> illustrates this.<P>
+
+At first, this may seem like the best possible method to grant I/O access--you
+set it once and don't need to grant access to each process individually. However,
+this method is dangerous and unrestrictive. It would allow, for instance, DOS
+programs to directly access the video registers, even if they were not running in
+full-screen mode. It would allow DOS disk utilities to access the hard drive
+directly and wreak havoc on NTFS partitions. NT device drivers keep information
+on the state of the devices they control, and TOTALIO would allow applications to
+completely violate this arrangement. As soon as you start up a DOS program, or
+any other program with port I/O, you risk trashing the whole system.<P>
+
+<h3><a name="0195_008d">Granting Access to a Single Process<a name="0195_008d"></h3><P>
+
+Since TOTALIO was risky, I looked for a method that would allow a kernel-mode
+driver to grant I/O access to a single process.<P>
+
+Using a debugger, I examined the NT TSS and found a block of 0xFFs extending from
+offset 0x88 up to the end of the TSS. I assumed that in NT, the block of 0xFFs
+was where the IOPM was intended to sit, even though the default IOPM offset
+points beyond this area. There were 0x2004 bytes of 0xFF. The extra four bytes
+are present because the 80x86 requires at least one extra byte of 0xFF at the end
+of the IOPM. The 80x86 requires the extra byte because it always accesses two
+bytes of the IOPM at a time.<P>
+
+I moved the IOPM offset to point to the start of the 0xFFs, as in <a href="1996019c.htm">Figure 3</A>. I zeroed a few bytes of the IOPM and tried to
+access ports. Nothing happened. My application still caused exceptions. The
+kernel-mode device-driver fragment in <a href="9605a.htm#0195_0097">Listing
+Two</A> illustrates this attempt.<P>
+
+What was wrong? A visual inspection of a memory dump of an NT process structure
+showed that NT stores the IOPM offset in a location of its own, within the
+process structure. The actual IOPM offset in the TSS is loaded from the value in
+the process structure whenever a process gains control, so changing the TSS
+directly is of no use. To change the IOPM base address, the value in the process
+structure must be changed. Once the IOPM offset in the process structure is
+changed, user-mode I/O access is granted to that process for all ports whose
+corresponding IOPM access bit is 0. <a href="9605a.htm#0195_0099">Listing
+Three</A> illustrates direct modification of the process structure.<P>
+
+<h3><a name="0195_008e">Yet Another Way<a name="0195_008e"></h3><P>
+
+Early on, I ran across some kernel-mode function names in the NTOSKRNL library
+(which contains kernel-mode device-driver support routines) that weren't
+documented in the DDK. Among these functions were <I>Ke386SetIoAccessMap()</I>,
+<I>Ke386QueryIoAccessMap()</I>, and <I>Ke386IoSetAccessProcess()</I>. From their
+names, these functions sounded like they might do what I needed, but because they
+were not documented, I initially had difficulty getting them to work. Only after
+I completely understood the 80x86 I/O protection mechanism and had my own
+implementation working, did I have the knowledge to go back and decipher them.<P>
+
+<I>Ke386SetIoAccessMap()</I> takes two arguments: an integer that must be set to
+1 in order for the function to work, and a buffer pointer. It copies a supplied
+I/O access bitmap of length 0x2000 from the buffer into the TSS at offset 0x88.
+<I>Ke386QueryIoAccessMap()</I> takes the same arguments but does the opposite,
+copying the current IOPM from the TSS into a buffer of length 0x2000. If the
+integer argument is set to 0, the <I>set</I> function copies 0xFFs to the IOPM,
+and the <I>query</I> function copies 0xFFs to the user's buffer.<P>
+
+<I>Ke386IoSetAccessProcess()</I> takes two arguments: a pointer to a process
+structure obtained from a call to <I>PsGetCurrentProcess()</I>, and an integer
+that must be set to 1 to grant I/O access, or to 0 to remove I/O access. When the
+integer argument is 0, the function disables I/O access by setting the IOPM
+offset of the passed process to point beyond the end of the TSS. When the integer
+argument is 1, the function enables I/O access by setting the IOPM offset of the
+passed process to point to the start of the IOPM at offset 0x88 in the TSS.<P>
+
+Using <I>set</I> and <I>query</I> together, it is possible to read, modify, and
+write back the IOPM, adding access to the desired ports by setting their
+respective permission bits to zero. <I>Ke386IoSetAccessProcess()</I> then enables
+the IOPM lookup for the desired process. The kernel-mode device driver in <a href="9605a.htm#0195_009b">Listing Four</A>, GIVEIO.C, sets the IOPM to 0s to
+allow full user-mode access to all I/O ports. <a href="9605a.htm#0195_009d">Listing Five</A>, a user-mode test application called
+TESTIO.C, uses direct port I/O to exercise the PC's internal speaker.<P>
+
+<h3><a name="0195_008f">Direct--for Real?<a name="0195_008f"></h3><P>
+
+Once a user-mode process is given permission to access an I/O port, the I/O
+access proceeds without any further help from the device driver. The purpose of
+the device driver is to modify the IOPM and the process's copy of the IOPM
+offset. Once that's done, the application's I/O port accesses proceed unhindered.
+In fact, the device driver could be unloaded once the IOPM is modified, and the
+application could still do direct I/O. <a href="9605a.htm#0195_009d">Listing
+Five</A> illustrates this by opening and closing the GIVEIO driver, giving the
+application I/O access, before it performs the port I/O.<P>
+
+<h3><a name="0195_0090">I/O Timing<a name="0195_0090"></h3><P>
+
+Using port I/O from an application isn't a free ride. There's overhead in the
+protection mechanism, so the 80x86 IN and OUT instructions take longer in user
+mode, where CPL &gt; IOPL. The number of processor-clock cycles it takes to
+execute the IN and OUT instructions varies depending on the CPU mode. In
+so-called real mode (plain-vanilla, nonextended DOS), an OUT instruction takes 16
+processor-clock cycles to execute on a 486; in virtual-8086 mode (a DOS program
+running in a Windows DOS box or an NT console window), it takes 29 cycles. In
+protected mode, the execution time depends on whether CPL &gt; IOPL. In the
+context of NT, this means that it depends on whether a process is executing in
+kernel mode or user mode. In kernel mode, an OUT instruction takes a mere ten
+cycles. In user mode it takes a whopping 30 cycles! So the execution time of a
+&quot;direct&quot; I/O operation is in fact three times longer for a user-mode
+process, but it is still tiny compared to a device-driver call, which might take
+on the order of 6000 to 12,000 clocks (somewhere in the 100-200ms range on my
+486). The extra time taken when CPL &gt; IOPL, and when the processor is in
+virtual 8086 mode, is the time it takes the processor to check the bits in the
+IOPM.<P>
+
+<h3><a name="0195_0091">Careful with that Axe, Eugene!<a name="0195_0091"></h3><P>
+
+Pardon the Pink Floyd reference, but it seems appropriate to provide warnings
+about this potentially dangerous tool. <P>
+
+With I/O access knowledge, you may be tempted to start using it for everything,
+but remember that I/O protection exists in NT for good reasons. I/O protection
+helps give the operating system its seemingly bullet-proof stability by forcing
+all access to a device to go through a single, controlled channel. Frivolous use
+of user-mode port I/O would tend to erode NT's stability. Circumventing an
+existing kernel-mode device driver is a bad idea. Device drivers maintain
+information about the state of the devices they control. Bypassing a driver and
+accessing hardware directly may cause the driver and the hardware to get out of
+sync, with unpredictable results. Imagine the chaos that would result if every
+application tried to directly access the network card.<P>
+
+User-mode I/O may be useful for developing device drivers. It might serve as a
+development tool for quickly testing new hardware. Direct I/O from user-mode
+processes should find very little use in software that is distributed to end
+users. It should never occur in an application. If you are accessing a device,
+you should be doing it from a device driver. User-mode port I/O might
+occasionally be useful in user-mode portions of a device driver to achieve better
+overall performance for the driver.<P>
+
+Having ruled out its use in applications, it is likely that even most device
+drivers would not benefit from user-mode port I/O. Although it may be tempting to
+use it in every device driver, just to squeeze out that last bit of performance,
+most devices would not become appreciably faster by using user-mode port I/O. In
+many devices, the time delays perceived by the user are not in the calls to the
+device driver, but in the action of the device. The user isn't usually waiting
+for the device-driver call itself to complete, but rather for the disk drive to
+spin, the read/write head to move, or the paper to feed through the printer.
+User-mode I/O should only be used if there is a definite bottleneck in port I/O
+access from applications, and then, only if direct user-mode I/O access would
+improve the driver by making a noticeable and significant difference to the user.
+Even Microsoft uses this technique sparingly. The only device driver in the
+system's DRIVERS directory that references the three undocumented routines is the
+VIDEOPRT.SYS driver, which contains the <I>VideoPort...()</I> functions.<P>
+
+If I/O access is done in the user-mode section of a driver, kernel mode may still
+be needed for, among other things, servicing interrupts and controlling DMA.
+User-mode port I/O does not remove the necessity of writing kernel-mode device
+drivers.<P>
+
+If you decide that you want to use port I/O in the user-mode portion of your
+device driver, your kernel-mode driver should modify only the IOPM permission
+bits that correspond to the I/O ports required by the user-mode portion of the
+driver. You should use the <I>Ke386QueryIoAccessMap()</I> to get the current
+IOPM, zero each of the permission bits required by the driver, then use the
+<I>Ke386SetIoAccessMap()</I> routine to write the IOPM back. If and when your
+driver is unloaded, it should set each permission bit back to 1. Only one IOPM is
+used by all processes in the system, including, possibly, the video driver. For
+this reason it is important that the IOPM is not simply written with 0xFFs when
+access is no longer needed. Of course, the usual device-driver rules given in the
+DDK manual for allocating I/O ports and keeping track of them in the registry
+would still apply.<P>
+
+Is system security and integrity violated by user-mode port I/O access? No,
+because a device driver is still required to grant the I/O access to the
+application, so it is not possible for an app to gain access to I/O ports on its
+own. The granting of I/O access may be done on a per-process basis, and the
+kernel-mode device driver that grants I/O access could be modified to grant
+access only to those processes that it trusts. Only a user running with
+administrator privileges can load device drivers, so in general, a user-mode
+application cannot load a device driver and grant itself I/O access unless the
+administrator is running it. Granting I/O access to a user-mode process is not
+directly related to NT's security system and does not make any attempt to foil
+it.<P>
+
+Granting I/O access to a process is a very specific action. It does not enable
+the use of the other protected 80x86 instructions, such as STI (enable
+interrupts) and CLI (disable interrupts). These, and the other privileged
+instructions, can be executed only by a kernel-mode driver.<P>
+
+<h3><a name="0195_0092">Portability<a name="0195_0092"></h3><P>
+
+The technique described here is specific to 80x86-compatible CPUs. Still, NT runs
+on several other platforms, including the DEC Alpha, MIPS, and PowerPC. Although
+this specific implementation is not portable to those processors, there shouldn't
+be any reason why the same effect could not be achieved on them. None of the
+other processors have I/O instructions; all hardware is memory mapped. Since any
+physical memory can be mapped into a user-mode process's memory space (see the
+MAPMEM example program in the DDK), it should be possible to make any hardware
+accessible to a user-mode process.<P>
+
+None of the techniques presented here are documented by Microsoft, so portability
+across releases of NT, even on the same processor platform, could be problematic.
+It is not likely that the whole mechanism would be removed, since the video
+drivers rely on it. But the names and functionality of specific undocumented
+routines could change, or the routines could go away altogether and perhaps
+become embedded in the video-port library.<P>
+
+It appears that the undocumented functions were added to NT to increase
+video-driver performance. On the 80x86 platform, increasing video performance
+required allowing access to some of the video I/O ports in user mode. Since this
+is the only use of the mechanism, and since it is documented indirectly through
+the <I>VideoPort...()</I> routines, there was no reason for the underlying
+<I>Ke386...()</I> routines to be documented. <P>
+
+Another reason Microsoft may have chosen not to document this mechanism is that
+it is not fully implemented. Currently, the IOPM is shared by all user-mode
+processes in the system. To be safer and more useful, the system should maintain
+a separate IOPM for each process. One way to do this would be to save the IOPM
+(or a pointer to one) in the process structure and copy it into the TSS each time
+a process changes. But copying 8192 bytes would add a large amount of overhead to
+a task switch. Another way to give each process its own IOPM would be to give
+each process its own TSS. NT's process structure could be stored in the TSS,
+since Intel reserves only the first 0x68 bytes of the TSS for the processor's use
+and allows the rest to be used by the operating system. Switching the TSS for
+each process requires reloading the TR. The LTR instruction, which loads the
+80x86 task register, has only a tiny overhead of 20 clocks on a 486. Each TSS
+could have its own segment descriptor in the GDT. Or, since segment descriptors
+are a commodity, the segment descriptor for the TSS could be modified for each
+process switch. In any case, keeping the entire IOPM would require an overhead of
+8 KB for each process. An alternative would be to store only as much of the IOPM
+as is needed, and to only create a new TSS and store the IOPM for processes that
+require user-mode I/O access. Most I/O devices exist below the 0x400 port
+address, so this would require only 0x80 (128) bytes of storage. To achieve full
+generality, NT could just save as much of the IOPM as is necessary to map the
+highest I/O address that needs to be accessed.<P>
+
+<h3><a name="0195_0093">Conclusion<a name="0195_0093"></h3><P>
+
+The availability of direct port I/O in user-mode processes opens new doors for NT
+programmers. Hopefully this technique will prove useful in dealing with hardware
+devices in an 80x86 NT environment.<P>
+
+<h4><B><a href="9605a1f1.gif">Figure 1</A>:</B> The segment selector in the
+processor's TR points to the segment descriptor in the GDT, which defines the
+location and size of the TSS in memory. The IOPM is stored as part of the TSS.
+Its offset is stored in a 2-byte integer at location 0x66 in the TSS.</h4><P>
+
+<h4><B><a href="1996019b.htm">Figure 2</A>:</B> The default TSS size is 0x20AB.
+We need to extend it to 0x2FAB so that the IOPM offset falls within the
+TSS.</h4><P>
+
+<h4><B><a href="1996019c.htm">Figure 3</A>:</B> NT places the IOPM at offset 0x88
+in the TSS. We need to modify the IOPM offset to point to this area.</h4><P>
+
+<P>
+
+<h4><a name="0195_0094"><a name="0195_0095">Listing One<a name="0195_0095"></h4><pre>
+/******************************************************************************
+TOTALIO.SYS -- by Dale Roberts
+Compile: Use DDK BUILD facility
+Purpose: Give direct port I/O access to the whole system. This driver grants
+total system-wide I/O access to all applications. Very dangerous, but useful 
+for short tests.  Note that no test application is required. Just use control 
+panel or &quot;net start totalio&quot; to start the device driver.  When the driver is
+stopped, total I/O is removed.  Because no Win32 app needs to communicate with
+the driver, we don't have to create a device object. So we have a tiny driver 
+here. Since we can safely extend the TSS only to the end of the physical memory
+page in which it lies, the I/O access is granted only up to port 0xf00. 
+Accesses beyond this port address will still generate exceptions.
+******************************************************************************/
+#include &lt;ntddk.h&gt;
+/* Make sure our structure is packed properly, on byte boundary, not
+ * on the default doubleword boundary. */
+#pragma pack(push,1)
+/* Structures for manipulating the GDT register and a GDT segment
+ * descriptor entry.  Documented in Intel processor handbooks. */
+typedef struct {
+    unsigned short  limit;
+    GDTENT  *base;
+} GDTREG;
+typedef struct {
+    unsigned limit : 16;
+    unsigned baselo : 16;
+    unsigned basemid : 8;
+    unsigned type : 4;
+    unsigned system : 1;
+    unsigned dpl : 2;
+    unsigned present : 1;
+    unsigned limithi : 4;
+    unsigned available : 1;
+    unsigned zero : 1;
+    unsigned size : 1;
+    unsigned granularity : 1;
+    unsigned basehi : 8;
+} GDTENT;
+#pragma pack(pop)
+/* This is the lowest level for setting the TSS segment descriptor limit field.
+ * We get the selector ID from the STR instruction, index into the GDT, and 
+ * poke in the new limit.  In order for the new limit to take effect, we must 
+ * then read the task segment selector back into the task register (TR).
+ */
+void SetTSSLimit(int size)
+{
+    GDTREG gdtreg;
+    GDTENT *g;
+    short TaskSeg;
+    _asm cli;                           // don't get interrupted!
+    _asm sgdt gdtreg;                   // get GDT address
+    _asm str TaskSeg;                   // get TSS selector index
+    g = gdtreg.base + (TaskSeg &gt;&gt; 3);   // get ptr to TSS descriptor
+    g-&gt;limit = size;                    // modify TSS segment limit
+//
+//  MUST set selector type field to 9, to indicate the task is
+// NOT BUSY.  Otherwise the LTR instruction causes a fault.
+//
+    g-&gt;type = 9;                        // mark TSS as &quot;not busy&quot;
+//  We must do a load of the Task register, else the processor
+// never sees the new TSS selector limit.
+    _asm ltr TaskSeg;                   // reload task register (TR)
+    _asm sti;                           // let interrupts continue
+}
+/* This routine gives total I/O access across the whole system. It does this
+ * by modifying the limit of the TSS segment by direct modification of the TSS
+ * descriptor entry in the GDT. This descriptor is set up just once at system 
+ * init time. Once we modify it, it stays untouched across all processes.
+ */
+void GiveTotalIO(void)
+{
+    SetTSSLimit(0x20ab + 0xf00);
+}
+/* This returns the TSS segment to its normal size of 0x20ab, which
+ * is two less than the default I/O map base address of 0x20ad. */
+void RemoveTotalIO(void)
+{
+    SetTSSLimit(0x20ab);
+}
+/****** Release all memory 'n' stuff. *******/
+VOID
+TotalIOdrvUnload(
+    IN  PDRIVER_OBJECT  DriverObject
+    )
+{
+    RemoveTotalIO();
+}
+/****** Entry routine.  Set everything up. *****/
+NTSTATUS DriverEntry(
+    IN PDRIVER_OBJECT DriverObject,
+    IN PUNICODE_STRING RegistryPath
+    )
+{
+    DriverObject-&gt;DriverUnload = TotalIOdrvUnload;
+    GiveTotalIO();
+    return STATUS_SUCCESS;
+}
+</pre>
+<h4><a name="0195_0096"><a name="0195_0097">Listing Two<a name="0195_0097"></h4><pre>
+/*****************************************************************************
+This code fragment illustrates the unsuccessful attempt to directly modify
+the IOPM base address. This code would appear in a kernel-mode device driver.
+Refer to the GIVEIO.C listing for a complete device driver example.
+******************************************************************************/
+/* Make sure our structure is packed properly, on byte boundary, not
+ * on the default doubleword boundary. */
+#pragma pack(push,1)
+/* Structure of a GDT (global descriptor table) entry; from processor manual.*/
+typedef struct {
+    unsigned limit : 16;
+    unsigned baselo : 16;
+    unsigned basemid : 8;
+    unsigned type : 4;
+    unsigned system : 1;
+    unsigned dpl : 2;
+    unsigned present : 1;
+    unsigned limithi : 4;
+    unsigned available : 1;
+    unsigned zero : 1;
+    unsigned size : 1;
+    unsigned granularity : 1;
+    unsigned basehi : 8;
+} GDTENT;
+/* Structure of the 48 bits of the GDT register that are stored
+ * by the SGDT instruction. */
+typedef struct {
+    unsigned short  limit;
+    GDTENT  *base;
+} GDTREG;
+#pragma pack(pop)
+/* This code demonstrates the brute force approach to modifying the IOPM base.
+ * The IOPM base is stored as a two byte integer at offset 0x66 within the TSS,
+ * as documented in the processor manual. In Windows NT, the IOPM is stored 
+ * within the TSS starting at offset 0x88, and going for 0x2004 bytes. This is
+ * not documented anywhere, and was determined by inspection. The code here 
+ * puts some 0's into the IOPM so that we can try to access some I/O ports, 
+ * then modifies the IOPM base address. This code is unsuccessful because NT 
+ * overwrites the IOPM base on each process switch. */
+void GiveIO()
+{
+    GDTREG gdtreg;
+    GDTENT *g;
+    short TaskSeg;
+    char *TSSbase;
+    int i;
+    _asm str TaskSeg;                   // get the TSS selector
+    _asm sgdt gdtreg;                   // get the GDT address
+    g = gdtreg.base + (TaskSeg &gt;&gt; 3);   // get the TSS descriptor
+                                        // get the TSS address
+    TSSbase = (PVOID)(g-&gt;baselo | (g-&gt;basemid &lt;&lt; 16) 
+                       | (g-&gt;basehi &lt;&lt; 24));
+    for(i=0; i &lt; 16; ++i)               // poke some 0's into the
+        TSSbase[0x88 + i] = 0;          //   IOPM
+    *((USHORT *)(TSSbase + 0x66)) = 0x88;
+}
+</pre>
+<h4><a name="0195_0098"><a name="0195_0099">Listing Three<a name="0195_0099"></h4><pre>
+/* From inpection of the TSS we know that NT's default IOPM offset is 0x20AD.
+ * From an inspection of a dump of a process structure, we can find the bytes 
+ * 'AD 20' at offset 0x30.  This is where NT stores the IOPM offset for each 
+ * process, so that I/O access can be granted on a process-by-process basis.  
+ * This portion of the process structure is not documented in the DDK.
+ * This kernel mode driver fragment illustrates the brute force
+ * method of poking the IOPM base into the process structure. */
+void GiveIO()
+{
+    char *CurProc;
+    CurProc = IoGetCurrentProcess();
+    *((USHORT *)(CurProc + 0x30)) = 0x88;
+}
+</pre>
+<h4><a name="0195_009a"><a name="0195_009b">Listing Four<a name="0195_009b"></h4><pre>
+/*********************************************************************
+GIVEIO.SYS -- by Dale Roberts
+Compile:    Use DDK BUILD facility
+Purpose:    Give direct port I/O access to a user mode process.
+*********************************************************************/
+#include &lt;ntddk.h&gt;
+#include &lt;mondebug.h&gt;
+/* The name of our device driver. */
+#define DEVICE_NAME_STRING  L&quot;giveio&quot;
+/* This is the &quot;structure&quot; of the IOPM.  It is just a simple character array 
+ * of length 0x2000. This holds 8K * 8 bits -&gt; 64K bits of the IOPM, which 
+ * maps the entire 64K I/O space of the x86 processor.  Any 0 bits will give
+ * access to the corresponding port for user mode processes. Any 1
+ * bits will disallow I/O access to the corresponding port. */
+#define IOPM_SIZE   0x2000
+typedef UCHAR IOPM[IOPM_SIZE];
+/* This will hold simply an array of 0's which will be copied into our actual 
+ * IOPM in the TSS by Ke386SetIoAccessMap(). The memory is allocated at 
+ * driver load time.  */
+IOPM *IOPM_local = 0;
+/* These are the two undocumented calls that we will use to give the calling 
+ * process I/O access. Ke386IoSetAccessMap() copies the passed map to the TSS.
+ *  Ke386IoSetAccessProcess() adjusts the IOPM offset pointer so that the newly
+ * copied map is actually used.  Otherwise, the IOPM offset points beyond the 
+ * end of the TSS segment limit, causing any I/O access by the user-mode 
+ * process to generate an exception. */
+void Ke386SetIoAccessMap(int, IOPM *);
+void Ke386QueryIoAccessMap(int, IOPM *);
+void Ke386IoSetAccessProcess(PEPROCESS, int);
+/***** Release any allocated objects. ******/
+VOID GiveioUnload(IN PDRIVER_OBJECT DriverObject)
+{
+    WCHAR DOSNameBuffer[] = L&quot;\\DosDevices\\&quot; DEVICE_NAME_STRING;
+    UNICODE_STRING uniDOSString;
+    if(IOPM_local)
+        MmFreeNonCachedMemory(IOPM_local, sizeof(IOPM));
+    RtlInitUnicodeString(&amp;uniDOSString, DOSNameBuffer);
+    IoDeleteSymbolicLink (&amp;uniDOSString);
+    IoDeleteDevice(DriverObject-&gt;DeviceObject);
+}
+/*****************************************************************************
+ Set the IOPM (I/O permission map) of the calling process so that it is given
+full I/O access. Our IOPM_local[] array is all zeros, so IOPM will be all 0s.
+If OnFlag is 1, process is given I/O access. If it is 0, access is removed.
+******************************************************************************/
+VOID SetIOPermissionMap(int OnFlag)
+{
+    Ke386IoSetAccessProcess(PsGetCurrentProcess(), OnFlag);
+    Ke386SetIoAccessMap(1, IOPM_local);
+}
+void GiveIO(void)
+{
+    SetIOPermissionMap(1);
+}
+/******************************************************************************
+Service handler for a CreateFile() user mode call. This routine is entered in
+the driver object function call table by DriverEntry(). When the user-mode 
+application calls CreateFile(), this routine gets called while still in the 
+context of the user-mode application, but with the CPL (the processor's Current
+Privelege Level) set to 0. This allows us to do kernel-mode operations. 
+GiveIO() is called to give the calling process I/O access. All the user-mode 
+app needs do to obtain I/O access is open this device with CreateFile(). No
+other operations are required.
+*********************************************************************/
+NTSTATUS GiveioCreateDispatch(
+    IN  PDEVICE_OBJECT  DeviceObject,
+    IN  PIRP            Irp
+    )
+{
+    GiveIO();           // give the calling process I/O access
+    Irp-&gt;IoStatus.Information = 0;
+    Irp-&gt;IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return STATUS_SUCCESS;
+}
+/*****************************************************************************
+Driver Entry routine. This routine is called only once after the driver is 
+initially loaded into memory. It allocates everything necessary for the 
+driver's operation. In our case, it allocates memory for our IOPM array, and 
+creates a device which user-mode applications can open. It also creates a 
+symbolic link to the device driver. This allows a user-mode application to 
+access our driver using the \\.\giveio notation.
+******************************************************************************/
+NTSTATUS DriverEntry(
+    IN PDRIVER_OBJECT DriverObject,
+    IN PUNICODE_STRING RegistryPath
+    )
+{
+    PDEVICE_OBJECT deviceObject;
+    NTSTATUS status;
+    WCHAR NameBuffer[] = L&quot;\\Device\\&quot; DEVICE_NAME_STRING;
+    WCHAR DOSNameBuffer[] = L&quot;\\DosDevices\\&quot; DEVICE_NAME_STRING;
+    UNICODE_STRING uniNameString, uniDOSString;
+    //  Allocate a buffer for the local IOPM and zero it.
+    IOPM_local = MmAllocateNonCachedMemory(sizeof(IOPM));
+    if(IOPM_local == 0)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(IOPM_local, sizeof(IOPM));
+    //  Set up device driver name and device object.
+    RtlInitUnicodeString(&amp;uniNameString, NameBuffer);
+    RtlInitUnicodeString(&amp;uniDOSString, DOSNameBuffer);
+    status = IoCreateDevice(DriverObject, 0, &amp;uniNameString,
+                FILE_DEVICE_UNKNOWN, 0, FALSE, &amp;deviceObject);
+    if(!NT_SUCCESS(status))
+        return status;
+    status = IoCreateSymbolicLink (&amp;uniDOSString, &amp;uniNameString);
+    if (!NT_SUCCESS(status))
+        return status;
+    //  Initialize the Driver Object with driver's entry points.
+    // All we require are the Create and Unload operations.
+    DriverObject-&gt;MajorFunction[IRP_MJ_CREATE] = GiveioCreateDispatch;
+    DriverObject-&gt;DriverUnload = GiveioUnload;
+    return STATUS_SUCCESS;
+}
+</pre>
+<h4><a name="0195_009c"><a name="0195_009d">Listing Five<a name="0195_009d"></h4><pre>
+/*********************************************************************
+TSTIO.EXE -- by Dale Roberts
+Compile:    cl -DWIN32 tstio.c
+Purpose:    Test the GIVEIO device driver by doing some direct
+            port I/O.  We access the PC's internal speaker.
+*********************************************************************/
+#include &lt;stdio.h&gt;
+#include &lt;windows.h&gt;
+#include &lt;math.h&gt;
+#include &lt;conio.h&gt;
+typedef struct {
+    short int pitch;
+    short int duration;
+} NOTE;
+/* Table of notes. Given in half steps. Communication from &quot;other side.&quot;  */
+NOTE notes[] = {{14, 500}, {16, 500}, {12, 500}, {0, 500}, {7, 1000}};
+/***** Set PC's speaker frequency in Hz.  The speaker is controlled by an
+ ***** Intel 8253/8254 timer at I/O port addresses 0x40-0x43. *****/
+void setfreq(int hz)
+{
+    hz = 1193180 / hz;                      // clocked at 1.19MHz
+    _outp(0x43, 0xb6);                      // timer 2, square wave
+    _outp(0x42, hz);
+    _outp(0x42, hz &gt;&gt; 8);
+}
+/*********************************************************************
+Pass a note, in half steps relative to 400 Hz.  The 12 step scale is an 
+exponential thing. Speaker control is at port 0x61. Setting lowest two bits 
+enables timer 2 of the 8253/8254 timer and turns on the speaker.
+*********************************************************************/
+void playnote(NOTE note)
+{
+    _outp(0x61, _inp(0x61) | 0x03);         // start speaker going
+    setfreq((int)(400 * pow(2, note.pitch / 12.0)));
+    Sleep(note.duration);
+    _outp(0x61, _inp(0x61) &amp; ~0x03);        // stop that racket!
+}
+/*********************************************************************
+  Open and close the GIVEIO device.  This should give us direct I/O
+access.  Then try it out by playin' our tune.
+*********************************************************************/
+int main()
+{
+    int i;
+    HANDLE h;
+    h = CreateFile(&quot;\\\\.\\giveio&quot;, GENERIC_READ, 0, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(h == INVALID_HANDLE_VALUE) {
+        printf(&quot;Couldn't access giveio device\n&quot;);
+        return -1;
+    }
+    CloseHandle(h);
+    for(i=0; i &lt; sizeof(notes)/sizeof(int); ++i)
+        playnote(notes[i]);
+    return 0;
+}
+</pre>
+
+</BODY></HTML>

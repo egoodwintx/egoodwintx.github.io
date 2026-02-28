@@ -1,0 +1,336 @@
+<html>
+<META NAME="year" CONTENT="1997">
+<head>
+<title>Dr. Dobb's Journal September 1997: Hash Functions</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Hash Functions</h1>
+
+<p><i>Dr. Dobb's Journal</i> September 1997
+</p>
+<h3>By Bob Jenkins</h3>
+
+<I>Bob works at Oracle, maintaining referential integrity. He can be contacted at bob_jenkins@compuserve.com.</I>
+
+<hr>
+
+<p>Over the past two years, I've experimented with many different hash functions, and eventually designed my own general-purpose function to address the weaknesses I found. To serve as a plug-in replacement for existing hash functions, it had to meet several requirements:</p>
+
+<p></p>
+
+<ul>
+<li>The keys must be unaligned variable-length byte arrays.  <li>Sometimes keys are several such arrays.
+  <li>Sometimes a set of independent hash functions are required.
+  <li>Average key lengths range from 8 bytes to 200 bytes.
+  <li>Keys might be character strings, numbers, bit-arrays, or weirder things.
+  <li>Table sizes can be anything, including powers of 2.
+  <li>The hash must be faster than its predecessor.
+  <li>The hash must do a good job.
+</ul>
+
+<p></p>
+
+<p>I developed this hash function with an elaborate search mechanism that tested for a variety of weaknesses. The result of this search is <a name="rl1"><a href="9709n.htm#l1">Listing One</A> which is the fastest hash I've been able to design that meets all of my requirements.</p>
+
+<p>Like most hashes, <a href="9709n.htm#l1">Listing One</A> can be modeled like <a name="re1"><a href="9709ne1.htm">Example 1</A>. In my hash, <i>mix()</i> takes 3<i>n</i> of the 6<i>n</i>+35 instructions needed to hash <i>n</i> bytes. Blocks of text are combined with the internal state (<i>a,b,c</i>) by addition. This combining step is the rest of the hash function, consuming the remaining 3<i>n</i> instructions. The only postprocessing is to choose <i>c</i> out of (<i>a,b,c</i>) to be the result.</p>
+
+<p>Three tricks promote speed:</p>
+
+<ul>
+<li>Mixing is done on three 4-byte registers rather than on a 1-byte quantity.  <li>Combining is done on 12-byte blocks, reducing the loop overhead.
+  <li>The final switch statement combines a variable-length final block with the registers <i>a,b,c</i> without a loop.
+</ul>
+
+<p></p>
+
+<p>The golden ratio in <a href="9709n.htm#l1">Listing One</A> is just an arbitrary value. It keeps all zeros from being hashed to all zeros.</p>
+
+<p>In this article, I'll explain some things I've learned about hashes, and show how some competing hashes stack up.</p>
+
+<h3>The Hash Must Do a Good Job</h3>
+
+<p>The most interesting requirement was that the hash must be better than its competition. What does it mean for a hash to be good for hash table lookup?</p>
+
+<p>A good hash function distributes hash values uniformly. If you don't know the keys before choosing the function, the best you can do is map an equal number of possible keys to each hash value. If keys are distributed uniformly, an excellent hash would be to choose the first few bytes of the key and use that as the hash value. Unfortunately, real keys aren't uniformly distributed. Choosing the first few bytes works quite poorly in practice.</p>
+
+<p>The real requirement then is that a good hash function should distribute hash values uniformly for the keys that users actually use. To understand some of the problems, consider <a name="rt1"><a href="9709nt1.htm">Table 1</A>, the EMP table. If you consider each horizontal row to be a key, you'll notice some patterns:</p>
+
+<ul>
+<li>Length matters. The only difference between zero and no value at all may be the length of the value. Also, "aa aaa" and "aaa aa" should hash to different values.  <li>Keys often consist of substrings arranged in different orders. For example, the MGR of some keys is the EMPNO of others.
+  <li>Some keys are mostly zero, with only a few bits set. (That pattern doesn't appear in this example, but it's a common pattern.)
+  <li>Keys often differ in only a few bits. For example, all the keys are ASCII, so the high bit of every byte is 0.
+</ul>
+
+<p></p>
+
+<p>It's easy to design hashes that handle the first three patterns. If the length is included in the data being hashed, then lengths are not a problem. If the hash does not treat text blocks commutatively, then substrings are not a problem. You can see how a hash behaves with strings that are mostly zeros by listing all strings with only one bit set and checking if that set of strings produces too many collisions.</p>
+
+<p>The remaining pattern is that keys often differ in only a few bits. If a hash allows small sets of input bits to cancel each other out, and some keys differ in only those bits, then those keys will map to the same handful of hash values.</p>
+
+<h3>A Common Weakness</h3>
+
+<p>Usually, when a small set of input bits cancel each other out, it is because those input bits only affect a smaller set of bits in the internal state.</p>
+
+<p>Consider the hash function in <a name="re2"><a href="9709ne2.htm">Example 2</A>, which maps the strings "EXXXXXB" and "AXXXXXC" to the same value. These keys differ in bit 3 of the first byte and bit 1 of the seventh byte. After the seventh byte is combined, no additional processing will help because the internal states are already the same.</p>
+
+<p>Any time <i>n</i> input bits can only affect <i>m</i> output bits, and <i>n</i>&gt;<i>m</i>, then the 2<sup><i>n</i></sup> keys that differ in those input bits can only produce 2<sup><i>m</i></sup> distinct hash values. The same is true if <i>n</i> input bits can only affect <i>m</i> bits of the internal state -- later mixing may make the 2<sup><i>m</i></sup> results look uniformly distributed, but there will still be only 2<sup><i>m</i></sup> results. I call this problem "funneling."</p>
+
+<p>The aforementioned function has many sets of 2 bits that affect only 1 bit of the internal state. If there are <i>n</i> input bits, there are (<i>n</i> choose 2)=(<i>n</i>*<i>n</i>/2-<i>n</i>/2) pairs of input bits, only a few of which match weaknesses in our sample function. It is a common pattern for keys to differ in only a few bits. If those bits match one of a hash's weaknesses, which is a rare but not negligible event, the hash will do extremely poorly. In most cases, though, it will do just fine. (This allows a function to slip through sanity checks, like hashing an English dictionary uniformly, while still frequently bombing on user data.)</p>
+
+<p>In hashes built of repeated combine-mix steps, this weakness usually arises because of the following sequence:</p>
+
+<p>1. A small number of bits <i>y</i> of one input block are combined, affecting only <i>y</i> bits of the internal state. So far so good.<BR>
+
+2. The mixing step causes those <i>y</i> bits of the internal state to affect only <i>z</i> bits of the internal state.<BR>
+
+3. The next combining step overwrites those bits with <i>z</i> more input bits, canceling out the first <i>y</i> input bits.<BR>
+</p>
+
+<P>
+When <i>z</i> is smaller than the number of bits in the output, then <i>y+z</i> input bits have affected only <i>z</i> bits of the internal state, causing 2<sup><i>y+z</i></sup> possible keys to produce, at most, 2<sup><i>z</i></sup> hash values.
+</P>
+
+<p>The same thing can happen in reverse:</p>
+
+<P>
+1. Uncombine this block, causing y block bits to reverse their effect on y bits of the internal state. <BR>
+2. Unmix the internal state, leaving x bits unaffected by the y bits from this block.<BR>
+3. Unmixing the previous block reverses the effect on those x bits, canceling out this block's y bits.<BR>
+</P>
+
+
+<p>If <i>x</i> is less than the number of bits in the output, then the 2<sup><i>x+y</i></sup> keys differing in only those <i>x+y</i> input bits can produce at most 2<sup><i>x</i></sup> hash values.</p>
+
+<p>If the mixing function is not a permutation of the internal state, it is not reversible. Instead, it loses information about the earlier blocks every time it is applied, so keys differing only in the first few input blocks are more likely to collide. The mixing function ought to be a permutation.</p>
+
+<p>It is easy to test whether this weakness exists: If the mixing step causes any bit of the internal state to affect fewer bits of the internal state than there are output bits, the weakness exists. This test should be run on the reverse of the mixing function as well. It can also be run with all sets of two internal state bits, or all sets of three.</p>
+
+<p>The final mix and postprocessing needs to cause every bit of the last input block to affect every bit of the output. If some bit of the last input block does not affect some bits of the output, the user may choose to use only those output bits. Then the user will get the same result for any keys differing in only that input bit.</p>
+
+<h3>A Survey of Hash Functions</h3>
+
+<p>We now have a new hash function and a theory for evaluating hash functions. <a name="rl2"><a href="9709n.htm#l2">Listing Two</A> presents source code implementations for a number of popular hash functions (for all except MD4). <a name="rt2"><a href="9709nt2.htm">Table 2</A> shows how they compare.</p>
+
+<p></p>
+
+<ul>
+<li>Additive hash takes 5<i>n</i>+3 instructions. There is no mixing step. The combining step handles 1 byte at a time. Input bytes commute. The table length must be prime, and can't be much bigger than 1 byte because the value of variable hash is never much bigger than 1 byte.  <li>Rotating hash takes 8<i>n</i>+3 instructions. This is the same as the additive hash, except it has a mixing step (a circular shift by 5) and the combining step is EXCLUSIVE-OR instead of addition. The table size is a prime, but the prime can be any size.
+  <li>Pearson's hash preinitializes <i>tab[]</i> to an arbitrary permutation of 0-255. It takes 6<i>n</i>+2 instructions, but produces only a 1-byte result. Larger results can be made by running it several times with different initial hash values.
+  <li>CRC hashing takes 9<i>n</i>+3 instructions. <i>tab</i> is initialized to simulate a maximal-length Linear Feedback Shift Register (LFSR). I used a 32-bit state with a polynomial of 0x04c11db7 for the tests.
+  <li>Generalized CRC hashing takes 9<i>n</i>+3 instructions. It is the same as CRC hashing except it fills <i>tab[]</i> with arbitrary values. The values in the low bytes must form a permutation of 0..255.
+  <li>Universal hashing takes 52<i>n</i>+3 instructions. The size of <i>tab[]</i> is the maximum number of input bits. Values in <i>tab[]</i> are chosen at random.
+  <li>Zobrist hashing takes 10<i>n</i>+3 instructions. The size of <i>tab[][256]</i> is the maximum number of input bytes. Values of <i>tab[][256]</i> are chosen at random. Universal hashing can be implemented by a Zobrist hash with carefully chosen table values.
+  <li>MD4 takes 9.5<i>n</i>+230 instructions. MD4 is a hash designed originally for cryptography by Ron Rivest. It takes 420 instructions to hash a block of 64 aligned bytes. I combined that with my hash's method of putting unaligned bytes into registers, adding 3<i>n</i> instructions. MD4 is overkill for hash table lookup.
+</ul>
+
+<h3>Conclusion</h3>
+
+<p>A common weakness in hash functions is that a small set of input bits can cancel each other out. There is an efficient test to detect most such weaknesses, and many functions pass this test. The code I present here is for the fastest such function I could find. Hash functions without this weakness work equally well on all classes of keys.</p>
+
+<p>More information about the search I used to discover this hash function can be found at http://ourworld.compuserve.com/homepage/bob_jenkins/avalanch.htm.</p>
+
+<HR>
+<H4><a name="l1">Listing One</H4>
+
+<pre>typedef  unsigned long  int  ub4;   /* unsigned 4-byte quantities */typedef  unsigned       char ub1;   /* unsigned 1-byte quantities */
+<p></p>
+#define hashsize(n) ((ub4)1&lt;&lt;(n))
+#define hashmask(n) (hashsize(n)-1)
+<p></p>
+/* mix -- mix 3 32-bit values reversibly.
+For every delta with one or two bits set, and the deltas of all three
+  high bits or all three low bits, whether the original value of a,b,c
+  is almost all zero or is uniformly distributed,
+* If mix() is run forward or backward, at least 32 bits in a,b,c
+  have at least 1/4 probability of changing.
+* If mix() is run forward, every bit of c will change between 1/3 and
+  2/3 of the time.  (Well, 22/100 and 78/100 for some 2-bit deltas.)
+mix() takes 36 machine instructions, but only 18 cycles on a superscalar
+  machine (like a Pentium or a Sparc).  No faster mixer seems to work,
+  that's the result of my brute-force search.  There were about 2^68
+  hashes to choose from.  I only tested about a billion of those.
+*/
+#define mix(a,b,c) \
+{ \
+  a -= b; a -= c; a ^= (c&gt;&gt;13); \
+  b -= c; b -= a; b ^= (a&lt;&lt;8); \
+  c -= a; c -= b; c ^= (b&gt;&gt;13); \
+  a -= b; a -= c; a ^= (c&gt;&gt;12);  \
+  b -= c; b -= a; b ^= (a&lt;&lt;16); \
+  c -= a; c -= b; c ^= (b&gt;&gt;5); \
+  a -= b; a -= c; a ^= (c&gt;&gt;3);  \
+  b -= c; b -= a; b ^= (a&lt;&lt;10); \
+  c -= a; c -= b; c ^= (b&gt;&gt;15); \
+}
+<p></p>
+/* hash() -- hash a variable-length key into a 32-bit value
+  k       : the key (the unaligned variable-length array of bytes)
+  len     : the length of the key, counting by bytes
+  initval : can be any 4-byte value
+Returns a 32-bit value.  Every bit of the key affects every bit of
+the return value.  Every 1-bit and 2-bit delta achieves avalanche.
+About 6*len+35 instructions.
+The best hash table sizes are powers of 2.  There is no need to do
+mod a prime (mod is sooo slow!).  If you need less than 32 bits,
+use a bitmask.  For example, if you need only 10 bits, do
+  h = (h &amp; hashmask(10));
+In which case, the hash table should have hashsize(10) elements.
+If you are hashing n strings (ub1 **)k, do it like this:
+  for (i=0, h=0; i&lt;n; ++i) h = hash( k[i], len[i], h);
+By Bob Jenkins, 1996.  bob_jenkins@compuserve.com.  You may use this
+code any way you wish, private, educational, or commercial.  It's free.
+See http://ourworld.compuserve.com/homepages/bob_jenkins/evahash.htm
+Use for hash table lookup, or anything where one collision in 2^^32 is
+acceptable.  Do NOT use for cryptographic purposes.
+*/
+<p></p>
+ub4 hash( k, length, initval)
+register ub1 *k;        /* the key */
+register ub4  length;   /* the length of the key */
+register ub4  initval;  /* the previous hash, or an arbitrary value */
+{
+   register ub4 a,b,c,len;
+<p></p>
+   /* Set up the internal state */
+   len = length;
+   a = b = 0x9e3779b9;  /* the golden ratio; an arbitrary value */
+   c = initval;         /* the previous hash value */
+<p></p>
+   /*---------------------------------------- handle most of the key */
+   while (len &gt;= 12)
+   {
+      a += (k[0] +((ub4)k[1]&lt;&lt;8) +((ub4)k[2]&lt;&lt;16) +((ub4)k[3]&lt;&lt;24));
+      b += (k[4] +((ub4)k[5]&lt;&lt;8) +((ub4)k[6]&lt;&lt;16) +((ub4)k[7]&lt;&lt;24));
+      c += (k[8] +((ub4)k[9]&lt;&lt;8) +((ub4)k[10]&lt;&lt;16)+((ub4)k[11]&lt;&lt;24));
+      mix(a,b,c);
+      k += 12; len -= 12;
+   }
+   /*------------------------------------- handle the last 11 bytes */
+   c += length;
+   switch(len)              /* all the case statements fall through */
+   {
+   case 11: c+=((ub4)k[10]&lt;&lt;24);
+   case 10: c+=((ub4)k[9]&lt;&lt;16);
+   case 9 : c+=((ub4)k[8]&lt;&lt;8);
+      /* the first byte of c is reserved for the length */
+   case 8 : b+=((ub4)k[7]&lt;&lt;24);
+   case 7 : b+=((ub4)k[6]&lt;&lt;16);
+   case 6 : b+=((ub4)k[5]&lt;&lt;8);
+   case 5 : b+=k[4];
+   case 4 : a+=((ub4)k[3]&lt;&lt;24);
+   case 3 : a+=((ub4)k[2]&lt;&lt;16);
+   case 2 : a+=((ub4)k[1]&lt;&lt;8);
+   case 1 : a+=k[0];
+     /* case 0: nothing left to add */
+   }
+   mix(a,b,c);
+   /*-------------------------------------------- report the result */
+   return c;
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>/* Additive Hash */int additive(char *key, int len, int prime)
+{
+  int hash, i;
+  for (hash=len, i=0; i&lt;len; ++i) 
+    hash += key[i];
+  return (hash % prime);
+}
+<p></p>
+/* Rotating Hash */
+int rotating(char *key, int len, int prime)
+{
+  int hash, i;
+  for (hash=len, i=0; i&lt;len; ++i)
+    hash = (hash&lt;&lt;5)^(hash&gt;&gt;27)^key[i];
+  return (hash % prime);
+}
+<p></p>
+/* Pearson's Hash */
+char pearson(char *key, int len, char tab[256])
+{
+  char hash;
+  int  i;
+  for (hash=len, i=0; i&lt;len; ++i) 
+    hash=tab[hash^key[i]];
+  return (hash);
+}
+<p></p>
+/* CRC Hash and Generalized CRC Hash */
+int crc(char *key, int len, int mask, int tab[256])
+{
+  int hash, i;
+  for (hash=len, i=0; i&lt;len; ++i)
+    hash = (hash&lt;&lt;8)^tab[(hash&gt;&gt;24)^key[i]];
+  return (hash &amp; mask);
+}
+<p></p>
+/* Universal Hash */
+int universal(char *key, int len, int mask, int tab[MAXBITS])
+{
+  int hash, i;
+  for (hash=len, i=0; i&lt;(length&lt;&lt;3); i+=8)
+  {
+    register char k = key[i&gt;&gt;3];
+    if (k&amp;0x01) hash ^= tab[i+0];
+    if (k&amp;0x02) hash ^= tab[i+1];
+    if (k&amp;0x04) hash ^= tab[i+2];
+    if (k&amp;0x08) hash ^= tab[i+3];
+    if (k&amp;0x10) hash ^= tab[i+4];
+    if (k&amp;0x20) hash ^= tab[i+5];
+    if (k&amp;0x40) hash ^= tab[i+6];
+    if (k&amp;0x80) hash ^= tab[i+7];
+  }
+  return (hash &amp; mask);
+}
+<p></p>
+/* Zobrist Hash */
+int zobrist( char *key, int len, int mask, int tab[MAXBYTES][256])
+{
+  int hash, i;
+  for (hash=len, i=0; i&lt;len; ++i)
+    hash ^= tab[i][key[i]];
+  return (hash &amp; mask);
+}
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three </H4>
+
+<pre>/* Compute the Funnel-15 result for CRC */void hum()
+{
+  ub4 i,j,k,whum,x;
+  x=0x80000000;
+  whum=31;
+  for (i=0; i&lt;(15*8); ++i)
+  {
+    x = (x &amp; 0x80000000) ? ((x &lt;&lt; 1) ^ 0x04c11db7) : (x &lt;&lt; 1);
+    printf("%.8lx\n",x);
+    for (k=0, j=1; j; j=(j&lt;&lt;1)) if (j&amp;x&amp;0xff) ++k;
+    if (k&lt;whum)
+    {
+      printf("k is %ld\n",k);
+      whum=k;
+    }
+  }
+  printf("whum is %ld %ld %ld %ld\n",whum,x,k,j);
+}
+</pre>
+<p></p>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+
+<p><b>DDJ</b></p>
+
+<HR><I>Copyright &copy; 1997, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

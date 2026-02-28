@@ -1,0 +1,203 @@
+<HTML>   
+     <HEAD>
+<TITLE>April 2002/Debugging Memory Errors with Custom Allocators</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocapr.htm"></A><FONT COLOR="#FF0000">   Testing &amp; Debugging</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Debugging Memory Errors with Custom Allocators</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Cristian Vlasceanu</FONT></H3>
+
+<BLOCKQUOTE>
+<p>Allocators may be weird, but it's a Good Weird. With a little help from your operating system, they can even find memory access errors.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<p>&#147;Allocators are weird.&#148; &#151; Scott Meyers <a href="#1">[1]</a></p>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>Illegal memory accesses are a common source of program bugs. An illegal memory access that stops the application immediately is not very difficult to debug; it&#146;s merely a matter of examining the stack trace in the debugger. However, in everyday programming practice, some piece of code may overwrite memory that it does not own and cause a crash in a different module, in a completely unrelated execution path. When the cause and effect are separated by both time and space, memory corruption bugs are hard to find and fix.</p>
+<p>The technique described in this article helps reduce this separation by bringing the cause and effect of the illegal memory accesses <a href="#2">[2]</a> closer together. When the program crashes as soon as there is an incorrect memory access, debugging the problem becomes trivial. This idea is inspired by techniques used by a debugging tool called Electric Fence, &lt;ftp://ftp.perens.com/pub/ElectricFence/&gt;.</p>
+<p>With a little support from the operating system, one can write a memory allocator that can be used with STL containers and that provides methods for setting access rights for the memory it manages. Such an allocator allows the memory owner to make the memory read-only (or not accessible) to the outside world.</p>
+
+<H3><FONT COLOR="#000080">The Scenario</FONT></H3>
+
+<p>Imagine the following scenario. You have a class that has been debugged, tested, and working fine in production for the last couple of months. Then, a new feature is added to the project, and your class starts breaking in a very inconsistent and hard-to-reproduce way. You know that it&#146;s not your bug, but it&#146;s your problem. The stack traces from the crash all go back to your code, your class has corrupt data, and the testing department has assigned the bug to you.</p>
+
+<H3><FONT COLOR="#000080">The Strategy</FONT></H3>
+
+<p>What can the victim class do to protect itself? Imagine a class that could declare all of its memory as read-only to the rest of the world &#151; anyone trying to write to it would be caught instantly.</p>
+<p>One strategy for bringing the bug into the spotlight is to make the block of memory that the bug corrupts read-only. This will cause the program to receive a notification <a href="#3">[3]</a> as soon as an illegal access to the memory is attempted. This event can be caught in the debugger, and the source of the problem can be found by examining the stack. <a href="list1.htm">Listing 1</a> shows the skeleton of a class to which has been added an extra method for controlling the access rights to the memory it owns.</p>
+<p><B>Victim</B>&#146;s constructor can &#147;lock&#148; the memory as soon as the initialization is completed:</p>
+
+<pre>
+Victim::Victim() // : initializer list
+{
+    // some more initializations...
+    // ...
+    setMemoryAccessMode(readOnly);
+}
+</pre>
+
+<p>Then, all member functions that modify the internal data (all non-<B>const</B> methods) have to be slightly rewritten:</p>
+
+<pre>
+void Victim::setSomeData(/* ... */)
+{
+    setMemoryAccessMode(readWrite);
+
+    // modify the internal data
+    // ...
+
+    setMemoryAccessMode(readOnly);
+}
+</pre>
+
+<p>This way, the class&#146; implementer makes sure that no other code writes to the memory owned by the class instances. Any attempt to tamper with the memory will result in an immediate crash, and finding the culprit becomes just a matter of examining the call stack in your favorite debugger.</p>
+<p>In the example above, the &#147;useful&#148; code is sandwiched between <B>setMemoryAccessMode</B> calls. There is a slightly better way to ensure that no early return from the function leaves the memory in a read-write mode. You can use a helper class to implement the &#147;resource acquisition is initialization&#148; idiom <a href="#4">[4]</a>:</p>
+
+<pre>
+template&lt;class T&gt;
+class ReadWriteMemoryScope
+{
+public:
+    explicit ReadWriteMemoryScope(T&amp; ref) : ref_(ref)
+    { ref_.setMemoryAccess(readWrite); }
+    // automatically restore read-only mode when destructed
+    ~ReadWriteMemoryScope()
+    { ref_.setMemoryAccess(readOnly); }
+
+private:
+    T&amp; ref_;
+};
+</pre>
+
+<p>The template class works with any class implementing <B>setMemoryAccessMode</B>, and now the example setter method can be rewritten as follows:</p>
+
+<pre>
+void Victim::setSomeData(/* ... */)
+{
+    ReadWriteMemoryScope&lt;Victim&gt;(*this);
+
+    // modify the internal data don&#146;t worry about restoring 
+    // the read-only mode, it&#146;s all automatic
+}
+</pre>
+
+<H3><FONT COLOR="#000080">Contiguous vs. Non-Contiguous Memory</FONT></H3>
+
+<p>The strategy that I have presented is not difficult to implement when the data members are placed in memory in a contiguous fashion. Assume that this class has a C-style array and an STL vector as its internal data members. Also assume that the operating system provides a C-style function named <B>protect_memory</B> with the following prototype:</p>
+
+<pre>
+int protect_memory(const void* address,
+    size_t size, int mode_flags);
+</pre>
+
+<p>where <B>address</B> is a pointer to the beginning of the memory area for which the access mode is to be applied, <B>size</B> is the size of the memory area in bytes, and <B>mode_flags</B> is a bit-mask of flags that specifies the new access modes. Bear in mind, though, that this is just an imaginary function to help describe the mechanism in a platform-independent way <a href="#5">[5]</a>.</p>
+<p>The <B>Victim</B> class now looks like the code shown in <a href="list2.htm">Listing 2</a>. For the class in <a href="list2.htm">Listing 2</a>, the definition of the <B>setMemoryAccessMode</B> method may look something like <a href="list3.htm">Listing 3</a>. Both the C-style array and the vector in <a href="list3.htm">Listing 3</a> place their elements in memory contiguously.</p>
+<p>But what happens when your memory layout is not contiguous? What if your code uses, say, an STL map? A map is an associative container. It is usually implemented as a red-black binary tree <a href="#6">[6]</a> (a non-contiguous data structure). The nodes of the tree are not placed in memory in a contiguous manner (although some implementations may strive for grouping them as close as possible <a href="#7">[7]</a>).</p>
+<p>If you run the code in <a href="list4.htm">Listing 4</a> and look at the stack trace when it crashes, you will see that appears to be the problem is in the <B>printElem</B> call. In this simple example, it is obvious that <B>printElem</B> is not the culprit (hopefully not just because I named the other function <B>offender</B>).</p>
+<p>In real life situations, it is much harder to prove the innocence of a function such as <B>printElem</B> and bring the real offender to justice. You can try using the strategy that I proposed earlier: make all the memory owned by the map in <a href="list4.htm">Listing 4</a> read-only after initializing it. You&#146;ll soon find that it is hard, if not impossible, to do. You don&#146;t know (and shouldn&#146;t care about) how the STL vendor has implemented the map. You don&#146;t know where the memory blocks are allocated. Do they store just your data, or some other internal information?</p>
+<p>In the earlier example shown in <a href="list2.htm">Listings 2</a> and <a href="list3.htm">3</a>, <B>vector</B> was much easier to deal with, since you can safely assume the elements are contiguous.</p>
+<p>This brings me to the following point. For STL containers other than <B>vector</B>, you need a custom allocator to keep track of (and make read-only) the memory.</p>
+<p>Fortunately, STL containers can be parameterized by how they obtain the raw memory they need. STL containers accept an allocator class in their list of template arguments. An allocator is an abstraction that basically encapsulates the methods for dynamically obtaining and releasing memory. You can write a custom allocator that keeps track of the memory blocks its &#147;client&#148; STL container uses and that provides the means for making all these blocks read-only with just one call.</p>
+
+<H3><FONT COLOR="#000080">Implementation</FONT></H3>
+
+<p>In order to make a block of dynamically allocated memory read-only, you will use the <B>VirtualProtect</B> function on Windows and <B>mprotect</B> on Unix. Both have signatures that resemble the <B>protect_memory</B> pseudo-system call that I used earlier. Please consult MSDN or your manual pages for more details.</p>
+<p>The memory allocation mechanisms are implemented by the stand-alone functions <B>allocate</B> and <B>deallocate</B>. While the first has a signature that reminds us of the standard <B>malloc</B>, the latter differs from <B>free</B> by taking the size of the memory to be deallocated in addition to the memory address.</p>
+<p>If you wonder why you have to write your own functions, the answer is simple. This implementation makes sure that the dynamically allocated memory satisfies the requirements imposed by the system-specific incarnation of <B>protect_memory</B>.</p>
+<p>On Windows, the <B>VirtualAlloc</B> and <B>VirtualFree</B> API calls are used for allocation, since, according to the documentation, <B>VirtualProtect</B> requires that all pages in the region to be locked must be within the same region allocated by calling <B>VirtualAlloc</B> or <B>VirtualAllocEx</B>, using <B>MEM_RESERVE</B>.</p>
+<p>On Linux, <B>mprotect</B>, which you will use to modify the memory access mode, requires the memory to be page-aligned. In this case, <B>allocate</B> calls <B>pvalloc</B>, which allocates memory aligned to a page boundary.</p>
+<p>Another Unix-specific way to allocate memory (not shown here but available for download in the companion code at &lt;www.cuj.com/code&gt;) is via <B>mmap</B> system calls. In the companion code, this implementation can be turned on by defining the <B>USE_MMAP</B> preprocessor macro. The stripped-down implementation looks essentially like <a href="list5.htm">Listing 5</a>.</p>
+<p>The allocator also needs a memory manager class that keeps track of the allocated blocks so that you can change their access mode in the application code. The implementation of the memory manager class does not need to be exposed to the clients. You should be able to change it without affecting the clients of our debug allocator. You should also be able to switch between different implementations depending on the application&#146;s threading model.</p>
+<p>For these reasons, the public interface of the memory manager is presented in <B>allocator.h</B> as an abstract class, but the actual implementation is buried in <B>allocator.cpp</B>. (Both files available at &lt;www.cuj.com/code&gt;.)</p>
+<p>The memory manager class sports functionality for registering and unregistering memory blocks (<B>insert</B> and <B>erase</B>). The allocator registers the allocated chunks with the memory manager after calling <B>allocate</B> and deregisters them after calling <B>deallocate</B>. This way, the memory manager knows the addresses and lengths of the currently allocated memory blocks. Its <B>setAccessMethod</B> can be invoked for modifying the access rights for all the blocks that have been registered (see <a href="list6.htm">Listing 6</a>).</p>
+<p>The <B>allocator</B> class uses <B>allocate</B> and <B>deallocate</B> to implement the homonym methods, as shown in <a href="list7.htm">Listing 7</a>. References <a href="#1">[1]</a> and <a href="#6">[6]</a> are good places to start if you want to understand all the scaffolding code needed to implement a custom allocator.</p>
+
+<H3><FONT COLOR="#000080">Usage Example</FONT></H3>
+
+<p>You can now rewrite the code in <a href="list4.htm">Listing 4</a> with just a few lines and find the culprit for the memory corruption. You change the type definition from:</p>
+
+<pre>
+typedef map&lt;int, string&gt; MapType;
+</pre>
+
+<p>to:</p>
+
+<pre>
+typedef map&lt;int, string, less&lt;int&gt;,
+    Allocator&lt;pair&lt;const int, string&gt; &gt; &gt; MapType;
+</pre>
+
+<p>In the main function, you will embed the code that uses the map in a read-only scope (see <B>allocator.h</B> available at &lt;www.cuj.com/code&gt; for the read-only scope class definition):</p>
+
+<pre>
+// ...
+// initialize map elements
+// ...
+    {
+        BaseAllocator::MemReadOnlyScope readOnlyScope;
+
+        offender(m.find(1)-&gt;second.getAddr());
+        printElem(m, 1);
+    }
+</pre>
+
+<p>Now if you recompile, run, and inspect the stack when the code crashes, you can clearly see the problem.</p>
+<p>This is the output from running the program under the GNU debugger:</p>
+
+<pre>
+(gdb) run
+Starting program:
+/home/cristiv/Projects/DebugAllocator/g++-Linux/test_allocator
+allocated 24 bytes at 0x8051000
+allocated 24 bytes at 0x8055000
+allocated 24 bytes at 0x8053000
+
+Program received signal SIGSEGV, Segmentation fault.
+0x40116b95 in memcpy () from /lib/i686/libc.so.6
+(gdb) backtrace
+#0  0x40116b95 in memcpy () from /lib/i686/libc.so.6
+#1  0x0804aec1 in offender (ptr=0x8055014) at ../Source/main.cpp:28
+#2  0x0804b0b6 in main () at ../Source/main.cpp:69
+#3  0x400ab177 in __libc_start_main (main=0x804af7c &lt;main&gt;, argc=1,
+ubp_av=0xbffff9fc, init=0x8049f74 &lt;_init&gt;,
+    fini=0x804e40c &lt;_fini&gt;, rtld_fini=0x4000e184 &lt;_dl_fini&gt;,
+stack_end=0xbffff9ec) at ../sysdeps/generic/libc-start.c:129
+(gdb)
+</pre>
+
+<H3><FONT COLOR="#000080">Caveats</FONT></H3>
+
+<p>First, the allocator presented in <B>allocator.cpp</B> (see the companion code) locks/unlocks the memory globally and not on a per-class basis. This design decision was based on the fact that I wanted to keep the implementation simple. The companion code (available at &lt;www.cuj.com/code&gt;) includes support for multithreaded applications (for Linux pthreads and Windows).</p>
+<p>Second, you must be aware that the custom allocator may change the behavior of the bug that you are trying to unveil. On Unix platforms, for example, the <B>mprotect</B> call works only if the memory is page-aligned. To allocate memory aligned to a page boundary, you can use (as shown in the companion code) either the <B>mmap</B> or <B>pvalloc</B> system calls. A side effect may be that the memory-corrupting bug magically disappears or manifests itself in a different way.</p>
+
+<H3><FONT COLOR="#000080">Conclusion</FONT></H3>
+
+<p>Custom allocators can be used for debugging memory corruption problems by controlling memory access rights.</p>
+<p>The companion code for this article contains a proposed implementation that has been developed on Windows 2000 and Linux, using Visual C++ 6.0, CodeWarrior 6.0, and g++ versions 2.95.2 and 3.0.1.</p>
+
+<H3><FONT COLOR="#000080">Acknowledgements</FONT></H3>
+
+<p>Thanks to Andrei Alexandrescu, Bob Archer, Ionut Burete, Chris Dyer, and Mark Riggins for taking the time to review this article, and for all of their suggestions and constructive criticism.</p>
+
+<H3><FONT COLOR="#000080">Notes and References</FONT></H3>
+
+<p><a name="1"></a>[1]  Scott Meyers. <I>Effective STL: 50 Specific Ways to Improve Your Use of the Standard Template Library</I> (Addison-Wesley, 2001), Item 10, page 48.</p>
+<p><a name="2"></a>[2]  When a program writes past the end of a buffer, it is called a memory overrun. When it tries to write before the beginning of a buffer (for example through an index that incorrectly assumes negative values), it is called a memory under run.</p>
+<p><a name="3"></a>[3]  On POSIX-compliant systems, the notification comes as a &#147;segmentation fault&#148; signal. Under Windows, it will take the shape of an &#147;Access Violation.&#148;</p>
+<p><a name="4"></a>[4]  &#147;Bjarne Stroustrup&#146;s C++ Glossary,&#148; &lt;www.research.att.com/~bs/glossary.html&gt;.</p>
+<p><a name="5"></a>[5]  In order to be able to implement the <B>setMemoryAccessMode method</B>, there is some support needed from the operation system. The good news is such support exists (see the section, &#147;Implementation&#148;). Win32 has <B>VirtualProtect</B> and <B>VirtualProtectEx</B>. Unix has <B>mprotect</B>. I will explain later how these system APIs are used to implement memory allocation.</p>
+<p><a name="6"></a>[6]  Nicolai M. Josuttis. <I>The C++ Standard Library: A Tutorial and Reference</I>, (Addison-Wesley, 1999).</p>
+<p><a name="7"></a>[7]  Scott Meyers. <I>Effective STL 50: Specific Ways to Improve Your Use of the Standard Template Library</I> (Addison-Wesley, 2001) Item 23, page 103.</p>
+<p><a name="8"></a>[8]  For Unix systems, please consult your manual pages for the <B>mprotect</B> system call.</p>
+
+<p><i><B>Cristian Vlasceanu</B> graduated from the &#147;Politehnica&#148; University of Bucharest in 1994. He is a software engineer with Amazon.com in Seattle, where he uses C++ for modeling and coding business logic. Previously, he worked for RealNetworks, where he developed code for interfacing portable players such as the Nomad Jukebox with RealNetworks software. His interests include network programming, generic algorithms, and classical guitar. He can be reached at <B>cristiv@amazon.com</B>.</i></p>
+
+<h4><a href="../../../source/2002/apr02/vlascean.zip"></a></h4>
+</blockquote></body></html>

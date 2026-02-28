@@ -1,0 +1,267 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v10, i11: Oracle, Hot Backups, and Redo Logs</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a11_s1.htm">Sidebar 1</a></span></td>
+		<td><a href="../../../../source/SA/2001/nov2001.tar"><b class=codeListing>nov2001.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <H1><img src="../../resource/backup.gif" width="150" height="150" align="right">Oracle, 
+              Hot Backups, and Redo Logs</h1>
+            <p> <i>W. Curtis Preston</i>
+            <p> In September's edition of lost+found, I explained the different 
+              parts of Oracle architecture, and especially how they relate to 
+              backup. This month's column centers around two very important 
+              issues: how a hot backup of an Oracle database actually works, and 
+              how you can manage your archived redo logs. If some of the terms 
+              used in this article seem new to you, the September column should 
+              help define them. (<b>http://www.sysadminmag.com/articles/2001/0109/0109g/0109g.htm</b>)
+            <p> <b>Inside a Hot Backup</b>
+            <p> What happens during a hot backup is widely misunderstood. Many 
+              people believe that while a tablespace is in backup mode, the datafiles 
+              within that tablespace are not written to. They believe that all 
+              changes to these files are kept in the redologs until the tablespace 
+              is taken out of backup mode, at which point all changes are applied 
+              to the datafiles just as they are during a media recovery. Although 
+              this explanation is easier to understand (and swallow) than how 
+              things really work, it is absolutely not how hot backups work in 
+              Oracle.
+            <p> A common reaction to this statement is a very loud "What?" 
+              followed by crossed arms and a really stern look. (I reacted the 
+              same way the first time I heard it.) "How could I safely back 
+              up these files if they are changing as I'm backing them up?" 
+              Don't worry -- Oracle has it all under control. Remember 
+              that every Oracle datafile has an SCN that is changed every time 
+              an update is made to the file. Also remember that every time Oracle 
+              makes a change to a datafile, it records the vector of that change 
+              in the redolog. Both of these behaviors change during hot backups. 
+              When a tablespace is put into backup mode, the following three things 
+              happen:
+            <p> 
+            <p> 1. Oracle checkpoints the tablespace, flushing all changes from 
+              shared memory to disk.
+            <p> 2. The SCN markers for each datafile in that tablespace are "frozen" 
+              at their current values. Even though further updates will be sent 
+              to the datafiles, the SCN markers will not be updated until the 
+              tablespace is taken out of backup mode.
+            <p> 3. Oracle switches to logging full images of changed database 
+              blocks to the redologs. Instead of recording how it changed a particular 
+              block (the change vector), it will log the entire image of the block 
+              after the change. This is why the redologs grow at a much faster 
+              rate while hot backups are going on.
+            <p> 
+            <p> After this happens, your backup program works happily through 
+              this datafile, backing it up block by block. Since the file is being 
+              updated as you are reading it, it may read blocks just before they're 
+              changed, after they're changed, or even while they're 
+              changing. Suppose that your filesystem block size is 4 KB, and Oracle's 
+              block size is 8 KB. Your backup program will be reading in increments 
+              of 4 KB. It could back up the first 4 KB of an 8-KB Oracle data 
+              block before a change is made to that block, then back up the last 
+              4 KB of that file after a change has been made. This results in 
+              what Oracle calls a "split block". However, when your 
+              backup program reaches the point of the datafile that contains the 
+              SCN, it will back up that block the way it looked when the backup 
+              began, since that block is frozen. Once you take the tablespace 
+              out of backup mode, the SCN marker is advanced to the current value, 
+              and Oracle switches back to logging change vectors instead of full 
+              images of changed blocks.
+            <p> How does Oracle straighten this out during media recovery? It's 
+              actually very simple. You use your backup program to restore the 
+              datafile. When you attempt to start the instance, Oracle looks at 
+              the datafile and sees an old SCN value. Actually, it sees the value 
+              that the SCN marker had before the hot backup began. When you enter 
+              recover datafile, it begins to apply redo against this datafile. 
+              Since the redologs contain a complete image of every block that 
+              changed during your backup, it can rebuild this file to a consistent 
+              state, regardless of when you backed up a particular block of data.
+            <p> Let's create a table called tapes in the tablespace test, 
+              insert the value "DLT" into it, and force a checkpoint:
+            <p> 
+            <pre>
+SQL&gt; create table tapes (name varchar2(32)) tablespace test;
+Table created
+SQL&gt; insert into tapes values ('DLT');
+1 row created
+SQL&gt; commit;
+Commit complete.
+SQL&gt; alter system checkpoint;
+System altered.
+</pre>
+            Now we ask Oracle what block number contains the new value:
+            <p> 
+            <pre>
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) blk, name from tapes;
+    BLK NAME
+------- ----------------
+      3 DLT
+</pre>
+            The value "DLT" is recorded in the third data block. Allowing 
+            nine blocks for the datafile headers, we can read the third block 
+            of data with <b>dd</b> and run <b>strings</b> on it to actually see 
+            that the value is there:
+            <p> 
+            <pre>
+$ dd if=/db/Oracle/a/oradata/crash/test01.dbf ibs=8192 skip=11 count=1|strings
+1+0 records in
+16+0 records out
+DLT
+</pre>
+            Now we place the tablespace in hot-backup mode:
+            <p> 
+            <pre>
+SQL&gt; alter tablespace test begin backup ;
+Tablespace altered.
+</pre>
+            Now we update the table, commit the update, and force a global checkpoint 
+            on the database:
+            <p> 
+            <pre>
+SQL&gt; update tapes set name = 'AIT';
+1 row updated
+SQL&gt; commit;
+Commit complete.
+SQL&gt; alter system checkpoint;
+System altered.
+</pre>
+            Now we extract the same block of data to show the new value was actually 
+            written to disk:
+            <p> 
+            <pre>
+$ dd if=/db/Oracle/a/oradata/crash/test01.dbf ibs=8192 skip=11 count=1|strings
+1+0 records in
+16+0 records out
+DLT,
+AIT
+</pre>
+            We now can take the tablespace out of backup mode:
+            <p> 
+            <pre>
+SQL&gt; alter tablespace test end backup;
+</pre>
+            This test proves that datafiles are indeed being written to during 
+            hot backups.
+            <p> <b>Managing the Archived Redologs</b>
+            <p> I am often asked the question, "Should I have archiving turned 
+              on?" Yes, yes, a thousand times yes! When in doubt, archive 
+              it out! Here's what is possible only if archiving is enabled:
+            <p> 
+            <p> 
+            <ul>
+              <li> Recover up to the point of failure. 
+              <li> Recover from a backup that is a month or more old -- if 
+                all the archived redo_ logs since then are available. 
+              <li> Perform a complete backup of the database without even shutting 
+                it down.
+            </ul>
+            <p> The existence of archive logs does all this without adding significant 
+              overhead to the entire process. The only difference between having 
+              archiving on or off is whether or not Oracle copies the current 
+              redolog out to disk when it "switches" from one redolog 
+              to the next, because even with archiving off, it still logs every 
+              transaction in the online redologs. This means that the only overhead 
+              associated with archiving is the overhead associated with copying 
+              the online file to the archive location, which is why there may 
+              be only a 1-3 percent performance hit in an environment with many 
+              transactions (if there is one at all). Feel free to experiment, 
+              but it is very difficult to justify turning off archiving on any 
+              production database. (See sidebar.)
+            <p> In my opinion, there are only two environments in which turning 
+              off archiving is acceptable. The first is an environment in which 
+              the data does not matter. What type of environment would that be? 
+              The only one is a true test environment that is using fake data 
+              or data restored from production volumes. No structure changes are 
+              being made to this database, and any changes made to the data will 
+              be discarded. This database does not need archiving and probably 
+              doesn't even need to be backed up at all. If you're doing 
+              any type of benchmarking of a database that will go into production, 
+              backup and archiving should be running. The test will be more realistic, 
+              even if all the archive logs are deleted as soon as they are made.
+            <p> Development databases do not fall into this category because, 
+              although the data in a development database may be unimportant, 
+              the structure of the database often is highly important. If archiving 
+              is off, a DBA cannot restore any development work that he has done 
+              since the last backup. That creates the opportunity to lose hours' 
+              or even days' worth of work, just so a development database 
+              can be 1-3 percent faster. That is a big risk for such a small gain.
+            <p> The second type of database that doesn't need archive logs 
+              is a completely read-only database or a "partially read-only" 
+              database where an archive log restore would be slower than a reload 
+              of the original data. The emergence of the data-warehouse has created 
+              this scenario. There are now some databases that have completely 
+              read-only tablespaces and never have data loaded into them. This 
+              type of database can be backed up once and then left alone until 
+              it changes again. A partially read-only database is one that stays 
+              read only for long periods of time and is updated by a batch process 
+              that runs nightly, weekly, or even as needed. The idea is that instead 
+              of saving hundreds of redologs, the database would be restored from 
+              a backup that was taken before the load. The DBA then could redo 
+              the load.
+            <p> There are two choices in this scenario. The first is to turn off 
+              archiving, making sure that there is a good cold backup after each 
+              database load. If the load aborted or a disk crashed after the load 
+              but before the next backup, you could simply load the older backup 
+              and then redo the load. The cold backup will cost some downtime, 
+              but having archiving off will speed up the loads somewhat. The other 
+              option would be to turn on archiving. That allows taking a hot backup 
+              anytime and creates the option of using the redologs to reload the 
+              data instead of doing an actual data reload. This method allows 
+              for greater backup flexibility. However, depending on the database 
+              and the type of data, an archive log restore could take longer than 
+              a reload of the original data, especially if it is a multithreaded 
+              load. It is a tradeoff of performance for recoverability. Test both 
+              ways to see which one works best for you.
+            <p> <b>Summary</b>
+            <p> For those of you with commercial backup and recovery products 
+              that have been complaining that your Oracle database files are changing 
+              during your hot backup, you now know why. I hope you get some value 
+              out of the discussion about the importance of archiving, and managing 
+              your archived redo logs.
+            <p> The last two editions of lost+found have been excerpts from Chapter 
+              15 of <i>Unix Backup &amp; Recovery</i>.
+            <p><i> W. Curtis Preston has specialized in storage for over eight 
+              years, and has designed and implemented storage systems for several 
+              Fortune 100 companies. He is the owner of Storage Designs, the Webmaster 
+              of Backup Central (</i><b>http://www.backupcentral.com</b><i>), 
+              and the author of two books on storage. He may be reached at </i><b>curtis@backupcentral.com</b><i>. 
+              (Portions of some articles may be excerpted from Curtis's books.)</i>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

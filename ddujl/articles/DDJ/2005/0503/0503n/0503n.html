@@ -1,0 +1,273 @@
+
+<html>
+<head>
+<title>March, 2005: 64-Bit Computing &amp; DSPs</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>64-Bit Computing &amp; DSPs</h1>
+<p><i>Dr. Dobb's Journal</i> March, 2005</p>
+<h2>Writing efficient  code for resource-constrained platforms</h2>
+
+
+<h3>By Shehrzad Qureshi</h3>
+
+
+<I>Shehrzad is an engineer at Labcyte Inc. Portions of this article were adapted from his forthcoming book Embedded Image Processing on the C6000 DSP (Springer, 2005). He can be contacted at shehrzad_q@ hotmail.com.</I>
+
+<hr>
+
+
+
+<a href="0503ns1.html">Autonomous Threshold Detection</a><br>
+
+
+<hr>
+
+
+
+
+
+<p>Writing efficient code for memory-  and resource-constrained embedded platforms is difficult, and the entire process is compounded when dealing with data-intensive computations such as signal- and image-processing algorithms. Digital Signal Processors (DSPs) are less general-purpose than familiar desktop CPU architectures&#151;IA32, PowerPC, AMD, and the like. However, DSPs are architected to excel at the computations typically found in signal- and image-processing applications. In this article, I examine how 64-bit architectural features of the Texas Instruments C6416, a fixed-point member of the TMS320C6000 (C6x) family of DSPs, engender significant performance boosts in common operations used in image processing. The C6416 is an updated and faster version of the older C62x fixed-point DSPs, and the C6x family also includes the floating-point C67x series. Specifically, I illustrate how packed data-processing optimizations that take advantage of double-word-wide memory accesses can be incorporated into C code using Code Composer Studio compiler intrinsics to enhance the performance of critical loops. Code Composer Studio (CCStudio) is TI's flagship IDE and in many respects looks and feels like Microsoft's Visual Studio. I've compiled all of the code accompanying this article using Version 2.20 of CCStudio, and tested it on a C6416 DSK (DSP Starter Kit).  </p>
+
+<p>My approach to DSP code optimization involves a series of stages:</p>
+
+<ol>
+  <li>Development of a MATLAB prototype to gain an in-depth understanding of the algorithm and underlying mathematics at a high level.</li>
+  <li>Implement a straightforward reference C/C++ implementation of the algorithm in Visual Studio. This is usually a MATLAB-to-C/C++ port that generates the same output as Step 1. Because the C6416 is a fixed-point processor, I generally convert any algorithms from floating point to fixed point here (see "Fixed-Point Arithmetic for Embedded Systems," by Jean Labrosse, <i>C/C++ Users Journal</i>, February 1998, for a discussion of fixed-point representations of numbers).</li>
+  <li>Get the code running on the DSP platform. If performance is unsatisfactory, begin the optimization process through techniques such as reducing the memory footprint and packed data-processing techniques via specialized compiler intrinsics.</li>
+  <li>After identifying bottlenecks, write gating loops in so-called "linear assembly" or hand-optimized native C6x assembly.</li>
+</ol>
+
+
+
+<p>Obviously, you must get to at least Step 3 during development of a DSP-based embedded system. It is essential to profile the code at this point to garner whether the processing meets the stated time requirements (hopefully such requirements are available). After all, if the code is fast enough as is, there is not much to be gained from proceeding to Steps 3 or 4, save for your own personal edification. Experimentation with the compiler and understanding its capabilities must be stressed&#151;it is easier to fiddle with the compiler optimizations than it is to code in assembly. The TI compiler has a "compiler directed feedback" feature that emits information on utilization of the processor's functional units, software pipelining, and other useful information that may point one towards which compiler optimizations may make sense in this context (see "Code Efficiency &amp; Compiler-Directed Feedback," by Jackie Brenner and Markus Levy, <i>DDJ</i>, December 2003, for additional information).</p>
+<h3>Using Compiler Intrinsics </h3>
+
+<p>Intrinsics provide you with access to the hardware while letting you remain within the friendly confines of the C programming environment. They directly translate into assembly instructions for processor-specific features that standard ANSI C cannot support, and are inlined so that there is no function call overhead. A simple example is the <i>_abs</i> intrinsic. The C6x instruction set includes an instruction that computes the absolute value of a register in a single clock cycle, which is going to be more efficient than a multicycle C ternary statement that includes a branch statement; for instance:</p>
+
+<blockquote>
+int absolute_value = (a&gt;0) ? a : -a;<br>
+
+</blockquote>
+
+<p>In CCStudio, this C statement can be replaced by:</p>
+
+<blockquote>
+int absolute_value = _abs(a);<br>
+
+</blockquote>
+
+<p>All C6x intrinsics begin with a leading underscore. Another basic operation encountered in image-processing algorithms is saturated arithmetic, whereby the result of an operation of two pixels is clamped to the maximum or minimum value of a predefined range. Rather than code a multicycle series of C statements that implement the saturated add, you should use the <i>_sadd</i> intrinsic (see Examples 2-6 in <i>TMS320C6000 Programmer's Guide</i>, literature number SPRU198g). Some of the C6x instructions are quite specialized, and many (not all) C6x assembly instructions have intrinsic equivalents&#151;a full list is enumerated in the programmer's guide to the C6x. For example, on the floating-point C67x DSPs, there are instructions for single- and double-precision reciprocal approximations&#151;<i>RCPSP</i> and <i>RCPDP</i>, respectively. These instructions, and their corresponding compilers intrinsics <i>(_rcpdp </i>and<i> _rcpsp)</i> can be used to either seed a Newton-Rhapson iterative procedure to increase the accuracy of the reciprocal or perhaps as the reciprocal itself, as accuracy requirements warrant. However, my focus here is not on the use of intrinsics for specialized operations, but rather on using intrinsics within image-processing loops for vectorizing code to use word-wide (32-bit), or preferably, double word-wide (64-bit) optimizations that operate on packed data.</p>
+<h3>Packed Data Processing</h3>
+
+<p>Image-processing algorithms are notorious memory hogs, as it takes large amounts of memory to store image pixels. While this may not be of huge concern to nonembedded developers who have oodles of available RAM, embedded developers do not have the luxury of being so cavalier. Hence, the first order of business in the optimization of image-processing algorithms is to make maximum utilization of fast on-chip memory. This often entails splitting the image into pieces and paging these pieces from external memory to on-chip RAM, where there is a reduced memory-access latency. </p>
+
+<p>Once the processing completes, the next order of business is to go the other way&#151;page the processed pixels back out to external memory. Equally salient to image processing and signal processing in general is this idea of "packed data processing," where the same instruction applies the identical operation on all elements in a data stream. This general concept is known as SIMD (Single Instruction, Multiple Data) processing in computer architecture circles, and is powerful because, more often than not, the operations acting on the data stream are independent of one another, leading to code-generation techniques that exploit this inherent parallelism. With the right optimization, code size is reduced and processor throughput fully maximized. As you might imagine, Texas Instruments is not the only chip developer to incorporate such techniques into its processor cores. Intel brought to market similar SIMD IA-32 instruction set extensions with MMX, SSE, SSE2, and SSE3, as did AMD with 3DNow!. In a nutshell, packed data processing boils down to storing multiple elements in a single register, then using specialized processor instructions to operate on this data. Here, I use compiler intrinsics to access these processor instructions from within C code.</p>
+
+<p>For example, consider the sum of products between two vectors in <a name="re1"></a><a href="0503ne1.html">Example 1</a>, which is critical in signal processing. This operation appears in various forms, a prominent example being the convolution of two sequences. Suppose <i>h</i> and <i>x</i> are 16-bit integer quantities, perhaps representing fixed-point numbers in Q15 format. Then a high-level description of what the processor is doing within a loop kernel that implements this vector product sum would look like <a name="re2"></a><a href="0503ne2.html">Example 2</a>. Since C6x registers are 32 bits wide, by reading the data in 16-bit (half-word) chunks at a time, you waste half of the storage capacity of registers 1 and 2. By packing the data to store multiple elements of the stream within registers 1 and 2, you can reduce the load pressure on this loop, as illustrated in the pseudocode in <a name="re3"></a><a href="0503ne3.html">Example 3</a>. </p>
+
+<p>Actually, <a name="re3"></a><a href="0503ne3.html">Example 3</a> is an embodiment of two optimizations that go hand-in-hand&#151;packed data and loop unrolling. You alleviate the load pressure in the loop kernel by reducing the number of instructions using word-wide data access; for example, replacing what would be <i>LDH</i> (Load Half-Word) instructions in the first loop with <i>LDW</i> (Load Word) instructions in the second loop, and subsequently packing two 16-bit quantities into the 32-bit registers. The same optimization holds (and is even more advantageous) if data elements in the stream are 8-bit quantities; then, using the just mentioned example, each load would place four data elements in each register and operate on them accordingly. This strategy replaces four <i>LDB</i> (Load Byte) instructions with a single <i>LDW</i> instruction. Of course, specifying these sorts of loads and stores is not feasible in strict and portable ANSI C, and it is a risky proposition to completely rely on the compiler's code optimization engine to generate code that takes full advantage of SIMD instructions operating on packed data. This is where intrinsics come in.</p>
+
+<p>All C6x DSPs have instructions and corresponding intrinsics that let you operate on 16-bit data stored in the high and low parts of a 32-bit register, as illustrated in <a name="re2"></a><a href="0503ne2.html">Example 2</a>. The C64x and C67x offer double word-wide access via the <i>LDDW</i> (Load Double Word) and <i>STDW</i> (Store Double Word) instructions and corresponding intrinsics. In this case, 64 bits worth of data are read into the register file, with elements packed into a pair of registers. A requirement is that arrays must now be aligned on certain boundaries to use these instructions. Arrays have to be word-aligned to use <i>LDW/STW</i>, and aligned on a double-word boundary to use <i>LDDW/STDW</i>. The C64x DSP builds upon this architectural feature by allowing nonaligned accesses of memory via various instructions such as <i>LDNW/STNW</i> (load/store nonaligned word) and <i>LDNDW/STNDW </i>(load/store nonaligned double word), which correspond to the intrinsics <i>_mem4</i> and <i>_memd8</i>, respectively. These nonaligned instructions constitute a significant advantage, especially in certain image- and video-processing scenarios when algorithms march along in 8-bit pixel (byte) boundaries. Without such instructions, you are locked out of the packed data optimization due to restrictions imposed by 32-bit or 64-bit alignment boundaries. </p>
+
+<p>One of the simplest examples of using intrinsics to help guide the compiler to take advantage of packed data is the implementation of a function that zeros out an array. This function is similar to the Standard C Library <i>memset</i> function; see <a name="rl1"></a><a href="#l1">Listing One</a>. This function only works with arrays aligned on a double-word boundary, where count is a multiple of 8 and greater than or equal to 32. However, given these restrictions, this function offers advantages over the general-purpose <i>memset</i> function, which by necessity must be more conservative than <i>memclear</i> to maintain generality (see <a name="rl2"></a><a href="#l2">Listing Two</a>). The <i>_nassert</i> intrinsic in <a name="rl1"></a><a href="#l1">Listing One</a> is an example of an intrinsic that does not generate any code, rather it asserts to the compiler that the address of the pointer passed into the function is divisible by 8; in other words, aligned on a double-word boundary. To declare an aligned array use the <i>DATA_ALIGN</i> pragma (see <a name="rl3"></a><a href="#l3">Listing Three</a>). The <i>MUST_ITERATE</i> pragma directive is a means of conveying information to the compiler regarding the number of times a loop iterates, commonly referred to as the "loop trip count." Through this directive, you can specify the exact number of times a loop executes, if the trip count is a multiple of some number, the minimum number of iterations through the loop, and so on. This pragma should be used wherever possible&#151;especially when the minimum trip count is known because this information lets the compiler be more aggressive when applying loop transformations. The form of the <i>MUST_ITERATE</i> pragma used in <i>memclear</i> specifies that the loop is guaranteed to execute at least 32 times, and armed with this information the compiler can proceed to unroll the loop. Loop unrolling is a code optimization technique where the kernel of a loop is expanded by some factor X&#151;and the loop stopping condition adjusted to N/X&#151;with the intent of reducing the number of branches. By reducing the branch overhead, the efficiency of the loop is increased, and it also allows for better scheduling of instructions contained within the loop kernel.</p>
+
+<p>By stipulating the minimum number of iterations through the <i>memclear</i> loop, the input pointer casted to a long (64-bit) type, and guaranteeing alignment of <i>lptr</i> to a 64-bit boundary via <i>_nassert</i>, the compiler is given numerous pieces of information so that it can generate a loop that runs faster than an equivalent <i>memset</i>-like function. The compiler is now free to use the <i>LDDW/STDW</i> (load/store aligned double word) instructions to initialize the 64-bit number pointed to by <i>lptr</i>. The more conservative code compiles to assembly language using <i>LDB/STB</i> (load/store byte) instructions to initialize the 8-bit values pointed to by <i>ptr</i>, and a series of these instructions is not as efficient as a series of <i>LDDW/STDW</i> instructions due to the lessened throughput of the data flowing through the DSP. <a name="rf1"></a><a href="0503nf1.html">Figure 1</a> highlights the difference in operation between <i>memclear</i> and <i>memset</i> (as defined in <a name="rl1"></a><a href="#l1">Listing One</a>). In a conservative, but more general, implementation, successive <i>LDB/STB</i> instructions are used for accessing and storing array elements. In a single iteration of <i>memclear</i>, each <i>LDDW</i> instruction loads 64 bits of data into a register pair. The assembly code would use two <i>MVK</i> (move constant) instructions to zero out both registers each time through the loop, then <i>STDW</i> to send the packed data back into the storage array pointed to by <i>lptr</i>. </p>
+<h3>Optimization of the  Center-of-Mass Calculation</h3>
+
+<p>The "isodata" clustering algorithm for automatic threshold detection (see the text box "Autonomous Threshold Detection") is used in image segmentation. This algorithm calls for computing the center-of-mass of two portions of an image histogram, where the histogram is split by the current threshold. The isodata algorithm also entails repeatedly performing these center-of-mass computations, as the iterative procedure continues until a "good" threshold value is found. The center-of-mass calculation is illustrated graphically in <a name="rf2"></a><a href="0503nf2.html">Figure 2</a>. The threshold <i>T=150</i> bifurcates the histogram, with c<sub>1</sub> the center-of-mass of the left portion of histogram and c<sub>2</sub> the center-of-mass to the right of <i>T</i>. The mechanics of this algorithm can be transformed so that you can employ the packed data-processing optimization via intrinsic functions to improve the performance of the algorithm. Furthermore, this optimization is an example where the nonaligned double-word instructions present only in the C64x series lets you use 64-bit memory accesses where you otherwise would not be able to.</p>
+
+<p>A description of the procedure for computing the center-of-mass of a region of the histogram is simple enough. Referring to <a name="rf2"></a><a href="0503nf2.html">Figure 2</a>, computing the center-of-mass to the left of <i>T</i> requires multiplying each histogram count by the bin number, summing those results together, and then dividing by the sum of the counts from 0 to <i>T</i>. In mathematical terminology, this translates to the equation in <a name="re4"></a><a href="0503ne4.html">Example 4</a>. Computation of the center-of-mass to the right of <i>T</i> is the same, except that the limits of summation change accordingly. Focusing attention on the numerator of this expression, note that you could state the numerator in terms of a dot product; in other words, the sum of products of two vectors, the values of the actual histogram, and the bins for that portion of the histogram we are summing over. So instead of loops like those in <a name="rl4"></a><a href="#l4">Listing Four</a>, you can rewrite them and replace the variable <i>ii</i> in the loop kernels with an array indexing operation. <a name="rl5"></a><a href="#l5">Listing Five</a> shows this modification, where the array <i>pixval</i> (consisting of an integer ramp) is used in lieu of <i>ii</i>. You can now vectorize the operation because you are willing to sacrifice memory usage (the <i>pixval</i> array for a 16-bit image would be large and would most likely preclude this optimization). If both the <i>hist</i> and <i>pixval</i> arrays are aligned on a double-word boundary, you might consider replacing half-word accesses with double-word accesses, reading and writing four elements at a time, and packing two elements per register. If you can make the assumption that the starting value of <i>ii</i> is divisible by 4 and <i>T-ii</i> is also divisible by 4 (64 bits divided by 16-bit elements), which is equivalent to saying the number of iterations through the loop is divisible by 4, then the loops in <a name="rl6"></a><a href="#l6">Listing Six</a> would suffice on both the C67x and c64x DSPs.</p>
+
+<p>The form of the <i>MUST_ITERATE</i> pragma in <a name="rl6"></a><a href="#l6">Listing Six</a> tells the compiler that the number of iterations is divisible by 4, and this in conjunction with <i>_nassert</i> should be a sufficient trigger for the compiler to apply packed data optimizations using <i>LDDW</i> and <i>STDW</i>. Unfortunately, you can make no such assumption about the number of times through either loop and by extension can make no such claim about the starting value of <i>ii</i> in the second loop. This fact prevents double word-wide accesses on the C67x; however, with the C64x, you can take advantage of the nonaligned double-word instructions <i>LDNDW</i> and <i>STNDW</i> to improve the loop performance. <a name="rl7"></a><a href="#l7">Listing Seven</a> shows the contents of the <i>dotprod</i> function that is used to compute the numerator of <a name="re4"></a><a href="0503ne4.html">Example 4</a>, assuming the existence of a global array <i>hist</i>. The use of <i>double</i> in the declarations for <i>h1_h2_h3_h4</i> and <i>b1_b2_b3_b4</i> may seem odd at first, but the type <i>double</i> in this context is just used as a placeholder to signify 64 bits of storage. The loop has been unrolled by a factor of 4 and the <i>_memd8_const</i> intrinsic, which generates code that uses <i>LDNDW</i>, is used to read 64 bits, or two words worth of data, into <i>h1_h2_h3_h4</i> and <i>b1_b2_b3_b4</i>. Next, both of these 64-bit elements, which in reality are stored in register pairs, are "split" into 32-bit upper and lower halves via the <i>_lo</i> and <i>_hi</i> intrinsics. At this point, you are left with a situation like that in <a name="rf3"></a><a href="0503nf3.html">Figure 3</a>, with four 32-bit elements.</p>
+
+<p>Although you could split the contents of the four registers again, you need not resort to that course of action. There are assembly instructions available that multiply the 16 LSBs (least significant bits) of one register by the 16 LSBs of another register. Similarly, there are assembly instructions for multiplying the 16 MSBs (most significant bits) of one register by the 16 MSBs of another register. There are actually four different variants of each of these instructions, pertaining to whether the data contained within the portion of the register are to be treated as signed or not, and whether the result should be truncated down to 16 bits or returned as a 32-bit entity. In general, multiplication of two 16-bit quantities yields a 32-bit result. As the comments in <a name="rl"></a><a href="#l">Listing 7</a> indicate, the <i>_mpyu</i> (16 unsigned LSBs multiplied together and returned as 32-bit quantity) and <i>_mpyhu</i> (16 unsigned MSBs multiplied together and returned as 32-bit quantity) intrinsics are used to perform four packed-data multiplications. These quantities are then added to the accumulators, four of which are used to avoid loop-carried dependencies that inhibit parallelism.</p>
+
+<p>A loop "epilogue" of sorts is required to clean up. Because you can make no claims about loop count being divisible by 4, you need to wrap up the dot product computation using a final "traditional" C loop, which iterates at most three times. Alternatively, you could zero pad the arrays such that you are guaranteed to iterate a number of times divisible by 4. We have now succeeded in fully vectorizing the loop kernel, given the memory bandwidth of the architecture, but in fact have yet to reach the denouement of this story. A hallmark of DSP architectures is the fabled multiply-and-accumulate, or MAC, instruction, and it is not surprising that the C64x provides just the intrinsic you need here to cut down on the number of operations within this loop kernel. TI provides another set of intrinsics that map to so-called "macro" instructions, and one of these is DOTP2. This instruction, accessed in C via <i>_dotp2</i>, performs a MAC-like operation on packed 16-bit data; that is, it returns the dot product between two pairs of packed 16-bit values, as in <a name="rf4"></a><a href="0503nf4.html">Figure 4</a> for one of the <i>_dotp2</i> "invocations" (remember, while they may look like function calls they are in reality inlined functions). With this final tweak, the number of add operations is further reduced, as <i>_dotp2</i> subsumes two of the four adds present in <a name="rl7"></a><a href="#l7">Listing Seven</a>. <a name="rl8"></a><a href="#l8">Listing Eight</a> is the fully optimized dot product function that can be used within an isodata image segmentation implementation.</p>
+<h3>Conclusion</h3>
+
+<p>While the aligned word (LDW/STW) and double-word (LDDW/STDW) wide instructions are useful in the application of packed data processing code optimization techniques, the C64x line of DSPs augments this functionality with unaligned variants of these instructions. There are many image- and video-processing algorithms that call for marching across image dimensions in step sizes that are not even multiples of 4 or 8 bytes. Consequently, without these unaligned instructions, you're locked out of utilizing 64-bit computation methods. Two good papers on C64x- specific code optimization strategies as they pertain to digital-image processing are "VLIW SIMD Architecture Based Implementation of a Multi-Level Dot Diffusion Algorithm" by Ju and Song (sips03.snu.ac.kr/pdf/adv_prog.pdf) and "Implementation of a Digital Copier Using TMS320C6414 VLIW DSP Processor" by Hwang and Sung (mpeg.snu.ac.kr/pub/conf/c61.pdf). For a more detailed exposition on C6x code optimizations, refer to the TI documentation (http://www.ti.com/) or "Preferred Strategies for Optimizing Convolution on VLIW DSP Architectures" by Sankaran, Pervin, and Cantrell (http://www.crest.gatech.edu/conferences/cases2004/ paper/sankaran.pdf).</p>
+
+
+<p><b></b></p>
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>void memclear( void * ptr, int count )
+{
+  long *lptr = ptr;
+  _nassert((int)ptr%8==0);
+  #pragma MUST_ITERATE (32);
+  for (count&gt;&gt;=3; count&gt;0; count--)
+    *lptr++ = 0;
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>void memset( void *ptr, int x, int count ) {
+    char *uch = ptr;
+    for (; count&gt;0; count--) *uch++ = x;
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>#pragma DATA_ALIGN(double_word_aligned_array, 8)
+unsigned char double_word_aligned_array[256];
+
+#pragma DATA_ALIGN(word_aligned_array, 4)
+unsigned char word_aligned_array[256];</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l4"></a>Listing Four</b><br>
+<pre>/* "left" center-of-mass numerator */
+for (ii=0; ii&lt;T; ii++)
+  sumofprod1 += ii*hist[ii];
+/* "right" center-of-mass numerator */
+for (ii=T+1; ii&lt;MP; ii++) /* MP=255 for 8-bit images */
+  sumofprod2 += ii*hist[ii];</pre>
+<a href="#rl4">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l5"></a>Listing Five</b><br>
+<pre>/* pixval = {0, 1, 2, ..., 255} for an 8-bit image */
+
+for (ii=0; ii&lt;T; ii++) /* left */
+  sumofprod1 += pixval[ii]*hist[ii];
+for (ii=T+1; ii&lt;MP; ii++)
+  sumofprod2 += pixval[ii]*hist[ii];</pre>
+<a href="#rl5">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l6"></a>Listing Six</b><br>
+<pre>#pragma MUST_ITERATE(,,4)
+_nassert((int)pixval%8 == 0)
+_nassert((int)hist%8 == 0)
+for (ii=0; ii&lt;T; ii++) /* left */
+  sumofprod1 += pixval[ii]*hist[ii];
+#pragma MUST_ITERATE(,,4)
+_nassert((int)pixval%8 == 0)
+_nassert((int)hist%8 == 0)
+for (ii=T+1; ii&lt;MP; ii++) /* right */
+  sumofprod2 += pixval[ii]*hist[ii];</pre>
+<a href="#rl6">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l7"></a>Listing Seven</b><br>
+<pre>unsigned long dotproduct(int lo, int hi)
+{
+  /* 0, 1, 2, ..., 255 */
+  static const unsigned short pixval[] = 
+                                 {0,1,2, /* 3,5,...,252 */ ,253,254,255};
+  unsigned long sum1 = 0, sum2 = 0, sum3 = 0, sum4 = 0, sum; 
+  const int N = hi-lo;
+  int ii=0, jj=lo, remaining;
+  double h1_h2_h3_h4, b1_b2_b3_b4;
+  unsigned int h1_h2, h3_h4, b1_b2, b3_b4;
+
+  /* unrolled dot-product loop with non-aligned double word reads */   
+  for (; ii&lt;N; ii+=4, jj+=4)     
+  {
+    h1_h2_h3_h4 = _memd8_const(&amp;hist[ii]);
+    h1_h2 = _lo(h1_h2_h3_h4);
+    h3_h4 = _hi(h1_h2_h3_h4);
+    
+    b1_b2_b3_b4 = _memd8_const(&amp;pixval[ii]);
+    b1_b2 = _lo(b1_b2_b3_b4);
+    b3_b4 = _hi(b1_b2_b3_b4);
+    
+    sum1 += _mpyu(h1_h2, b1_b2); /* (h1)(b1) */        
+    sum2 += _mpyhu(h1_h2, b1_b2); /* (h2)(b2) */
+    sum3 += _mpyu(h3_h4, b3_b4); /* (h3)(b3) */
+    sum4 += _mpyhu(h3_h4, b3_b4);  /* (h4)(b4) */  
+  }
+  sum = sum1 + sum2 + sum3 + sum4;
+  /* loop epilogue: if # iterations guaranteed to
+   * be a multiple of 4, then this would not be required. 
+   */
+  remaining = N - ii;
+  jj = N - remaining;
+  for (ii=jj; ii&lt;N; ii++)
+    sum += hist[ii]*pixval[ii];
+  return sum;
+}</pre>
+<a href="#rl7">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l8"></a>Listing Eight</b><br>
+<pre>unsigned long dotproduct(int lo, int hi)
+{
+  /* 0, 1, 2, ..., 255 */
+  static const unsigned short pixval[] = 
+            {0,1,2, /* 3,5,...,252 */, 253,254,255};
+  unsigned long sum1 = 0, sum2 = 0, sum; 
+  const int N = hi-lo;
+  int ii=0, jj=lo, remaining;
+  double h1_h2_h3_h4, b1_b2_b3_b4;
+  unsigned int h1_h2, h3_h4, b1_b2, b3_b4;
+
+  /* unrolled dot-product loop with non-aligned double word reads */   
+  for (; ii&lt;N; ii+=4, jj+=4)     
+  {
+    h1_h2_h3_h4 = _memd8_const(&amp;smoothed_hist[ii]);
+    h1_h2 = _lo(h1_h2_h3_h4);
+    h3_h4 = _hi(h1_h2_h3_h4);
+    
+    b1_b2_b3_b4 = _memd8_const(&amp;pixval[ii]);
+    b1_b2 = _lo(b1_b2_b3_b4);
+    b3_b4 = _hi(b1_b2_b3_b4);
+    
+    sum1 += _dotp2(h1_h2, b1_b2); /* see Figure 4 */        
+    sum2 += _dotp2(h3_h4, b3_b4); 
+  }
+  sum = sum1 + sum2;
+  /* loop epilogue: if # iterations guaranteed to
+   * be a multiple of 4, then this would not be required. 
+   */
+  remaining = N - ii;
+  jj = N - remaining;
+  for (ii=jj; ii&lt;N; ii++)
+    sum += smoothed_hist[ii]*pixval[ii];
+    
+  return sum;
+}</pre>
+<a href="#rl8">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

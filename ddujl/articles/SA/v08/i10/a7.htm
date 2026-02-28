@@ -1,0 +1,232 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v08, i10: File Transfer and Verification Between Non-Connected Networks</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#990000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink>Article</a></span></td>
+		<td><a href="../../../../source/SA/1999/oct99.tar"><b class=codeListing>oct99.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<! -- Insert Content ------ >
+
+<H1>File Transfer and Verification Between Non-Connected Networks</H1><p>
+<P>Robert Blader
+<P>
+Our users routinely need to transfer applications from a development (source) network to a production (target) network that has a higher security classification. Although the applications are the same, the data processed on the target network is received from another agency and is sensitive in nature. Due to the differences in the security levels of the networks, any physical connectivity is prohibited. The requirement was to write a utility to transfer files from one network to another. All files were to be copied to the same absolute path on the target network as on the source network, with the same access modes, ownership, and group as on the source side. Dates were also to be preserved on regular files but not necessarily for the directories.<P>
+<B>Complications</b><p>There was no wire connecting the networks, which ruled out directory replication schemes such as the one described by Jim McKinstry in "File Replication" (<I>Sys Admin</I>, Feb. 1998, Vol. 7, No. 2) or adaptations of it. Initially, I tried a simple script that <B>tar</B>'ed files to a tape on a workstation connected to the source network. Then, I copied them onto the target network using a tape drive connected to the target network. Unfortunately, ownership and permissions were not consistent. I verified that I had used the <B>-p</B> flag in the <B>tar</B> commands, and that the files on tape showed the correct owner and access information. When I transferred a file whose path was something like <B>/dir1/dir2/dir3/dir4/file.out</B> on the source network, and the target network only had <B>/dir1/dir2</B>, directories dir3 and dir4 were being created with root as the owner and root's umask (026) determined the access mode. The <B>-p</B> only seemed to apply to <B>file.out</B> but not to the directories in its path. <B>cpio</B> had even worse side affects, so I went back to the drawing board using <B>tar</B>.<P>
+<B>Solution</b><p>The Korn shell script, <B>net_xfer </B>(Listing 1), was written to have a simple user interface. The user types:<P>
+<PRE>
+net_xfer  [-f | -l | -help] filename
+</PRE>
+<P>
+where <B>-f</B> indicates that "filename" is the name of the file to be transferred, and <B>-l</B> indicates that "filename" is a listing of the files (absolute paths) that are to be transferred. The listing can be generated with a find command. The only constraint on the value for "filename" is that it must be an absolute path, which I can verify by seeing that the first character is a slash. <B>-help</B> displays a usage message. The requests are queued up in a file called <B>requests.xfr</B>, and this file is appended with each user request and removed once the request is satisfied. We track who requested files in <B>xfer_verify.$USER</B>. The <B>$USER</B> suffix is really the user's login name. This is used later to send a verification notice on the target system. When the user makes a request, a function called <B>dir_parse()</B> is invoked. It takes the absolute path of the files in <B>xfer_verify.$USER</B>, breaks it into its component parts, and appends it to a <B>/usr/bin/ls -ld</B> command. We execute this script and save the output in <B>xfer_verify.$USER.out</B>. Both the <B>xfer_verify.$USER</B> script and its output are added to the list of files to transfer, <B>requests.xfr</B>. (All listings for this article are available from the <I>Sys Admin</I> Web site at: <B>www.sysadminmag.com</B> or from <B>ftp.mfi.com</B> in <B>/pub/sysadmin</B>.<P>
+<PRE>
+dir_parse()
+{
+
+FILENAME=$1             # file whose path is to be broken down
+VERIFY_SCRIPT=$2    # file that will contain ls -ld commands
+
+DIR=`dirname $FILENAME `
+
+# Run dirname on the path until we are down to "/"
+while [ $DIR != "/" ];
+do
+echo "ls -ld $DIR" &gt;&gt; $VERIFY_SCRIPT
+     DIR=`dirname $DIR`
+done
+# Sort and remove duplicate entries
+sort -u -o $VERIFY_SCRIPT $VERIFY_SCRIPT }
+</PRE>
+<P>
+So, for example, if a user enters <B>net_xfer -f /a/b/c</B> , <B>/a/b/c</B> is written to <B>requests.xfer</B>, and a script is created that contains:<P>
+<PRE>
+#!/bin/ksh
+ls -ld /a
+ls -ld /a/b
+ls -ld /a/b/c
+</PRE>
+<P>
+This script is run and its output is saved in <B>xfer_verify.$USER.out</B>. Then, the script and the output are added to the requests file, <B>request.xfer</B>. We also log the requests to a file that is group writeable. <B>net_xfer</B> is setgid. This way the log file does not have to be world-writeable, and we do not need a setuid script.<P>
+Once a day in a cron job, <B>net_xfer</B> is run as root with a <B>-now</B> flag. This flag is only intended for use as root, which is why it was not discussed earlier. If there is a requests file, the files in it are <B>tar</B>'ed to an 8-mm tape using <B>tar</B>'s <B>-I</B> flag (which says do not archive the requests file, but rather archive the files in it) and the tape is ejected. Operators know to check for an ejected tape at the scheduled time. If the tape has not ejected, there were no requests for that day. If it did eject, the tape is write-locked and carried over to the target network. A cron job on that system runs as root and reads the tape. Because relative pathnames are not allowed, files are written where they belong. We then run the same verification script that was run on the source network and compare the results from both systems. We strip access mode, owner, and group from each line of both files, and compare the fields.<P>
+<PRE>
+#
+# Use tr to remove multiple blanks so that we can use cut on 
+# fields delimited by blanks.
+#
+  TARGET_SHORT=`echo $TARGET | tr -s `
+  SOURCE_SHORT=`echo $SOURCE_LS_LINE | tr -s `
+
+  target_mode=`echo $TARGET_SHORT | cut -f1 -d" "`
+  target_owner=`echo $TARGET_SHORT | cut -f3 -d" "`
+  target_group=`echo $TARGET_SHORT | cut -f4 -d" "`
+  target_file=`echo $TARGET_SHORT | cut -f9 -d" "`
+
+  source_mode=`echo $SOURCE_SHORT | cut -f1 -d" "`
+  source_owner=`echo $SOURCE_SHORT | cut -f3 -d" "`
+  source_group=`echo $SOURCE_SHORT | cut -f4 -d" "`
+  source_file=`echo $SOURCE_SHORT | cut -f9 -d" "`
+</PRE>
+<P>
+If the filenames don't match, we exit because something is out of sync, and we provide a message to the operator. When any of the other fields do not match, we use the values from the source network and run the appropriate <B>chmod</B>, <B>chown</B> or <B>chgrp</B> command. This way any differences are resolved as shown below: <P>
+<PRE>
+  #
+  # Compare the modes
+  #
+
+  if [[ $source_mode != $target_mode ]]; then
+  chmod 000 $target_file
+
+#Just in case the "lock bit is set, make sure to unset it"  
+# If a regular file is setgid and not executable, mandatory locking 
+# will be in effect for the file.  See chmod (2) for more details.
+#
+
+  if [ -d $target_file ]; then
+             chmod g-l $target_file
+  fi
+
+# skip the first bit that indicates if the file is a link, 
+# directory, or plain file.<
+
+  let index=2	
+  while [ $index -le 10 ]<
+  do
+
+
+     MODE_BIT=`echo $source_mode | cut -c $index`
+     if [ $MODE_BIT != '-' ]; then
+
+     case $index in
+
+     2|3)
+          chmod u+$MODE_BIT $target_file
+               ;;
+     4)
+          case $MODE_BIT in
+
+          s) chmod u+x $target_file
+             chmod u+s $target_file
+               ;;
+          x)
+             chmod u+x $target_file
+               ;;
+          esac
+               ;;
+
+     5|6)
+           chmod g+$MODE_BIT $target_file
+               ;;     
+#
+# Some code to handle GID bit
+#
+
+     7)
+     case $MODE_BIT in
+
+#
+# On directories, an l means setgid without group execution.
+#
+          s|l)
+                    chmod g+x $target_file
+                    chmod g+s $target_file
+                         ;;
+          x)        chmod g+x $target_file
+                         ;;
+     esac
+
+
+                    ;;
+
+     8|9)
+
+               chmod o+$MODE_BIT $target_file
+                    ;;
+     10)
+#
+# Case statement to accommodate the sticky bit.
+#
+          case $MODE_BIT in
+          
+               x)
+
+               chmod o+$MODE_BIT  $target_file
+                    ;;
+               t)
+
+               chmod o+x $target_file
+               chmod u+t $target_file
+                     ;;
+
+               T)
+
+               chmod u+t $target_file
+               ;;
+          esac
+
+     esac
+
+
+fi
+let index=$index+1
+done
+
+     fi # end mode comparison 
+
+#
+# Compare ownership
+#
+     if [[ $target_owner != $source_owner ]]; then
+          chown $source_owner $target_file
+     fi
+
+#
+# Compare group ownership
+#
+     if [[ $target_group != $source_group ]]; then
+           chgrp $source_group $target_file
+     fi
+     </PRE>
+<P>
+To summarize the process, users run <B>net_xfer [ -l | -f} filename </B>on the source network to queue up requests. Root runs <B>net_xfer -now</B> to <B>tar</B> the requests to tape and empty out the request queue. An operator write-protects the tape and loads it on the target system where a cron job runs <B>read_xfer</B> (Listing 2), which untars the tape and invokes <B>file_verify</B> to reconcile any differences between permissions on the files that were copied and the directories that are in their paths. <P>
+Verification of the transfer is mailed to the user and the process is complete. This utility can also be adapted by sites that need to distribute software across LANs to remote sites, or transfer published Web pages from a Web development site to a Web server. It could also be a component of a configuration management tool. <B>file_verify</B> (Listing 3), can be the basis of a tool to help recover from certain types of accidents. For instance, copying a large directory structure with <B>tar</B> and forgetting the <B>-p</B>, or issuing a command like <B>chown username .* *</B>, which would traverse the <B>..</B> link. A listing from an old backup <B>tar</B> tape could be used as the <B>xfer_verify.$USER.out</B> file, and security modes could be reset without losing any data.<P>
+Enhancements to it might include a comparison of the file size, and perhaps a checksum to ensure that the files were copied correctly. A rule to handle the case in which a user that owns a file on the source network does not have an account on the target network might also be worthwhile. The code in its entirety may be downloaded from <I>Sys Admin</I>. <P>
+<p>
+<h1>About the Author</h1><p>
+Robert Blader has been a systems administrator since 1988 at the Naval Surface Warfare Center, Dahlgren Division. He recently began focusing in the areas of network security and risk management. He can be reached at bladerrg@nswc.navy.mil.</BODY>
+
+
+
+
+<! -- Begin Content ------ >
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

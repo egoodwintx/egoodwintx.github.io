@@ -1,0 +1,64 @@
+<HTML>
+<HEAD>
+<TITLE>Starting Threads in a C++ Compatible Fashion</TITLE>
+</HEAD><BODY>
+<h2>Starting Threads in a C++ Compatible Fashion</h2>
+<h3>Wolfgang Bangerth</h3>
+
+
+<P>In POSIX and apparently all other thread implementations, the function that starts a new thread needs to satisfy a signature similar to:<P>
+
+<pre>
+void * thread_entry_point (void *);
+</pre>
+
+<P>This requirement makes things complicated if you want to spawn a new thread with a function that takes different arguments or more than one argument. Usually, you would put all the arguments into an object and pass the address of this object to the thread function. This is a cumbersome solution, since you must have a new class for the argument lists of basically all functions you call on new threads. Not even Boost [1] has a more convenient solution at present. What you need is a syntax like this:<P>
+
+<pre>
+spawn foo(1,2,x,y);
+</pre>
+
+<P>However, this syntax seems impossible to achieve in C++. Will the following work instead?<P>
+
+<pre>
+spawn (&amp;foo)(1,2,x,y);
+</pre>
+
+<P>This article describes a way to achieve this syntax by using a method similar to the one used by the deal.II finite element library [2] for the past three years.<P>
+
+<h3>Ideas</h3>
+<P>Focusing on functions that do not return values, what do you need for the preceding syntax? Parsing left to right, the <B>spawn</B> function should generate an object that holds the function&#146;s address. This object should have an <B>operator()</B>, taking the same arguments as foo(). It packages the argument into a suitable object and spawns a new thread with this object. On this thread, you unpack the object and call the requested function with this argument.<P>
+
+<P><a href="cuj0310bangerth_l1.htm">Listing 1</a> shows the code for this technique; <a href="cuj0310bangerth_l2.htm">Listing 2</a> shows how to use it. I&#146;ll start from the bottom up: when I invoke the <B>spawn</B> function, it takes a pointer to a unary function and packs it into a <B>FunWrapper1&lt;Arg1&gt;</B> object. The function&#146;s name is misleading since it does not spawn threads at all, but it serves its purpose. Then I call <B>operator()</B> on the wrapper object with the argument I want to pass to the function on the new thread. There, an intermediate object of type <B>Wrapper&lt;Arg1&gt;::Data</B> is created, which stores the function pointer and the value of the argument and passes these parameters to the <B>do_spawn</B> function. <B>do_spawn</B> in turn creates a new thread with the function <B>*data.thread_entry_point</B> and passes the inner <B>Data</B> object to it as a single <B>void*</B> argument. (A real implementation would check the result of <B>pthread_create</B>, however). The <B>Data</B> class&#146;s constructor previously set the <B>thread_entry_point</B> variable in its base class to <B>FunWrapper1&lt;Arg1&gt;:: Data::thread_entry_point</B>, so this is where the new thread starts. Looking there, you&#146;ll see that it unpacks the <B>Data</B> object and calls the desired function with the correct argument, the type of which it knows through its template argument.<P>
+
+<P>Note that <B>do_spawn</B> returns a <B>Thread</B> object, which you can later use to join a thread (i.e., wait for its oblivion; see <a href="cuj0310bangerth_l2.htm">Listing 2</a>). It is also worth mentioning that <B>FunWrapper1::operator()</B> takes the same argument as the function on the new thread, so the same conversions for arguments are performed.<P>
+
+<h3>Pitfalls</h3>
+<P>Simple? Not really. When <B>FunWrapper1&lt;Arg1&gt;::operator()</B> calls <B>do_spawn</B>, it does so by passing the data object by reference. <B>do_spawn</B> spawns a new thread with the address of this local object, returns, and then the local object is destroyed, and <B>FunWrapper1&lt;Arg1&gt;::operator()</B> returns. At the same time, the new thread tries to unpack this object and start working with it. Bad things may happen if the new thread is late for some reason. You can generate this result by letting <B>thread_entry_point</B> sleep for a while before its first statement: on my system, this yields a reproducible segmentation fault.<P>
+
+<P>To avoid this problem, I must delay destruction of the data object in <B>FunWrapper1&lt;Arg1&gt;::operator()</B> until <B>thread_entry_point</B> has copied the data. I do this by adding a mutex to the <B>FunData</B> class and acquiring it right at the point of its construction (see <a href="cuj0310bangerth_l3.htm">Listing 3</a>). Then, in <B>FunWrapper1&lt;Arg1&gt;::operator()</B>, I try to acquire this lock again before the temporary object is destroyed. This approach will only succeed if someone releases the lock beforehand, which you do on the new thread after copying the relevant data in <B>thread_entry_point</B>. This, by the way, also takes care of cases where a temporary is used as an argument, as the <B>1</B> in <a href="cuj0310bangerth_l2.htm">Listing 2</a>.<P>
+
+<h3>More Pitfalls</h3>
+<P>Did I get it right for reference arguments? You should not copy their values somewhere inbetween! Tracing through the various classes, I see that indeed <B>Arg1</B> should be a reference type, and the intermediate objects only store this reference, never a copy of the object&#146;s value. Of course, it is the user&#146;s responsibility to make sure that the referenced object lives at least as long as the thread needs it.<P>
+
+<h3>More Arguments</h3>
+<P>If you want functions with two or more arguments, you only need to add more functions and classes (see <a href="cuj0310bangerth_l4.htm">Listing 4</a>): a <B>FunWrapper2</B> with an inner <B>Data</B> structure that can hold the values of two parameters, an <B>operator()</B> that takes these two values, a <B>thread_entry_point</B> that calls the desired function with these arguments, and a <B>spawn</B> variant for binary functions.<P>
+
+<P>In this way, you can go on defining classes for functions that take three, four, or more arguments. You should also have a class for functions that take no arguments. This solution is a little tedious, but it is not difficult; unfortunately, I did not find a way within the language to work with arbitrarily numerous parameters.<P>
+
+<h3>Member Functions</h3>
+<P>I can treat (non-static) member functions similarly: the object, which calls the member function, is just another parameter. Since the object is somewhat special, I pass it in the call to <B>spawn</B>, rather than with the other parameters, see <a href="cuj0310bangerth_l5.htm">Listing 5</a>. There is one complication: member functions may be marked <B>const</B>. If their class name is <B>X</B>, then I must take a reference to a <B>const</B> <B>X</B> object. Transferring <B>const</B>ness from the function declaration to the object and back requires some template magic, but it is not too complicated. <a href="cuj0310bangerth_l6.htm">Listing 6</a> shows the code for unary member functions.<P>
+
+<h3>What Else?</h3>
+<P>The only kind of function that does not fit in right now is a function that returns a value. This is actually not so difficult, but required some thought for functions returning references or <B>void</B>. A function that returns a reference requires its own set of techniques. I leave this as an exercise for the reader.<P>
+
+<h3>Notes</h3>
+<P>[1]  &lt;<a href="http://www.boost.org">www.boost.org</a>&gt;<P>
+<P>[2] &lt;<a href="http://www.dealii.org">www.dealii.org</a>&gt;
+<P>
+
+<hr>
+<i><B>Wolfgang Bangerth</B> has a Ph.D. in mathematics from the University of 
+Heidelberg, Germany, and is presently a postdoctoral research fellow at the Texas 
+Institute of Computational and Applied Mathematics in Austin, Texas. He is the 
+founder and project leader of the open-source finite element library deal.</i></HTML>

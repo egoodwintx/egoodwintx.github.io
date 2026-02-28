@@ -1,0 +1,177 @@
+<HTML>
+<META NAME="year" CONTENT="1989">
+<HEAD>
+
+<TITLE>JAN89: UNIX STREAMS</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>UNIX STREAMS<a name="003b_0002"><a name="003b_0002"></h1><P>
+<h2><a name="003b_0001"><a name="003b_0000">If modularity and portability are part of your Unix problems, Streams may be part of the solution</h2><P>
+<h3>Michael W. Garwood and Andrew E. Schweig</h3><P>
+<p><i><a name="003b_0000"><a name="003b_0000">Michael Garwood and Andrew Schweig are developers for Lachman Associates Inc. and can be reached at 1901 N. Naper Blvd., Naperville, IL 60540-1301.  Portions of this article previously appeared in The European Unix User's Guide.</i></p><hr><P>
+Not long ago, in an effort to overcome some of the shortcomings associated with traditional Unix mechanisms for dealing with character-based I/O systems, a new framework called Streams was introduced and implemented for Unix System V, Release 3.  This Streams framework incorporates several design strengths that are important to the development of efficient, portable network protocols for the Unix system.<P>
+Streams is a framework that provides for a full-duplex data connection between a user process and a device or pseudodevice.  This connection, termed a stream, is composed of a module stack with which communication among neighboring modules on the stack is achieved by passing messages through a well-defined, intermodule interface.  (Throughout this article, the terms module and driver are used interchangeably; however, device driver refers to the software used to directly control a particular hardware device or pseudodevice.)  Messages are passed &quot;downstream&quot; on the write half of the stream toward the device driver and &quot;upstream&quot; on the read half of the stream toward the stream head or user process.  A module passes messages to a neighboring module by calling the neighbor module's put procedure.  Once a message is received by a module, it may either be passed to a neighboring stream module or be enqueued for subsequent processing by the module's service procedure.<P>
+A simple put and service strategy is shown in <a href="8901c.htm#003b_0003">Example 1</A>, page 53. The put procedure (modput):<P>
+<ol>1.     Processes all IOCTL messages immediately</ol><P>
+<ol>2.     Enqueues all messages of type M_DATA</ol><P>
+<ol>3.     Passes all other messages downstream</ol><P>
+<h4><a name="003b_0003"><a name="003b_0003"><B>Example 1:</B> A Streams module put and service procedure</h4><P>
+<pre>
+  /*
+   * module put procedure
+   */
+  modput (q, mp)
+           queue_t *q;
+           mblk_t *mp;
+  {
+           switch (mp-&gt;b_datap-&gt;db_type) {
+
+           case M_IOCTL:
+                   do_ioctl (mp);           /* process IOCTLs
+                                               immediately */
+                   break;
+
+           case M_DATA:
+                   putq(q, mp);             /* enqueue for service
+                                               processing */
+                   break;
+
+           default:
+                   putnext (q, mp);         /* pass downstream */
+                   break;
+           }
+  }
+  /*
+   * module service procedure
+   */
+  modsrv (q)
+           queue_t *q;
+  {
+           mblk_t *mp;
+
+           while (mp = getq( ))              /* dequeue messages */
+                   if (canput (q-&gt;q_next)) {
+                           transform(mp);   /* local transformation of
+                                               data */
+                           putnext(q, mp);
+                   } else {
+                           putbq(q, mp);
+                           return;
+                   }
+  }</pre><P>
+<P>
+The service procedure (modsrv) processes as much locally enqueued data as possible until the downstream queues fill up.  At that point the dequeued message is reenqueued via putbq and the service procedure returns.  The flow-control mechanisms of Streams will reinvoke the service procedure when the downstream blockage has subsided.  Note that putq, put next, getq, canput, and putbq are standard Streams utilities.<P>
+Information about a particular module is included in a pair of structures called queues. One queue describes the write half of the module, and the other describes the read half of the module.  Information kept by the queue structures contains, among other things, pointers to module entry points, state flags, a data queue, and low and high watermarks used for flow control on the stream.<P>
+<h3><a name="003b_0004">Streams Benefits<a name="003b_0004"></h3><P>
+The Streams design provides several advantages over the traditional Unix method of establishing communication between a user process and character-type driver.  Most notably, it enforces (or at least strongly encourages) modularity of design.  It is certainly possible to write a module that does not conform to the standard Streams interface among modules, but it would be a lot less trouble to stay within the Streams' framework.  For example, we developed a raw IP driver to provide a TLI interface to the network-level IP driver without making any modifications whatsoever to the network driver.  In this way the network driver can multiplex to other drivers (for example, TCP and UDP) without the overhead imposed by a complex user interface.<P>
+The structure imposed by this framework delivers another bonus: portability.  Not only is Streams itself reasonably portable among different machine environments, but modules that cooperate with the communication principles laid down by the Streams framework also tend to be fairly portable.<P>
+Streams permits logical data (messages) to be split across several buffers.  The capability to efficiently construct large messages from several smaller components proved to be of great benefit in the design of the data reassembly portions of IP and TCP drivers we developed. Data can also be efficiently duplicated (shared) without being copied in the Streams environment.  This feature allows a reliable transmission protocol (such as TCP) to send data and keep a &quot;copy&quot; for possible retransmission without actually copying the data.<P>
+Another nicety in the Streams package is the clone driver feature.  This feature makes it possible to open a driver in &quot;clone&quot; mode and have the driver itself pick an available minor device number.  Gone are the days of a user process sequencing through a long line of major-minor pairs in order to locate an available device.  The burden is more efficiently handled by the kernel driver itself.  For example, we wrote a socket interface that requires each socket endpoint be attached to a specific protocol device major-minor pair.  Because the socket creation interface does not require an argument that would specify a minor device number for a particular protocol driver, it would be cumbersome to locate an available minor device number without the Streams clone feature.<P>
+The use of this clone feature is demonstrated by the Streams driver open routine in <a href="8901c.htm#003b_0005">Example 2</A>, below.  If the driver open flag sflag is CLONEOPEN, denoting a clone open, the driver must allocate and return an unused minor or return OPENFAIL.  A &quot;normal&quot; open should check to see if the minor is already in use and, if so, should make certain that the queue pointer is the same as the previous open.  This avoids a small window in the current Streams implementation.<P>
+<h4><a name="003b_0005"><a name="003b_0005"><B>Example 2:</B> A Streams clone device driver open procedure</h4><P>
+<pre>
+  struct queue_t *drvqueue [MAXDEV];
+
+  drvopen (q, dev, flag, sflag)
+           queue_t *q;
+           dev_t    dev;
+  {
+           unsigned int       mindev;
+           char               error = 0;
+
+           if (sflag == CLONEOPEN) {
+                   for (mindev = 0 ; mindev &lt; MAXDEV; mindev++) /* allocate
+                                                                   dev */
+                           if (drvqueue [mindev] == NULL)
+                                   break;
+                   if (mindev &gt;= MAXDEV)
+                            return (OPENFAIL);
+           } else {
+                   mindev = minor(dev);
+                   if (mindev &gt;= MAXDEV)
+                           error = ENXIO;
+                   else
+                           if (drvqueue [mindev] &amp;&amp;
+                           drvqueue [mindev] != q)              /* one at a
+                                                                    time */
+                               error = EBUSY;                   /* maybe
+                                                               EAGAIN */
+           }
+           if (error)
+                   u.u_error = error;
+           else
+                   drvqueue[mindev] = q;
+           return (mindev);              /* return minor for clone
+                                                          driver */
+  }</pre><P>
+<P>
+The resource allocation scheme used by the Streams package is simple and fast.  Because the resource pools (buffers, queues, message headers, and so on) are statically allocated, freeing or allocating a resource is as simple as linking or unlinking a pointer from a free list. This simplicity, however, does have its drawbacks, as we will discuss later.<P>
+<h3><a name="003b_0006">Streams Caveats<a name="003b_0006"></h3><P>
+Despite the aforementioned advantages of Streams, there are still a few areas in which the System V, Release 3, Streams implementation requires attention.  The relative severity of any of these items depends, for the most part, on the particular system being implemented.  The amount of memory allocated to a particular Streams resource pool (that is, streams, queues, buffers, and so forth) is determined by various configuration parameters.  No dynamic capability is currently built into Streams resource management.  Once you've hit a resource limit, you've hit it.<P>
+One twist with respect to resource management concerns data buffer allocation.  The buffer allocation scheme utilized by Streams divides data buffers into nine, different, statically configured size classes (4, 16, 32, 64, 128, 256, 512, 1,024, and 4,096 bytes).  Although the Streams allocation algorithm tries a couple of different classes in an attempt to satisfy a buffer request, this request may fail even when the buffer pool on the whole N is relatively underutilized (for example, a request for a buffer in class N may fail when there is a large number of buffers available in classes other than N or N+1).  These allocation failures may occur quite frequently on a heavily loaded or improperly configured system; therefore, the driver must at all times be prepared for such a failure, allowing for graceful recovery of the device or system.  It may be the case that the processing module is in a state whereby it can wait synchronously for an available buffer; most of the time, however, this is not the case as a module has no process context after open and before close.  (Normal character-based drivers have this restriction for interrupt-side processing only.)  This Streams design choice prevents service routines from running as independent processes (which would allow them to sleep whenever necessary), makes performance measurements difficult, and makes necessary asynchronous buffer allocation recovery measures.<P>
+Streams provides a mechanism for asynchronous recovery from buffer allocation failures.  The driver interface to this mechanism, the function bufcall, schedules an event to notify the driver when a buffer of a particular size becomes available.  At least three problems can occur here.  First of all, this notification is not a guarantee that the awaited buffer will be obtainable by the driver; thus, the driver must be prepared for another allocation failure.  Second, bufcall may fail because the event structures that it uses are also statically allocated and can be depleted at times of heavy load.  Finally, the buffer may become available and the event may be triggered too late, forcing the driver to take (sometimes complicated) actions to avoid potential problems.<P>
+We have attempted to get around some of the buffer allocation shortcomings by building our own allocation routine around the Streams buffer allocator, allocb.  This new allocator tries a little harder than allocb by waiting for buffers requested at low priority and/or attempting to cut and paste together buffers from different-size classes to fulfill the size requested. In the cases in which bufcall is required after an allocation failure, we check the validity of the function argument supplied by the buffer event.  In the event that bufcall should fail, we use timeout.  <a href="8901c.htm#003b_0007">Example 3</A>, this page, is a routine that tries very hard to pass a buffer to its neighbor.  Note that the buffer may or may not have actually been sent upon return to the original caller.<P>
+<h4><a name="003b_0007"><a name="003b_0007"><B>Example 3:</B> Usage of bufcall</h4><P>
+<pre>
+  sendbuf(q)
+          queue_t *q;
+  {
+          mblk_t  *bp;
+
+          if (!(bp = alloc(BUFSIZE, BPRI_MED))) {
+                  if (!bufcall (BUFSIZE, BPRI_MED, sendbuf, q))
+                          timeout (sendbuf, q, HZ);       /* if all else
+                                                             fails */
+                  return(0);
+          }
+          putnext (q, bp);
+          return (1);
+  }</pre><P>
+<P>
+Each open driver has an associated pair of queues (one for read, one for write) that contains, among other things, low and high watermarks that are used to control the flow from neighboring modules.  Although these may be useful quantities to dynamically configure, Streams does not provide an administrative interface that would support this easily.  Although Streams does define a special message type (M_SETOPTS) to allow a Streams module to set streamhead read queue parameters, no method is provided for setting parameters of other queues.  We got around this problem to a certain extent by providing each one of our drivers with an IOCTL that sets the low and high watermarks for the various queues associated with the driver.<P>
+The driver queues also contain information about the module entry points and data service routines.  As such, these queues are important in scheduling the module to run.  These queues, however, are deallocated unconditionally when the module is closed.  Drivers such as TCP that still have processing to do after the close returns to the user process can no longer be scheduled using the ordinary queue-scheduling mechanism.  We overcame this problem by using our own built-in, queue-independent scheduler after the TCP queues were deallocated.  An alternative may have been to allocate a new pair of queues before the original pair were deallocated, although this allocation may fail because of static allocation problems discussed previously.<P>
+The Streams message architecture that allows data to be shared among multiple messages also gives rise to a minor inconvenience.  Given a reference into the data portion of a buffer, it is difficult to find a reference back to the buffer header itself.  Our fragment reassembly code, for instance, uses fields within the IP header itself to sequence incoming packet fragments properly; however, when the time comes for the assembled packet to be passed upstream, it is necessary to find the corresponding buffer header.  We have circumvented this problem by temporarily overlaying the header pointer onto the IP header itself.<P>
+<h3><a name="003b_0008">Streams Impact on High-Level Services<a name="003b_0008"></h3><P>
+For the most part, Streams should be relatively transparent to a typical user program or high-level application; however, there are a couple of new features that are visible at the user level.  First of all, there are new system call (getmsg and putmsg) that can be used in addition to read and write to read and write a stream endpoint.  These new system calls enable a user process to receive and send packetized control and normal stream data.  A poll system call, similar to the Berkeley select call, permits a user process to monitor several stream endpoints for various events, including data arrival and departure.  Streams also provides several useful IOCTLs, which, among other things assist in stream-administration, access control, and interprocess communication.- A summary of these IOCTLs is given in <a href="8901c.htm#003b_0009">Table 1</A>, page 56.<P>
+<h4><a name="003b_0009"><a name="003b_0009"><B>Table 1:</B> Streams' IOCTLs</h4><P>
+<pre>
+  I_STR       Send IOCTL message on stream
+  I_LINK      Link two streams
+  I_UNLINK    Unlink streams linked via I_LINK
+  I_PUSH      Push module onto stream below stream
+              head
+  I_POP       Pop top module from stream
+  I_LOOK      Return name of first module on stream
+  I_FIND      Look for particular module on stream
+  I_SETSIG    Arrange for asynchronous stream event
+              notification
+  I_GETSIG    Return registry of asynchronous events
+              for which process is to be signaled
+  I_PEEK      Nonconsumptive read of stream
+  I_NREAD     Return size of first stream message
+  I_FLUSH     Send flush message on stream
+  I_SRDOPT    Set read characteristics of the stream
+              head read queue
+  I_GRDOPT    Get read characteristics of the stream
+              head read queue
+  I_SENDFD    Pass file descriptor through stream
+  I_RECVFD    Retrieve and set up previously sent
+              (I_SENDFD) file descriptor
+  I_FDINSERT  Pass characteristic of one stream to
+              another stream (for stream pipe creation)</pre><P>
+<P>
+The mechanics for sending an IOCTL are slightly different for a Streams device than for a &quot;normal,&quot; character-based device driver.  An IOCTL on a non-Streams device is fairly simple:<P>
+<pre>  ioctl(fd, IOCFOO, &amp;arg);</pre><P>
+For a Streams device, issuance of the IOCTL requires more preparation:<P>
+<pre>     struct strioctl strioc;
+   strioc.ic_cmd = IOCFOO;      strioc.ic_timout = -1; /* seconds,                                            -1 == forever */   strioc.ic_len = sizeof(arg);   strioc.io_dp = (char *) &amp;arg;   ioct(fd, I_STR, &amp;strioc);</pre><P>
+<h3><a name="003b_000a">Conclusion<a name="003b_000a"></h3><P>
+Despite any limitations that may exist in its current implementation under Unix System V, Release 3, Streams has clearly been demonstrated as a practical framework for networking.  The general premise around which Streams is based is a sound one; the problems that arise in using the framework are more related to correctable defects in implementation than to any flaws in the main structure itself.  As a relatively new technology, Streams will certainly be improved through new advances by AT&amp;T and other Streams implementors.<P>
+<h3><a name="003b_000b">Acknowledgments<a name="003b_000b"></h3><P>
+The authors wish to thank Steve Alexander, Mike Eisler, and Michele Merens for their assistance.<P>
+<h3><a name="003b_000c">Bibliography<a name="003b_000c"></h3><P>
+Ritchie, D.M. &quot;A Stream Input-Output System.&quot;  AT&amp;T Bell Laboratories Technical Journal 63(8) (October 1984).<P>
+Unix System V Release 3 Streams Programmer's Guide.  Englewood Cliffs: Prentice-Hall, 1986.<P>
+Presotto, D.L., and Ritchie, D.M. &quot;Interprocess Communication in the Eighth Edition Unix System.&quot; USENIX Conference Proceedings (Summer 1985).<P>
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1989, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

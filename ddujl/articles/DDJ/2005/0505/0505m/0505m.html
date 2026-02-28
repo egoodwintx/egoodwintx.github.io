@@ -1,0 +1,271 @@
+
+<html>
+<head>
+<title>May, 2005: Eclipse &amp;  Custom Class Loaders</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Eclipse &amp;  Custom Class Loaders</h1>
+<p><i>Dr. Dobb's Journal</i> May, 2005</p>
+<h2>Preparing classes for the JVM</h2>
+
+
+<h3>By Greg Bednarek</h3>
+
+
+<I>Greg is an alumnus of McGill University Computer Engineering and is currently employed as a software contractor with Medrad Inc. in Pittsburgh, Pennsylvania. He can be contacted at greg.bednarek@ gmail.com</I>
+
+<hr>
+
+
+
+<a href="0505ms1.html">Installing the MacroRunner Project</a><br>
+
+
+<hr>
+
+
+
+
+
+<p>Class loaders load Java classes into memory and prepare them for use by the JVM. Engineers doing Java development become familiar with the class loader through the CLASSPATH environment variable, or command-line option to the VM, that tells the class loader where to look for class files. For most applications, the default class loader supplied with the Java Runtime Environment (JRE) works just fine after supplying it with the correct parameters.</p>
+
+<p>The Eclipse environment, with its plug-in model, cannot use the built-in class loader, as it needs finer control over how the system locates classes. The plug-in model, which the designers of Eclipse created gives the user the ability to create a plug-in with its own CLASSPATH that is independent of other plug-ins. This design decision lets plug-in developers control what classes their plug-in will load while not interfering with any other plug-in.</p>
+
+<p>When creating a plug-in manifest, users specify the class path almost as a side effect. While the class path created by the plug-in manifest is usually correct, sometimes the programmer needs more control over how the Eclipse class loader operates than is offered by the plug-in manifest editor. In this article, I describe the theory and strategy behind controlling the Eclipse class loader, showing how Eclipse can be trained to load and execute an arbitrary class&#151;even if the class does not reside in the plug-in's declared class loader. Handy uses for such a feature include the ability to create classes that do some housekeeping chores that you would like to keep in your development toolbox, but don't necessarily want to include in production code.</p>
+<h3>Bootstrap and Custom Class Loaders</h3>
+
+<p>All classes used in a Java application must be loaded by either the bootstrap class loader, otherwise known as the System class loader, or through a custom, user-defined class loader. The bootstrap class loader is the "root" class loader, and as such, forms an integral part of the JRE, responsible for loading the basic Java library classes. Every time a class is instantiated with Java's <i>new</i> keyword, the JVM delegates the task to the current class loader, which is by default the bootstrap class loader.</p>
+
+<p>Custom class loaders, on the other hand, are not part of the JRE; rather, they are subclasses of the abstract base class <i>java.lang.ClassLoader</i> and are compiled, instantiated, and run like any other Java class. However, there are a few general rules that custom class loaders are required to follow:</p>
+
+
+
+<ul>
+  <li>Class loaders must have a parent class loader, except for the bootstrap class loader.</li>
+  <li>Class loaders must delegate the loading of classes to their parent class loader before attempting to load a class themselves.</li>
+  <li>A class can only be loaded once by any one class loader; any attempts to load an identical class (where the name serves as the identifier) in a class loader that has already loaded a class of the same name results in the cached copy of the original class being loaded. This rule implies that a class may be loaded several different times by several different loaders, but only once by each class loader. </li>
+</ul>
+<h3>Class Loading Nickel Tour</h3>
+
+<p>The basics of class loading are straightforward; it's the nuances that make custom class loading so tricky. Class loaders follow a hierarchical structure, with the bootstrap class loaders as the root of the class loader "tree" hierarchy; see <a name="rf1"></a><a href="0505mf1.html">Figure 1</a>.</p>
+
+<p>Again, Java class loading follows a "delegation" model, in which class loaders are expected to first attempt to delegate the loading of a class to the parent class loader before subsequently attempting to load the class themselves. The class loader that first receives the request to load a class is referred to as the initiating class loader. The class loader that actually ends up loading the class is referred to as the effective class loader. One important factor that derives from this upward delegation model is the issue of class visibility. In Java, class visibility extends upwards through the class loader hierarchy. In practice, what this means is that a particular class loader instance can access any classes that its parent hierarchy has loaded, along with any classes that it has itself loaded.</p>
+
+<p>For example, if a class loading request is received by class loader <i>A</i> (which has the bootstrap class loader that I refer to as <i>CL</i> as its parent), then class loader <i>A</i> is referred to as the initiating class loader. By definition, class loader <i>A</i> must delegate the actual loading of the class to its parent before attempting to load the class itself. If the parent class loader <i>CL</i> succeeds in loading the class, then <i>CL</i> becomes the effective class loader. If <i>CL</i> cannot load the class, then the responsibility for loading the class is returned to class loader <i>A</i>, which will attempt to load the class itself. Assuming that the class can be loaded by class loader <i>A</i>, then class loader <i>A</i> becomes both the initiating and effective class loader. At this point, if you were to examine the class visibility scope, you would see that from the perspective of class loader <i>A</i>, all classes currently accessible by the parent class loader <i>CL</i> are visible. However, the converse is not true. From the perspective of the parent class loader <i>CL</i>, classes loaded by class loader <i>A</i> are not visible. </p>
+
+<p>This leads to the following model for class loading, based on the <i>java.lang.ClassLoader</i> implementation:</p>
+
+
+
+<ol>
+  <li>A request is made to load a class (this can occur in any number of ways, such as through a new or through a direct call to the <i>loadClass()</i> method of a custom class loader).</li>
+  <li>The class loader calls its own <i>loadClass()</i> method, which in turn: (a) invokes its <i>findLoadedClass()</i> method to see if the class has already been loaded by this class loader. For a previously loaded class, the loader returns a reference to the class maintained in its cache; (b) invokes the <i>loadClass()</i> method of its parent class loader, thus delegating the chore to the parent to perform first. If the class cannot be loaded by the parent, the class load again is delegate to its parent, until the calls reach the bootstrap class loader; (c) if the class has still not been loaded, the class loader invokes its own <i>findClass()</i> method attempting to find and load the class itself.</li>
+</ol>
+
+
+
+<p>The <i>loadClass()</i> method of <i>java.lang.ClassLoader</i> itself simply attempts to load the class specified by its input parameter, given as a string. </p>
+
+<p>In general, it is safer (and easier) to override the <i>findClass()</i> method and leave the <i>loadClass()</i> method intact when creating a custom class loader based upon <i>java.lang.ClassLoader</i>, as it is the <i>loadClass()</i> method that enforces the delegating nature of Java class loaders. Simply overriding the <i>findClass()method</i> allows for class loading based on custom needs, while at the same time maintaining expected compatibility with other Java class loaders.</p>
+<h3>The Eclipse Platform and Class Loading</h3>
+
+<p>The Eclipse platform conforms to the delegating model for Java class loading. Eclipse maintains its own custom "system" class loader, which is loaded by the bootstrap class loader when Eclipse starts. This class loader, called <i>org.eclipse.core.internal.boot.PlatformClassLoader</i>, itself instantiates an <i>org.eclipse.core.internal.plugins.PluginClassLoader</i> for each plug-in. Each <i>PluginClassLoader</i> is then responsible for loading the classes associated with its particular plug-in. From the perspective of a particular plug-in, you can view Eclipse as having a default class loader called <i>PluginClassLoader</i>, even though this class loader actually resides several layers below the real system, or bootstrap, class loader. </p>
+<h3>A Concrete Example</h3>
+
+<p>MacroRunner is a plug-in that illustrates the concepts presented here. MacroRunner (available electronically; see "Resource Center," page 5) lets users select an arbitrary class from the filesystem and execute it within the currently running instance of Eclipse. With MacroRunner, it's easy to create and execute bits of Java code as macros that automate repetitive or detail-oriented chores in Eclipse.</p>
+
+<p>A particular class can only be loaded once by any instance of a particular class loader. Since there is only ever one instance of the bootstrap, or system class loader, it is not possible to load an arbitrary macro class from the filesystem and then subsequently modify the class and reload the identically named class at runtime.</p>
+
+<p>An attempt to reload the modified class at runtime using the default, system class loader will not result in an error, but at the same time it will not reload your class either&#151;rather it notices that a class by the same name has already been loaded by the class loader and, therefore, looks to its internal cache for a copy of the class. This behavior is correct and expected, but for the purpose of executing Java macros inside Eclipse, this just does not work very well.</p>
+
+<p>With a custom class loader, however, a new class loader instance could be created each time we needed to load a macro class file, thereby circumventing the class cache. Think of it as follows: If classes are defined uniquely by their name together with the class loader instance that loaded them, then instantiating a new class loader allows for the loading of a modified version of the same class in this new class loader instance.</p>
+
+<p>In <a name="rf2"></a><a href="0505mf2.html">Figure 2</a>, the System class loader has loaded two instances of a class loader <i>CL</i>&#151;<i>CL1</i> and <i>CL2</i>. As <i>CL1</i> and <i>CL2</i> are two different instances of the same class loader, they can each load an instance of the same class <i>A</i>, labeled <i>A1</i> and <i>A2</i> above. The instances of <i>A</i> (<i>A1</i> and <i>A2</i>) do not necessarily have to contain the same code, even though they are both instances of class <i>A</i>. It is possible to load an instance of class <i>A</i> using <i>CL1</i>, then modify the contents of class <i>A</i> on the file system, and load this new class <i>A</i> in another class loader instance <i>CL2</i>. At this point, two separate though identically named classes are loaded. In fact, it might be more appropriate to name class instances <i>A1</i> and <i>A2</i> rather <i>CL1:A1</i> and <i>CL2:A2,</i> respectively, as a class instance is in the end defined both by the class name and the class loader that created the instance of the class. Due to the aforementioned upwards visibility of classes through the class loader hierarchy, any classes loaded by a class loader then have access to any classes that its parents can access. In <a name="rf2"></a><a href="0505mf2.html">Figure 2</a>, <i>CL1</i> can see class instance <i>A1</i> along with any class instances loaded by its parent class loader, the system class loader. Likewise, <i>CL2</i> can see class instance <i>A2</i> along with any class instances loaded by the system class loader. <i>CL1</i>, however, cannot see class instance <i>A2</i> nor can <i>CL2</i> see class instance <i>A1</i>.</p>
+<h3>Inside MacroRunner</h3>
+
+<p>MacroRunner uses a plug-in created using the "Sample Action Set" sample plug-in of the Eclipse Custom Plugin Wizard as its base. This plug-in adds a menu entry to the Eclipse menu bar, and executes the <i>MacroAction.run()</i> method whenever the menu selection is chosen.</p>
+
+<p>Inside this <i>run()</i> method, a simple input dialog is spawned querying the user for the absolute path to a precompiled Java class file to run within the current Eclipse environment. MacroRunner expects that the macro class file implements the <i>java.lang.Runnable</i> interface, and also that the class itself resides in the default Java package. After some simple error checking to validate that the path provided actually points to a file on the local file system, the loading of the class is initiated by the custom class loader, <i>MacroClassLoader</i>; see <a name="rl1"></a><a href="#l1">Listing One</a>.</p>
+
+<p>The process of instantiating a custom class loader and subsequently instantiating a new instance of a class is quite simple. Notice the check made after the instantiation of the macro class in <a name="rl1"></a><a href="#l1">Listing One</a>. This check is made to ensure that the custom class loader <i>MacroClassLoader</i> actually succeeded in loading the class. Due to the delegating nature of Java class loaders, if the class <i>classToLoad</i>, located in the directory classLocation, lies on the CLASSPATH of the System class loader, then when the custom class loader <i>MacroClassLoader</i> delegates to its parent, the System loader loads the class, and efforts to load the class using the custom class loader have been in vain. </p>
+
+<p>In the context of Eclipse, to ensure that this does not occur, you must be certain that the class being loaded is not visible to the parent Eclipse class loader. Because the MacroRunner plug-in project has no dependencies on any other Eclipse plug-ins (other than the <i>org.eclipse.core.resources</i> plug-in, which is required for interaction within the Eclipse framework), you can create your <i>java.lang.Runnable</i> class in any project outside of the MacroRunner project. </p>
+<h3>MacroRunner's Class Loader</h3>
+
+<p>The custom class loader implementation itself is straightforward, leveraging <i>java.net.URLClassLoader</i> for most of its functionality. The <i>URLClassLoader</i> provides a full class loader implementation accepting an array of <i>java.net.URL</i> instances as input to its constructor. This array of URLs, which can either point to locations on the local filesystem or on a network, is then used as a class search path when the class loader instance is asked to load a class. </p>
+
+<p>Following the delegating pattern of a Java class loading, the <i>URLCLassLoader</i> implementation first attempts to delegate the loading of any class to its parent class loader. If the parent class loader cannot locate the particular class in question, the <i>URLClassLoader</i> itself tries to locate the class along its URL search path(s).</p>
+
+<p><i>MacroClassLoader</i> (<a name="rl2"></a><a href="#l2">Listing Two</a>) simply extends <i>java.net.URLClassLoader</i>, providing a constructor accepting the path to the class to be run, as well as the parent class loader of the calling instance. With this information, a <i>URL[]</i> array of size 1 is created with the class location information converted from a simple path into a URL location. To learn more about Java URLs, consult the documentation for the <i>java.net.URL</i> class (http://java.sun.com/j2se/1.4.2/docs/api/java/net/URL.html). </p>
+
+<p>Since the <i>java.net.URLClassLoader</i> implementation meets all of your needs, there is no need for any method modification, other than the slight simplification we have made to the constructor to hide the need for URLs from the application developer. If, however, a different behavior than the default were required, you could extend the <i>URLClassLoader </i>in a few different ways by creating a class descending from <i>java.lang.ClassLoader</i> (or any of its subclasses) and overriding one or more of the following methods:</p>
+
+
+
+<ul>
+  <li><i>Class findClass(String name)</i>. The <i>findClass()</i> method is the preferred route through which to modify class loading behavior. This method resolves the .class file associated with the input name parameter, reading in this class representation to an array of bytes, and returning a class instance representing this byte array through a call to the <i>defineClass()</i> method. The ability of application developers to modify the search paths of a class loader through an overridden <i>findClass()</i> method is what truly provides the power and flexibility of Java's dynamic class loading methodology.</li>
+  <li><i>String findLibrary(String name)</i> is an analogue to the <i>findClass()</i> method, except that this method can be overridden to resolve native libraries in a custom fashion, such as shared objects in UNIX-like operating systems or DLLs in Windows. Any library loaded via <i>java.lang.System.loadLibrary()</i> at runtime has the resolution of the library path accomplished through the <i>findLibrary()</i> method of the calling class's class loader.</li>
+  <li><i>Class loadClass(String name)</i>. It is not generally good practice to override this method, as the enforcement of the delegating nature of Java class loading is performed here. If, however, a custom application required such a feature, the <i>loadClass()</i> method could be overridden to change the delegating nature of class loading for a particular class loader instance so that the child class loader first attempted to load a class by itself before delegating to its parent.</li>
+  <li><i>Class defineClass(String name, byte[] classBytes, int offset, int length)</i>. Though <i>defineClass()</i> is a final method and as such cannot be overridden, it warrants mention as it forms an integral part of the <i>ClassLoader</i> implementation. The <i>defineClass()</i> method accepts an array of bytes defining a .class file and returns a <i>java.lang.Class</i> instance representing that array of bytes, or a <i>ClassFormatError</i> exception on error. The <i>findClass()</i> method should return a <i>java.lang.Class</i> instance created by this method.</li>
+</ul>
+<h3>A MacroRunner Sample Java Macro</h3>
+
+<p>To demonstrate how you can manipulate the Eclipse environment, I turn to an example that renames all of the projects in the current Eclipse workspace. Though not very useful, this example still demonstrates how the Eclipse internals are accessible to our macro file executed with the aid of our custom class loader in the MacroRunner plug-in.</p>
+
+<p><a name="rl3"></a><a href="#l3">Listing Three</a> is a class implementing the <i>java.lang.Runnable</i> interface. The example leverages the Resource API of Eclipse in order to get a reference to the current Eclipse workspace, and to all of the projects in the workspace. It then iterates over all of the projects in the workspace, appending the <i>String "_Modified"</i> to each of the project names.</p>
+
+<p>To see this macro code in action, compile the macro into a Java class file, run the MacroRunner example from within your Eclipse instance, and load the macro file via MacroRunner's Java macro class loading functionality (see the accompanying text box entitled "Installing the MacroRunner Project").</p>
+<h3>Common Custom Class Loader Pitfalls</h3>
+
+<p>Debugging custom class loaders isn't as hard as you may think. During development work at TimeSys, we ran across these common problems that may cause grief for you as well when working with custom class loaders: </p>
+
+
+
+<p><b>Problem:</b> Wrong class loaded. Your class loader fails to load a class that you wished it to load; because class loading is delegated to the parent class loader, your class does load properly but not in the correct context</p>
+
+<p><b>Solution:</b> Call <i>getClass().getClassLoader().getClass().getName()</i> on the instance of the loaded class that you have; this returns the name of the class that implements the class loader, which actually ended up loading the instance of this class. Once you have established that your class loader is failing to load the class properly, the next step should be to ensure that the class does not reside anywhere on the System class loaders' CLASSPATH.</p>
+
+<p><b></b></p>
+
+<p>Problem: Parent Class loader finds class first. <i>URLClassLoader</i> delegates to its parent class loader before attempting to load the class with your derived class loader.</p>
+
+<p><b>Solution:</b> This is actually the expected behavior: Java class loaders generally follow the delegating model, which offers the parent class loader the first attempt at loading any class. If, however, the parent class loader cannot find the class to be loaded, the loading of the class needs to be handled by your class loader. If you would like to make sure that your parent class loader in Eclipse does not load a particular class, make sure that the class lies in a plug-in external to the plug-in in which your class loading code resides,  and also ensure that there are no interdependencies between the plug-ins.</p>
+<h3>Conclusion</h3>
+
+<p>The Eclipse environment has created its own class loaders so that a plug-in's class path requirements won't interfere with each other; instead of the class loader being a Singleton with respect to the running JVM, each plug-in has it own. When working with Eclipse, the plug-in manifest describes the class path for the plug-in.</p>
+
+<p>While the stock class loader for Eclipse is adequate for most uses, the platform is flexible enough that you can still supply a custom class loader if necessary. The plug-in I describe in this article uses a custom class loader to load and execute an arbitrary class within the current Eclipse instance and serves as an excellent tool to learn about the mechanics of creating your own class loader as well as being a great productivity tool for Eclipse. </p>
+
+
+<p><b>DDJ</b></p>
+
+
+
+	
+	
+<br>
+<br>
+<b><a name="l1"></a>Listing One</b><br>
+<pre>try {
+//Instantiate ClassLoader, passing the location (directory) of the class to
+//load and the parent class loader
+ClassLoader loader = new MacroClassLoader(classLocation,
+                                          this.getClass().getClassLoader());
+
+//Load the class with the custom ClassLoader;
+// we can now instantiate new using the newInstance() method
+Class klass = loader.loadClass(classToLoad);
+
+//Instantiate a new instance of the loaded class - this is equivalent to the
+//"new" keyword
+Runnable loadedClass = (Runnable)klass.newInstance();
+
+//Check to make sure that our custom ClassLoader succeeded
+// in loading the class, and not the System class loader
+if(this.getClass().getClassLoader() == loadedClass.getClass().getClassLoader())
+{
+  //If we get here, then the class instance loadedClass was
+  //loaded by the System class loader, not by our custom class loader!!!
+  printErrorMsg(classToLoad,
+                new String("Class was not loaded by the proper class loader"));
+  return;
+}
+} catch (ClassCastException e){
+  printErrorMsg(classToLoad,
+                new String("Class must implement java.lang.Runnable"));
+  return;
+} catch (ClassNotFoundException e){
+  printErrorMsg(classToLoad,
+                new String("Class could not be located at " + classLocation));
+  return;
+} catch (IllegalAccessException e){
+  printErrorMsg(classToLoad,
+                new String("ClassLoader threw an IllegalAccessException"))
+  return;
+} catch (InstantiationException e){
+  printErrorMsg(classToLoad,
+                new String("ClassLoader threw an InstantiationException"));
+  return;
+} catch (MalformedURLException e) {
+  printErrorMsg(classToLoad, 
+                new String("ClassLoader threw a MalformedURLException"));
+  return;
+}</pre>
+<a href="#rl1">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l2"></a>Listing Two</b><br>
+<pre>public class MacroClassLoader extends java.net.URLClassLoader {
+
+  public MacroClassLoader(String classLocation, ClassLoader parent)
+    throws MalformedURLException {
+//Create a new URL[] array with one entry, a URL expressing the
+//location of the String classLocation which is an input parameter to this
+//method. We will assume that the class location is on the local filesystem,
+//and will prepend the file:// (Unix) or file:/// (Windows) URL identifier as 
+//well as replacing any Windows-style forward slashes with URL-style 
+//backslashes
+    super(new URL[] {
+          new URL("file:" + ((classLocation.charAt(0) == '/') ? "//" : "///" )
+                   + classLocation.replace('\\', '/') + "/")}, parent);
+  }
+}</pre>
+<a href="#rl2">Back to article</a><br>
+	
+	
+	
+<br>
+<br>
+<b><a name="l3"></a>Listing Three</b><br>
+<pre>public class TestRunnableProjRename implements java.lang.Runnable {
+// (non-Javadoc) * @see java.lang.Runnable#run() 
+
+  public void run() {
+    IWorkspace workspace = null;
+    IWorkspaceRoot workspaceRoot = null;
+    IProject [] projects = null;
+    
+    System.out.println("In TestRunnableProjRename...");
+
+    workspace = ResourcesPlugin.getWorkspace();
+    workspaceRoot = workspace.getRoot();
+    projects = workspaceRoot.getProjects();
+
+    //Iterate over all of the projects in the current workspace
+    for(int i=0; i &lt; projects.length; i++){
+      
+      //Closed projects should be ignored...
+      if(!projects[i].isOpen())
+        continue;
+
+      //Rename all projects in workspace to $(PROJNAME)_Modified
+      try {
+        IProjectDescription description = projects[i].getDescription();
+        System.out.println("\tAttempting to change project "
+                           + description.getName());
+        description.setLocation(description.getLocation());
+        description.setName(description.getName().concat("_Modified"));
+        
+           //Actually perform the rename
+        IResource resource = (IResource)projects[i];
+        resource.move(description, true, false, null);
+      } catch (Exception e) {
+        e.printStackTrace();
+      }
+    }
+  }
+}</pre>
+<a href="#rl3">Back to article</a><br>
+	
+	
+	
+
+
+</body>
+</html>

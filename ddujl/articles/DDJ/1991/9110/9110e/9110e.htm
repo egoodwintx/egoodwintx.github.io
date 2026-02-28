@@ -1,0 +1,520 @@
+<HTML>
+<META NAME="year" CONTENT="1991">
+<HEAD>
+<TITLE>OCT91: PORTING UNIX TO THE 386 THE BASIC KERNEL</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>PORTING UNIX TO THE 386 THE BASIC KERNEL<a name="0235_0002"></h1><P>
+<h2><a name="0235_0001"><a name="0235_0000">Multiprogramming and Multitasking, Part II</h2><P>
+<h3>William Frederick Jolitz and Lynne Greer Jolitz</h3><P>
+<p><i><a name="0235_0000">Bill was the principal developer of 2.8 and 2.9BSD and the chief architect of National Semiconductor's GENIX project, the first virtual memory microprocessor-based UNIX system. Prior to establishing TeleMuse, a market research firm, Lynne was vice president of marketing at Symmetric Computer Systems.  They conduct seminars on BSD, ISDN, and TCP/IP.  Send e-mail questions or comments to lynne@berkeley.edu. (c) 1991 TeleMuse.</i></p><hr><P>
+In last month's installment, we embarked upon an exploration of multiprogramming and multitasking -- two of the important elements which help make UNIX &quot;UNIX.&quot;  Now that we have examined these key UNIX conventions and have developed the intellectual framework for multiprogramming, we will now proceed to an examination of some actual code, in particular sleep(), wakeup(), and switch() and how these three programs carry off the illusion of multiple simultaneous process execution on a sole processor.<P>
+Following our discussion of the 386BSD switching mechanisms, we will then discuss some of the requirements for the extensions needed to support multiprocessor and multithread operations in the monolithic 386BSD kernel.  Finally, we will reexamine the multiprogramming attempts of some other operating systems in light of what we have learned.<P>
+<h3><a name="0235_0003">The 386BSD swtch() Routine<a name="0235_0003"></h3><P>
+The process context switching routine in our 386BSD kernel that provides the actual functionality is called swtch().  In a nutshell, swtch() stores the process's context in a pcb (process context block) data structure, finds the next process to run from those waiting to be run, loads the new process's state, and then executes a return.  Note that in this case, the call to swtch() occurred the last time the new process was running and calling swtch().<P>
+This mechanism relies on the fact that a process must effectively request a context switch to the next consecutive process, whatever it is.  This way, either another process is run, or, if it is the only running process, it switches back to itself again.  If there is no process to run, such as when the sole running process switches while waiting for disk I/O to complete, swtch() must idle the processor and rescan the run queue when a process is added to the queue.<P>
+The 386BSD swtch() routine attempts to avoid work when possible, because at times, literally hundreds to thousands of switches per second may be demanded as we use a large number of processes running on top of the kernel.  To reduce overhead, swtch() does nothing to ensure that the data structures remain unchanged between the call and subsequent return from swtch().  As such, other parts of the kernel must incorporate mechanisms concerned with critical sections (that we can implement as needed at those sites).  Similarly, nothing in swtch() is done to prevent deadlocks or even ensure that a process is ever executed again!  (MULTICS, in contrast, has refined to a fine art the ability to avoid deadlocks.)  By reducing the overhead on context switching, we also reduce the cost of a process.<P>
+Other operating systems attempt to reduce the overhead on process switching by avoiding switches when possible and planning for them when forced to use them.  The designers of UNIX took a different approach -- make the mechanism for context switching simple and cheap, use it often, and build new mechanisms for handling other requirements on an as needed basis.  In other words, multitasking comes first, and everything else falls within our multitasking framework.<P>
+<h3><a name="0235_0004">Where Is swtch() Used?<a name="0235_0004"></h3><P>
+swtch() is called only in the &quot;top&quot; layers of the kernel when a process, in kernel mode, blocks for a resource.  To keep processes that stay in user mode from locking or rescheduling, swtch() is called as an exception at the end of interrupt processing, when we would be returning to the user-mode program.  A periodic clock interrupt (used to recalculate the process priorities used by swtch() to determine who to run next) also ensures that a process can't overstay its welcome even if no other interrupts occur.<P>
+If a process is not running, it is either waiting to return to user mode (for instance, a higher priority process preempted it) or its kernel mode alter ego is waiting for some event or resource to &quot;wakeup&quot; so that it can be switched.  In most UNIX systems, a process status command called ps can be used to differentiate between these two cases.  In the first case, a process will be marked as &quot;runnable&quot; (R or SRUN).  In the second, it will be marked as &quot;sleeping&quot; (S or SSLEEP) and be assigned a &quot;wchan&quot; (or wakeup event number) to indicate which event it is waiting for.<P>
+<a href="#0235_000d">Listing One</A> (page 118) is a code fragment executed after a system call or interrupt, when the process is about to return to user mode.  At this point, no resources capable of causing a deadlock condition are being held, so the process sees no semantic difference between running now or later -- it is safe to switch.  Note that policy decisions of when and who to switch to are made elsewhere.  Also note that signals, including ones that might result in termination, are processed at this point.<P>
+tsleep(), or &quot;timed sleep&quot; (see <a href="#0235_000f">Listing Two</A>, page 118), is a blocking call in the BSD kernel that sets a process sleeping and switches away to run another process (or idle) until the event occurs.  It works by marking the process as waiting for an event, inserting it on a sleep queue (frequently many processes sleep for the same event), and switching.  In addition, tsleep() has options to abort a sleep after a time limit, as well as the ability to catch &quot;signals&quot; (that is, someone has killed the process and the code calling tsleep should clean up and let other routines, such as system calls, process the incoming signal).<P>
+Unlike tsleep(), wakeup() (see <a href="#0235_0011">Listing Three</A>, page 118) does not cause control to pass to another process.  It simply removes the block ( indicated by the &quot;chan&quot; event), stopping processes that are sleeping for it.  To reduce time spent finding processes, the sleep queue is hashed.  Found processes are added to the run queues.  If the process is not loaded, the swap scheduler associated with process 0, the first process, is awakened to bring it in.  (Of course, we won't put it on a run queue and reschedule.)  Note that is not an error if no processes are waiting for the event.  The processes now placed on the run queue will be run (in order of priority and on a FIFO order) as swtch() is called.<P>
+When swtch() is called by other portions of the kernel, caution must be observed -- its &quot;simple&quot; nature should not cause more problems than it solves.  For example, to forestall deadlocks and data structure corruption created by another process that may have been run in the interim, we must make sure that calls are &quot;safe.&quot;  These rules, by the way, are generic to the entire kernel.<P>
+<h3><a name="0235_0005">The Life Cycle of a Process<a name="0235_0005"></h3><P>
+By now you might have noticed that swtch() relies upon the existence of a current process, and possibly even other processes, to be summarily executed.  But we still have not discussed how processes come into being and how they cease to exist -- in other words, the life cycle of a process.  We'll briefly touch on these to complete the picture.<P>
+Processes are created by a fork() system call.  The microscopic, inner portion of a fork() call must create a process context that can be swtch()ed to so that it can be run.  This process context is created by a cpu_fork() routine.  It builds the process context into the newly allocated process data structure, then adds it to the list of executable processes.<P>
+Process termination is conducted by a similarly named routine, cpu_exit().  This routine, the inner part of the exit() system call, deallocates a process and its related data structures, and then switches away.  The process no longer exists, so it never runs the risk of being switched back.  This is also true for &quot;killed&quot; processes, because exit() is called in the course of processing a signal.  Exiting UNIX processes are, in effect, suicides.<P>
+For those of you wondering why an apparently &quot;unkillable&quot; process occurred (a not uncommon occurrence), this is because the process &quot;sees&quot; a termination signal only when it returns to user mode.  If the process is blocked waiting for an event or a resource, and the blocking mechanism does not notice the existence of the signal, it will continue to wait in vain for that resource.  This problem usually arises from a programming error in a device driver or as an unintended deadlock that a new feature in the system just provoked.<P>
+<h3><a name="0235_0006">The Magic of swtch(): a Simple Scenario<a name="0235_0006"></h3><P>
+Now that we've outlined what swtch() does, we need to know how it brings off the illusion of multiprogramming -- the magic, if you will.  As a working example, we will now set up a hypothetical session: Three people, each running a process (each on a terminal), are typing simultaneously.<P>
+User A presses a key.  This causes the computer to interrupt User C's read() system call that was reading a file off the disk.  User A's key press is processed by the system and put on a character queue associated with User A's process.  A wakeup is then issued to this process, and the computer, in clearing the interrupt, returns to User C's read() system call.<P>
+User C's process, in kernel mode, requests a block from the disk.  It now blocks waiting for the disk, and switches.  However, User B had a disk I/O process waiting even before this example began (yes, an argument for preexisting universes) and is now competing with User C's process.<P>
+User B's process now becomes the current running process because it has more priority than User A's process.  User B's process runs, returning to user mode and continuing the user program until its timeslice is used up.  (The rescheduling clock interrupt routine periodically checks the timeslice as it monitors the passage of time, typically 60-100 times a second.)  On the last clock interrupt, the rescheduling code sets the wantresched flag, and a call to swtch() occurs just before the return to user mode.  User A's process is then selected to run.  It then processes the received character in the top half of the system, completes its system call, and returns to the user.<P>
+This entire scenario took place in the order of a hundredth of a second.  Unlike the audiophile who claims to dislike CDs because &quot;he can hear the sound breaking up&quot; 44,000 times a second (good ears!), most mortals can't resolve time this finely.  However, if 70 users on an anemic little machine such as a PDP-11/70 all hit return at the same time, this tolerable hundredth-of-a-second delay would grow to encompass seconds.  In fact, you could go get an espresso while running a simple compilation and get back in time for a prompt.  (Except that someone would probably steal your terminal in the meantime.  Yes, it used to be this way.)<P>
+This should illustrate the amount of work done by this tiny subroutine.  As such, it's time to dissect the innards of the 386BSD swtch() routine.<P>
+<h3><a name="0235_0007">A Closer Look at swtch()<a name="0235_0007"></h3><P>
+For all practical purposes, switch() boils down to three functions: store, select, and load.  We store the current process's state, select the new process to be run, and load in the new process's state.<P>
+Storing and loading processor state is pretty simple (see <a href="#0235_0013">Listing Four</A>, page 118).  All we really need to do is move processor registers appropriately and get a new address space.  The key global variable within our BSD kernel is the curproc variable; it points to the active process at all times.  From the process data structure (which acts as a directory of data structures for this process), we obtain from the p_addr field the address of the pcb to hold the context we will store and load.  One element of that context, the page table base pointer %cr3 of the process, defines the address space of the user process page tables.<P>
+Floating point is dealt with here by setting a bit on a processor special register %cr0, which causes a trap on the next floating-point operation.  In this way, we can delay the store and unload of the coprocessor until it's absolutely needed.  Storing and loading the &quot;Numeric Coprocessor Extension&quot; (NPX) is costly, and usually only one or two processes use it at a time, to minimize the impact on the remaining processes.<P>
+For the system hardware, we have to remember the priority level of hardware interrupts (the cpl) and restore it as well.  Naturally, we must also set curproc to point to the successor process.<P>
+The mechanism for selecting the new process is more complicated.  In 386BSD we have 32 run queues of ascending priorities.  swtch() is a consumer of the run queues, taking the leading process off the highest priority run queue and loading it.  It will consume all processes off a high priority queue before consuming any from a lower queue.  To quickly find which queue to consume first, the queue status variable whichqs records the &quot;filled versus empty&quot; status of all queues (32 queues corresponding to 32 bits, one bit per queue).  With a single-bit scan instruction, we can determine if: 1. A process is on any queue at all (for example, if 0, no process to run); and 2.64 the highest priority queue that has a process in it.<P>
+What if we can't find a process to run?  We must &quot;idle,&quot; awaiting a process that can be serviced.  In our idle loop, we reenable interrupts and execute the hlt instruction to stop the processor.  In reality, the hlt instruction pauses until the next interrupt.  We actually could do other things at this point (some systems, for example, scrub dirty pages), but we choose to idle the processor in an (usually vain) attempt to avoid stealing bandwidth from the bus (ah...but ISA has no other bus masters or other CPUs), or, in the case of a CMOS 386 in a laptop, save power (almost none are &quot;low-power&quot; CMOS).<P>
+In order to be run for a time from swtch(), processes must first be queued on a run queue. The setrq() routine (see <a href="#0235_0015">Listing Five</A>, page 120) places them on the end or tail of the run queue associated with the process's priority.  Priority may change as a process runs, so we have a remrq() as well (see <a href="#0235_0015">Listing Five</A>) to remove a process from a run queue.  This allows us to reinsert the process with setrq() at a different priority, and thus, a different run queue.<P>
+<h3><a name="0235_0008">Alternative Implementations and Trade-offs<a name="0235_0008"></h3><P>
+There are a number of other ways to implement this process switching routine.  On the 386, at least three ways of loading and unloading the registers provide different degrees of functionality at a given cost.  Also, we can choose to reorder the structure of this routine to minimize the costs for common cases (switch to self and switch to idle, for instance).<P>
+Instead of storing and loading the registers with individual move instructions, we could have used a single pushal instruction.  In that case, we would point the stack at the pcb before issuing the instruction, then restore it afterward.  Something below the pcb might be written on if we got an interrupt, so we would also have to bracket it with instructions to lock out interrupts and reenable them.<P>
+Another way we could store and load registers on the 386 is to use the all-en-compassing JUMP TSS task switch instruction (ljmp to a TSS descriptor).  This instruction, unique to the 386, stores all register state in a special data structure and loads new state as well from the new process.  It even switches the page tables and sets the TS bit dealing with the coprocessor.  (Does just about everything but walk the dog!)<P>
+To use the JUMP TSS instruction, we would need a TSS descriptor for each process that could be active at any time.  Also, we would have to detect the case where we might he switching back onto ourselves, and avoid using JMP TSS at this point.  (This instruction is so helpful, it even tracks whether we are using the very TSS loaded, and gives us an exception if we do that!)  This instruction, true to its calling, really does it all, storing and loading all registers (sans the coprocessor, thank goodness) all the time.<P>
+RISC fanatics tend to have a field day with CISC instructions of this kind because of the complexity and expense.  As a matter of fact, while comprehensive, we find it too slow to use efficiently for our purposes.  However, to be fair to the designers of the 386, if you need to do all of the things that JUMP TSS offers, using this instruction is probably your best bet. (At the moment, 386BSD doesn't really need all this instruction's features, but our pcb format allows us to use JUMP TSS in subsequent versions, should it become more desirable.)  The 386 also supports exceptions and interrupts optionally handled with a transparent CALL TSS, an instruction which may also offer some advantage in certain circumstances.<P>
+In comparing our three methods outlined for process switching routines, it is important to sit down and add up the instruction costs.  We know that by saving fewer registers, we end up doing fewer loads and stores, and hence make our end-to-end cost lower.  In our 386BSD swtch ( ) function (see <a href="#0235_0013">Listing Four</A>), we get away with saving only six registers.  We don't need to save %eax, %edx, and %ecx because these are compiler temporary registers which are discarded on return.  We also don't save the segment registers because they don't change in this version of the system.  In contrast, pushal saves eight registers and JMP TSS saves 20.  Adding up the instruction costs, our approach is the best of the three.<P>
+We can also look at structural changes to swtch ( ) itself.  For example, instead of our (store, select, load) sequence we could try a (select, store, load) sequence.  In this example, if we detect the case of switching to ourselves (perhaps after an idle wait), we can avoid both the store and load of registers.  (This is particularly useful if you have a RISC with 30-100 registers or more.)  We actually coded the first version this way and ran the operating system like this for a year.  But due to the paucity of registers on the 386, little advantage was gained.<P>
+The simpler arrangement seems to work better, because with (store, select, load), we have more registers free to keep the values used by select, thus reducing the number of memory accesses.  Also, there is usually a delay between when the processor idles and when an interrupt occurs (which will cause a wakeup ( ) and then a setrq ( )), so the store occurs during this delay time.  This in turn makes the delay shorter because only the load would need to be completed to finish the swtch ( )!  Thus, the average real time elapsed would be shorter, because the store is overlapped with the wait!<P>
+Another change one could make is to move the select portion to the setrq ( ) function, and rely on a single comparison to determine if a switch or idle needs to be done (having already pre-calculated which one it is).  But this adds to the complexity, and might not result in a gain, because the places that matter have a setrq ( ) call just prior to swtch ( ).  It might even be slower, because there are more setrq ( ) calls than swtch ( ) calls.  Sometimes clever optimizations just move the problem around rather than improve the situation.<P>
+<h3><a name="0235_0009">Multiprocessing<a name="0235_0009"></h3><P>
+Multiprocessing describes a system capable of managing multiple processors.  (It does not mean running multiple processes, which is called &quot;multiprogramming.&quot;)  UNIX kernel paradigms we have mentioned are extensible to multiprocessors (with semaphores and effort), because many of the problems we've dealt with (serialization, deadlock prevention, blocking, and context switching) apply here as well, but on a grander scale.  With multiprocessors, there's obviously even more competition for shared data structures, as each processor may want the very same data object at the same moment in time.<P>
+The degree to which multiprocessors can be applied is often confusing.  In the common case, multiple processors can each do a process at a time -- parallelism exists at the process level.  Such UNIX systems have &quot;make&quot; programs that can run multiple, simultaneous compilations.  A smaller set of systems (including some MACH and Chorus systems) also permit multiple processors to each do a part of a process simultaneously.  This is a form of &quot;fine grain&quot; parallelism.  The mechanisms of multiprocessor operation within a single process are facilitated by either threads or lightweight processes.<P>
+Threads are &quot;nanotasks&quot; -- in other words, the smallest possible state living in address space.  They are inexpensive mechanisms added to existing processes.  However, most thread programming models use different primitives for dealing with threads than for processes.<P>
+Lightweight processes (LWP) are &quot;nanoprocesses&quot; that may share all, or a portion, of an address space.  They are treated by the system just like processes, but share resources, so they are &quot;lighter&quot; than UNIX processes.  Lightweight processes use similar or identical primitives to deal with processes in general.<P>
+If you are beginning to notice that the disagreement between these two approaches is one of either being &quot;inside out&quot; instead of &quot;outside in,&quot; you're dead on the money.  Reading Swift is an excellent exercise for those unclear on such conflicts, as the residents of Lilliput and Blefescu well know!<P>
+<h3><a name="0235_000a">Adding Multiprocessing to 386BSD<a name="0235_000a"></h3><P>
+Current versions of 386BSD have the sole goal of running on a uniprocessor machine, but that's not to say it will always be this way.  Should we wish to extend it to multiple processors, we would need to consider a number of issues.<P>
+386BSD is a &quot;monolithic&quot; kernel: All its functionality is built in a single program known as the kernel.  On a uniprocessor, this kernel program is multitasking, in a sense, to provide multiple processes with system call functionality.  On a multiprocessor, the same program would be present, but would have to support multiprocessing as well.<P>
+Among the most significant modifications to 386BSD would be changes to the subroutines that block, unblock, and select processes that would serialize access to process state.  System call requests from processes in 386BSD are always processed with a process pointer, so the state within the process structure and the process's kernel stack would be uniquely accessed by that very processor.  Other objects, such as the corresponding user process's address space, files, file descriptors, buffers, and the like, would then be arbitrated for by a series of &quot;spin&quot; locks and reference-checked on allocation and deletion.  Much of this has already been anticipated in the current version of the system, unlike previous editions of BSD.<P>
+How might such extensions allow multiprocessing inside a single process?  Well, processes could share all or part of an address space, so they could become lightweight by not requiring a complete copy of all of a process's parts, for example, vfork().  (See the sidebar entitled &quot;Brief Notes: Lightweight Processes and Threads&quot; in the September issue.)  By virtue of &quot;gang&quot; scheduling, a set of shared processes could all become active, each individual one per processor.  Debugging such an arrangement would be identical in form to multiple process debugging.<P>
+<h3><a name="0235_000b">Reflection: Why is it Hard to Add Multiprogramming After the Fact?<a name="0235_000b"></h3><P>
+UNIX has been around for over 20 years and predates other operating systems which have come (and gone) such as CPM, MS-DOS, and Finder.  So, why has multiprogramming come to mass market platforms such as the PC and Mac so late?  Both MS-DOS and Finder were written with some multiprogramming &quot;writing on the wall&quot; in mind, but it's been a long road between &quot;it's going to be there&quot; and &quot;it's here,&quot; and it's not common yet.<P>
+Windows/386 accomplishes some aspects of multiprogramming (somewhat like UNIX) through a hardware trick: by simulating PCs via the virtual 8086 mode, with the actual windows kernel running in protected mode.  Multifinder (System 7.0) on the Macintosh also attempts multiprogramming, but the price is that no safety nets are held out for naughty programs.  (In other words, programs were doing things they should never have been doing, so they should be changed to work appropriately.  This does not go over well on the applications circuit, to say the least.)<P>
+What was the problem?  The experiences of the past were not heeded in many areas, and an appropriate model was not completely thought out.  (In addition, the cost of an MMU was considered &quot;too high&quot; for the PC and Mac.)<P>
+<UL>
+<li>These systems did not separate the application program from the kernel, as UNIX has done since its early days on the PDP-11/45.  This meant that missing functionality in the system could be bestowed by a clever applications program, but there was a downside.  These applications got far more intimate with its internals than the operating system's designers probably desired.  It's hard to believe that MS-DOS redirectors and TSRs were anything but a bad dream to such designers, who had different plans for the future.</li>
+<li>The drivers and other portions of the system were written expecting synchronous operation without preemption by the system.  This precludes multiprogramming, because the system can't run another program in the idle time waiting for the disk.  (Early versions of UNIX suffered this flaw as well.)  To put this in UNIX terminology, the top half of the system blured together with the bottom half, because it didn't matter with nonmultitasking systems such as MS-DOS and Finder.</li>
+</UL>
+In general, the lessons learned from UNIX (and other operating systems) are often ignored by operating systems designers.  The desire to &quot;create from the bottom up&quot; can result in short-sighted and incomplete designs which are difficult to rectify later.  A good operating systems designer should attempt to leverage as much as possible from other efforts, sorting out the good from the bad, and then proceeding onwards with a new set of goals.  After all, we don't go ahead and design the microprocessor, design and build the hardware, port the operating system, and then write the applications programs all at once, do we?  (Well, we wouldn't recommend this route, but we have actually done three of the four, and it was not easy.)<P>
+Remember also that shortcuts that appear not to matter often come back to bite, so trade-offs should be carefully hashed out before a decision is made.  That's why we discuss why we didn't do something as well as what we did do in 386BSD.  These rules are pertinent to all operating system design, not just UNIX.<P>
+After understanding the broad implications of multiprogramming, along with the minutiae which make it possible, it's impressive that it's all based on a simple set of conventions. Through a careful understanding of these conventions and how they are implemented, we gain appreciation for how a simple model, carefully arranged, can offer much years down the line.<P>
+<h3><a name="0235_000c">Onward and Forward<a name="0235_000c"></h3><P>
+The mechanics of processes and context switching, coupled with a basic understanding of multiprogramming, multiprocessing, and multitasking, form some of the key components of a true UNIX system.  These fundamental constructs were incorporated into the original design of UNIX, with the result that extending it into the realms of multiprocessing, for example, becomes a plausible goal not buffeted by contradictory design elements (as in MS-DOS, for example).  Any operating system which purports to be multiprogramming must meet the definitions and constructs of a multiprogramming system, else it quite simply is not.<P>
+As we stated earlier, we are working on many areas of this 386BSD port at once, so we will be returning to our main ( ) procedure (see DDJ August 1991) next month to continue our discussion in more detail and focus on the primitives and organization which impact device drivers.  In particular, we will examine important areas such as auto-configuration, the enabling operation of the PC hardware devices, splX() (interrupt vector-level management), and the interrupt vector code.  The following month, after having laid the groundwork for our UNIX device drivers, we will discuss sample device drivers.  In particular, we will examine in detail some of the code required for the console, disk, and clock interrupt drivers.  The basic structure of these drivers, minimal requirements, and extending the functionality through procedures such as disklabels will also be discussed.<P>
+
+<PRE>
+
+_PORTING UNIX TO THE 386: MULTIPROGRAMMING AND MULTITASKING_
+by William Frederick Jolitz and Lynne Greer Jolitz
+
+<a name="0235_000d">
+<a name="0235_000e"></pre><B>[LISTING ONE]</B><pre><a name="0235_000e">
+
+/* code fragment from i386/trap.c (in trap() and syscall()) */
+ ...
+    if (want_resched) {
+        /*
+         * Enqueue our current running process first, so
+         * that we may eventually run again. Block clock
+         * interrupts that may interfere with priority
+         * (e.g. we'd rather it not be recalculated part
+         * way thru setrun).
+         */
+        (void) splclock();
+        setrq(p);
+        (void) splnone();
+        p-&gt;p_stats-&gt;p_ru.ru_nivcsw++;
+        swtch();
+        while (i = CURSIG(p))
+            psig(i);
+    }
+ ...
+
+
+
+
+
+
+<a name="0235_000f">
+<a name="0235_0010"></pre><B>[LISTING TWO]</B><pre><a name="0235_0010">
+
+/*-
+ * Copyright (c) 1982, 1986, 1990 The Regents of the University of California.
+ * Copyright (c) 1991 The Regents of the University of California.
+ * All rights reserved.
+ */
+
+/*
+ * General sleep call.
+ * Suspends current process until a wakeup is made on chan.
+ * The process will then be made runnable with priority pri.
+ * Sleeps at most timo/hz seconds (0 means no timeout).
+ * If pri includes PCATCH flag, signals are checked
+ * before and after sleeping, else signals are not checked.
+ * Returns 0 if awakened, EWOULDBLOCK if the timeout expires.
+ * If PCATCH is set and a signal needs to be delivered,
+ * ERESTART is returned if the current system call should be restarted
+ * if possible, and EINTR is returned if the system call should
+ * be interrupted by the signal (return EINTR).
+ */
+tsleep(chan, pri, wmesg, timo)
+    caddr_t chan;
+    int pri;
+    char *wmesg;
+    int timo;
+{
+    register struct proc *p = curproc;
+    register struct slpque *qp;
+    register s;
+    int sig, catch = pri &amp; PCATCH;
+    extern int cold;
+    int endtsleep();
+
+    s = splhigh();
+    if (cold || panicstr) {
+        /*
+         * After a panic, or during autoconfiguration,
+         * just give interrupts a chance, then just return;
+         * don't run any other procs or panic below,
+         * in case this is the idle process and already asleep.
+         */
+        splx(safepri);
+        splx(s);
+        return (0);
+    }
+
+#ifdef DIAGNOSTIC
+    if (chan == 0 || p-&gt;p_stat != SRUN || p-&gt;p_rlink)
+        panic(&quot;tsleep&quot;);
+#endif
+
+    p-&gt;p_wchan = chan;
+    p-&gt;p_wmesg = wmesg;
+    p-&gt;p_slptime = 0;
+    p-&gt;p_pri = pri &amp; PRIMASK;
+
+    /* Insert onto the tail of a sleep queue list. */
+    qp = &amp;slpque[HASH(chan)];
+    if (qp-&gt;sq_head == 0)
+        qp-&gt;sq_head = p;
+    else
+        *qp-&gt;sq_tailp = p;
+    *(qp-&gt;sq_tailp = &amp;p-&gt;p_link) = 0;
+
+    /*
+     * If time limit to sleep, schedule a timeout
+     */
+    if (timo)
+        timeout(endtsleep, (caddr_t)p, timo);
+
+    /* We put ourselves on the sleep queue and start our timeout
+     * before calling CURSIG, as we could stop there, and a wakeup
+     * or a SIGCONT (or both) could occur while we were stopped.
+     * A SIGCONT would cause us to be marked as SSLEEP
+     * without resuming us, thus we must be ready for sleep
+     * when CURSIG is called.  If the wakeup happens while we're
+     * stopped, p-&gt;p_wchan will be 0 upon return from CURSIG.
+     */
+    if (catch) {
+        p-&gt;p_flag |= SSINTR;
+        if (sig = CURSIG(p)) {
+            if (p-&gt;p_wchan)
+                unsleep(p);
+            p-&gt;p_stat = SRUN;
+            goto resume;
+        }
+        if (p-&gt;p_wchan == 0) {
+            catch = 0;
+            goto resume;
+        }
+    }
+
+    /* Set process sleeping, go find another process to run */
+    p-&gt;p_stat = SSLEEP;
+    p-&gt;p_stats-&gt;p_ru.ru_nvcsw++;
+    swtch();
+
+resume:
+    splx(s);
+    p-&gt;p_flag &amp;= ~SSINTR;
+
+    /* cleanup timeout case */
+    if (p-&gt;p_flag &amp; STIMO) {
+        p-&gt;p_flag &amp;= ~STIMO;
+        if (catch == 0 || sig == 0)
+            return (EWOULDBLOCK);
+    } else if (timo)
+        untimeout(endtsleep, (caddr_t)p);
+
+    /* if signal was caught, return appropriately */
+    if (catch &amp;&amp; (sig != 0 || (sig = CURSIG(p)))) {
+        if (p-&gt;p_sigacts-&gt;ps_sigintr &amp; sigmask(sig))
+            return (EINTR);
+        return (ERESTART);
+    }
+    return (0);
+}
+
+
+
+
+
+
+
+<a name="0235_0011">
+<a name="0235_0012"></pre><B>[LISTING THREE]</B><pre><a name="0235_0012">
+
+/*-
+ * Copyright (c) 1982, 1986, 1990 The Regents of the University of California.
+ * Copyright (c) 1991 The Regents of the University of California.
+ * All rights reserved.
+ */
+
+/* Wakeup on &quot;chan&quot;; set all processes
+ * sleeping on chan to run state.
+ */
+wakeup(chan)
+    register caddr_t chan;
+{
+    register struct slpque *qp;
+    register struct proc *p, **q;
+    int s;
+
+    s = splhigh();
+    qp = &amp;slpque[HASH(chan)];
+
+restart:
+    for (q = &amp;qp-&gt;sq_head; p = *q; ) {
+#ifdef DIAGNOSTIC
+        if (p-&gt;p_rlink || p-&gt;p_stat != SSLEEP &amp;&amp; p-&gt;p_stat != SSTOP)
+            panic(&quot;wakeup&quot;);
+#endif
+        if (p-&gt;p_wchan == chan) {
+            p-&gt;p_wchan = 0;
+            *q = p-&gt;p_link;
+            if (qp-&gt;sq_tailp == &amp;p-&gt;p_link)
+                qp-&gt;sq_tailp = q;
+            if (p-&gt;p_stat == SSLEEP) {
+                /* OPTIMIZED INLINE EXPANSION OF setrun(p) */
+                if (p-&gt;p_slptime &gt; 1)
+                    updatepri(p);
+                p-&gt;p_slptime = 0;
+                p-&gt;p_stat = SRUN;
+                if (p-&gt;p_flag &amp; SLOAD)
+                    setrq(p);
+                /*
+                 * Since curpri is a usrpri,
+                 * p-&gt;p_pri is always better than curpri.
+                 */
+                if ((p-&gt;p_flag&amp;SLOAD) == 0)
+                    wakeup((caddr_t)&amp;proc0);
+                else
+                    need_resched();
+                /* END INLINE EXPANSION */
+                goto restart;
+            }
+        } else
+            q = &amp;p-&gt;p_link;
+    }
+    splx(s);
+}
+
+
+
+
+
+<a name="0235_0013">
+<a name="0235_0014"></pre><B>[LISTING FOUR]</B><pre><a name="0235_0014">
+
+/* Copyright (c) 1989, 1990, 1991 William Jolitz. All rights reserved.
+ * Written by William Jolitz 6/89
+ *
+ * Redistribution and use in source and binary forms are freely permitted
+ * provided that the above copyright notice and attribution and date of work
+ * and this paragraph are duplicated in all such forms.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
+/* Swtch() */
+ENTRY(swtch)
+
+    incl    _cnt+V_SWTCH
+
+    /* switch to new process. first, save context as needed */
+    movl    _curproc, %ecx
+    movl    P_ADDR(%ecx), %ecx
+
+    /* unload processor registers, we need to use them */
+    movl    (%esp),%eax
+    movl    %eax, PCB_EIP(%ecx)
+    movl    %ebx, PCB_EBX(%ecx)
+    movl    %esp, PCB_ESP(%ecx)
+    movl    %ebp, PCB_EBP(%ecx)
+    movl    %esi, PCB_ESI(%ecx)
+    movl    %edi, PCB_EDI(%ecx)
+
+    /* save system related details */
+    movl    $0,_CMAP2       /* blast temporary map PTE */
+    movw    _cpl, %ax
+    movw    %ax, PCB_IML(%ecx)  /* save ipl */
+
+    /* save is done, now choose a new process or idle */
+rescanfromidle:
+    movl    _whichqs,%edi
+2:
+    bsfl    %edi,%eax       /* found a full queue? */
+    jz  idle            /* if nothing, idle waiting for some */
+
+    /* we have a queue with something in it */
+    btrl    %eax,%edi       /* clear queue full status */
+    jnb 2b          /* if it was clear, look for another */
+    movl    %eax,%ebx       /* save which one we are using */
+
+    /* obtain the run queue header */
+    shll    $3,%eax
+    addl    $_qs,%eax
+    movl    %eax,%esi
+
+#ifdef  DIAGNOSTIC
+      /* queue was promised to have a process in it */
+      cmpl  P_LINK(%eax),%eax   /* linked to self? (e.g. not on list) */
+      fje   panicswtch          /* not possible */
+#endif
+
+    /* unlink from front of process q */
+    movl    P_LINK(%eax),%ecx
+    movl    P_LINK(%ecx),%edx
+    movl    %edx,P_LINK(%eax)
+    movl    P_RLINK(%ecx),%eax
+    movl    %eax,P_RLINK(%edx)
+
+    /* is the queue truely empty? */
+    cmpl    P_LINK(%ecx),%esi
+    je  3f
+    btsl    %ebx,%edi       /* nope, set to indicate full */
+3:
+    movl    %edi,_whichqs       /* update queue status */
+
+    /* notify system we've rescheduled */
+    movl    $0,%eax
+    movl    %eax,_want_resched
+
+#ifdef  DIAGNOSTIC
+    /* process was insured to be runnable, not sleeping */
+    cmpl    %eax,P_WCHAN(%ecx)
+    jne panicswtch
+    cmpb    $ SRUN,P_STAT(%ecx)
+    jne panicswtch
+#endif
+
+    /* isolate process from run queues */
+    movl    %eax,P_RLINK(%ecx)
+
+    /* record details of newproc in our global variables */
+    movl    %ecx,_curproc
+    movl    P_ADDR(%ecx),%edx
+    movl    %edx,_curpcb
+    movl    PCB_CR3(%edx),%ebx
+
+    /* switch address space */
+    movl    %ebx,%cr3
+
+    /* restore context */
+    movl    PCB_EBX(%edx), %ebx
+    movl    PCB_ESP(%edx), %esp
+    movl    PCB_EBP(%edx), %ebp
+    movl    PCB_ESI(%edx), %esi
+    movl    PCB_EDI(%edx), %edi
+    movl    PCB_EIP(%edx), %eax
+    movl    %eax, (%esp)
+
+#ifdef  NPX
+    /* npx will interrupt next instruction, delay npx switch till then */
+#define CR0_TS  0x08
+    movl    %cr0,%eax
+    orb     $CR0_TS,%al         /* disable it */
+    movl    %eax,%cr0
+#endif
+
+    /* set priority level we were at last time */
+    pushl   PCB_IML(%edx)
+    call    _splx
+    popl    %eax
+
+    movl    %edx,%eax       /* return (1); (actually, non-zero) */
+    ret
+
+/* When no processes are on the runq, Swtch branches to idle
+ * to wait for something to come ready.
+ */
+    .globl  Idle
+Idle:
+idle:
+    call    _spl0
+    cmpl    $0,_whichqs
+    jne rescanfromidle
+    hlt             /* wait for interrupt */
+    jmp idle
+
+
+
+
+
+
+
+
+<a name="0235_0015">
+<a name="0235_0016"></pre><B>[LISTING FIVE]</B><pre><a name="0235_0016">
+
+/* Copyright (c) 1989, 1990 William Jolitz. All rights reserved.
+ * Written by William Jolitz 7/91
+ * Redistribution and use in source and binary forms are freely permitted
+ * provided that the above copyright notice and attribution and date of work
+ * and this paragraph are duplicated in all such forms.
+ * THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, WITHOUT LIMITATION, THE IMPLIED
+ * WARRANTIES OF MERCHANTIBILITY AND FITNESS FOR A PARTICULAR PURPOSE.
+ */
+
+/*
+ * Enqueue a process on a run queue. Process will be on a run queue
+ * until run for a time slice (swtch()), or removed by remrq().
+ * Should only be called with a running process, and with the
+ * processor protecting against rescheduling.
+ */
+setrq(p) struct proc *p; {
+    register rqidx;
+    struct prochd *ph;
+    struct proc *or;
+
+    /* Rescale 256 priority levels to fit into 32 queue headers */
+    rqidx = p-&gt;p_pri / 4;
+
+#ifdef  DIAGNOSTIC
+    /* If this process is already linked on run queue, we're in trouble. */
+    if (p-&gt;p_rlink != 0)
+        panic(&quot;setrq: already linked&quot;);
+#endif
+
+    /* Link this process on the appropriate queue tail */
+    ph = qs + rqidx;
+    p-&gt;p_link = (struct proc *)ph;
+    or = p-&gt;p_rlink = ph-&gt;ph_rlink;
+    ph-&gt;ph_rlink = or-&gt;p_link = p;
+
+    /* Indicate that this queue has at least one process in it */
+    whichqs |= (1&lt;&lt;rqidx);
+}
+
+/* Dequeue a process from the run queue its stuck on. Must be called
+ * with rescheduling clock blocked.
+ */
+remrq(p) struct proc *p; {
+    register rqidx;
+    struct prochd *ph;
+
+    /* Rescale 256 priority levels to fit into 32 queue headers */
+    rqidx = p-&gt;p_pri / 4;
+
+#ifdef  DIAGNOSTIC
+    /* If a run queue is empty, something is definitely wrong */
+    if (whichqs &amp; (1&lt;&lt;rqidx) == 0)
+        panic(&quot;remrq&quot;);
+#endif
+
+    /* Unlink process off doublely-linked run queue */
+    p-&gt;p_link-&gt;p_rlink = p-&gt;p_rlink;
+    p-&gt;p_rlink-&gt;p_link = p-&gt;p_link;
+
+    /* If something is still present on the queue,
+     * set the corresponding bit. Otherwise clear it.
+     */
+    ph = qs + rqidx;
+    if (ph-&gt;ph_link == ph)
+        whichqs &amp;= ~(1&lt;&lt;rqidx);
+    else
+        whichqs |= (1&lt;&lt;rqidx);
+
+    /* Mark this process as unlinked */
+    p-&gt;p_rlink = (struct proc *) 0;
+}
+</pre>
+
+<HR><P>Copyright &copy; 1991, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

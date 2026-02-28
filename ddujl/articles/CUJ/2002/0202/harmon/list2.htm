@@ -1,0 +1,235 @@
+<HTML><HEAD>
+<TITLE>February 2002/Probing the Palm OS/Listing 2</TITLE></HEAD>
+
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+
+<h4><A NAME="heading1">Listing 2: Etch.c</A></h4>
+<pre>
+#include &lt;PalmOS.h&gt;
+#include "EtchRes.h"
+
+#define EtchID       'ETCH'
+#define EtchDataType 'DATA'
+#define EtchDBName   "EtchDB"
+
+MenuBarPtr currentMenu;
+PointType lastPenPos;
+Coord maxX, maxY;
+Boolean erase = false;
+
+BitmapPtr CaptureScreen()
+{
+   WinHandle offscreen;
+   Err err;
+   BitmapPtr bitmap = BmpCreate(maxX, maxY, 1, NULL, &amp;err);
+   RectangleType rect;
+
+   RctSetRectangle(&amp;rect, 0, 0, maxX, maxY);
+
+   if (!err)
+   {  
+      offscreen = WinCreateBitmapWindow(bitmap, &amp;err);
+
+      if (!err)
+      {
+         WinCopyRectangle(WinGetDrawWindow(), offscreen,
+                                      &amp;rect, 0, 0, winPaint);
+         WinDeleteWindow(offscreen, false);
+      }
+   }
+
+   return bitmap;
+}
+
+Boolean MainFormHandleEvent(EventPtr event)
+{
+   FormPtr frm;
+   
+   switch (event-&gt;eType)
+   {
+      case penDownEvent:
+         lastPenPos.x = event-&gt;screenX;
+         lastPenPos.y = event-&gt;screenY;
+         // Don't break; fall through
+         
+      case penMoveEvent:
+
+         if (event-&gt;screenY &gt; maxY) event-&gt;screenY = maxY-1;
+
+         if (erase)
+         {
+            RectangleType rect;
+            RctSetRectangle(&amp;rect, event-&gt;screenX-5,
+                                  event-&gt;screenY-5, 10, 10);
+            WinEraseRectangle(&amp;rect, 0);
+         }
+         else
+            WinDrawLine(lastPenPos.x, lastPenPos.y,
+                            event-&gt;screenX, event-&gt;screenY);
+
+         lastPenPos.x = event-&gt;screenX;
+         lastPenPos.y = event-&gt;screenY;
+         
+         return true;
+         
+      case keyDownEvent:
+         if (event-&gt;data.keyDown.chr == 'c')
+         {
+            WinEraseWindow();
+            return true;
+         }
+         else if (event-&gt;data.keyDown.chr == vchrPageDown)
+         {
+            erase = !erase;
+            return true;
+         }
+         break;
+         
+      case menuEvent:
+         if (event-&gt;data.menu.itemID == AboutCmd)
+         {
+            frm = FrmInitForm(AboutForm);
+            FrmDoDialog(frm);
+            FrmDeleteForm(frm);
+            return true;
+         }
+         else if (event-&gt;data.menu.itemID == ToggleEraseCmd)
+         {
+            erase = !erase;
+            return true;
+         }
+         else if (event-&gt;data.menu.itemID == ClearCmd)
+         {
+            WinEraseWindow();
+            return true;
+         }
+         break;
+   }
+
+   return false;
+}
+
+Boolean ApplicationHandleEvent(EventPtr event)
+{
+   FormPtr frm;
+   
+   switch (event-&gt;eType)
+   {
+      case frmLoadEvent:         
+         if (event-&gt;data.frmLoad.formID == EtchForm)
+         {
+            frm = FrmInitForm(EtchForm);
+            FrmSetActiveForm(frm);
+            FrmSetEventHandler(frm, MainFormHandleEvent);
+            return true;
+         }
+         break;
+   }
+   
+   return false;
+}
+
+void EventLoop()
+{
+   UInt16 error;
+   EventType event;
+
+   do
+   {
+      EvtGetEvent(&amp;event, evtWaitForever);
+
+      if (!SysHandleEvent(&amp;event))
+      
+         if (!MenuHandleEvent(currentMenu, &amp;event, &amp;error))
+
+            if (!ApplicationHandleEvent(&amp;event))
+
+               FrmDispatchEvent(&amp;event); 
+   }
+   while (event.eType != appStopEvent);
+}
+
+void StartApplication()
+{
+   DmOpenRef dbRef;
+   
+   WinGetDisplayExtent(&amp;maxX, &amp;maxY);
+   
+   lastPenPos.x = -1;
+   lastPenPos.y = -1;
+   
+   dbRef = DmOpenDatabaseByTypeCreator(EtchDataType, EtchID,
+                                               dmModeReadOnly);
+   if (dbRef)
+   {
+      MemHandle rec = DmQueryRecord(dbRef, 0);
+      
+      if (rec)
+      {
+         BitmapPtr bitmap = (BitmapPtr) MemHandleLock(rec);
+         if (bitmap)
+         {
+            WinDrawBitmap(bitmap, 0, 0);
+            MemHandleUnlock(rec);
+         }
+      }
+      
+      DmCloseDatabase(dbRef);
+   }  
+}
+
+void StopApplication()
+{
+   BitmapPtr bitmap = CaptureScreen();
+   UInt16 bmpSize;
+   MemHandle record;
+   UInt16 recIndex = 0;
+   DmOpenRef dbRef;
+      
+   BmpCompress(bitmap, BitmapCompressionTypeRLE);
+   bmpSize = BmpSize(bitmap);
+   
+   dbRef = DmOpenDatabaseByTypeCreator(EtchDataType, EtchID,
+                                                  dmModeWrite);
+   if (!dbRef)
+   {
+      if (DmCreateDatabase(0, EtchDBName, EtchID,
+                                        EtchDataType, false))
+         return;
+
+      dbRef = DmOpenDatabaseByTypeCreator(EtchDataType,
+                                         EtchID, dmModeWrite);
+      if (!dbRef) return;
+      record = DmNewRecord(dbRef, &amp;recIndex, bmpSize);
+   }
+   else
+   {
+      record = DmResizeRecord(dbRef, 0, bmpSize);
+   }
+
+   if (record)
+   {
+      MemPtr recordPtr = MemHandleLock(record);
+      DmWrite(recordPtr, 0, bitmap, bmpSize);
+      MemHandleUnlock(record);
+      DmReleaseRecord(dbRef, 0, false);
+   }
+
+   DmCloseDatabase(dbRef);
+   BmpDelete(bitmap);
+}
+
+UInt32 PilotMain(UInt16 cmd, void* cmdPBP, UInt16 launchFlags)
+{
+   if (cmd == sysAppLaunchCmdNormalLaunch)
+   {
+      StartApplication();
+      
+      FrmGotoForm(EtchForm);
+      EventLoop();
+      StopApplication();
+   }
+
+   return errNone;
+}
+&#151; End of Listing &#151;</pre></body></html>

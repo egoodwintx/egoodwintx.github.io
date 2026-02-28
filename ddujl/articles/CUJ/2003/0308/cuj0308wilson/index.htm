@@ -1,0 +1,368 @@
+<HTML>
+<HEAD>
+<TITLE>Generalized String Manipulation: Access Shims and Type Tunneling</TITLE>
+</HEAD>
+<body bgcolor="#FFFFFF" text="#000000">
+<H2>Generalized String Manipulation: Access Shims and Type Tunneling</H2>
+<P> <h3>Matthew Wilson</h3>
+<p><i>Sophisticated machinery for truly generic string processing.</i> </p>
+<p>Sidebar &quot;<a href="cuj0308wilson_sb4.htm">Null Strings</a>&quot; </p>
+ <h3>Introduction</h3>
+Strings are a fundamental concept within software engineering, but strings are 
+not a built-in type in C or C++. They have been conventionally expressed in C 
+as null-terminated contiguous sequences of characters. In C++, this C-style string 
+is still a common form, but there have also been many attempts to objectify strings 
+into string classes. Most C++ developers have written at least one string class 
+during their career, and a number of widely accepted forms exist. The standardization 
+of C++ [1] has seen the advent of the standard template class <B>std::basic_string,</B> and its common <B>char</B> and <B>wchar_t</B> instantiations.
+<P> There is a mismatch between objects and the C-library and operating system 
+  (and other) C APIs when it comes to string handling. Specifically, most C++ 
+  string classes are dealt with as atomic entities (usually passed by value or 
+  reference), whereas C APIs deal with pointer to null-terminated sequences. The 
+  standard C++ string class allows for the internal representation to not be null-terminated 
+  [2]<B>,</B> and there are also instances of other string types, eg., the Win32 
+  <B>LSA_UNICODE_STRING</B> type, that do not do so. Therefore there can be quite 
+  different ways of accessing the string contents, determining the string length, 
+  or even determining whether the string is empty.
+<P> Except in rare circumstances -- where there are no literals and no interaction 
+  with the C API string functions, or where one uses C-style strings only -- it 
+  is virtually impossible to avoid having multiple string types. Usually this 
+  is limited to C-style strings and one string class, although one must often 
+  deal with multiple string classes within one code base. Indeed, we may develop 
+  using a standard string class for expediency, and seek to replace some/all of 
+  the strings with a custom class type that may not share a common interface with 
+  the standard one.
+<P> That there are usually two or more string forms within a single code base 
+  can lead to a number of problems:
+ 
+<ul>
+  <li> brittleness -- changing the main/only string type can require many changes 
+    within the client code; 
+  <li> complexity -- code contains different syntactic elements doing the same 
+    semantic job; 
+  <li> specificity -- generalization of the manipulation of strings in (usually 
+    template) algorithms is made difficult or impossible.
+</ul>
+In this article I will discuss problems with some strategies for achieving generalization 
+in the manipulation of strings (and, by extension, value types in general), including 
+the use of a common interface, implicit conversions operators, traits, or the 
+pre-processor. Then I will cover the technique of generalization via explicit 
+conversion, which addresses the requirements of flexibility, genericity and simplicity, 
+whilst avoiding the shortfalls of the other approaches.
+<P> This technique uses the concept of Access Shims [3] -- lightweight components 
+  (including free-functions and conversion classes) that explicitly convert from 
+  a specific type to a common type when accessed. The method I will describe combines 
+  the concepts of Attribute Shims and Conversion Shims (see the "<a href="cuj0308wilson_sb1.htm">Shims</a>"   sidebar). By use of this technique, compatible client code can be written with 
+  minimal or no involvement of the pre-processor, and algorithms can be written 
+  and applied to strings of arbitrary type. Furthermore, the use of the shims 
+  involves no additional runtime costs, so the generalization is for free. Finally, 
+  I will describe how Access Shims facilitate the more fundamental technique of 
+  "type tunnelling", illustrated with a practical example. 
+<P> <h3>Generalization via Common Interface</h3>
+Let's say that we wish to display the contents of the <B>PATH</B> environment 
+variable in a list control. We could implement this as shown in <a href="cuj0308wilson_l1.htm">Listing 
+1</a>. 
+<P> This works fine. The environment variable definition is tokenized (using the 
+  <B>stlsoft::string_tokenizer</B> [4], parameterized to use <B>string_t</B>, 
+  which is <B>std::string</B> in this case). The token sequence is then iterated, 
+  and each item is passed to the list control via the API call (actually a macro) 
+  <B>ListBox_AddString()</B>, using the <B>c_str()</B> method to access the null-terminated 
+  string contents.
+<P> If we now wish to change the code to use another string class, say <B>stlsoft::basic_frame_string&lt;char, 
+  ...&gt; </B>[4],<B> </B>then the code change is limited to one line, as in
+ 
+<pre>
+ typedef stlsoft::basic_frame_string&lt;char,
+  _MAX_PATH&gt;  string_t;
+</pre>
+Because <B>stlsoft::basic_frame_string</B> has a method <B>c_str(),</B> the rest 
+of the code will compile without issue. In circumstances where the classes exhibit 
+identical, or sufficiently similar public interfaces, such code changes are trivial. 
+However, this is seldom the case.
+<P> Consider that we want to change the string type again, this time to MFC's 
+  <B>CString</B>. This class does not have a <B>c_str()</B> method; instead it 
+  has an implicit conversion operator (operator <B>TCHAR const *() const)</B>. 
+  The code changes required are
+ 
+<pre>
+typedef CString     string_t;
+
+  ...
+
+  ListBox_AddString(hwndList, static_cast&lt;char const *&gt;(s));
+//  ListBox_AddString(hwndList, s); // Also works in this case
+</pre>
+Now we must change code within the loop, in addition to the <B>typedef</B>. The 
+change is in the call to <B>ListBox_AddString()</B>, which takes the <B>char const*</B> form of the string, via the implicit conversion operator.
+<P> If we wish that only a <B>typedef</B> change be required, then we must ensure 
+  that <B>CString</B> shares a common interface, in as far as it is exercised 
+  in our code, with <B>std::string</B>. We have the option of defining derived 
+  types in order to homogenize and unify the functionality. To do this we might 
+  use an adaptive veneer [5], as in <a href="cuj0308wilson_l2.htm">Listing 2</a>, 
+  which would mean the only code change from the original required to support 
+  <B>CString</B> would be the following:
+ 
+<pre>
+typedef c_str_veneer&lt;CString&gt;   string_t;
+</pre>
+In general, adaptive veneers must either support a union of all methods provided 
+by all types covered (which is brittle and highly dubious) or must ensure that 
+each adapted type exhibits an agreed set of operations. In this case we are adapting 
+<B>CString</B>'s interface to that of <B>std::string</B>, but even this cannot 
+always be achieved. Consider the case of Win32's <B>LSA_UNICODE_STRING,</B> which 
+does not contain null-terminated strings. Though we can borrow from the techniques 
+employed in the Conversion Shims (described below) to synthesize accessible, temporary, 
+null-terminated strings, we are still left with the fact that the conversions 
+we will be employing are implicit. Implicit conversions that carry out significant 
+operations, including resource (de-)allocation, are not desirable [6, 7].
+<P> <h3>Generalization via Implicit Conversions</h3>
+Another answer is to provide implicit conversion operators to the degenerate type 
+which, for strings, will be C-strings, i.e., <B>char/wchar_t const*</B>. <a href="cuj0308wilson_l3.htm">Listing 
+3</a> shows a veneer [5] template that provides such functionality for string 
+types with a <B>c_str()</B> accessor method. 
+<P> Authors have written much on this subject [6, 7], and I think it's fair to 
+  say that use of implicit conversion operators coupled with implicit constructors 
+  is particularly pernicious. One can get by with relatively few problems with 
+  one or the other, but it is far better to eschew both. It may lead to more typing, 
+  but in such cases the extra work is not onerous and often leads to a better 
+  understanding of the code.
+<P> On these grounds alone, I would rule this technique out. However, providing 
+  implicit conversions doesn't even represent a full solution to the problem. 
+  It only provides generalization between types that can provide null-terminated 
+  contiguous arrays of characters. The use of smart-pointer intermediary temporaries 
+  is not allowed since the compiler is already carrying out one implicit conversion 
+  (of the string type itself) so cannot legally perform another for the temporary 
+  [6].
+<P> Furthermore, this technique only provides generalization for access to string 
+  contents, not to other attributes, such as length (see the sidebar titled "<a href="cuj0308wilson_sb5.htm">String 
+  Length</a>"). Overall, then, implicit conversion is a thoroughly unsuitable 
+  solution (not that I haven't seen it used on more than one occasion!).
+<P> <h3>Generalization via the Preprocessor</h3>
+The changes in the loop code with respect to <B>CString</B> don't seem a huge 
+effort, and in application code they aren't, so we could live with the small effort. 
+When dealing with library code, however, it becomes a great deal more important. 
+When expressing the code as templates is not feasible or desirable, the conventional 
+choices amount to prescribing a single string type that must be used, or relying 
+on a common interface, or resorting to ugly pre-processing hacks. Such hacks could 
+be something like the gruesome, and difficult to maintain, variant of the code 
+shown in <a href="cuj0308wilson_l4.htm">Listing 4</a>. Lamentably I have seen 
+(and written!) such code. 
+<P> Clearly, this is no way to write generalized code in C++. 
+<P> <h3>Generalization via Explicit Conversion: Access Shims</h3>
+Before I discuss the details of the proposed solution, I'll just take a look at 
+its application in our example.
+
+<pre>
+for(; begin != end; ++begin)
+{
+  string_t const  &amp;s(*begin);
+
+  ListBox_AddString(hwndList, c_str_ptr(s));
+}
+</pre>
+That's all there is to it! (Naturally, we don't even need the intermediate reference 
+<B>s</B>; it's just for clarity in these examples.) It uses the <B>c_str_ptr</B> access shim. The concept of Access Shims is actually a combination of the concepts 
+of Attribute Shims and Conversion Shims (see the "<a href="cuj0308wilson_sb1.htm">Shims</a>" sidebar). Access Shims are a collection of components (including free functions 
+and classes) that provide access to instances of a number of types expressed in 
+another common type. For example, <a href="cuj0308wilson_l5.htm">Listing 5</a> shows some of the access shims that are defined within the <B>stlsoft</B> namespace. 
+<P> As you can see, these shims provide simple conversion to the ANSI/Unicode 
+  C-string equivalents of the given types, and no temporaries are created. Hence, 
+  they are pure Attribute Shims. Table 1 shows a matrix of convertee and conversion 
+  types for some of the shims described here. Access Shim names usually do not 
+  follow the naming convention for either Attribute Shims or Conversion Shims, 
+  since they need to share token names in order to function. Hence, the shim we 
+  will examine in detail in this article is called <B>c_str_ptr</B> (and its character-encoding 
+  specific derivatives <B>c_str_ptr_a</B> and <B>c_str_ptr_w)</B>.
+<P> The intent is that the shim provides a conversion to a C-string pointer, and 
+  the name obviously borrows from <B>std::basic_string</B>'s<B> c_str()</B> method. 
+  The original version of a few years ago was initially named <B>c_str</B>,but 
+  I thought I was asking for name-clash trouble so I changed it. Since shims are 
+  necessarily "imported" from disparate namespaces rather than explicitly qualified 
+  -- and thereby disambiguated -- it is important to have a reasonably good level 
+  of name independence.
+<P> When the conversion type is not actually directly accessible from the convertee 
+  type, it can be necessary to use a conversion shim to access an equivalent C-string 
+  form. <a href="cuj0308wilson_l6.htm">Listing 6</a> shows some access shims defined 
+  within the <B>winstl </B>[8] namespace. These are significantly different from 
+  the shims in the STLSoft namespace. They do not return <B>char const *</B> (or 
+  <B>wchar_t const *</B>), but instead return instances of proxy classes. The 
+  declaration of one of these, <B>c_str_ptr_HWND_proxy,</B> is also shown in <a href="cuj0308wilson_l6.htm">Listing 
+  6</a>.
+<P> The class is a template, which is parameterized on character type C (e.g., 
+  <B>char, wchar_t</B>). It has an explicit conversion constructor from <B>HWND</B>, 
+  and an implicit conversion operator to C <B>const *</B>. This essentially provides 
+  the conversion mechanism, and allows the access shims that use it to work. Put 
+  together it works simply, as in:
+
+<pre>
+// print the window text to stdout
+  puts(c_str_ptr_a(hwnd)); 
+</pre>
+The <B>c_str_ptr_a(HWND )</B> function is called, passing <B>hwnd</B> as the parameter, 
+and returns an instance of <B>c_str_ptr_HWND_proxy&lt;char&gt;</B>. This instance 
+is then passed to <B>puts()</B>. Because <B>puts()</B>requires an argument of 
+type<B> char const *</B>, the compiler looks for a conversion, which is provided 
+by <B>c_str_ptr_HWND_proxy&lt;C&gt;</B>'s operator <B>C const *() const</B> (with 
+<B>C == char</B>) so this method is called, and the result passed to <B>puts()</B>.
+<P> The second constructor, the move-constructor [9], is provided so that when 
+  compilers cannot implement the return-value-optimization [6], the buffer is 
+  transferred into the "copied" instance, ensuring that it is present in the instance 
+  on which the conversion operator will be invoked. Since the first instance will 
+  not, in such a case, have the conversion operator invoked, it is more efficient 
+  to move the buffer from one to the other rather than taking a copy.
+<P> Where Koenig lookup does not apply (see sidebar titled "<a href="cuj0308wilson_sb2.htm">Koenig 
+  Lookup, Includes and Namespaces</a>"), in order to use the shims from a certain 
+  namespace, naturally one must introduce them, preferably via the <B>using</B>   declaration (e.g., <B>using stlsoft::c_str_ptr</B>). By this simple mechanism 
+  one can have control over which shims are visible and which are not -- albeit 
+  that this is granular only at the namespace level -- and it is a trivial matter 
+  to introduce newly compatible types, by the introduction of compatible shims, 
+  into an extant algorithm or client code function. (One will see more of the 
+  implications of this in the Type Tunnelling section.)
+<P> There is an important point to be gleaned from the implementation of the <B>winstl::c_str_ptr</B>   shims. Since they return temporaries it is not legitimate to write code such 
+  as
+ 
+<pre>
+char const *s = c_str_ptr_a(hwnd);
+
+puts(s);
+</pre>
+As soon as <B>s</B> has been initialized to point to the window text buffer in 
+the <B>c_str_ptr_HWND_proxy&lt;char&gt;</B> instance, the instance is destroyed 
+and the buffer can contain who-knows-what?
+<P> All conversion shims have this constraint; attribute shims do not. However, 
+  since access shims (of the same name) can be composed of either or both of these 
+  more basic shim concepts, they also have this constraint.
+<P> In common with many user-defined types, one should also be cautious when applying 
+  shims directly to <B>printf()</B> and other functions that have variable parameter 
+  lists. Although most of the conversion shims currently implemented actually 
+  store the pointer at zero offset within them and so function correctly in such 
+  conditions, this is still an undefined and inherently dangerous thing to do 
+  with any class type. (One popular compiler, Digital Mars C++ [12], addresses 
+  this problem and helpfully balks at un-cast class type instances when passed 
+  to variable parameter lists.)
+<P> <h3>Generalization via Templates and Traits</h3>
+You may be contrasting the shims technique with the widely known technique of 
+templates and traits [10, 11] and wondering why I have not chosen the latter as 
+the solution. Certainly it is possible to define string access traits (as shown 
+in <a href="cuj0308wilson_l7.htm">Listing 7</a>). Using these shims could look 
+something like the following: 
+
+<pre>
+template &lt;typename S&gt;
+inline void dump_string(S const &amp;s)
+{
+  puts(stlsoft::string_access_traits&lt;S&gt;::c_str(s));
+
+}
+</pre>
+However, when one wants to define components that live in another namespace, the 
+picture is much more complicated. Because of the way specialization works, the 
+specialized form must still be defined within the original namespace (as shown 
+in <a href="cuj0308wilson_l8.htm">Listing 8</a>). 
+<P> This requires the involvement of three namespaces: the one containing the 
+  component (windows), the one containing the traits (stlsoft), and the one in 
+  which we will "use" types from the other two. Furthermore, it requires that 
+  the original non-specialized template definition, within namespace <B>stlsoft</B>, 
+  is available before the definition of the specialization <B>string_access_traits&lt;windows::Window&gt;,</B>   which increases coupling, or that a forward declaration of it is made, which 
+  involves coupling as well as being fragile in having a type declared in more 
+  than one place.
+<P> This extra level of complexity is bought for no gain over the shims approach. 
+  But the most compelling reason is that if we use a class (traits) rather than 
+  functions (shims) we cannot take advantage of the compiler's built in type-resolution 
+  and will have to explicitly specify the type. This is only useful within template 
+  functions, and so is only part of the solution domain we are aiming for, or 
+  when the programmer is prepared to specify the explicit type, which defeats 
+  our whole aim of achieving generalized manipulation in both template and non-template 
+  contexts.
+<P> The two disadvantages of the shims approach are that a <B>using</B> declaration 
+  must often be made (see "<a href="cuj0308wilson_sb2.htm">Koenig Lookup, Includes 
+  and Namespaces</a>" sidebar) to introduce the shims from a particular namespace, 
+  and the consequent slight local namespace pollution. Table 2 summarizes the 
+  relative merits of the two approaches. 
+<P> <h3>Type Tunneling</h3>
+Now that we have seen how to increase the flexibility of our types and algorithms, 
+we can ask whether the generalization effects can be taken further. In general, 
+the expanded spectrum of convertible types facilitates the more powerful technique 
+of Type Tunnelling, which allows types to be used with APIs where each is entirely 
+independent of the other. The application of this technique to our code results 
+in the example's hand-written loop being replaced with the single line
+
+<pre>
+std::for_each(begin, end, listbox_add_inserter(hwndList));
+</pre>
+The <B>listbox_add_inserter</B> is one of a suite of control inserter function 
+objects in the <B>WinSTL </B>[8] libraries (defined in <a href="cuj0308wilson_l9.htm">Listing 
+9</a>). 
+<P> The template function call operator method employs a <B>c_str_ptr shim</B>, 
+  which is selected by the compiler only at the point when the method is instantiated 
+  (inside the instantiation of <B>std::for_each</B>). Thus the definition of <B>string_t</B>   can be changed to any type for which a <B>c_str_ptr </B>shim is defined and 
+  accessible in the instantiating scope, without any other changes being necessary 
+  to the code.
+<P> All this seems highly flexible, but it is not clear why this is type tunnelling. 
+  A different example may help. Consider a debugging subsystem wherein one can 
+  pass descriptive strings to assertions. Using the <B>c_str_ptr</B> access shims, 
+  we can layer inline C++ functions over a C-API (<B>GFAssert2A/W()</B>) (<a href="cuj0308wilson_l10.htm">Listing 
+  10</a>) such that instances of arbitrary type (e.g. <B>std::string</B>, <B>VARIANT</B>, 
+  <B>HWND</B>, etc.) can be passed as the descriptive string. The base API manipulates 
+  a degenerate type -- in this case C-style strings -- and does not need to change 
+  to accommodate new types, as long as suitable shims are available. Hence new 
+  types can be "tunnelled" through the C++ functions into the API via shims.
+<P> <h3>Summary</h3>
+In this article I have discussed the desirability for generalized manipulation 
+of strings and illustrated some of the classic problems encountered when trying 
+to write generic code. I have also demonstrated why none of the common techniques 
+cater to the full gamut of generalization requirements and have proposed one -- 
+explicit conversion using access shims -- that does.
+<P> By using explicit conversions, we gain the benefits of significant increases 
+  in flexibility, simplicity and genericity. Access shims also facilitate the 
+  powerful flexible technique of type tunnelling. Furthermore, they can be used 
+  as a convenient standalone conversion mechanism (e.g., for converting <B>VARIANT</B>   to C-string).
+<P> The focus of the article has been on string generalization, which is natural 
+  since strings are one of the most common inter-conversion types, and also probably 
+  the easiest for which one can see the relevance. But access shims and type tunnelling 
+  can be (and are) applied to any set of syntactically disparate but logically 
+  related types.
+<P> <h3>Acknowledgements</h3>
+I'd like to thank Scott Patterson for providing his usual insight and criticism, 
+once again helping to curb my tendency to wander at great lengths in making small 
+points. Also, many thanks to Joe and Darrah at <I>CUJ</I> for giving a lot of 
+flexibility in the preparation of the draft(s).
+<P> <h3>Notes and References</h3>
+[1] ISO/IEC C++ standard, 1998 (ISO/IEC 14882:1998(E)) 
+<P> [2] <I>The C++ Programming Language</I>, Bjarne Stroustrup, Third Edition, 
+  Addison-Wesley, 1997 
+<P> [3] http://synesis.com.au/resources/articles/cpp/shims.pdf 
+<P> [4] http://stlsoft.org/
+<P> [5] http://synesis.com.au/resources/articles/cpp/veneers.pdf 
+<P> [6] <I>Effective C++</I>, 2nd Edition, Scott Meyers, Addison-Wesley, 1998 
+<P> [7] <I>More Effective C++</I>, Scott Meyers, Addison-Wesley, 1996 
+<P> [8] http://winstl.org/
+<P> [9] "Move Constructors", Matthew Wilson, Synesis Technical Report, available 
+  at http://synesis.com.au/resources/articles/cpp/movectors.pdf. Also "A Proposal 
+  to Add Move Semantics Support to the C++ Language," Abrahams, Dimov and Hinnant, 
+  at http://anubis.dkuug.dk/jtc1sc22/wg21/docs/papers/2002/n1377.htm. 
+<P> [10] Nathan Myers, "A New and Useful Template Technique: Traits," C++ Report, 
+  June 1995 
+<P> [11] Generic Programming and the STL: Using and Extending the C++ Standard 
+  Template Library, Matthew Austern, Addison-Wesley, 1998 
+<P> [12] http://digitalmars.com/
+<P> [13] The New Shorter English Dictionary, Lesley Brown (ed), Oxford University 
+  Press, 1993. 
+<P> [14] The STLSoft libraries are specifically written to support ANSI and Unicode 
+  character-encodings (see sidebar titled &quot;<a href="cuj0308wilson_sb3.htm">ANSI 
+  vs Unicode Encoding</a>&quot;). They are not intended to support other encoding 
+  schemes, such as Microsoft's MBCS, since the effort involved in manipulating 
+  variable length character-encoding sequences is deemed too great. The purpose 
+  of the libraries is that they are very lightweight, prescribe as few constraints 
+  on their use as possible, and are exclusively header-only. If you want to write 
+  for non-English language encodings and want to use the STLSoft libraries, then 
+  you should use Unicode (which is a good option in any case). 
+<p> <h3>About the Author</h3>
+Matthew Wilson holds a degree in Information Technology and a PhD in Electrical 
+Engineering. He is currently a software development consultant for Synesis Software. 
+Matthew's work interests are in writing bullet-proof real-time, GUI and software-analysis 
+software in C, C++, C# and Java. He has been working with C++ for over 10 years, 
+and is currently bringing STLSoft.org and its offshoots into the public domain. 
+Matthew can be contacted via matthew@synesis.com.au or at http://stlsoft.org. 
+</BODY>
+</HTML>

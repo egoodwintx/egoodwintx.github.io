@@ -1,0 +1,555 @@
+<HTML>
+<META NAME="year" CONTENT="1991">
+<HEAD>
+<TITLE>AUG91: SCALING AND PRINTING FAXES FASTER</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>SCALING AND PRINTING FAXES FASTER<a name="01d5_0003"></h1><P>
+<h2><a name="01d5_0001"><a name="01d5_0000">Some C code, a bit of assembler, and a couple of tricks</h2><P>
+ This article contains the following executables: FAX.ARC<P>
+<h3>Greg Pickles</h3><P>
+<p><i><a name="01d5_0002"><a name="01d5_0000">Greg's 22 years of computer experience ranges from applications programming to embedded systems design.  Currently he is developing custom PC applications as a consultant, and he can be reached by fax at Elegant Technology Associates, 206-747-9447, or on CompuServe 70303,2435.</i></p><hr><P>
+After purchasing a fax card, I needed a way to print the images on my laser printer.  Because the printer was on another machine across the network, I couldn't use the Fax card's built-in software.<P>
+The resolution of fax images is about 200 x 100 dots per inch (dpi) in standard mode, and 200 x 200 in fine mode.  My fax board stores all images at 200 x 200 -- if necessary, duplicating each horizontal line (for standard resolution images).  So, in order to print images at full size using the 300 x 300 dpi resolution of my Laser printer, the images must be scaled at a 2:3 ratio.<P>
+I first tried printing the images in Postscript mode, using the Postscript image scaling operator.  This worked, but it took more than five minutes per page.  I then decided to use the PCL4 printer language native to HP's LaserjetII (and emulated by my printer).  PCL4 doesn't support general scaling of raster images (there are fixed ratios of 1:2, 1:3, and 1:4), so I had to do this part myself.  I wrote the scaling routine in assembler, the bulk of the program in C, and, after a couple of optimization tricks, I can now print many fax pages in about a minute.<P>
+<h3><a name="01d5_0004">Scaling Algorithm<a name="01d5_0004"></h3><P>
+My scaling technique is conceptually very simple: Take every 2 x 2 pixel group from the original image and map it to a 3 x 3 pixel group in the scaled image (see <a href="199101d7.htm">Figure 1</A>).  The quality of fax images as received is poor enough that such a straightforward algorithm is perfectly adequate.<P>
+Because the scaling ratio is not integral, there is room for artistic license in mapping 2 x 2 groups to 3 x 3 groups.  <a href="199101d8.htm">Figure 1</A> shows the mapping I used.  I prefer a bolder look for ease of reading, this mapping favors black pixels.  You can easily change this to one you prefer.  Each input group has a code based on the four pixels it contains (the top two pixels are bits 0 and 1, the bottom two are bits 2 and 3).<P>
+PCX and PCL4 represent monochrome raster image data in a similar manner.  A raster line is stored as a series of bytes each representing eight pixels on a raster line.  The high-order bit in a byte corresponds to the left-most pixel.  One major difference is that PCX files represent a white pixel by 1 and PCL4 represents it by 0.<P>
+<a href="199101d9.htm">Figure 2</A> shows how two input data bytes from adjacent raster lines are divided into four input group codes.  The scale ratio dictated dealing with the output data in groups of three bits.  Because an integral number of these groups does not fit in a byte, I had to cover the cases where a group spans a byte boundary.  My scaling routine handles this problem by accessing output data in words, and by using word addresses on both odd- and even-byte boundaries, which would place the current output group entirely within a word.<P>
+<a href="199101da.htm">Figure 3</A> shows how eight output groups correspond to bytes of output data.  For groups 0 through 4 the data is accessed as word 0.  For groups 5 through 7 it is accessed as word 1.  The ninth group is treated exactly like the first, the tenth like the second, and so forth.<P>
+The mapping from 2 x 2 to 3 x 3 groups is done with a translation table.  Each table entry consists of four words; the first three words are data for the rows of the output group, the fourth word is a dummy placeholder so that a simple shift instruction can derive table offsets.  <a href="199101db.htm">Figure 1</A> lists the output data for each kind of group.  <a href="199101dc.htm">Figure 3</A> shows 3 bytes of output data.  Note that, due to Intel byte-ordering conventions, the bytes get swapped when accessed as a word.<P>
+The 3 bits of output data are stored in bits 8 through 10 of the words in the mapping table.  For each output group, these 3 bits are shifted by an appropriate amount to position them properly before ORing them into the output.  In my routine, the shifting is always performed by a ROtate Left (ROL) instruction.<P>
+The rotations for output groups 0 through 7, respectively, are as follows: 13,10,7,4,1,6,3, and 0.  The rotation value starts at 13 and decreases by 3 for each group until 1 has been reached.  These values correspond to output groups 0 through 4 shown in <a href="199101dd.htm">Figure 3</A>.  After a rotation of 1 is used, the output address must be incremented and the rotation count set to 6 to process the groups in the next word (which overlaps the previous word by 1 byte).  After the step with a rotation count of 0, the whole process starts over.<P>
+<h3><a name="01d5_0005">Scaling Function<a name="01d5_0005"></h3><P>
+Because the scaling requires a lot of bit manipulation, I wrote the key routine in assembly language (<a href="#01d5_0009">Listing One</A>, page 136).  It is written for MASM 5.1 and uses MASM's high-level language support.  The C-callable function takes four parameters: a far pointer to two raster lines of input, a far pointer to a buffer to receive the scaled output, the number of bytes in each input line, and a flag indicating whether to invert the data or not.  The second line of input data is expected to immediately follow the first in memory. Likewise, the output data lines will be created in consecutive memory locations.<P>
+First Scale2to3 sets the outer loop count to the number of bytes in an input line and computes the number of bytes in an output line.  The output line size is saved in DX for use in accessing the three lines in the output buffer.<P>
+Next the function computes the size of the output buffer and fills it with 0s.  The code assumes that the buffer will be word-aligned and the caller must ensure that it is.  Most variables in C end up word-aligned anyway.  (In Microsoft C, dynamic memory allocation will always be word-aligned.)<P>
+At the label S23_15, DS:SI is loaded with the segment: offset of the mapping table.  CL is loaded with the initial rotate amount.  Label S23_30 starts the outer loop that processes bytes of input data.  A byte from the first line is loaded into AH and from the second line into AL.  If the inversion parameter is set, the data in AX is negated.<P>
+Label S23_40 starts the inner loop that processes the four input groups contained in AX. Every time the routine comes to S23_40, the bits to use for the input group code are the high bits in AH and AL.  The next seven instructions isolate these bits and convert them into an input group number in AX.  In the process, the input data is saved on the stack so that it will be available the next time around the inner loop.  The group number is then shifted left three to get an offset into the mapping table.  Having the offset into the table, it is merely a matter of loading three words, rotating them as necessary, and ORing them into the output buffer at the correct address.<P>
+At the bottom of the inner loop, the bookkeeping to manage the rotate count and output address is done.  If CL is above 1, 3 is subtracted from it.  If CL is equal to 1 it is set to 6 and the output address is incremented.  This is the point at which access to the output data switches from one word address to the subsequent word.  If CL is 0, it is set to 16 and the output address is incremented twice.  The new values loaded into CL are 3 more than actually needed because 3 will be subtracted at label S23_60.<P>
+After the inner loop has been traversed four times, the outer loop count is decremented and the input data pointer is incremented.  This continues until all of the input data has been processed.<P>
+<h3><a name="01d5_0006">Puffing it to Use<a name="01d5_0006"></h3><P>
+Having a fast function to perform the scaling was only half the battle; I needed an efficient program to use it that wouldn't destroy all my hard-won speed.  <a href="#01d5_000b">Listings Two</A> (page 136) and <a href="#01d5_000d">Three</A> (page 138) present the C code for a program that reads a PCX file, applies the 2:3 scaling, and outputs PCL4 commands for a printer.  To improve performance, I used buffered I/O.  C provides buffered I/O but for some reason (using MSC 5.1), output characters would on occasion disappear.<P>
+Rather than fix the problem, I wrote my own I/O routines.  These are not shown in the printed listings here, but are provided in the electronic version of the listings (see &quot;Availability,&quot; page 3).  Five functions provide the needed operations, using DOS &quot;handle I/O.&quot;  GetBufCh() returns the next byte from a file, reading data into the buffer as needed. (PCX files must be processed 1 byte at a time, so this is all that's needed.)  Output, however, is usually performed on blocks of data (an entire raster line, for example). BufWrite( ) copies blocks of data into the output buffer until it fills up; then BufFlush( ) writes out the buffer.  FileOpen( ) and FileClose( ) complete the function set.<P>
+<h3><a name="01d5_0007">Reading PCX Files<a name="01d5_0007"></h3><P>
+<a href="#01d5_000b">Listings Two</A> and <a href="#01d5_000d">Three</A> give the source code for the PCX and Laserjet related parts of the program.  The header file in <a href="#01d5_000b"> Listing Two</A> declares a structure that passes options and control information from main( ) to PCXToHP( ) and a structure for reading the PCX file header.  The PCX file reading functions are loosely based on Kent Quirk's PCX-to-Postscript program (DDJ, August 1989) so I won't discuss them in detail.<P>
+The main( ) routine, after some initialization and option parsing, opens the output file. The output file/device name can be specified on the command line or by an environment variable named PCXHP.  If neither is present, the program defaults to PRN.<P>
+In monochrome PCX file format, a bit value of 1 means a white pixel, and 0 means black -- the opposite of how PCL4 interprets things.  Consequently the OPTIONS structure is initialized with inversion enabled to get a normal (black on white) printed page.<P>
+PcxReadLines( ) reads input data and processes it to form a requested number of raster lines.  If it runs out of data at the beginning of the first line, it returns FALSE to indicate the end of input data.  If it runs out of data after the beginning of the first line, it fills the remainder of the requested lines with 1 bit, making all lines past the end of the PCX data white.<P>
+Some programs generate a PCX file with more bytes of data in a raster line than are actually required for the number of pixels.  The Windows Paintbrush program is a notable example, filling any bits and/or bytes beyond the end of the raster image with 0s which, if interpreted as image data, print as black.  PcxReadLines( ) sets any bits beyond the end of the image data to 1 so that they will print as white.  Three members of the OPTIONS structure allow PcxReadLines( ) to deal with extra bits efficiently.  sEndAdjust is set to the number of bytes at the end of a raster line requiring adjustment.  sAdjOffset is set to the offset of the first byte needing adjustment.  ucMask has bits set which are ORed into the first adjusted byte to accommodate images ending in the middle of a byte.<P>
+<h3><a name="01d5_0008">Optimizing Output<a name="01d5_0008"></h3><P>
+A fax image for a letter-size page scaled for a laser printer contains over one million bytes of data.  Just transferring the data to my printer (using COPY /B in DOS) took over 3.5 minutes.  Data sent can be reduced if the printer understands some form of data compression. Unlike PCL5, PCL4 does not support compressed data, so I had to do something else.<P>
+In PCL4, raster graphics are printed on a page by &quot;painting&quot; the black dots; there is no need to print the white ones (all dots are white by default).  Because a typical fax image consists of a lot of white space, PCXToHP( ) exploits this to reduce the amount of data sent to the printer.  By skipping the bytes that are blank at the beginning and end of a line (and by skipping blank lines entirely), PCXToHP( ) may have to send less than 20 percent of the original data.  (The savings, of course, depend strongly on the contents of the image.)<P>
+Another optimization that is not implemented here is the search for runs of all white bytes within a line and skip them if they are longer than about 20 bytes (the number of bytes required by the additional cursor positioning commands).<P>
+To print raster graphics using PCL4, the program positions the print cursor and then issues a start raster graphics, which sets the left margin (X position) at the current location. Each raster line moves the print cursor one dot down the page (Y position) but keeps the same left margin.  Consecutive lines at the same X position need only be sent to the printer one after the other; the Y position for each line is automatically adjusted.  White space can be skipped with a Y positioning command.  Whenever the X position changes, a full X-Y position command must be sent, along with a start graphics.<P>
+The first part of PCXToHP( ) opens the PCX file, reads its header, and verifies that it is a monochrome file.  It then determines if there are any bits at the end of each raster line that must be masked because they are not part of the image, and sets the members of the OPTIONS structure appropriately.  Next it computes the number of bytes in a scaled line and allocates a buffer to hold three of them.  Then it outputs a command to set graphics resolution to 300 dpi.<P>
+The key variables are iCurX, iCurY, iNewX, and iNewY.  iCurX and iCurY hold the position at which the next graphics data will be printed if no positioning commands are issued.  They are initialized to -1 to insure that an X-Y positioning command is sent before the first line of data.  iNewX and iNewY are set to the position at which the next graphics data must be printed.  They are initialized at the X-Y position specified by the OPTIONS structure for the image.  If iCurX and iCurY do not equal iNewX and iNewY, a full X-Y positioning command is required.<P>
+The outer loop reads through the input data two lines at a time, scales it to three lines of output data, determines when it is appropriate to skip data because it is blank, and outputs the data with appropriate positioning commands.  The loop continues until all lines in the image are printed or it comes to the end of the PCX file.<P>
+The inner loop deals with each of the three output lines.  IndexNE( ) is a function returning the index of the first byte in a buffer not equaling a value, or -1 if all bytes in the buffer equal the value.  It is used here to find the index (stored in iFront) of the first nonzero byte in a line.  If all bytes are 0, nothing happens except that iNewY is incremented.  If there is something to print, iFront is used to compute the value of iNewX for the line.<P>
+CntREQ( ) is a function that counts the number of bytes equal to a value working backwards (decrementing) from an address.  It is used here to determine the number of bytes (stored in iBack) of 0 at the end of the line.<P>
+Based on the values of iCurX, iCurY, iNewX, and iNewY a positioning command is sent, if necessary.  A start graphics command is then sent, followed by the graphics data.  iFront is used to compute the address of the first byte of graphics data to be output and iFront and iBack are used to compute the actual number of bytes to send.  The graphics data is followed by an end graphics command.  Then, a form feed causes the page to be printed.<P>
+With PCXHP, I am now happily printing faxes on my laser printer in a reasonable amount of time.<P>
+<PRE>
+
+_SCALING AND PRINTING FAXES FASTER_
+by Greg Pickles
+
+<a name="01d5_0009">
+<a name="01d5_000a"></pre><B>[LISTING ONE]</B><pre><a name="01d5_000a">
+
+;--------------------------------------------------------------------------
+;  Scale2To3 -- by Greg Pickles -- C callable assembly language routine to
+;  expand 2 lines of 200 DPI bitmap to 3 lines of 300 DPI bitmap. Assumes that
+;  all memory for storing the lines is allocated outside this routine.
+;--------------------------------------------------------------------------
+.model  large,c
+.286
+    .data
+    ;----------------------------------------------------------------
+    ; MapTbl contains the output bit map for each 2x2 input section
+    ; Entries are groups of 4 bytes, with the 4th byte a placeholder.
+    ;----------------------------------------------------------------
+MapTbl  dw  0000000000000000b       ;0
+    dw  0000000000000000b
+    dw  0000000000000000b
+    dw  0
+    dw  0000001100000000b       ;1
+    dw  0000001100000000b
+    dw  0000000000000000b
+    dw  0
+    dw  0000011000000000b       ;2
+    dw  0000011000000000b
+    dw  0000000000000000b
+    dw  0
+    dw  0000011100000000b       ;3
+    dw  0000011100000000b
+    dw  0000000000000000b
+    dw  0
+    dw  0000000000000000b       ;4
+    dw  0000001100000000b
+    dw  0000001100000000b
+    dw  0
+    dw  0000001100000000b       ;5
+    dw  0000001100000000b
+    dw  0000001100000000b
+    dw  0
+    dw  0000011000000000b       ;6
+    dw  0000011100000000b
+    dw  0000001100000000b
+    dw  0
+    dw  0000011100000000b       ;7
+    dw  0000011100000000b
+    dw  0000001100000000b
+    dw  0
+    dw  0000000000000000b       ;8
+    dw  0000011000000000b
+    dw  0000011000000000b
+    dw  0
+    dw  0000001100000000b       ;9
+    dw  0000011100000000b
+    dw  0000011000000000b
+    dw  0
+    dw  0000011000000000b       ;a
+    dw  0000011000000000b
+    dw  0000011000000000b
+    dw  0
+    dw  0000011100000000b       ;b
+    dw  0000011100000000b
+    dw  0000011000000000b
+    dw  0
+    dw  0000000000000000b       ;c
+    dw  0000011100000000b
+    dw  0000011100000000b
+    dw  0
+    dw  0000001100000000b       ;d
+    dw  0000011100000000b
+    dw  0000011100000000b
+    dw  0
+    dw  0000011000000000b       ;e
+    dw  0000011100000000b
+    dw  0000011100000000b
+    dw  0
+    dw  0000011100000000b       ;f
+    dw  0000011100000000b
+    dw  0000011100000000b
+    dw  0
+
+    .code
+;--------------------------------------------------------------------
+; void Scale2to3(char far*,char far*,short,short);
+;--------------------------------------------------------------------
+    public  Scale2to3
+Scale2to3  proc uses si di ds,pIn:PTR,pOut:PTR,nBytes:WORD,InvFlg:Word
+LOCAL   OuterCnt:WORD
+S23_0:
+    mov ax,nBytes   ;get number of bytes in input line
+    mov OuterCnt,ax ;set outer loop count
+    mov dx,ax       ;mult AX by 3/2 and put result in DX
+    shr ax,1        ;div AX by 2
+    jnc S23_10      ;if carry, then there is a fractional
+    inc ax      ;  bytein the result, so inc for it
+S23_10: add dx,ax       ;save # of bytes in output line in dx
+                    ;fill the output buffer with 0
+    mov cx,dx       ;multiply output line size by 3
+    shl cx,1
+    add cx,dx
+    mov bx,cx       ;save CX to test for odd value later
+    shr cx,1        ;divide CX by 2 to get word count
+    les di,pOut     ;get pointer to output buffer
+    sub ax,ax       ;get fill value
+    rep stosw
+    test    bl,1        ;see if extra byte to fill
+    jz  S23_15
+    stosb
+S23_15: mov ax,@data
+    mov ds,ax
+    mov si,offset MapTbl
+    mov cl,13       ;amount to shift initial output value
+            ;top of loop that processes a byte of input
+            ; register usage:
+            ;  AX = input data and output data
+            ;  BX = ofset into map table
+            ;  CH = inner loop counter
+            ;  CL = shift count for this output group
+            ;  DX = size of output line
+            ;  DS:SI pointer to map table
+            ;  ES:DI pointer to output word
+S23_30: les di,pIn      ;get pointer to 1st input line
+    mov ah,byte ptr es:[di] ;get data from line 1
+    add di,nBytes
+    mov al,byte ptr es:[di] ;get data from line 2
+
+    test    InvFlg,0ffffh   ;see if we need to invert
+    jz  S23_35
+    not ax
+S23_35: mov ch,4        ;do 4 2-bit segments in next loop
+    mov es,word ptr pOut+2  ;get segment address of output
+S23_40: rol ax,2        ;bits we want are in 0,1,8,9
+    push    ax
+    and ax,303h     ;mask out other bits
+    shl ah,2        ;move bits from 8,9 to 10,11
+    or  al,ah       ;or them into al
+    sub ah,ah       ;clear ah
+    shl ax,3        ;ax now has offset into enlarge table
+    mov bx,ax
+
+    mov ax,[si+bx]  ;get output value
+    rol ax,cl       ;shift it
+    mov di,word ptr pOut
+    or  es:[di],ax  ;or into output
+
+    add di,dx       ;get pointer to line 2 of output
+    mov ax,[si+bx+2]    ;get output value
+    rol ax,cl       ;shift it
+    or  es:[di],ax  ;or into output
+
+    add di,dx       ;get pointer to line 3 of output
+    mov ax,[si+bx+4]    ;get output value
+    rol ax,cl       ;shift it
+    or  es:[di],ax  ;or into output
+
+    pop ax
+            ;adjust the shift count for the output data
+            ;and the output pointer, if necessary
+    cmp cl,1        ;see if we need to bump output pointer
+    ja  S23_60      ;jump if just need to adjust count
+                ;CL is either 0 or 1 so it must become
+                ; either 13 or 6, respectively
+                ; NOTE: we are later going to sub 3
+                ;       so set CL what we want + 3
+    mov cl,9        ;assume CL was 1
+    je  S23_50      ;jump if CL=1
+    mov cl,16       ;opps! guessed wrong so make it 13
+    inc word ptr pOut   ;when CL goes from 0 to 13, need to
+                ; bump the output pointer by 2
+S23_50: inc word ptr pOut   ;increment output pointer
+S23_60: sub cl,3
+    dec ch      ;decrement inner loop counter
+    jnz S23_40      ;jump to inner loop if not 0
+
+    inc word ptr pIn    ;increment input pointer
+    dec OuterCnt    ;decrement outer loop counter
+    jnz S23_30
+
+    ret
+Scale2to3   endp
+    end
+
+
+
+
+<a name="01d5_000b">
+<a name="01d5_000c"></pre><B>[LISTING TWO]</B><pre><a name="01d5_000c">
+
+/*******************************************************************
+ * PCXHP.H  by Greg Pickles -- Header file for FAX image print program.
+ *******************************************************************/
+
+typedef struct {        // This struct passes control information.
+    SHORT sXpos;        // x pos for image on page in pixels
+    SHORT sYpos;        // y pos for image on page in pixels
+    SHORT sInv;         // TRUE to invert image
+    SHORT sEndAdjust;   // number of bytes at end of a raster line to adjust
+                        // because they are beyond the end of the actual image
+    SHORT sAdjOffset;   // offset in line of first byte to adjust
+    UCHAR ucMask;       // mask to OR in to the first byte that is
+                        //  adjusted (image may end in middle of byte)
+} OPTIONS;
+typedef struct {          // This struct is the PCX file header.
+    UCHAR  ucPcxId;                // PCX ID, always 0x0a
+    UCHAR  ucVer;                  // PCX version
+    UCHAR  ucEncMeth;              // 1 = run length
+    UCHAR  ucBPP;                  // bits per pixel
+    USHORT usUpLeftX, usUpLeftY;   // position of upper left corner
+    USHORT usLoRightX, usLoRightY; // position of lower right corner
+    USHORT usDispXRes, usDispYRes; // resolution of display
+    UCHAR  aucPalette[48];         // palette data
+    UCHAR  ucRes;
+    UCHAR  ucNumPlanes;            // number of bit planes of data
+    USHORT usBytePerLine;          // # bytes in an raster line
+    UCHAR  ucRes2[60];
+} PCX_HDR;
+
+/*-------------- Function prototypes-------------------------------------*/
+int PCXToHP(char*, FILEBUFFER*, OPTIONS*);
+void usage(void);
+PCX_HDR *PcxReadHeader(PCX_HDR*, FILEBUFFER*);
+void pcx_print_header(PCX_HDR*);
+UCHAR *pcx_alloc_line(PCX_HDR*, SHORT);
+int PcxReadLines(PCX_HDR*, UCHAR*, FILEBUFFER*, SHORT, OPTIONS*);
+UCHAR *pcx_test_line(PCX_HDR*, UCHAR*, SHORT, SHORT);
+UCHAR *ScanNE(UCHAR*, UCHAR, int);
+int IndexNE(UCHAR*, UCHAR, int);
+int CntREQ(UCHAR*, UCHAR, int);
+int main(int, char**);
+
+void Scale2to3(char far*,char far*,short,short);
+
+
+
+
+<a name="01d5_000d">
+<a name="01d5_000e"></pre><B>[LISTING THREE]</B><pre><a name="01d5_000e">
+
+/*******************************************************************
+ * PCXHP.C  by Greg Pickles --- FAX to LaserJetII image print program.
+ *******************************************************************/
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;memory.h&gt;
+#include &lt;malloc.h&gt;
+#include &lt;fcntl.h&gt;
+#include &lt;io.h&gt;
+#include &lt;sys\types.h&gt;
+#include &lt;sys\stat.h&gt;
+#include &lt;conio.h&gt;
+
+#include &quot;bufio.h&quot;
+#include &quot;pcxhp.h&quot;
+
+/*******************************************************************
+ * PCXToHP -- Process a PCX file. Returns 0 if successful, non-0  if error
+ *  pszFileName   :  pointer to the input file name
+ *  pstrcOutFile  :  pointer to output file buffer structure
+ *  pstrcOpt      :  pointer to OPTIONS struc for processing this file
+ *******************************************************************/
+int PCXToHP(char *pszFileName, FILEBUFFER *pstrcOutFile, OPTIONS *pstrcOpt)
+{
+FILEBUFFER  *pstrcInFile;
+PCX_HDR     strcHdr;
+SHORT       i, k, sXsize, sYsize, sLineBytes, sExpLineSize;
+UCHAR       *pucLine, *pucExpBuf;
+int         iCurX = -1, iCurY = -1;
+int         iNewX, iNewY, iFront, iBack;
+char        szFileName[80];
+char        szHpLineLead[20];
+char        szHpPos[50];
+                          // these strings are for building PCL4 commands
+static  char    szPosFmtFXYO [] = &quot;\x01b*p%dx%dY\x01b*r1A&quot;;
+static  char    szPosFmtY    [] = &quot;\x01b*p%dY&quot;;
+static  char    szGrDataFmt  [] = &quot;\x01b*b%dW&quot;;
+static  char    szEndGr      [] = &quot;\x01b*rB&quot;;
+static  char    szRes300     [] = &quot;\x01b*t300R&quot;;
+
+  strcpy(szFileName, pszFileName);       // make local copy of name
+  if (strchr(szFileName,'.') == NULL)    // add .PCX if needed
+    strcat(szFileName,&quot;.pcx&quot;);
+  // allocate input file buffer and open file, using my buffered I/O routines
+  if ( (pstrcInFile=FileOpen(szFileName,0)) == NULL )
+    return 1;
+  if (PcxReadHeader(&amp;strcHdr,pstrcInFile) == NULL)   {
+    fprintf(stderr,&quot;Error reading PCX header in file '%s'\n&quot;,
+            szFileName);
+    close(pstrcInFile-&gt;hFile);
+    return 3;
+    }
+  if (strcHdr.ucNumPlanes != 1) {
+    fprintf(stderr,&quot;Error: Not a monochrome PCX file.\n&quot;);
+    close(pstrcInFile-&gt;hFile);
+    return 5;
+    }
+           // extract size of line, compute number of rows,
+           // allocate buffer for 2 input lines
+  sLineBytes = strcHdr.usBytePerLine;
+  sYsize = strcHdr.usLoRightY - strcHdr.usUpLeftY + 1;
+  pucLine = malloc(2*sLineBytes);
+              // determine whether any bits/bytes need to be masked
+              // at the end of a decompressed line
+  sXsize = (strcHdr.usLoRightX - strcHdr.usUpLeftX + 1);
+  if ( sXsize/8 &lt; sLineBytes ) {
+    pstrcOpt-&gt;sEndAdjust = sLineBytes - sXsize/8;
+    pstrcOpt-&gt;sAdjOffset = sXsize/8;
+    pstrcOpt-&gt;ucMask = (UCHAR) (0xff &gt;&gt; sXsize%8);
+  }
+              // compute length of scaled line and allocate buffer
+  sExpLineSize = strcHdr.usBytePerLine + (strcHdr.usBytePerLine/2) +
+                ((strcHdr.usBytePerLine &amp; 1) ? 1 : 0);
+  pucExpBuf = malloc(sExpLineSize*3);
+              // set HP graphics resolution to 300 DPI
+  BufWrite(pstrcOutFile,szRes300, strlen(szRes300));
+              // init position on page
+  iNewX = pstrcOpt-&gt;sXpos;
+  iNewY = pstrcOpt-&gt;sYpos;
+
+  for (i=0; i&lt;sYsize; i+=2)  {
+    if ( !PcxReadLines(&amp;strcHdr, pucLine, pstrcInFile, 2, pstrcOpt) )
+      break;
+    Scale2to3(pucLine,pucExpBuf,sLineBytes,pstrcOpt-&gt;sInv);
+
+    for (k=0; k&lt;3; k++)  {
+      if ((iFront=IndexNE(pucExpBuf+k*sExpLineSize,0,sExpLineSize)) &gt;= 0) {
+        iNewX = pstrcOpt-&gt;sXpos + iFront*8;
+        iBack=CntREQ(pucExpBuf+(k+1)*sExpLineSize-1,0,sExpLineSize);
+        if (iNewX != iCurX) {
+          sprintf(szHpPos,szPosFmtFXYO,iNewX,iNewY);
+          BufWrite(pstrcOutFile,szHpPos,strlen(szHpPos));
+          iCurX = iNewX;
+          iCurY = iNewY;
+          }
+        else if (iNewY != iCurY) {
+          sprintf(szHpPos,szPosFmtY,iNewY);
+          BufWrite(pstrcOutFile,szHpPos,strlen(szHpPos));
+          iCurY = iNewY;
+          }
+                // note: a possible optimization is to remember the previous
+                // leadin string, value of iFront, and leadin string length
+                // and only create them when they change
+        sprintf(szHpLineLead,szGrDataFmt, sExpLineSize-iFront-iBack);
+
+        BufWrite(pstrcOutFile,szHpLineLead,strlen(szHpLineLead));
+        BufWrite(pstrcOutFile,pucExpBuf+k*sExpLineSize+iFront,
+                    sExpLineSize-iFront-iBack);
+        iCurY++;
+        }
+      iNewY++;
+      }
+    }
+  BufWrite(pstrcOutFile,szEndGr,strlen(szEndGr));
+  BufWrite(pstrcOutFile,&quot;\f&quot;,1);
+  free(pucLine);
+  free(pucExpBuf);
+  FileClose(pstrcInFile);
+  return 0;
+}
+/*******************************************************************/
+void usage(void)    // displays help info about usage, return to system
+{
+  printf(&quot;PCXHP\n&quot;);
+  printf(&quot;  Given a .PCX file, this program creates a file which can be\n&quot;);
+  printf(&quot;   sent to an HP LaserJet printer to print the image.\n&quot;);
+  printf(&quot; PCXHP [-xX] [-yY][-d] [-i] [-ofilename] filename\n&quot;);
+  printf(&quot;   Options include:               (units)              [default]\n&quot;);
+  printf(&quot;   -xPOS  set horizontal position (pixels from left)   [0]\n&quot;);
+  printf(&quot;   -yPOS  set vertical position   (pixels from bottom) [0]\n&quot;);
+  printf(&quot;   -d     dump PCX file info to stdout                 [off]\n&quot;);
+  printf(&quot;   -i     sInv image                                 [off]\n&quot;);
+  printf(&quot;   -oFIL  set output filename, or use SET PCXHP=filename\n&quot;);
+  exit(1);
+}
+/*******************************************************************
+ * PcxReadHeader -- Reads the header of a PCX file. Returns NULL if can't.
+ *******************************************************************/
+PCX_HDR *PcxReadHeader(PCX_HDR *pstrcHdr, FILEBUFFER *pstrcF)
+{ lseek(pstrcF-&gt;hFile,0L,SEEK_SET);
+  if (read(pstrcF-&gt;hFile,(char*)pstrcHdr,sizeof(PCX_HDR))
+          != sizeof(*pstrcHdr))
+          return NULL;
+  else    return pstrcHdr;
+}
+/*******************************************************************
+ * PcxReadLines         --- returns TRUE if success, FALSE if out of data
+ *  Reads and expands the next  N line from the PCX file.  Assumes
+ *  that the file pointer is positioned at the point in the file at
+ *  which to begin reading.  Performs data expansion as necessary.
+ *  pstrcHdr   :     pointer to PCX header struct for the file
+ *  pbLine     :     pointer to the buffer in which to put lines
+ *  pstrcF     :     pointer to the opened FILEBUFFER for the file
+ *  sLines     :     number of lines to read and expand
+ *******************************************************************/
+int PcxReadLines(PCX_HDR *pstrcHdr, UCHAR *pucLine, FILEBUFFER *pstrcF,
+                 SHORT sLines, OPTIONS *pstrcOpt)
+{
+int     iData, iData2;
+UCHAR   *pucDst, *pucLineStart;
+USHORT  usLSize = pstrcHdr-&gt;usBytePerLine;
+int     i, j;
+  for (j=0, pucDst=pucLine; j&lt;sLines; j++)  {
+    for (i=0, pucLineStart=pucDst; i&lt;usLSize; )    {
+              // if we get EOF on the first line, return FALSE
+              // to indicate we're done, otherwise fill the
+              // rest of the lines with 0xff (i.e. blank)
+      if ((iData=GetBufCh(pstrcF)) == EOF)    {
+        if ( (j &gt; 0) || (i &gt; 0) )  {
+          memset(pucDst,0xff,usLSize-i);
+          i = usLSize;
+          pucDst += (usLSize-i);
+          }
+        else
+          return FALSE;
+        }
+      else   {
+        if ((iData &amp; 0xc0) == 0xc0) {     // check for run length
+              // read data to be repeated; if EOF, return FALSE
+          if ((iData2=GetBufCh(pstrcF)) == EOF)
+            return FALSE;
+          memset(pucDst, (UCHAR)iData2, iData &amp; 0x3f);
+          pucDst += iData &amp; 0x3f;
+          i += iData &amp; 0x3f;
+        }
+    else {
+          *pucDst++ = (UCHAR)iData;
+          i++;
+          }
+        }
+      }
+    if (i=pstrcOpt-&gt;sEndAdjust) {
+      pucLineStart += pstrcOpt-&gt;sAdjOffset;
+      *pucLineStart |= pstrcOpt-&gt;ucMask;
+      while (--i)
+        *(++pucLineStart) = 0xff;
+      }
+    }
+  return TRUE;
+}
+/*******************************************************************
+ * IndexNE -- Scans a buffer for the first byte not equal to a specified byte.
+ *  pbBuf           pointer to the buffer to test
+ *  bVal            value to test for
+ *  iCount          number of bytes to test
+ *  Returns: -1 if the buffer contains only the specified byte
+ *  otherwise offset of the first byte that is not the specified byte
+ *******************************************************************/
+int IndexNE(UCHAR *bBuf, UCHAR bVal, int iCount)
+{ int iOrig = iCount;
+  while (iCount &amp;&amp; (*bBuf == bVal)) {  iCount--;  bBuf++;  }
+  if (iCount)    return iOrig-iCount;
+  return -1;
+}
+/*******************************************************************
+ * CntREQ -- Counts the number of bytes equal to a specified byte from a
+ *  starting point in memory backwards.
+ *  pbBuf    :       pointer to the (end of the) buffer to test
+ *  bVal     :       value to test for
+ *  iCount   :       number of bytes to test
+ *  Returns number of bytes found that are equal to the specified byte
+ *******************************************************************/
+int CntREQ(UCHAR *bBuf, UCHAR bVal, int iCount)
+{ int iOrig = iCount;
+  while (iCount &amp;&amp; (*bBuf == bVal)) { iCount--; bBuf--; }
+  return iOrig-iCount;
+}
+/*******************************************************************/
+int main(int argc, char *argv[])
+{
+int i;
+FILEBUFFER  *OutFile;
+char    *outfname = NULL;
+char    *filename = NULL;
+static OPTIONS Opt = {0,0,TRUE,0,0,0};
+  if (argc &lt; 2) usage();
+  for (i=1; i&lt;argc; i++)  {
+    if (argv[i][0] == '-' || argv[i][0] == '/')
+      switch (toupper(argv[i][1]))
+        {
+        case 'X':  Opt.sXpos = atoi(argv[i]+2); break;
+        case 'Y':  Opt.sYpos = atoi(argv[i]+2); break;
+        case 'I':  Opt.sInv = !Opt.sInv;        break;
+        case 'O':  outfname=argv[i]+2;          break;
+        case '?':  usage();                     break;
+        default:  fprintf(stderr, &quot;Unknown option %s\n&quot;,argv[i]);
+                  usage();                      break;
+        }
+      else
+        filename = argv[i];
+    }
+  if ( (outfname == NULL) &amp;&amp; ((outfname = getenv(&quot;PCXHP&quot;)) == NULL) )
+    outfname = &quot;prn&quot;;
+  if ( (OutFile=FileOpen(outfname,1)) == NULL )  exit(1);
+  i = PCXToHP(filename, OutFile, &amp;Opt);
+  FileClose(OutFile);
+  return i;
+}
+</pre>
+
+<HR><P>Copyright &copy; 1991, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

@@ -1,0 +1,387 @@
+<HTML>
+<META NAME="year" CONTENT="1994">
+<HEAD>
+<TITLE>MAR94: UNDOCUMENTED CORNER</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>UNDOCUMENTED CORNER<a name="00ee_0003"></h1><P>
+<h2><a name="00ee_0001"><a name="00ee_0000">RINGO: VxDs on the Fly</h2><P>
+<h3>Alex Shmidt</h3><P>
+<p><i><a name="00ee_0002"><a name="00ee_0000">Alex works for a large financial company in New York, where he develops multiplatform network software. He's been doing low-level Windows programming since 1991. Alex can be reached on CompuServe at 73302,60.</i></p><hr><P>
+<a name="00ee_0004">Introduction<a name="00ee_0004"><P>
+<h3>by Andrew Schulman</h3><P>
+A key feature of Microsoft's forthcoming &quot;Chicago&quot; operating system is &quot;plug-and-play,&quot; a specification that, once fully implemented, will allow completely dynamic configuration of a PC, without user intervention or rebooting the system. While your Windows program is running, drive letters may come and go, the screen resolution may change, and new device drivers may come on line or suddenly become unavailable. This should make for interesting behavior as applications learn to adjust themselves to the new regime. (GO PLUGPLAY on CompuServe has more about plug-and-play.)<P>
+In Chicago, a key part of plug-and-play is the ability to dynamically load and unload virtual device drivers (VxDs) on the fly. This is provided by a VxD called VXDLDR.386, which has already been released as part of Windows for Workgroups 3.11. It appears that only specially marked VxDs can be dynamically loaded and unloaded.<P>
+In this month's &quot;Undocumented Corner,&quot; Alex Shmidt shows another way to achieve dynamic VxD loading and unloading, without using VXDLDR, and even without a VxD file. Actually, Alex provides a general technique for calling <I>any</I> 32-bit Ring 0 (privileged) code from a normal Ring 3 (under-privileged) Windows program. In the May 1993 <I>Microsoft Systems Journal</I>, Matt Pietrek used callgates to access 16-bit Ring 0 code. Alex extends Matt's technique to 32-bit Ring 0 code, and then shows how to take some of this code and link it onto the VxD chain. Thus, the VxD code need not reside in a Linear Executable (LE) .386 file. Alex keeps his VxD code in a normal Windows DLL.<P>
+This really works! For example, after starting Alex's sample GATEVIEW program, his newly created RINGO VxD shows up in the output from my VXDLIST program (see the December 1993 &quot;Undocumented Corner&quot;). This works not only in Windows 3.1 but also in a prerelease of Chicago. Of course, VxDs dynamically installed after the system has started will not receive initialization messages such as SYS_DEVICE_INIT. (VXDLDR solves this with new messages such as SYS_DYNAMIC_DEVICE_INIT.)<P>
+Alex refers to this dynamic VxD facility as RINGO, in obvious reference to Ring 0, and perhaps also in tribute to Ringo Starr. RINGO relies on several pieces of undocumented functionality. In particular, its ability to add to the VxD chain at run time depends on knowledge of the Virtual Machine Manager (VMM) INT 20h dynamic linker. I also found myself relying on this in my generic VxD (see <I>MSJ</I>, February 1993). But Alex has uncovered an odd side-effect of the VMM dynamic linker that can be used to retrieve the root of the VxD chain; this seems a lot cleaner than the technique I used in the December 1993 <I>DDJ</I>. Clearly, knowledge of VMM's INT 20h dynamic linker is useful.<P>
+Alex also uses an undocumented parameter to the <I>_Allocate_GDT_Selector</I> service, and uses (though does not depend on) an undocumented Windows service for getting a selector to the Local Descriptor Table (LDT). This backdoor, accessible via INT 2Fh AX=168Ah, is described in Chapter 1 of Matt Pietrek's <I>Windows Internals</I> (Addison-Wesley, 1993).<P>
+For future columns, I'd love to hear from any reader who might be able to write something on Windows multimedia internals (MMSYSTEM.DLL), or describe how &quot;OS/2 for Windows&quot; works. Contact me on CompuServe at 76320,302, or in the new &quot;Undocumented Corner&quot; area on CompuServe (GO DDJ).<P>
+A major advantage of protected-mode operating systems is their robustness. Running at the processor's highest execution-privilege level, the operating system ensures its exclusive access to vital computing resources. The simple fact that certain machine instructions are unavailable to applications makes it difficult for them to fool around with vital system areas and violate the system integrity.<P>
+Unfortunately, this user-supervisor separation also presents a major problem: Because normal applications aren't allowed low-level access to the system, any program that needs such access must be built with a special set of programming tools, and can only be loaded in a special way, usually requiring a reboot of the whole system.<P>
+Although often described as something less than a full operating system, Microsoft Windows 3 really does contain a complete operating system. It's presented by the Virtual Machine Manager (VMM) and a set of Virtual Device Drivers (VxDs), whose primary purpose is to preemptively multitask Virtual Machines (VMs), visible to us as DOS boxes. The VMM and VxDs run 32-bit code in the flat memory model at the most-privileged level of the 80x86 CPU, often called Ring 0, which refers to the innermost circle of a concentric ring diagram. The &quot;virtualization&quot; introduced by VxDs depends on their ability to execute any CPU instruction.<P>
+On the user-mode side of the fence, we find native Windows and DOS programs. They run at the least-privileged level, Ring 3 (Windows 3.0 programs ran at Ring 1) and have no control over their privilege level. Still, many Windows programs need to do some low-level work (for port I/O and the like) while maintaining a high level of performance. This is why so many application installations add a VxD to the SYSTEM.INI file. For example, Microsoft's recent C compilers install several VxDs.<P>
+Without Microsoft's VXDLDR, there usually isn't a way to install and remove a VxD while Windows is running. VxDs reside in the linear executable (LE) files, and their presence is under complete control of the LE loader, which only runs when Windows bootstraps. When a typical installation ends, a message pops up indicating that we need to restart Windows to have it load the new VxDs.<P>
+When creating a VxD, you're limited by the toolset distributed with the Device Driver Kit (DDK), which contains a special version of assembler (MASM5), the linker LINK386 for producing LE files, and some other tools. This problem has been lately addressed in several packages for writing VxDs with 32-bit Watcom C or Microsoft C. But these VxDs still can only be loaded at Windows startup.<P>
+This article shows how to overcome these limitations, using an installable VxD called &quot;RINGO.&quot; RINGO is actually a dual-faced program, running in both Ring 3 and Ring 0. RINGO is a Windows DLL, but provides a technique equally applicable to the protected-mode DOS world. As you'll see, it used some undocumented VMM functionality. RINGO works in both the debug and retail versions of Windows 3.1. Besides, the functionality RINGO relies upon is so central to Windows that it will likely remain in the future versions. Indeed, RINGO works fine with the August 1993 prerelease of Chicago.<P>
+To give you an idea what RINGO is capable of, I wrote a sample program, GATEVIEW. As seen in <a href="199400f0.htm">Figure 1</A>, GATEVIEW can display both CPU and operating-system internal data, like the contents of the Page Directory, GDT and LDT, the VMCB (see &quot;Undocumented Corner,&quot; January and February 1994), the VxD list, and the stream of VMM events.<P>
+RINGO resides in a regular Win16 DLL, has the standard USE16 code segment _TEXT produced by the C compiler, with <I>LibMain</I>, WEP, and exported functions. To the Windows loader it looks like any other DLL. What makes RINGO a VxD is the USE32 segment _GATESEG, with which it's linked. The code in this segment executes at Ring 0, communicates with the VMM, and provides to the Ring 3 part a service function, <I>SeeYouAtRing0</I> (see <a href="#00ee_000e">Listing Four</A>, page 151). When GATEVIEW.EXE calls the exports, RINGO steps down to Ring 0 and retrieves tons of internal information for GATEVIEW, usually available only to a system-level debugger. RINGO also inserts itself into the VxD chain and posts messages back to GATE-<P>VIEW, whenever it gets called asynchronously by the VMM.<P>
+Although the code for RINGO and GATEVIEW is too long to reprint here in its entirety, excerpts from CALLGATE.H, RINGO.C, RINGO.INC, and CALLGATE.ASM are shown in Listings One through Four. The complete source code is available electronically (see &quot;Availability,&quot; page 3).<P>
+<h3><a name="00ee_0005">Using Callgates<a name="00ee_0005"></h3><P>
+RINGO does not call Ring 0 directly, as this would invite a general-protection (GP) fault. Instead, RINGO makes ring transitions via callgates.<P>
+Callgates are a native part of the CPU protection mechanism, performing ring transitions (somewhat slowly) in just one machine instruction. They are one of the several types of gates designed to allow less-privileged applications to access more-privileged operating-system services. Callgates are special entries in a descriptor table, and they have associated selectors. Unlike segment descriptors, which use bases and limits, callgates are built around 16:16 or 16:32 far pointers to entry points at Rings 0, 1, or 2. When the operating system wants to provide a strictly controlled interface to its service at that entry point, it creates a callgate descriptor and makes its selector available to applications. When an application targets the callgate selector in the far call or jump instruction, the ring transition occurs. For example, OS/2 1.x relied heavily upon callgates to provide most DOSCALL kernel services.<P>
+It's worth mentioning that Windows ignores callgates and instead uses a completely different (and, presumably, faster) ring-transition scheme that forces the application code to generate an explicit or implicit fault, which VMM traps and dispatches to the appropriate handler. For example, the VMM <I>Install_<P>V86_Break_Point</I> service plants a byte 63h in user code; this corresponds to an illegal ARPL instruction. When a program running in V86 mode executes the illegal instruction, a fault is generated that VMM interprets as a signal to dispatch control to a Ring 0 handler.<P>
+Let's avoid duplicating the Intel manuals and take a look at how RINGO constructs its callgates; see <a href="199400f1.htm">Figure 2</A>.<P>
+Each Virtual Machine in Windows has its own LDT. This means that when a task switch occurs and the current VM goes to sleep, all of its LDT selectors become meaningless until the next time this VM is scheduled. Since RINGO is an equal-opportunity employer, nice to all VMs, it creates a callgate to the <I>SeeYouAtRing0</I> service in the global descriptor table (GDT), available to everybody.<P>
+When the Windows loader brings RINGO.DLL into memory, it knows nothing about USE32 segments. Just as it always does, the loader allocates a memory block for _GATESEG from the System VM global memory pool and allocates a USE16 code selector that maps it. At this point, RINGO treats _GATESEG as just a memory object. RINGO translates the 16:16 far address of the <I>SeeYouAtRing0</I> function within the object into the linear address and inserts it into the gate descriptor's OFFSET field. This 0-based offset needs a selector, mapping the entire 4-gigabyte address space. RINGO borrows the flat-model code selector (28h) from the VMM and inserts it into the descriptor's SELECTOR field. This allows RINGO to make near calls to the VMM, as is expected of a VxD.<P>
+Although callgates literally open doors to interlevel calls, the CPU still verifies an application's access rights to the gate itself. That's why RINGO sets the callgate descriptor's DPL and its selector's RPL to 3. It sets the system bit to 0 to let the CPU know what kind of descriptor it's creating. Since <I>SeeYouAtRing0</I>is a 32-bit function, RINGO sets the type field to 12 (it would be 4 for 16-bit code). <I>SeeYouAtRing0 </I>executes when the Ring 3 code in RINGO.DLL calls a function of type GATEPROC, whose prototype in CALLGATE.H (<a href="#00ee_0008">Listing One</A>, page 150) accepts two WORDs and one DWORD as parameters, resulting in two DWORDs total, and RINGO sets the DWORD parameter count field to 2. Finally, RINGO permanently sets the descriptor's present bit, because VxDs can't be swapped out of memory.<P>
+As usual, the callgate selector is an index to its descriptor in the GDT. When the Ring 3 code in RINGO makes a far call, the CPU sees that the CS register has been loaded with the callgate selector, and loads SS:ESP with the stack of the <I>SeeYouAtRing0</I> entry point's privilege level from the task state segment (TSS), copies the number of DWORD parameters specified in the gate descriptor from the caller stack, and transfers control to <I>SeeYouAtRing0</I> at Ring 0. The CPU switches stacks to ensure that the stack segment's DPL will be equal to the CPL when the instructions manipulating the stack get executed from Ring 0. Otherwise, a GP fault would occur. This is why there are Ring 0, 1, and 2 stacks specified in the TSS; the CPU is thus always ready for a ring transition between any two levels. <a href="199400f2.htm">Figure 3</A> shows the stack layout.<P>
+When <I>SeeYouAtRing0</I> is about to return to Ring 3, the CPU cannot remember that it's getting back from a gate. To restore the stack properly, <I>SeeYouAtRing0</I> uses an <I>RETF&lt;# of bytes&gt; </I>instruction. Interestingly enough, it clears the stack frames of both rings, which means that callgate procedures are typical Pascal calling convention functions (the called function pops the stack).<P>
+How does RINGO modify the GDT? Since both the Windows API and the DOS Protected Mode Interface (DPMI) know only about LDT segment descriptors, RINGO uses the <I>VMM _Allocate_GDT_Selector</I> service. If you just construct your callgate DWORDs and call this API, though, you'll get back 0. Doesn't it like system descriptors? But wait a second. How does VMM itself get nonsegment descriptors, such as interrupt gates, for example? The answer is that the undocumented flag 20000000h must be passed to <I>_Allocate_GDT_<P>Selector</I> to make the function do what we need. Sure enough, the DDK documentation for the <I>_Allocate_GDT_<P>Selector</I> flags parameter states: &quot;Specifies the operation flags. This parameter should be set to 0.&quot; Ignore this advice to get a GDT callgate.<P>
+Okay, that's a key piece, but we're still at the improper ring to call the VMM. So how do we get to the proper ring? Personally, I prefer using a tiny VxD, CALLGATE.386, whose only job is to create and destroy callgates on behalf of applications.<P>
+However, this requires that CALLGATE.386 already be installed. Therefore, I made RINGO a totally independent and self-loadable VxD. I modified the technique presented in Matt Pietrek's article, &quot;Run Privileged Code from Your Windows-based Program Using callgates&quot; (<I>MSJ</I>, May 1993).<P>
+To launch itself into the Ring 0 orbit, RINGO creates another callgate, this time in the LDT. It uses Microsoft's undocumented &quot;MS-DOS&quot; extension to DPMI, accessible via INT 2Fh AX=168Ah, to get a selector that maps the LDT. Just like KRNL386.EXE in Windows, RINGO uses this to write directly to the LDT, building the callgate for another Ring 0 flat-model function, <I>RingoInit</I> (<a href="#00ee_000e">Listing Four</A>), which initializes the VxD environment. When constructing the callgate descriptor, I hardcoded selector 28h (see <I>GetLdtRing0CallGate</I> in RINGO.C, <a href="#00ee_000a">Listing Two</A>, page 150). Neither that selector value nor the LDT callgate approach are needed with CALLGATE.386.<P>
+Note that Microsoft's DPMI extension sets the carry flag, indicating an error, if called from outside the System VM. To use the RINGO approach with protected-mode DOS programs, you'll have to use some other method for allocating LDT callgates, such as CALLGATE.386. (Another method involves the Intel SLDT and SGDT instructions, which are not privileged.)<P>
+If you compile RINGO.C with CALLGATE_386 switch defined, RINGO will get the callgate for <I>RingoInit</I> from CALLGATE.386. Unlike RINGO, CALLGATE<P>.386 is a conventional VxD. It implements an INT 2Fh AX=168Ah DPMI-extension interface to communicate with applications, and thus doesn't need a VxD ID. (Given the current confusion surrounding VxD IDs, you might want to think about giving your own VxDs DPMI extension interfaces rather than VxD protected-mode API interfaces.)<P>
+So what happens when <I>LibMain</I> (see <a href="#00ee_000a">Listing Two</A>) calls the far pointer with the gate selector in it? Because of the callgate, the next instruction the CPU executes is the PUSH EBP in <I>RingoInit</I> at Ring 0, somewhere at address 28h:<P>80xxxxxx. Having stepped into Ring 0, RINGO is going to make extensive use of VMM services, and needs to set up several things to be a good neighbor. <I>RingoInit</I> starts by building the stack frame, partially set by the CPU. Our SS:ESP points to the Ring 0 stack loaded from the TSS. Then, after loading the segment registers with the flat-model data selector, <I>RingoInit</I> relocates _GATESEG in linear memory.<P>
+Conventional VxDs never worry about their flat-model environment: Together, the compiler, linker, and LE loader take care of that. Without this luxury, RINGO faces two problems:<P>
+First, _GATESEG still resides in a DISCARDABLE memory block allocated by the Windows DLL loader, as specified in RINGO.DEF. Staying in there, RINGO would crash very soon, because there is no demand-paging for segments referenced by selectors obtained at run time. Moreover, RINGO installs callback functions to be called in a context where page-swapping is out of the question. Eventually, RINGO would get hit when _GATESEG was swapped out, resulting in a page fault. If we assigned it a FIXED attribute, or <I>Pagelock</I>ed it at run time, Windows would likely move _GATESEG in the linear address space somewhere below 640K, which is too expensive. Besides, the VMM (especially its debug version) and the debugger would get confused, since they expect VxDs to always reside above the 2-gigabyte line.<P>
+Second, the code and data references in RINGO aren't properly resolved yet; they are still relative to the start of _GATESEG, as calculated by the assembler.<P>
+The <I>RelocateRingo</I> function plays the part of the absent loader. First, it calls VMM's <I>_PageAllocate</I> service for a group of <I>PageFix</I>ed (meaning also <I>PageLock</I>ed) pages, large enough to accommodate _GATESEG. <I>RelocateRingo</I> simply moves the entire _GATESEG segment into this memory, whose linear address is above 80000000h, exactly where VxDs should live. RINGO uses this address to resolve the code references. The <I>movoffs</I> macro in RINGO.INC (<a href="#00ee_000c">Listing Three</A>, page 150) deals with this issue. Next, <I>RelocateRingo</I> creates a GDT data-selector alias for the _GATESEG run-time space to address its variables. This eliminates the need for resolving data references, because the offsets didn't change when _GATESEG was relocated. The GS: segment overrides throughout the code explain how RINGO accesses the variables.<P>
+<h3><a name="00ee_0006">Adding to the VxD Chain<a name="00ee_0006"></h3><P>
+Let's get back to <I>RingoInit</I>. RINGO processes <I>System_Control</I> messages and needs a Device Descriptor Block (DDB) attached to the VxD chain. Since Windows 3.1 provides no VMM service to return the DDB root, RINGO gets it using another piece of undocumented VMM functionality.<P>
+The VMM contains an INT 20h dynamic linker for VMM and VxD function calls. To access a VMM or VxD service, VxDs use the <I>VMMCall</I> or <I>VxDCall</I> macro, which expands into 6 bytes: 0CDh 20h (INT 20h) followed by a DWORD composed of the VxD ID and the service number. For example, <I>_Allo-cate_GDT_Selector</I> is service 76h provided by VMM (VxD ID 1), so its DWORD is 010076h. When someone first issues a <I>VMMCall</I> or <I>VxDCall</I>, the interrupt gate assigned to INT 20h calls the centralized handler within the VMM. This handler saves all the registers, makes an indirect call to the dynalink handler, and the fun begins:<P>
+The dynalink handler looks back at the stack, finds our six bytes, extracts the device ID and service number, and passes them to a helper function, which traverses the DDB linked list and returns the requested service address. In other words, this is just like a <I>GetProcAddress</I> for VMM and VxD calls. A side effect of the helper function call is that it returns the device DDB pointer in the ECX register. In the case of the VMM macro call, ECX contains a VMM DDB pointer, which is the device-chain root we're looking for. The dynalink handler patches the original six bytes of the macro call, making them look like a 32-bit near calls to the device service, and returns back to the interrupt dispatcher, which restores the registers, including EIP. Our VxD executes again at the same address as the INT 20h, but this time using a direct service call instead. Neatly done!<P>
+The <I>DynalinkTrick</I> function in CALLGATE.ASM (see <a href="#00ee_000e">Listing Four</A>) uses this knowledge to get the VxD root. Based on the fact the dynalink handler is one of the VMM faults, <I>DynalinkTrick</I> installs its own handler, <I>Ringo_Dynalink_Handler</I>, using the <I>Hook_VMM_<P>Fault</I> service. Effectively, this operation simply swaps function pointers in the fault call table. <I>DynalinkTrick</I> then makes a dummy call to the <I>Get_VMM_<P>Version</I> service, giving <I>Ringo_Dynalink_Handler</I> one chance to execute. The latter calls the original dynalink handler and saves the value of ECX. Finally, <I>DynalinkTrick</I> restores the original INT 20h fault and exits with the VMM DDB pointer in hand.<P>
+The VxD chain is a linked list, and RINGO inserts itself right after the VMM. You can run the VXDLIST program from the December 1993 &quot;Undocumented Corner&quot; to verify this. The function <I>RingoControlProc</I> installed as a Control Procedure in the DDB responds to the VMM messages until we disconnect RINGO from the device chain. As <a href="199400f3.htm">Figure 1</A> shows, GATEVIEW displays these messages.<P>
+Finally, <I>RingoInit</I> creates a callgate for <I>SeeYouAtRing0</I> using undocumented <I>_Allocate_GDT_Selector</I> functionality described earlier and returns it back to <I>LibMain</I> in the form of a ready-to-use far pointer.<P>
+To sum up, we wrote the flat-model code and integrated it with a Windows DLL using ordinary tools. After that binary started, we set up the environment and programmatically launched our VxD to the VMM sphere of influence. Finally, we established the fast communication channel for user-mode programs to talk to our VxD. When the DLL usage count decrements to 0, and the WEP entry point gets called, RINGO discontinues his membership in the VxD club, deallocates all its resources, including the callgates, and gracefully disappears. A small taste of plug-and-play!<P>
+<h3><a name="00ee_0007">GATEVIEW<a name="00ee_0007"></h3><P>
+What kind of goodies can RINGO get for us? Since it's also a DLL, RINGO exports five functions which are just shells around calls through the gate to <I>SeeYouAtRing0</I>. GATEVIEW gets a lot of stuff from RINGO by calling these exports. As <a href="199400f4.htm">Figure 1</A> shows, it dumps the contents of the Page Directory and any Page Table, GDT, LDT, IDT, TSS, Control, and Debug registers, the list of running VMs and their parameters, and the list of installed VxDs, including RINGO itself.<P>
+Even if you don't press any GATEVIEW buttons, the lower list box will reflect internal VMM events relevant to the VM multitasking. Every time one of these events occurs, the VMM sends a message to all VxDs. Since RINGO is a legitimate (though oddly created) VxD, it sees these messages and passes them on to GATEVIEW by calling PostMessage in a nested execution block. (See the full CALLGATE.ASM, available electronically.)<P>
+If you press GATEVIEW's DOS button, you won't be able to start a DOS box until you press it again, because RINGO will return the carry flag set to the <I>Create_VM</I> control message. If you press the button before starting Microsoft Visual C++, it refuses to compile anything, saying &quot;Error initializing build VM.&quot; This should convince you that Visual C++ runs a hidden VM.<P>
+What can be done with the technique presented here? As one example, consider hardware device-driver DLLs installing Ring 0 interrupt handlers. They would eliminate the interrupt-latency problem faced by their Ring 3 counterparts, which force developers to write VxDs in the first place. Another application for installable VxDs would be a generic loader, doing run-time relocations and fixups. With this, it would be fairly straightforward to create VxDs in C or even C++. And whereas Microsoft's VXDLDR can only load special dynamic VxDs located in LE files, the RINGO approach described here can load VxDs residing in normal Windows DLLs. The only significant difference between RINGO and conventional VxDs is that RINGO doesn't receive VMM initialization messages. If your VxD doesn't process these messages, there would seem to be several advantages to the RINGO approach. If you can think of other uses for installable VxDs, I'd welcome your suggestions and comments.<P>
+<h4><B> <a href="199400f5.htm">Figure 1</A>:</B> GATEVIEW displays information such as the page directory and the stream of VMMevents.</h4><P>
+<h4><B> <a href="199400f6.htm">Figure 2</A>: </B>RINGO callgate descriptor for the SeeYouAtRing0 function.</h4><P>
+<h4><B> <a href="199400f7.htm">Figure 3</A>:</B> Stack frame during a call to SeeYouAtRing0 through the callgate.</h4><P>
+
+<h4><a name="00ee_0008"><a name="00ee_0009"><B>[LISTING ONE]</B></H4>
+
+<PRE>
+
+/* CALLGATE.H */
+typedef DWORD (FAR PASCAL *GATEPROC)(WORD svc, WORD cnt, DWORD extra);
+
+/* SeeYouAtRing0  services */
+#define Get386_Svc               0                       //get system info
+#define PhysToLin_Svc            Get386_Svc + 1          //map phys to linear
+#define Register_Hwnd_Svc        PhysToLin_Svc + 1       //register HWND
+#define Unregister_Hwnd_Svc      Register_Hwnd_Svc + 1   //unregister HWND
+#define StopVM_Svc               Unregister_Hwnd_Svc + 1 //toggle DOS box exec
+#define RemapGate_Svc            StopVM_Svc + 1          //remap call gate
+
+typedef struct {        /* call gate procedure parameters */
+   DWORD G_Dword;       // Dword parameter
+   WORD  G_Word;        // Word parameter
+   WORD  G_Svc;         // service number
+}GPARAM;
+
+/* RingoInit functions */
+#define EXITRINGO   0xFFFF
+#define INITRINGO   0
+
+
+</PRE>
+
+<h4><a name="00ee_000a"><a name="00ee_000b"><B>[LISTING TWO]</B></H4>
+
+<PRE>
+
+
+/* RINGO.C -- excerpts */
+//#define CALLGATE_386  //define CALLGATE_386 to get gates from CALLGATE.386
+
+#include &lt;windows.h&gt;
+#include &quot;386.h&quot;
+#include &quot;callgate.h&quot;
+
+#ifdef CALLGATE_386
+GATEPROC GetFirstCallGateVxD (FARPROC entrypoint,BYTE paramcount);
+void     DestroyInitGateVxD (WORD callgateselector);
+#endif
+
+VOID WINAPI RingoInit(void);
+VOID WINAPI SeeYouAtRing0(void);
+VOID WINAPI MakeSureOurSegIsInMemory(void);
+GATEPROC GetLdtRing0CallGate (FARPROC entrypoint,
+        BYTE paramcount,WORD callgate);
+GATEPROC GDT_Gate,LDT_Gate;
+
+int FAR PASCAL LibMain ( HANDLE hInstance, WORD wDataSeg,
+                         WORD cbHeapSize, LPSTR lpszCmdLine )
+{
+   FARPROC ri = (FARPROC) RingoInit;
+
+   if (!(GetWinFlags () &amp; WF_ENHANCED))  /*VxDs exist in enhanced mode only*/
+      return 0;
+
+#ifdef CALLGATE_386             // get the GDT call gate from CALLGATE.386
+   if (!(LDT_Gate = GetFirstCallGateVxD (ri, sizeof(GPARAM)/4)))
+#else                           // get the LDT call gate with INT 2F, AX=168A
+   if (!(LDT_Gate = GetLdtRing0CallGate (ri, sizeof(GPARAM)/4, 0)))
+#endif
+      return 0;
+
+   /*** get the main call gate in GDT ***/
+   GDT_Gate = (GATEPROC)LDT_Gate (INITRINGO, sizeof(GPARAM)/4,
+          (DWORD)SeeYouAtRing0);
+   if (cbHeapSize)
+      UnlockData (0);
+   return (1);
+}
+
+char vendor[] = &quot;MS-DOS&quot;;               // Microsoft's signature
+
+GATEPROC GetLdtRing0CallGate (FARPROC gproc, BYTE params,WORD gatesel)
+{
+#define VENDOR_SPECIFIC_API 0x168a
+WORD    ldt_map;                       // LDT selector, which maps LDT itself
+WORD    (far * entryp)(void);          // entry point to get the above
+LPCALLGATEDESCRPT  CGateDescriptor;    // build call gate descriptor with this
+WORD    RW_ldt_map;   /* ldt map selector fixes segment read-only problem */
+WORD    CGateSelector;                  // to be a call gate selector
+DWORD   initgate_flat;                  // callgate procedure's linear address
+
+   _asm {
+   mov     si, offset vendor
+   mov     ax, VENDOR_SPECIFIC_API
+   int     2fh
+   or      al, al
+   jnz     no_vendor
+   mov     word ptr [entryp], di        /* private entry point */
+   mov     word ptr [entryp+2], es
+   mov     ax, 100h                     /* magic number */
+   }
+
+   ldt_map = entryp();                  /* returns LDT map selector */
+
+   _asm    jnc vendor_ok
+no_vendor:
+   return  0;
+
+vendor_ok:
+   // When run under SoftICE/W LDT alias returns read_only, give us a good one
+   if (!(RW_ldt_map = AllocSelector(SELECTOROF((void FAR *)&amp;GDT_Gate))))
+      return 0;
+   SetSelectorBase(RW_ldt_map, GetSelectorBase(ldt_map));
+   SetSelectorLimit(RW_ldt_map, GetSelectorLimit(ldt_map));
+   if ((CGateSelector = gatesel) == 0)          // we might already have one
+      if (!(CGateSelector = AllocSelector(0)))  // Get a selector for the gate
+      {
+         FreeSelector (RW_ldt_map);
+         return 0;
+      }
+
+   // create a pointer to write into the LDT
+   CGateDescriptor = MAKELP(RW_ldt_map,CGateSelector &amp; SELECTOR_MASK);
+
+   // build 32-bit ring 3-to-0 call gate
+   #define MK_LIN(x)  (GetSelectorBase(SELECTOROF(x)) + (DWORD)OFFSETOF(x))
+   initgate_flat = MK_LIN(gproc);
+   CGateDescriptor-&gt;Offset_O_15 =  LOWORD (initgate_flat);
+   CGateDescriptor-&gt;Offset_16_31 = HIWORD (initgate_flat);
+   CGateDescriptor-&gt;Selector = 0x28;                // ring0 flat code seg
+   CGateDescriptor-&gt;DWord_Count = params &amp; CALLGATE_DDCOUNT_MASK;
+   CGateDescriptor-&gt;Access_Rights = GATE32_RING3;   //pres,sys,dpl3,32CallGate
+   FreeSelector (RW_ldt_map);                       // don't need you any more
+   return ((GATEPROC)MAKELP(CGateSelector,0));
+}
+
+DWORD WINAPI _export MapPhysToLinear (DWORD physaddr, WORD mapsize)
+{
+   return (GDT_Gate)(PhysToLin_Svc,mapsize,physaddr); /* DPMI alternative */
+}
+
+
+</PRE>
+
+<h4><a name="00ee_000c"><a name="00ee_000d"><B>[LISTING THREE]</B></H4>
+
+<PRE>
+
+
+;;; RINGO.INC -- excerpts
+
+GPARAM          struc           ; parameters
+ G_Dword        dd      ?
+ G_Word         dw      ?
+ G_Svc          dw      ?
+GPARAM          ends
+CALLGATE_FRAME  struc           ; stack frame at the time of ring transition
+ CG_pushbp      dd      ?
+ CG_Old_EIP     dd      ?               ; this is where we came from
+ CG_Old_CS      dd      ?               ; and will get back
+ CG_Params      db (type GPARAM) dup (?) ; call gate parameters
+ CG_Old_ESP     dd      ?               ; caller's
+ CG_Old_SS      dd      ?               ; stack
+CALLGATE_FRAME  ends
+
+BuildGateStackFrame     macro dataseg
+        push    ebp
+        mov     ebp,esp
+        push    gs
+        push    ds
+        push    es
+        push    fs
+        push    esi
+        push    edi
+ ifidni &lt;dataseg&gt;,&lt;_DATA&gt;
+        mov     ax,ds
+        mov     gs,ax           ; we'll access our data seg via gs
+ endif
+        mov     ax,ss
+        mov     ds,ax           ; ring 0 flat data delector
+        mov     es,ax
+        mov     fs,ax
+ ifdifi &lt;dataseg&gt;,&lt;_DATA&gt;
+        call    GetRingoGdtDataSel
+ endif
+endm
+
+ClearGateStackFrame     macro cleanup
+        pop     edi
+        pop     esi
+        pop     fs
+        pop     es
+        pop     ds
+        pop     gs
+        pop     ebp
+        ret     cleanup
+endm
+
+movoffs macro   reg,off32                ; run-time fixup
+        mov     reg, offset &amp;off32
+        add     reg,gs:[ringo_flat]
+endm
+
+
+</PRE>
+
+<h4><a name="00ee_000e"><a name="00ee_000f"><B>[LISTING FOUR]</B></H4>
+
+<PRE>
+
+
+;;; CALLGATE.ASM -- excerpts
+
+.386p
+        include vmm.inc
+        include ringo.inc
+        include 386.inc
+public  RingoInit,SeeYouAtRing0,MakeSureOurSegIsInMemory
+_GATESEG segment dword use32 public 'CODE'
+        assume  cs:_GATESEG,gs:_DATA
+RingoInit       proc    far
+        BuildGateStackFrame _DATA
+        cmp     [ebp].CG_Params.G_Svc,EXITRINGOCALL
+        jnz     short @f
+        call    RingoExit               ; deallocate everything we've got
+        jmp     short retini
+@@:     call    RelocateRingo           ; run-time relocation and fixups
+        jc      short init_ret
+        call    DynalinkTrick           ; get the VxD chain root
+        call    InsertRingoDDB          ; welcome to the VxD club
+        call    CreateRingoGDTGate      ; GDT call gate to SeeYouAtRing0
+retini: mov     edx, eax                ; prepare return values for the ring 3
+        shr     edx, 16
+        ClearGateStackFrame &lt;size CG_Params&gt;    ; clear both ring stack frames
+RingoInit       endp
+
+SeeYouAtRing0   proc     far            ; The callgate service proc
+        BuildGateStackFrame
+        VMMCall Get_Cur_VM_Handle               ; always helpful
+        movzx   eax, [ebp].CG_Params.G_Svc      ; service dispatcher
+        cmp     eax,LASTSVC
+        ja      @f
+        call    gs:Gate_Service_Table[eax*4]
+@@:     mov     edx, eax
+        shr     edx, 16
+        ClearGateStackFrame &lt;size CG_Params&gt;
+SeeYouAtRing0   endp
+
+CreateRingoGDTGate      proc
+        movzx   edx, word ptr [ebp].CG_Params.G_Dword   ; offset16
+        add     edx,gs:[ringo_flat]                     ; fixup
+        mov     ax, cs                                  ; VMM code selector
+        mov     cx, [ebp].CG_Params.G_Word              ; parameter count
+        and     cx, CALLGATE_DDCOUNT_MASK ; make sure it's a reasonable number
+        or      cx, GATE32_RING3                        ; call gate type
+        call    BuildCallGateDWords
+        VMMCall _Allocate_GDT_Selector,&lt;edx,eax,20000000h&gt; ; undocumented flag
+        ror     eax,16
+        ret
+CreateRingoGDTGate      endp
+
+BeginProc       DestroyGDTCallGate,public
+        movzx   eax,[ebp].CG_Params.G_Word
+        VMMCall _Free_GDT_Selector,&lt;eax,0&gt;
+        ret
+EndProc         DestroyGDTCallGate
+
+BuildCallGateDWords     proc
+        movzx   eax, ax
+        shl     eax, 16                         ; selector
+        mov     ax, dx                          ; offset 0-15
+        mov     dx, cx                          ; offset 16-31 + type + count
+        ret
+BuildCallGateDWords     endp
+
+;***************************************************************************
+; To get the VxD Base (VMM DDB ptr) we're using the undocumented fact that
+; VMM's dynalink handler (considered a 'fault' 20h in DDK spec parlance)
+; returns it in ecx. The idea is to hook VMM fault 20h, call any VMM service
+; to get our fault handler receive control, call VMM's dynalink directly,
+; store ecx in a static variable, and hook fault 20h again, this time
+; with fault handlers reversed.
+;***************************************************************************
+
+BeginProc       DynalinkTrick
+        mov     esi, gs:[OurDynalinkHandler]
+twice:  mov     eax, 20h
+        VMMCall Hook_VMM_Fault              ; install our handler
+        mov     gs:[OLD_DYNALINK_HANDLER], esi
+        VMMCall Get_VMM_Version             ; need one call get it executed
+        cmp     esi, gs:[OurDynalinkHandler]
+        jnz     twice
+        mov     eax, gs:[VXD_FIRST]
+        ret
+EndProc         DynalinkTrick
+
+Ringo_Dynalink_Handler  proc
+        call    gs:[OLD_DYNALINK_HANDLER]
+        mov     gs:[VXD_FIRST], ecx             ; DDB pointer
+        ret
+Ringo_Dynalink_Handler  endp
+
+PhysToLin       proc               ; physical to linear address mapping
+        movzx   ecx, [ebp].CG_Params.G_Word
+        VMMcall _MapPhysToLinear,&lt;[ebp].CG_Params.G_Dword,ecx,0&gt;
+        ret
+PhysToLin       endp
+
+ringo_flat              dd      0               ; run-time space base
+OLD_DYNALINK_HANDLER    dd      0
+VXD_FIRST               dd      0               ; VxD chain root
+OurDynalinkHandler      dd      offset Ringo_Dynalink_Handler
+Ringo_DDB VxD_Desc_Block  &lt;,,,1,0,,'Ringo   ',,offset RingoControlProc,,,,,,,&gt;
+Gate_Service_Table      label   dword
+        dd      offset          Get386
+        dd      offset          PhysToLin
+        dd      offset          RegisterHWND
+        dd      offset          UnregisterHWND
+        dd      offset          StopVM
+        dd      offset          RemapCallGate
+_GATESEG  ends
+end
+</pre>
+
+<HR><P>Copyright &copy; 1994, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

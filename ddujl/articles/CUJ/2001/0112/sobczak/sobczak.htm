@@ -1,0 +1,187 @@
+<HTML>   
+     <HEAD>
+<TITLE>December 2001/An Iostream-Compatible Socket Wrapper</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocdec.htm"></A><FONT COLOR="#FF0000">   Internet and Network Programming</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">An Iostream-Compatible Socket Wrapper</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Maciej Sobczak</FONT></H3>
+
+<BLOCKQUOTE>
+<p>With suitable scaffolding, writing to a socket is as easy as <b>cout &lt;&lt; "Hello, world";</b>.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>When I was attending the C++ course at my university (which followed the C course), I was told that now there are better tools to do the job than before, and that, for example, the following form should no longer be used:</p>
+
+<pre>
+fprintf(stdout, "Hello World!");
+</pre>
+
+<p>Instead, the object-based approach is preferred:</p>
+
+<pre>
+cout &lt;&lt; "Hello World!" &lt;&lt; endl;
+</pre>
+
+<p>I know a lot of people who would argue that the second line is not a bit more object-oriented than the first; the former is even better, because it clearly states what operation is performed on what entity. What is the improvement, then? The improvement comes from code reuse and the polymorphism that the iostream-compatible objects expose. Consider this:</p>
+
+<pre>
+void printHello(ostream &amp;stream)
+{
+    stream &lt;&lt; "Hello World!" &lt;&lt; endl;
+}
+</pre>
+
+<p><B>printHello</B> is reusable, because it treats its arguments polymorphically <a href="#1">[1]</a>. You can use it with the standard <B>cout</B> object, or with any other stream you can invent, whether it is connected to a file (by <B>std::ofstream</B>) or to a string buffer (by <B>std::ostringstream</B>) or to something else derived from <B>ostream</B>. Indeed, with a slight change you can make it work with all of the standard streams, including the wide-character versions. Beyond that, it will also work with anything else that supports <B>operator&lt;&lt;</B> and understands <B>endl</B>, whether the stream happens to be derived from a standard stream class or not:</p>
+
+<pre>
+template&lt;typename T&gt;
+void printHello(T &amp;stream)
+{
+    stream &lt;&lt; "Hello World!" &lt;&lt; endl;
+}
+</pre>
+
+<p>The possibilities are countless, and there is tons of code like the above to reuse. There is one minor problem, though. The standard library cannot provide all the classes needed for all I/O, because I/O programming is not limited to terminals, files, and memory devices like strings. Computers are used also for network communication where sockets are the popular abstraction. Is there any possibility to use the existing, iostream-compatible code in programs based on socket networking? Of course, there is.</p>
+
+<H3><FONT COLOR="#000080">Iostream Mechanics Revisited</FONT></H3>
+
+<p>Each iostream object (for example the standard <B>cout</B>) is composed of three parts:</p>
+
+<UL><LI>   The stream state component &#151; this keeps information concerning the current condition of the stream.</LI>
+<LI>   The buffer component &#151; this is a &#147;transit&#148; area for transmitted data.</LI>
+<LI>   The conversion component &#151; this performs all the transformations between objects and raw sequences of bytes. The conversion component knows how to turn <B>int</B> or <B>double</B> into the sequence of bytes, for example.</LI></UL>
+
+<p>Those three components are glued together by the tools available in the language: inheritance, aggregation, and containment. For example, <a href="fig1.htm">Figure 1</a> shows the structure of <B>ostream</B> objects (only the key components are shown). Above the horizontal dashed line, there are framework classes, which provide the interface of the stream. Below that line, two concrete classes are shown, which together implement the ultimate <B>ostream</B> object (file-based <B>stream</B> in this example). The <B>istream</B> objects have conceptually the same structure, where the <B>basic_istream</B> class is on the bottom of the hierarchy instead of <B>basic_ostream</B>.</p>
+<p>These classes are in fact templates. This was introduced a few years ago by the Standard and distinguishes &#147;new&#148; from &#147;old&#148; iostreams <a href="#2">[2]</a>. The <B>charT</B> template parameter represents the character type used to transmit the data. When the term &#147;ostream&#148; is used, it means the <B>basic_ostream&lt;charT&gt;</B> instantiated with the <B>char</B> type. In fact, <B>ostream</B> is merely a <B>typedef</B> for <B>basic_ostream&lt;char&gt;</B>; <B>istream</B> and <B>iostream</B> are <B>typedef</B>ed in a similar way. There is also a second template parameter for this template, called traits, but its default value is good enough for most needs. (It is good enough to be used in the <B>istream</B> and <B>ostream</B> <B>typedef</B>s, for example.)</p>
+<p>The <B>ios_base</B> and <B>basic_ios</B> classes make up the state component of the <B>ostream</B> object.</p>
+<p>The <B>basic_streambuf</B> object is responsible for providing the uniform view over the physical I/O device, which means that it provides the access to the underlying device through its public methods. <B>basic_ostream</B> objects keep the pointer to the <B>basic_streambuf</B> components and use its methods when they need to write or read some bytes as objects of type <B>charT</B>.</p>
+<p>The <B>streambuf</B> component manages its own buffer area. In order to present the abstract notion of unlimited-size buffer, <B>streambuf</B> has to properly react when the overflow (when the user puts more bytes than fit into the buffer &#151; this can happen in <B>ostream</B> objects) or underflow (when the user wants to extract more bytes than are currently in memory &#151; in <B>istream</B> objects) condition occurs.</p>
+<p>For example, for file I/O, when overflow occurs while performing the insertion operation (most frequently <B>by operator&lt;&lt;</B>), the <B>ofstream</B> object has to flush some or all of its buffer to the file, making room in the buffer area for new bytes. Similarly, when underflow happens, the <B>ifstream</B> object has to read a new portion of data from the file into the buffer area, making them available for future extraction operations (usually by <B>operator&gt;&gt;</B>).</p>
+<p>Writing a new stream buffer class that will work with a new I/O device (for example network sockets) concentrates on those two unusual conditions. For socket-based I/O, the overflow condition should trigger writing the buffer&#146;s contents to the socket, and for the underflow condition, the new portion of data should be read from the network connection.</p>
+
+<H3><FONT COLOR="#000080">The Simple Socket Wrapper</FONT></H3>
+
+<p>Before implementing the full solution in the context of iostream classes, I will present a simple wrapper for the socket functionality, which can be used on its own without streams. The iostream classes will then be implemented in terms of this wrapper.</p>
+<p>The wrapper defines two of its own exception classes for error reporting:</p>
+
+<pre>
+class SocketLogicException :
+    public std::logic_error
+{
+    // ...
+};
+class SocketRunTimeException :
+    public std::runtime_error
+{
+    // ...
+};
+</pre>
+
+<p>The first class is used to report design errors. For example, when the programmer wants to read from a socket object that was not connected, it is a serious design flaw. The instances of the second class are thrown when the error related to the network happened. For example, if the IP address cannot be resolved, it can mean that the network is unavailable. The <B>what</B> method in both classes gives a human-readable message describing the error.</p>
+<p><a href="list1.htm">Listing 1</a> presents the interface of the socket wrapper class, <B>TCPSocketWrapper</B>. This class can be used only for TCP sockets (stream mode), opened in blocking mode. In fact, the user does not have any control over the internal socket details, but this is not a restriction for the purpose of writing an iostream-compatible class.</p>
+<p><a href="list2.htm">Listing 2</a> presents the simple server program that uses <B>TCPSocketWrapper</B>. It waits for a connection, prints the message read from the socket, then closes its end, and waits for another connection. <a href="list3.htm">Listing 3</a> presents a simple example client program that connects to the server process running on the same machine, sends the message to the server, and quits <a href="#3">[3]</a>. (Note: both programs are illustrative examples; production versions would be more complex and perform robust error checking and handling.) </p>
+
+<H3><FONT COLOR="#000080">The Iostream-Compatible Socket Wrapper</FONT></H3>
+
+<p>A basic understanding of iostream mechanics is enough to implement a custom iostream-compatible class. The key component is the stream buffer object, and for custom streams, you need to write your own buffer class, derived (possibly indirectly) from the <B>basic_streambuf</B> template. <a href="list4.htm">Listing 4</a> presents the skeleton of the custom, stream buffer class. To be fully compatible with the &#147;new&#148; iostreams, <B>TCPStreamBuffer</B> is a template, which accepts two template parameters, as does <B>basic_streambuf</B>. Both parameters are used to instantiate the base class <B>basic_streambuf</B>.</p>
+<p>The buffer object keeps a reference to the socket wrapper. It will use this wrapper to perform all the physical I/O operations. It is possible to declare that the buffer object should be responsible for the socket wrapper. The second argument to the buffer&#146;s constructor is a boolean flag. If it is true, the buffer object will automatically close the socket in its own destructor. The third parameter of the constructor is the size of the buffer area that will be allocated if the user did not provide his own buffer. You can experiment with different default values to obtain the best performance. The buffer&#146;s size has an influence on how often it should be flushed (or reloaded) and, thus, how often the physical I/O is performed.</p>
+<p>Note the <B>overflow</B> and <B>underflow</B> methods in <B>TCPStreamBuffer</B>. They are virtual methods (they are declared so in the <B>basic_streambuf</B> base class) and will be called when there is a need for flushing or reloading the buffer area of the iostream object&#146;s stream buffer component. The core part of the <B>underflow</B> method looks like this (for details please refer to the complete source code available for download at &lt;www.cuj.com/code&gt;):</p>
+
+<pre>
+int readn = rsocket_.read(inbuf_,
+    bufsize_ * sizeof(char_type));
+if (readn == 0)
+    return (int_type)traits::eof();
+setg(inbuf_, inbuf_,
+    inbuf_ + readn / sizeof(char_type));
+return sgetc();
+</pre>
+
+<p>Here, the socket wrapper is used to read the next data packet from the network. The number of bytes to read is the buffer size expressed in bytes, not in the units used to instantiate the template, hence the scaling. After reading the data, <B>underflow</B> makes a call to <B>setg</B> to reset the <B>basic_streambuf</B> internal pointers to the buffer area.</p>
+<p>Note the return value from the <B>underflow</B> method: it is the next character from the buffer area, taken by the call to <B>basic_streambuf::sgetc</B>. If the <B>underflow</B> function cannot successfully fill the buffer area, it should return the special end-of-file value.</p>
+<p>The <B>overflow</B> method is written in essentially similar style.</p>
+<p>You can use the stream buffer class to build a fully-functional stream class. <a href="list5.htm">Listing 5</a> shows the essence of the socket-based stream. Using containment, it manages the stream buffer class (a <B>TCPStreamBuffer</B> object) and instantiates the base class <B>basic_iostream</B> with the pointer to the stream buffer. Private inheritance is used to ensure that the <B>TCPStreamBuffer</B> object is constructed before passing its pointer (by implicitly upcasting the <B>this</B> pointer) to the <B>basic_iostream</B> component. The layout of the whole stream object is still compatible with <a href="fig1.htm">Figure 1</a>, except for the fact that the stream buffer object is physically contained by the most-derived class, <B>TCPGenericStream</B>, as an instance of its private base class. Note, that <B>TCPGenericStream</B> is still a template.</p>
+<p>The constructor of <B>TCPGenericStream</B> accepts the socket wrapper object. This means that, before constructing the stream object (and finally reusing all that iostream-based code), the socket wrapper has to be created. These semantics are useful for server-side code; on the server-side, the usual steps of setting up the connection are:</p>
+
+<UL><LI>   Create the listening socket, which will accept connections from clients. (These steps are performed with the <B>bind</B> and <B>listen</B> functions that are part of the sockets API.)</LI>
+<LI>   Create the connected socket when the client opens the connection. (This is achieved by calling the <B>accept</B> function.)</LI></UL>
+
+<p>After these two steps, the server-side process has an open socket through which it can communicate with the client. <B>TCPGenericStream</B>s semantics make it very easy and intuitive. Its constructor takes that open socket and turns it into stream object.</p>
+<p>On the client-side, however, the steps taken to set up the communication are much simpler:</p>
+
+<UL><LI>   Create the socket.</LI>
+<LI>   Connect it to the server (by calling the <B>connect</B> function).</LI></UL>
+
+<p>Here, there is always just one socket. It could be more intuitive not to split the responsibilities between two different objects: one socket wrapper (for making the connection) and one stream built around the socket (for inserting and extracting data). <B>TCPGenericClientStream</B> is designed exactly to combine those two tasks. <a href="list6.htm">Listing 6</a> presents its complete implementation. Again, the private inheritance ensures that <B>TCPSocketWrapper</B> is created before passing its reference to <B>TCPGenericStream</B>&#146;s constructor.</p>
+<p><B>TCPGenericClientStream</B>&#146;s constructor takes two arguments: the IP address of the server to which it should connect (as either a raw IP address <B>"xxx.xxx.xxx.xxx"</B>, or as a symbolic host name <B>"comp.company.com"</B>) and its IP port number. In the constructor&#146;s body, the private socket wrapper connects to the server. Note that the base class, <B>TCPGenericStream</B>, is instantiated with the socket wrapper contained in the <B>TCPGenericClientStream</B> object. No other socket object is necessary to set up the communication on the client side.</p>
+<p>All the classes are templates in the spirit of the iostream library. To make life easier, you can use <B>typedef</B>s similar to the ones found in the standard library for the <B>istream</B> and <B>ostream</B> classes:</p>
+
+<pre>
+typedef
+TCPGenericStream&lt;char&gt;
+TCPStream;
+
+typedef
+TCPGenericStream&lt;wchar_t&gt;
+TCPWStream;
+
+typedef
+TCPGenericClientStream&lt;char&gt;
+TCPClientStream;
+
+typedef
+TCPGenericClientStream&lt;wchar_t&gt;
+TCPWClientStream;
+</pre>
+
+<H3><FONT COLOR="#000080">Sample Application</FONT></H3>
+
+<p><a href="list7.htm">Listing 7</a> shows a sample server application. This application opens the listening socket and waits for a connection from the client; once established, it reads the commands sent by the client. The command is just an integer value:</p>
+
+<OL><LI>The server sends back a string message.</LI>
+<LI>The server sends back an integer value.</LI>
+<LI>The server sends back a complex number.</LI></OL>
+
+<p>For any other command, the server just quits. Of course, a normal full-blown server would fork or at least spawn a thread for each client, but here it is not needed.</p>
+<p>These different commands show that the formatting capabilities of the stream object are preserved, even for new, custom stream classes. If you can write this:</p>
+
+<pre>
+complex&lt;double&gt; cplx(1, 2);
+cout &lt;&lt; cplx &lt;&lt; endl;
+</pre>
+
+<p>you can also write this:</p>
+
+<pre>
+complex&lt;double&gt; cplx(1, 2);
+yourstream &lt;&lt; cplx &lt;&lt; endl;
+</pre>
+
+<p>This is the beauty of the iostream class hierarchy.</p>
+<p><a href="list8.htm">Listing 8</a> presents the example client program. It allows the user to choose which command should be sent to the server, sends it, and (in case of commands 1, 2, and 3) reads the response from the server. Again, the formatting abilities of stream classes are preserved because the <B>TCPStream</B> and <B>TCPClientStream</B> classes have appropriate base classes. The server can insert whatever it wants to its stream, and if the client knows how to extract it properly, it can do it with a simple call to the extraction operator. Of course, this applies not only to standard classes (like <B>string</B> and <B>complex</B>), but also to any user-defined class with <B>operator&lt;&lt;</B> and <B>operator&gt;&gt;</B> overloaded for iostreams.</p>
+
+<H3><FONT COLOR="#000080">Acknowledgements</FONT></H3>
+<p>I would like to thank James Dennett for his tips on porting the code to Linux (although it was not tested on this platform) and to Marta Jakubowska for her support while I was working on this article.</p>
+<p>Special thanks goes to Herb Sutter for his instructive comments on the initial draft.</p>
+
+<H3><FONT COLOR="#000080">Notes and References</FONT></H3>
+<p><a name="1"></a>[1]  In fact, this kind of overloading is to some extent possible in C. For example, POSIX <B>read</B> and <B>write</B> functions accept the file descriptor, but from the programmer&#146;s point of view, it does not matter if the descriptor denotes file, pipe, socket, or anything else. This kind of &#147;polymorphism&#148; is present in many places in different operating systems, which confirms that OO is a way of programming rather than any language construct typical to C++ or Java.</p>
+<p><a name="2"></a>[2]  It also distinguishes &#147;new&#148; compilers from &#147;old&#148; ones if we take into account that the compiler and library are usually shipped together. I have written the code and successfully tested it on Microsoft Visual C++ 7.0 beta. You may have problems running the examples if you compile them with Microsoft Visual C++ 6.0 &#151; this is the result of a bug in the library shipped with this compiler. See &lt;http://support.microsoft.com/support/kb/articles/Q240/0/15.ASP&gt; to learn about the bug and how to fix it. You may also need some recent version of g++ if you want to use the code on Linux.</p>
+<p><a name="3"></a>[3]  Note the use of <B>socketsInit</B> and <B>socketsEnd</B>. These functions are required on the Microsoft Windows system to properly initialize the sockets library (when compiling the code on Microsoft Windows, be sure to link with <B>Ws2_32.lib</B>). This is not required on Unix-like systems, but for compatibility it is a good idea to use them. On Unix systems, these functions do nothing.</p>
+<p><a name="4"></a>[4]  Angelika Langer and Klaus Kreft. <I>Standard C++ IOStreams and Locales: Advanced Programmer&#146;s Guide and Reference</I> (Addison-Wesley, 2000).</p>
+<p><a name="5"></a>[5]  Cameron Hughes and Tracey Hughes. <I>Mastering the Standard C++ Classes</I> (John Wiley &amp; Sons, 1999).</p>
+<p><a name="6"></a>[6]  &#147;ISO/IEC 14882:1998(E), Programming Languages &#151; C++.&#148; A very cryptic name for the C++ Standard, it is the final reference in case (and also source) of confusion.</p>
+
+<p><i><B>Maciej Sobczak</B> is a student at the Institute of Computer Science, Warsaw University of Technology. He is passionate about C++ (and experiments with other technologies, too) with two years working experience. Maciej is interested in distributed, object-oriented computing. You can visit him at &lt; www.maciejsobczak.com&gt;.</i></p>
+
+<h4><a href="../../../source/2001/dec01/sobczak.zip"></a></h4>
+
+</blockquote></body></html>

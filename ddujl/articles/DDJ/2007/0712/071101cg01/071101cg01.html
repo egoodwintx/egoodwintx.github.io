@@ -1,0 +1,589 @@
+<html>
+<head>
+<title>Transactional Programming</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Journal</i> December 2007</p>
+
+<h1>Transactional Programming</h1>
+<h2>Database techniques applied to C++ development</h2>
+
+
+<h3>By Calum Grant </h3>
+
+
+<I>Calum, who holds a Ph.D. in Computer Science from the University of Cambridge, is a senior software engineer at Sophos Plc. He can be contacted at calum.grant@sophos.com. </I>
+
+<hr>
+
+
+
+
+<p>When programs encounter exceptions, they must not leave data in an inconsistent state. It would be no good for a function to half-complete because that could leave the data in an unexpected state and lead to bugs later in the program. But this is exactly what can happen when exceptions are thrown halfway through a function. </p>
+
+<p>For example, the problem with this function:</p>
+
+<pre class="code">
+
+std::vector&lt;std::string&gt; list1, list2;
+void f(const std::string &amp;s)
+{
+ list1.push_back(s);
+ list2.push_back(s);
+}
+
+</pre>
+<p>is that the second <i>push_back() </i>might fail and throw <i>std::bad_alloc</i>. This would leave the program in an inconsistent state because <i>list1</i> and <i>list2</i> are different. While desktop computers rarely deny a memory request, <i>std::bad_alloc</i> should be anticipated on portable devices or servers. </p>
+
+<p>In an ideal world, functions should either completely succeed or fail without side effects. This all-or-nothing behavior is referred to as "atomic" because it will never leave the program in a halfway state.</p>
+
+<p>A way of describing the effects of exceptions on functions is with Abrahams guarantees [1]:</p>
+
+
+
+<ul>
+  <li>Basic Guarantee. If an exception is thrown, no resources are leaked and objects remain in a destructible and usable&#151;but not necessarily predictable&#151;state.</li>
+  <li>Strong Guarantee. If an exception is thrown, the program state remains unchanged.</li>
+  <li>Nothrow Guarantee. The function will not emit an exception under any circumstances.</li>
+  </ul>
+
+<p>Although the nothrow guarantee sounds ideal, it is often impossible to arrange for a function to never throw an exception, especially when memory allocation takes place, which could throw <i>std::bad_alloc</i> at an inopportune moment. Many standard library containers rely on memory allocation and could, therefore, throw. The basic guarantee is often not good enough, since leaving a program in a safe but indeterminate state is not terribly useful. It is much better to live with exceptions, and let them propagate out to the caller in a safe and predictable way.</p>
+
+<p>But error recovery is not straightforward in C++. When an exception is thrown, all of the side effects prior to the exception must be undone. In real code this is not often done, or it is added as an afterthought. Even when exceptions are considered up front, analyzing them and recovering from them is difficult and error prone. Exceptional paths are generally the least tested part of software&#151;it is impractical to unit-test every exceptional path caused by <i>std::bad_alloc</i>. </p>
+
+<p>While the best solution is to try to redesign the data structures, this isn't always possible. Consequently, you might try to catch the second exception and undo the <i>push_back()</i> on <i>list1</i>:</p>
+
+<pre class="code">
+
+void f(const std::string &amp;s)
+{
+ list1.push_back(s);
+ try
+ {
+  list2.push_back(s);
+ }
+ catch(...)
+ {
+  list1.pop_back();
+  throw;
+ }
+}
+
+</pre>
+<p>This code is safe because the Standard guarantees that <i>pop_back()</i> will not throw an exception. Unfortunately, it is also ugly. In more complex situations, wrapping individual operations in a <i>try-catch</i> is hard work and makes the code difficult to read.</p>
+
+<p>Scope-guards [2] offer an alternative. A scope-guard is a utility class that performs some important clean-up in its destructor, as in:</p>
+
+
+
+<pre class="code">
+void f(const std::string &amp;s)
+{
+  list1.push_back(s);
+  ScopeGuard guard = MakeObjGuard(
+   list1, &amp;std::vector&lt;std::string&gt;::pop_back);
+  list2.push_back(s);
+  guard.Dismiss();
+}
+
+</pre>
+<p><i>guard</i> calls <i>list1.pop_back()</i> in its destructor, unless <i>guard.Dismiss()</i> is called. So the scope-guard automatically undoes <i>list1.push_back()</i> if <i>list2.push_back()</i> fails. This is an improvement because there is no need to write out the exception handler.</p>
+
+<p>Unfortunately, while you can safely undo a <i>push_back(),</i> you cannot safely undo a deletion or a <i>push_front()</i> because an exception could be thrown while trying to clean up after the first exception. For example:</p>
+
+<pre class="code">
+
+void g()
+{
+  list.pop_back();
+  h(list);
+}
+
+</pre>
+<p>You could not write:</p>
+
+<pre class="code">
+void g()
+{
+ std::string saved_back = 
+    list.back();
+ list.pop_back();
+ try
+ {
+  h(list);
+ }
+ catch(...)
+ {
+  list.push_back(saved_back);
+                  // Can throw
+  throw;
+ }
+}
+
+</pre>
+<p>because <i>list.push_back()</i> could itself fail, breaking our guarantee of atomic behavior.</p>
+
+<p>This shows that only certain operations can be undone on the standard containers. Atomic behavior is only possible to guarantee when a function has no side effects prior to an exception being thrown, or the availability of a guaranteed undo function that can be called in a scope-guard or an exception handler.</p>
+
+<p>Dealing with exceptions is complicated and sometimes messy, and requires different approaches in different circumstances. Some good examples of the subtleties of exception handling are given by Herb Sutter both in <i>Exceptional C++: 47 Engineering Puzzles, Programming Problems and Solutions </i>(Addison-Wesley, 2000); and <i>More Exceptional C++</i> (Addison-Wesley, 2002).</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Transactions</h3>
+
+<p>Databases approach errors in a completely different way. Instead of making error recovery explicit, databases make error recovery implicit through the use of transactions; see <i>An Introduction to Database Systems </i>by C.J. Date (Addison-Wesley, 1991).</p>
+
+<p>In this Transact-SQL example, the transaction begins with BEGIN TRAN T1 and ends with COMMIT TRAN T1:</p>
+
+<pre class="code">
+
+BEGIN TRAN T1
+UPDATE table1 ...
+UPDATE table2 ...
+SELECT * from table1
+UPDATE table3 ...
+COMMIT TRAN T1
+
+</pre>
+<p>Transactions are units of work that either completely succeed, or can be rolled back completely. If an error such as a disk full, a key violation, or user error occurs during the transaction, it simply rolls back (undoes) all of the operations to the beginning of the transaction. This is safe and robust because the data is guaranteed to be left in its initial consistent state. While recovering from exceptions is difficult in C++, it is extremely easy in databases with transactions.</p>
+
+<p>The Atomic Library (calumgrant.net/atomic) I present here implements transactions in C++, based on database transactions. Here is the same example using a transaction:</p>
+
+<pre class="code">
+
+atomic::vector&lt;std::string&gt;    list1, list2;
+void f(const std::string &amp;s)
+{
+ atomic::transaction tr;
+ list1.push_back(s);
+ list2.push_back(s);
+ tr.commit();
+}
+
+</pre>
+<p>The transaction <i>tr</i> defines the scope of the transaction, namely the entire function <i>f(). list1 and list2 </i>are of type <i>atomic::vector</i>, which is a special container that interacts with <i>atomic::transaction</i>. If <i>f()</i> exits without calling <i>tr.commit()</i>, then all of the changes in <i>f()</i> are undone.</p>
+
+<p>The Atomic C++ Library for transactional programming provides a range of containers that can be rolled back to any point in their past by transactions. </p>
+
+<p>Transactional containers are designed in such a way that deletions can be safely undone without the possibility of failure when the container is rolled back, even if it involves inserting data back into the data structure.</p>
+
+
+
+
+
+
+
+
+
+<h3>Nesting Transactions</h3>
+
+<p>The ability to roll back a single function is okay, but what about functions that need to call other functions? For instance:</p>
+
+<pre class="code" style="width:200">
+
+void f()
+{
+ g();
+ h();
+}
+
+</pre>
+
+
+<p>If <i>h()</i> throws an exception, how do you roll back <i>g(),</i> if <i>g()</i> could do something such as detonate a bomb? The answer is that you can't. But if <i>g()</i> and<i> h()</i> only use transactional operations, then they can be rolled back by a transaction in<i> f()</i>; for example:</p>
+
+<pre class="code">
+void f()
+{
+ atomic::transaction t1;
+ ...
+ g();
+ ...
+ h();
+ ..
+ t1.commit();
+}
+g()
+{
+ atomic::transaction t2;
+ ...
+ t2.commit();
+} 
+h()
+{
+ atomic::transaction t3;
+ ...
+ t3.commit();
+}
+
+</pre>
+<p><i>g()</i> is atomic because of the transaction <i>t2</i>. <i>h()</i> is atomic because of the transaction <i>t3</i>. And <i>f()</i> is atomic because the transaction <i>t1</i> can roll back anything in <i>f(), g()</i>, or <i>h().</i> Even when <i>t2.commit()</i> has been called in <i>g(),</i> <i>t2</i> can still be rolled back.</p>
+
+<p><i>Transactions</i> can be nested to any depth. <i>Transaction</i> objects must always be nested, which is guaranteed by the C++ scoping rules.</p>
+
+
+<h3>Transactional Containers</h3>
+
+<p>The Atomic Library has a variety of containers that can be used in transactions:</p>
+
+<ul>
+  <li><i>atomic::list</i>, the atomic equivalent of <i>std::list</i>.</li>
+  <li><i>atomic::map</i>, the atomic equivalent of <i>std::map</i>.</li>
+  <li><i>atomic::vector</i>, the atomic equivalent of <i>std::vector</i>. This container only supports the <i>push_back()</i> operation.</li>
+  <li><i>atomic::set</i>, the atomic equivalent of <i>std::set</i>.</li>
+  <li><i>atomic::multimap</i>, the atomic equivalent of <i>std::multimap</i>.</li>
+  <li><i>atomic::multiset</i>, the atomic equivalent of <i>std::multiset</i>.</li>
+  </ul>
+
+<p>In general, these containers behave exactly as their <i>std</i> equivalents, but they can be rolled back by <i>atomic::transaction</i>. For example:</p>
+
+<pre class="code">
+
+atomic::set&lt;Item&gt; pending;
+atomic::list&lt;Item&gt; processed;
+void process()
+{
+  atomic::transaction tr;
+  while(!pending.empty())
+  {
+    Item &amp;i = pending.front();
+    i.process();
+  processed.push_back(i);
+    pending.pop_front();
+  }
+  tr.commit();
+}
+
+
+</pre>
+<p>When the function encounters an exception in <i>process(),</i> the entire function is rolled back as if no items had been moved from pending to processed. </p>
+
+<p>All functions on atomic containers are guaranteed to be strongly exception safe, unlike the C++ Standard Library.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Transactional  Values</h3>
+
+<p>Any C++ class can be made transactional. The <i>atomic::value</i> class template holds a single value that can be rolled back to any previous value.</p>
+
+<pre class="code" style="width:250">
+
+atomic::value&lt;std::string&gt; name =
+     "bill";
+{
+  atomic::transaction t1;
+ name = "tom";
+  assert(*name == "tom");
+ {
+  atomic::transaction t2;
+    name = "fred";
+  assert(*name == "fred");
+  t2.commit();
+ }
+  assert(*name == "fred"); 
+    // Committed by t2
+}
+assert(*name == "bill");
+    // Rolled back by t1
+
+</pre>
+<p>The stored object is <i>const</i>, so that it cannot be accidentally modified in a way that cannot be rolled back by a transaction. Previous values are not destroyed until the end of the transaction, in case they need to be reincarnated.</p>
+
+
+<h3>Transactional  Pointers</h3>
+
+<p>The Atomic Library provides shared pointers and weak pointers that are similar to the TR1  smart pointers (www.open-std.org/jtc1/sc22/wg21/docs/papers/2005/n1745.pdf). These pointers keep a counter of the number of pointers to the object. When the count reaches zero, the object can be deleted.</p>
+
+<p>These pointers do not destroy the pointee object until the end of the transaction in case the pointer needs to be rolled back, but the reference count (<i>q.expired()</i>, for example) behaves as if the object is destroyed. For instance:</p>
+
+<pre class="code">
+
+atomic::shared_ptr&lt;int&gt; 
+    p(new int(1));
+atomic::weak_ptr&lt;int&gt; q(p);
+{
+ atomic::transaction tr;
+ p.reset(new int(2));
+ assert(q.expired());
+ assert(*p == 2);
+}
+assert(*p == 1);  
+    // Rolled back by tr
+assert(!q.expired()); 
+    // Rolled back by tr
+
+
+</pre>
+<p>If compatibility with <i>std::tr1::shared_ptr</i> is required, then a suitable approach would be<i> atomic::value&lt;std::tr1::shared_ptr&lt;&gt; &gt;</i>.</p>
+
+
+
+
+
+
+
+
+
+
+
+<h3>Implementation</h3>
+
+<p>The implementation of the Atomic Library is based around a central stack&#151;a transaction stack&#151;that logs each operation. Whenever an atomic container is modified, it pushes a record of the operation onto the stack. </p>
+
+<p>Each operation is recorded in the <i>struct</i>:</p>
+
+<pre class="code" style="width:300">
+
+struct Transaction
+{
+ atomic::container* container;
+ object_pointer node;
+ enum { insertion, deletion } event;
+};
+
+</pre>
+<p>When a transaction is entered, the constructor of <i>atomic::transaction</i> stores the initial size of the transaction stack. When a transaction exits, the destructor of <i>atomic::transaction</i> can roll back all operations (in reverse order) to the initial size of the transaction stack. The <i>transaction::commit()</i> method sets a flag in the transaction telling it not to roll back.</p>
+
+<p>There are just two types of atomic operations&#151;<i>insert</i> and <i>delete</i>. Other operations can be composed of insertions or  deletions.</p>
+
+<p>All atomic containers derive from <i>atomic::container</i>:</p>
+
+
+
+<pre class="code">
+
+class container
+{
+public:
+ virtual ~container();
+ virtual void destroy(object_pointer)=0;
+ virtual void unlink(object_pointer)=0;
+ virtual void relink(object_pointer)=0;
+};
+
+</pre>
+<p>When an item is inserted into a container, it logs an insertion, a pointer to the container, and a pointer to the inserted object on the transaction stack.</p>
+
+<p>When an item is deleted from a container, it logs a deletion, a pointer to the container, and a pointer to the deleted object on the transaction stack. The object is not destroyed at this point in case it needs to be inserted back into the container.</p>
+<h3>Rolling Back</h3>
+
+<p>Rolling back is performed differently on different containers. But what is extremely important is that rolling back must not fail. Fortunately, this turns out to be possible, even for tree-based containers such as <i>atomic::set, atomic::map, atomic::multiset</i>, and <i>atomic::multimap</i>.</p>
+
+<p>When an insertion is rolled back, the <i>unlink()</i> function is called on the container to remove the item from the data structure, and <i>destroy()</i> is called to delete the object.</p>
+
+<p>When a deletion is rolled back, the <i>relink()</i> function is called on the container to insert the item back into the data structure. The deleted item must contain a hint where the item should be inserted.</p>
+
+
+
+
+
+
+
+
+
+
+<h3>Lists</h3>
+
+<p><i>atomic::list</i> is implemented as a doubly linked list of nodes, just like <i>std::list</i> would be implemented. When an item is inserted into the list, the node containing the item is logged on the transaction stack. When an item is deleted, it is removed from the data structure and stored on the transaction stack. To roll back a delete, the left and right pointers point to live nodes, giving the correct place in the list to insert the node. </p>
+
+<p>There is no possibility of an exception being thrown because roll back only requires pointer manipulation, not any memory allocation. To roll back an insertion, the list node is removed and deleted (which will not throw). Figure 1 shows how list operations can be rolled back.</p>
+
+
+<div>
+    
+<!--  -->    
+<img class="illowide" src="071101cg01_f1.gif" style="width:400">
+
+<div class="caption" style="width:402">
+Figure 1: Operations on atomic::list&lt;int&gt;: (a) Initial list; (b) list after push_front(4); (c) list after pop_back(); (d) list after rolling back step (c); (e) the list after rolling back step (b).
+</div>
+</div>
+
+
+<h3>Trees</h3>
+
+<p>The tree-based containers (<i>atomic::map</i> and the like) are based upon an implementation of red-black trees (a standard technique for balancing trees). When an item is inserted into the data structure, it is logged on the transaction stack. When an item is deleted, it is removed from the data structure and stored on the transaction stack.</p>
+
+<p>Rolling back a deletion is tricky because the object must be inserted in the correct position in the tree. You cannot simply call <i>insert()</i> to insert the node back into the data structure because the comparators might throw, and the nodes might end up in a different order than the original. So the deleted node stores the next node in the data structure. When the deletion is rolled back, the node is reinserted immediately before the next node in the data structure. There are a few cases to consider, but the procedure can be performed reliably. Figure 2 shows how tree operations are rolled back (ignoring tree balancing).</p>
+
+
+<div>
+    
+<!-- http://i.cmpnet.com/ddj/images/article/2007/07/ -->    
+<img class="illowide" src="071101cg01_f2.gif" style="width:300">
+
+<div class="caption" style="width:302">
+Figure 2: Operations on atomic::set&lt;int&gt;: (a) Initial tree; (b) tree after insert(6); (c) Tree after erase(5); (d) tree after rolling back step (c); this is equivalent to tree (b); (e) tree after rolling back step (b).
+</div>
+</div>
+
+
+
+<p>With red-back trees, the tree-balancing algorithms must be called after an insertion or a deletion, but these only perform pointer manipulation and will not throw exceptions.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+<h3>Cleanup</h3>
+
+<p>If the program could be rolled back right to the beginning, no memory would ever be freed and eventually the program would run out of memory. So objects marked for deletion must actually be deleted at some point.</p>
+
+<p>This can be done when the outermost transaction has completed. At this point, there is no possibility of roll back. So the entire transaction stack is scanned for deleted objects, which are deleted, and then the transaction stack is resized to 0.</p>
+
+<p>If transactions are kept short, then the transaction stack will be small, and deleted objects will not be hanging around for very long. On the other hand, if the entire program is wrapped in a transaction, then the program will never free any memory!</p>
+
+
+<h3>Concurrent Access</h3>
+
+<p>Transactions in different threads should be independent. When one thread throws an exception and rolls back some containers, it should not interfere with another thread that is executing quite happily. This means that concurrent threads cannot share the same transaction stack.</p>
+
+<p>There are basically two solutions to this problem.</p>
+
+<ul>
+  <li>Provide a lock so that transactions in different threads are mutually exclusive. This is the only truly safe thing to do, and is easy for programmers who no longer need to write any locks in the program, because they are implicit in the transaction. But this reduces concurrency so it is not an ideal solution.</li>
+  <li>Have one transaction stack per thread. But extreme care is required. Suppose a list contains two elements, <i>a</i> and <i>b</i>. If thread A deletes <i>a</i>, then thread B deletes <i>b</i>, then thread A rolls back the deletion, where does <i>a</i> get inserted? Its hint says that it should be inserted before <i>b</i>, but <i>b</i> is a deleted object! Such problems do not arise in a single-threaded program. It is not enough to lock just the operation, the destructor of the transaction must be protected by the mutex as well, in case rolling back interferes with another thread. </li>
+</ul>
+    
+    
+<p>The general pattern is as follows:</p>
+
+<pre class="code">
+
+{
+ Lock lock(mutex);  
+  // Destructor unlocks
+ atomic::transaction tr;
+  // Modify container
+ tr.commit();
+}
+
+</pre>
+
+
+
+
+
+
+
+<h3>Performance</h3>
+
+<p>Transactions add around 5-15 percent of CPU time for insertion and deletion. The main overhead is logging each operation on the transaction stack. The extra memory used is proportional to the size of the transaction, not the size of the data. Provided that transactions are short, little extra memory is required. Object deletion is deferred until the end of the transaction. </p>
+
+<p>Table 1 shows some performance comparisons of atomic containers compared to their <i>std</i> equivalents, in nonthrowing circumstances. The program used to generate these numbers is available online (see "Resource Center," page 5) and at calumgrant.net/atomic. These figures measure the same operation performed repeatedly on different types of containers. As you can see from these results, atomic containers do add some overhead, which is to be expected. The only container for which the overhead dominates the performance is for <i>vector&lt;int&gt;</i>, which is so efficient that the operations on the transaction stack are slower than the operations on the vector itself.</p>
+
+
+
+<div>
+<table border="0" cellpadding="3" cellspacing="3">
+	<tr>
+		<td><b>Container</b></td> <td><b>Operation</b></td> <td><b>std:: (ms)</b></td> <td><b>atomic:: (ms)</b></td> <td><b>atomic/std</b></td>
+	</tr>
+	<tr>
+		<td>list<int> </td> <td>insert </td> <td>750  </td> <td>937 </td> <td>1.25    </td>
+	</tr>
+	<tr>
+		<td></td> <td>delete </td> <td>297  </td> <td>313  </td> <td>1.05    </td>
+	</tr>
+	<tr>
+		<td>list<string> </td> <td>insert </td> <td>3469  </td> <td>3718    </td> <td>1.07    </td>
+	</tr>
+	<tr>
+		<td></td> <td>delete</td> <td>985   </td> <td>937    </td> <td>0.95    </td>
+	</tr>
+	<tr>
+		<td>vector<int> </td> <td>insert</td> <td>16      </td> <td>375</td> <td>23.4 </td>
+	</tr>
+	<tr>
+		<td>vector<string> </td> <td>insert </td> <td>3688 </td> <td>4516    </td> <td>1.22    </td>
+	</tr>
+	<tr>
+		<td>set<int>    </td> <td>insert </td> <td>1172  </td> <td>1484    </td> <td>1.26    </td>
+	</tr>
+	<tr>
+		<td></td> <td>delete </td> <td>375   </td> <td>390     </td> <td>1.04    </td>
+	</tr>
+	<tr>
+		<td>set<string>  </td> <td>insert</td> <td>5765   </td> <td>5890     </td> <td>1.02    </td>
+	</tr>
+	<tr>
+		<td></td> <td>delete</td> <td>1062      </td> <td>1016     </td> <td>0.96    </td>
+	</tr>
+	<tr>
+		<td>map<int,int>  </td> <td>insert  </td> <td>2203  </td> <td>2452 </td> <td>1.11    </td>
+	</tr>
+	<tr>
+		<td></td> <td>delete</td> <td>375   </td> <td>390  </td> <td>1.04    </td>
+	</tr>
+	<tr>
+		<td>map<string,string></td> <td>insert </td> <td>9517   </td> <td>9813    </td> <td>1.03    </td>
+	</tr>
+	<tr>
+		<td></td> <td>delete </td> <td>1375   </td> <td>1391      </td> <td>1.01</td>
+	</tr>
+	<tr>
+		<td></td>
+	</tr>
+</table>
+
+<div class="caption">
+Table 1: Measuring the performance of transactions.
+</div>
+</div>
+
+
+
+<h3>Conclusion</h3>
+
+<p>The problem with C++ exceptions is that they can occur at many points in a program, and if even a single exception is overlooked, the program is potentially unsafe. Database transactions don't suffer from this problem because atomic behavior is guaranteed by the transaction. By copying the database approach, C++ can also implement transactions. It provides guarantees of atomic behavior, helps in complex error-recovery situations, and allows smaller functions to be composed into larger transactions. Whichever exception strategy is used, it is an important part of the design and needs care, attention, and planning.</p>
+
+
+<h3>References</h3>
+
+<p>[1]	Abrahams, D. "Exception-Safety in Generic Components," <i>Generic Programming: Proceedings of a Dagstuhl Seminar</i>, M. Jazayeri, R. Loos, and D. Musser, eds. (Springer Verlag, 1999).</p>
+
+<p>[2]	Alexandrescu, A., P. Marginean. "Change the Way You Write Exception-Safe Code&#151;Forever." (www.cuj.com/ documents/s=8000/cujcexp1812alexandr/alexandr.htm).</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</body>
+</html>

@@ -1,0 +1,923 @@
+<HTML>
+<META NAME="year" CONTENT="1994">
+<HEAD>
+<TITLE>SP 94: Compressing Waveform  Audio Files</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>Compressing Waveform  Audio Files<a name="01f9_0003"></h1><P>
+<h2><a name="01f9_0001"><a name="01f9_0000">Cut your .WAV files in half with Windows' low-level waveform API</h2><P>
+<h3>Neil G. Rowland, Jr.</h3><P>
+<p><i><a name="01f9_0002"><a name="01f9_0000">Neil is a programmer at Gradient Technologies, porting OSF's Distributed Computing Environment to DOS/Windows machines. He can be reached on CompuServe at 72133,426, on the Internet as neil_r@gradient.com, and on Channel One as &quot;Neil Rowland.&quot;</i></p><hr><P>
+If you're a Windows multimedia developer and have been working with waveform audio files, you know that sampled waveform data can grow in size pretty fast. In fact, a single channel with a minimal sampling rate of 11.025 kHz at eight bits per sample translates into 11,025 bytes per second, or roughly 660 Kbytes per minute of audio data. Higher sampling rates and stereo each double these storage requirements.<P>
+Recently, I developed an application in C++, that uses the low-level waveform services to do some signal processing. It also happens to do something interesting. It compresses waveform files to about half the original size.<P>
+In this article, I'll show you how I accomplished this, and provide a class library that tames the Windows waveform API. To compile and run the source code from this article, you'll need a C++ compiler and the Microsoft Multimedia Development Kit (MDK). Of course, you'll also need a sound card with Windows drivers.<P>
+<h3><a name="01f9_0004">NYB1 Compression<a name="01f9_0004"></h3><P>
+The NYB1 format is a &quot;lossy&quot; compression scheme that I've developed. That is to say, it &quot;loses&quot; (throws out) some of the information in the input file in order to save space. The trick of it is to throw out the least-important information. NYB1 uses a single nybble for each sample, plus some slight overhead, and minus some compression of silence. If the input file uses one byte per sample (the usual case), then there is about 50 percent compression, guaranteed. I used some educated guesses, plus a little trial and error, to decide what should go in that nybble. The most obvious thing to try is just to store the top nybble of each sample. You still get a representation of the waveform, but it's less precise. In practice, this leads to a great deal of hiss in the output. This quantization noise is always present in digital audio, but is normally unobtrusive. Clearly, four bits per sample is not enough to keep it unobtrusive, at least by this brute-force method.<P>
+It's possible to improve the performance in the general case by storing the first-order differential of the input signal, then reintegrating it upon playback. Something similar to this goes on in analog tape recording. This works because of the way sound energy is distributed in the real world. Each octave in the audible range has roughly the same amount of sound on average as every other. (By roughly, I mean within an order of magnitude.) Human hearing seems constructed to take advantage of this. So is audio equipment. Look at any graphic equalizer with a spectrum analyzer. The bands are divided into equal sections of a logarithmic scale of frequency, usually by octaves. The spectrum analyzer outputs pink noise, which has an exactly equal distribution of energy per octave. When you view pink noise on the spectrum analyzer, it looks like a flat line.<P>
+But the brute-force method of digital coding, where you just convert each sample into a linear number, works best for a very different situation. The most complex waveform you can throw at it is a completely random value for each sample. This amounts to what's called &quot;white noise.&quot; White noise has its energy equally distributed across frequencies on a linear frequency scale (not a logarithmic one), which is very rare in nature.<P>
+When you store the sort of sounds you hear in nature this way, all but the highest frequencies are stored inefficiently. Because the amplitudes of the lower frequencies are typically much lower than those of the higher frequencies, a scaling factor that does justice to the high frequencies makes the low frequencies use only part of the range of numbers. Thus, the low-frequency sounds are stored with less than the full precision the sample has room for. This translates into a poorer signal-to-noise ratio in the lower frequencies. (The &quot;noise&quot; in this signal-to-noise is quantization noise.)<P>
+You can turn pink noise into white noise by taking its first-order differential. Do the same to an audio waveform, and you've translated something similar to pink noise into something similar to white noise. Store this quasi-white noise digitally, and you're making the most of the digital medium. You've adapted the nature of the input to map to the medium's strengths.<P>
+During less-loud parts of the waveform, the quantization noise can swamp the &quot;real&quot; waveform because there isn't enough precision in the sample to represent small (soft) details. Even with the first-order differential, this is a problem. One solution is to change the scale of samples to reflect the range of the waveform values. That way, precision isn't wasted.<P>
+I've broken the sample into two parts, a mantissa and an exponent. The mantissa is the sample proper. It represents the first-order differential of the waveform, to a certain scale. Each mantissa is one nybble. The exponent indicates the scale. I call the exponent &quot;shrite,&quot; short for &quot;shift right.&quot; On encoding, I take the first-order differential as a 16-bit integer, then I shift it right by the exponent. This gives me a mantissa in the bottom four bits that I can store. On decoding, I do the reverse.<P>
+It takes one nybble for the mantissa and one nybble (roughly) for the exponent. This adds up to one byte, the same size as a typical, uncompressed .WAV file sample. Obviously, you gain nothing if you store the exponent with each mantissa. Therefore, I divide the incoming waveform samples into groups of seven each. I take their first-order differentials and determine the exponent that is appropriate for the highest amplitude sample in the group. This will be the shrite value for the entire group. Thus, I store four bytes (seven mantissa nybbles plus one exponent nybble) for each seven samples in the original waveform. This is reasonably close to 2:1 compression.<P>
+The number seven is somewhat arbitrary. There's a trade-off between precision and compression ratio. If you make the group smaller, then there are more exponents (shrites) in the file, and the storage efficiency suffers. If you make the group larger, then the one shrite chosen for the greatest-magnitude sample is less likely to be well suited for any other sample in the group. Consider the extreme case, where there's one exponent for all the mantissas, which is the same as having no exponent at all. It's a case of one size fits one, and can be made to do for a few, but not for many.<P>
+Finally, I compress silent sections by leaving out the mantissas altogether. I simply store the exponent of each group, which is 0.<P>
+<h3><a name="01f9_0005">Encoding/Decoding Logic<a name="01f9_0005"></h3><P>
+The code to work with WAV files is in WAVELIB.CPP; see <a href="#01f9_000c">Listing Two</A> (page 24). The prototypes are in WAVELIB.H; <a href="#01f9_000a">Listing One</A> (page 24). The WAV library has three classes: WAVUSR, which is a superclass; WAVRDR to read WAV files; and WAVWRT to write them. WAVUSR's base class is RIFFUSR, which contains logic common to RIFF files. Both WAVRDR and WAVWRT have APIs that let the caller deal with them on a sample-by-sample basis, and all the messy details of buffering are hidden inside the classes. The classes also partially hide the differences between mono and stereo and the detail of how many bits each sample consists of.<P>
+At any given point, an open WAV object has a file position that is on a given sample. When you read a sample via <I>mNextSample()</I> or write a sample via <I>mWriteSample()</I>, the object steps to the next sample in the file. Each class has three public members named <I>sample</I>, <I>left, </I>and <I>right</I>. These unsigned 16-bit values hold the current sample. The value 32,768 represents an amplitude of 0. <I>Left </I>and <I>right </I>are the current values for the left and right channel. <I>Sample </I>is the average of the two. Each <I>mNextSample()</I> reads in the next sample from the WAV file and fills in these three values accordingly. <I>mWriteSample()</I> writes out <I>sample </I>if it's a mono file, or <I>left</I> and <I>right</I> if it's stereo.<P>
+The NYB1 library (see <a href="#01f9_000e">Listing Three</A>, page 25 and <a href="#01f9_0010">Listing Four</A>, page 26) shares code with the WAV library by means of the RIFFUSR class. It contains the classes NYBUSR, NYBRDR, and NYBWRT. These all have interfaces identical to the corresponding WAV classes. So the caller can treat them as if they were WAV classes. The process of encoding and decoding in the NYB1 format is hidden inside these classes.<P>
+The NYBWRT version of <I>mWriteSample()</I> collects incoming samples <P>into groups. When it's just been called for the last sample in a group, it processes the group it's built. First, it figures the exponent by taking a first-order differential of all the samples, figures the appropriate shrite value for the largest differential it sees, and calls <I>iNegFeedbackStage()</I>  for each mantissa in the group. <I>iNegFeedbackStage()</I> does three things: It applies the encoding by calling <I>iEncode()</I>; writes the encoded group out to the NYB1 file; and decodes each encoded mantissa and compares the result to the original value. <I>iNegFeedbackStage() </I>determines the sign of the error value and on the next sample applies this as a bias to the encoded sample before writing it out. This has the effect of preventing cumulative error, by a sort of negative feedback.<P>
+The decoding is done by the NYBRDR version of <I>mNextSample(),</I> which reads in nybbles from the NYB1 file, stores shrite values when it encounters them, and decodes mantissas. There's no need to worry about cumulative error at this phase. The <I>iNegFeedbackStage()</I> routine acted to prevent this when the file was created. Finally, <I>mNextSample()</I> recognizes when you're in a zero-compressed group and dummies up seven silent samples (sample=32,768).<P>
+<h3><a name="01f9_0006">Using the Library<a name="01f9_0006"></h3><P>
+The sample application that I've provided demonstrates how to use the NYB1 library. <I>WinMain()</I> in <a href="#01f9_0012">Listing Five</A> (page 27) simply shovels samples between the input and output objects, one sample at a time. On conversion, it opens the input WAV file by means of WAVRDR object, and the output NYB1 file by means of a NYBWRT object. Then it repeatedly calls <I>mNextSample()</I>, feeds the sample to the NYBWRT object, and calls an <I>mWriteSample()</I> for that object. On playback, the input object is a NYBRDR, and the output object is a WAVEPLAYER. Again, it's a matter of ferrying samples from one to the other, one at a time, until there are no more samples at the input end.<P>
+When running the program, notice that the main screen is a small dialog with two edit fields. The top field is for an input wave file. If you want to convert a file from WAV to NYB1 format, enter the full path and file specification of the source file here. To simply play an existing NYB1 file, leave this blank. The second edit control takes the full path and file specification of the NYB1 file. If you leave it blank, it defaults to \X.NYB. For playback, this is the input specification. For conversion, it is the output specification.<P>
+<h3><a name="01f9_0007">The WAVEPLAYER Class<a name="01f9_0007"></h3><P>
+The output stage is encapsulated in the WAVEPLAYER class (see <a href="#01f9_000c">Listing Two</A>). The waveform portion of a sound-card driver for Windows takes its input in buffers. Then it plays the current buffer in the background while the CPU prepares the next buffer for it. This is good for efficiency, but you'll want to deal with the waveform output as a serial string of samples. The Windows API does almost nothing to hide the details of buffering from us. So, I do it in the WAVEPLAYER class. The programmer using the class feeds it a string of samples, one at a time. The WAVEPLAYER object handles the buffering. The code calling WAVEPLAYER need not bother with any part of the Windows waveform API calls.<P>
+When WAVEPLAYER is started, it opens the wave-playing side of the sound card. The <I>WAVEPLAYER::mOpen()</I> method uses Windows API call <I>waveOutOpen()</I> to open a WAVE_MAPPER device, which specifies a default device for waveform handling. Currently, it's the only device ID supported by Windows. The <I>mOpen()</I> method then allocates a buffer header, of type WAVEHDR. This is the Windows object that manages the buffers for the sound card. When <I>WAVEPLAYER::mPlaySample()</I> is called for a sample, it's usually appended to the samples in the current buffer. But when there's no room in the buffer, it must flush the buffer. <I>iCloseoutSampleBuffer()</I> contains the logic to flush the previous buffer. The call to <I>waveOutUnPrepareHeader()</I> tells Windows you're done with a buffer. It won't return (successfully) unless and until Windows itself is done playing the contents of the buffer. When <I>waveOutUnPrepareHeader()</I> returns you can safely free the old buffer.<P>
+A note on the parameter to <I>WAVEPLAYER::mOpen</I> is needed. Though its type is a pointer to type WAVEFORMAT, it is really being passed a PCMWAVEFORMAT. This oddity is a result of the way the Windows API call <I>waveOut-Open </I>is prototyped. This call takes a pionter to type WAVEFORMAT. But in reality, when the device type in the passed structure is WAVE_FORMAT _PCM (and it always is), it should point to a PCMWAVEFORMAT. The difference is that PCWAVEFORMAT has an extra field, <I>wBitsPerSample,</I> that Windows must have. In NYBI.CPP, PlayIt makes the call <I>Play.mOpen (</I>&amp;<I>NybIn.Fmt.wf).</I> This is the same as saying <I>Play.mOpen ((WAVEFORMAT*)(</I>&amp;<I>NybIn.Fmt)).</I><P>
+<I>mPlaySample()</I> &quot;hands&quot; Windows the buffer just filled, calling the <I>iPlay()</I> method to handle the mechanics of handing over a buffer. <I>iPlay()</I> sets up the WAVHDR to point to the new buffer, and calls <I>waveOutPrepareHeader()</I> and <I>waveOutWrite()</I>. Both calls are necessary to tell Windows to play the buffer.<P>
+<I>iCloseoutSampleBuffer()</I> then sets the buffer pointer to NULL and returns. The next call to <I>mPlaySample()</I> will see this null pointer, allocate a new buffer, and start filling it. For now, <I>mPlaySample()</I> simply returns to the caller.<P>
+When you've finished with the output, and closed the WAVEPLAYER, flush the current buffer, even though it's probably not full. Otherwise, you'll never hear the last bit of the waveform. <I>iCloseoutBuffer()</I> is the method that does this. First it waits until the sound card is done with the previous buffer. The WHDR_DONE flag in the WAVEHDR that manages the buffer will go to 0 when this happens. Then it executes a final <I>waveOutUnPrepareHeader()</I> to tell Windows you're done with the final buffer. Finally, it frees the buffer and returns.<P>
+<h3><a name="01f9_0008">RIFFUSR and Friends<a name="01f9_0008"></h3><P>
+Windows Multimedia file formats are all special cases of the RIFF file format. Therefore, a WAV file is a type of RIFF file. For consistency, I've decided to make my NYB1 file format a RIFF format as well. Windows has an API to help parse RIFF files. Both the WAV and NYB1 libraries need it, so I've encapsulated it in the RIFFUSR class.<P>
+A RIFF file consists of &quot;chunks,&quot; each of which has a 4-byte type, a length field, and the actual data. These chunks, which vary according to format, can be nested. In the case of a WAV file, there is one top-level RIFF chunk of type WAVE, containing a format chunk (type <I>fmt</I>) and a large data chunk (type <I>data</I>) that takes up most of the file. I use the same scheme in NYB1 format to help share code. The only difference is that the top-level chunk is of type NYB1. The RIFFUSR methods <I>iOpenRead()</I> and <I>iOpenWrite()</I> are made possible by this consistency. <I>iOpenRead()</I> and <I>iOpenWrite()</I> use the Windows call <I>mmioOpen()</I> to open the file in such a way that it can be manipulated with the <I>mmio*()</I> calls. The option flag MMIO_ALLOCBUF instructs Windows to allocate buffers for use.<P>
+The Windows API for RIFF files deals with these chunks almost as if they were files. There are calls to open, close, read, and write chunks. The API calls <I>mmioAscend()</I> and <I>mmioDescend()</I> determine which chunk within the file is currently open. <I>mmioDescend()</I> moves the read pointer into a chunk within the current chunk. If there's not currently one, it moves into a top-level chunk. It finds the chunk, given its name in the parameter <I>ck</I>, and then moves the file pointer to point to the first data byte of that chunk, essentially opening it. Note that since chunks can be nested, so can <I>mmioDescend()</I> calls. <I>mmioRead()</I> and <I>mmioWrite()</I> are analogous to the standard library <I>read()</I> and <I>write()</I> calls, except that they deal with the current chunk instead of the whole file. <I>mmioRead()</I> won't read past the end of the chunk. <I>mmioWrite()</I> appends to the current chunk.<P>
+Finally, <I>mmioAscend()</I> is analogous to <I>close()</I>. On writing, it closes out the chunk in a tidy manner. On reading, it tells Windows that you are done reading that chunk. You have then &quot;ascended&quot; one level higher in the hierarchy of nested chunks. You can then do another <I>mmioDescend()</I> to select another chunk to work with. Also note that because <I>mmioDescend()</I> calls can be nested, <I>mmioAscend()</I> calls are also nested. Every <I>mmioDescend()</I> must have a matching <I>mmioAscend()</I>.<P>
+This API is somewhat object oriented. All of the calls with the &quot;mmio&quot; prefix take a handle of type HMMIO as the first parameter. HMMIO is a scalar that acts like a file handle, but it is especially for RIFF files and for the mmio calls. There's also an MMIOINFO structure, which holds various useful bits of information about the RIFF file. The most important items in MMIOINFO are the next and end pointers to the current buffer (fields <I>pchNext</I> and <I>pchEndWrite</I>). Though I use <I>mmioSetBuffer()</I> to tell Windows to allocate buffers for me, I still need to know where they are since I must manipulate them directly. The call <I>mmioGetInfo()</I> reads the MMIOINFO data. I store both the HMMIO handle and the MMIOINFO data in the RIFFUSR object.<P>
+The inline functions <I>iReadByte()</I> and <I>iWriteByte()</I> encapsulate this buffer business. Using these calls, I can write my code as if I were dealing with a stream of bytes, instead of a buffer-oriented API. The calls are in WAVELIB.H. When they need to go to another buffer, they call <I>iReadBuf()</I> and <I>iWriteBuf()</I>. These routines use the Windows API call <I>mmioAdvance()</I> to get another buffer and simultaneously update your copy of the MMIOINFO data. One messy detail: On writing, you must set the MMIO_DIRTY flag in MMIOINFO so that Windows knows that you want this buffer written out. Then you must do <I>mmioSetInfo()</I> so that Windows' internal information is in sync with yours and knows you've set the flag.<P>
+Finally, when you close an output RIFF file, the last buffer needs to be flushed. Consider <I>RIFFUSR::iClose()</I> in <a href="#01f9_000c">Listing Two</A>. First set MMIO_DIRTY and do the <I>mmioSetBuffer()</I> to tell Windows to flush the buffer. However, Windows doesn't flush it just then. Do an <I>mmioAscend()</I>, which writes the last buffer out to disk, and takes the file pointer out of the chunk. But you're still in the RIFF chunk (recall that these chunks are nested). One more <I>mmioAscend()</I> to get out of this, and finally an <I>mmioClose()</I> to tell Windows that you're done with the RIFF file.<P>
+<h3><a name="01f9_0009">Future Enhancements<a name="01f9_0009"></h3><P>
+NYB1 is not the final word on compressing waveforms cheaply and easily, but it's a good starting point, and many areas can be improved or enhanced. I've left out certain optimizations for clarity's sake. For example, you may want to rewrite <I>iNegFeedback()</I> so it no longer does the differential twice for each sample.<P>
+There are also possibilities for enhancements in the format itself. For example, you may want to use more bits for louder sections. When the shrite value is high, the quantization noise that isn't filtered out by various tricks is very noticeable. To counter this, use more than four bits for each mantissa. Experiment to determine just how much more and where the cutoff point should be. Remember, you're sacrificing compression here for greater clarity.<P>
+Also, consider the case of 16-bit input samples. Should NYB2 be able to creditably handle high-fidelity waveforms? This could call for a different trade-off. Consider a separate formula for increasing the bits per mantissa in the case of a 16-bit input. Remember, the header of the .NYB file contains a copy of the header of the original WAV file, so you'll know which formula to use on playback.<P>
+A final enhancement might be to provide for stereo. This is simple enough. If the header says the input was stereo, then use left/right channel pairs of mantissas. The exponent (shrite) needn't be doubled in this way. Even when the overall loudness varies between left and right channels, the listener probably won't notice any improvement in clarity in the quieter channel, because the louder channel will drown it out.<P>
+<HR>
+<h4><a name="01f9_000a"><a name="01f9_000b"><B>[LISTING ONE]</B></H4>
+
+<PRE>
+
+
+//****************************** WAVELIB.H *********************************
+// Class library for Windows waveforms and MIDI.
+// Copyright (c) 1993 by  Neil G. Rowland, Jr. 04-JUN-93
+#ifndef __WAVELIB_H
+#define __WAVELIB_H
+extern &quot;C&quot;
+    {
+    #include &lt;windows.h&gt;
+    #include &lt;mmsystem.h&gt;
+    }
+#pragma hdrstop
+//**************************************************************************
+
+class RIFFUSR
+    { // Base class for a user for a RIFF file.
+  public:
+    HMMIO       hmmio;      // handle to open WAVE file
+    MMCKINFO    ckRIFF;     // chunk info. for RIFF chunk
+    MMCKINFO    ck;         // info. for a chunk
+    MMIOINFO    mmioinfo;   // current status
+
+    RIFFUSR()  { hmmio = NULL; };
+
+  protected:
+    BOOL iOpenRead(char* _pszInFile, char* _pFmt, int _fmtlen,
+                                      char _t1, char _t2, char _t3, char _t4);
+    void iCloseRead();
+    BOOL iReadBuf();
+    BOOL iReadByte(BYTE&amp; _byte)
+        { // If we are at end of the input file I/O buffer, fill it.
+          // Test that we don't hit end of file while (lSamples &gt; 0).
+             if (mmioinfo.pchNext == mmioinfo.pchEndRead)  {
+             if (!iReadBuf())  { MessageBeep(0);  return FALSE; }
+             if (mmioinfo.pchNext == mmioinfo.pchEndRead) return FALSE;
+        }
+        _byte = *(mmioinfo.pchNext);
+        mmioinfo.pchNext++;
+        return TRUE;
+        };
+    BOOL iOpenWrite(char* _pszOutFile, const char* _pFmt, int _fmtlen,
+                      char _t1, char _t2, char _t3, char _t4);
+    void iCloseWrite();
+    BOOL iWriteBuf();
+    BOOL iWriteByte(BYTE _byte)
+        {
+        if (!mmioinfo.pchNext)  return FALSE;
+        if (mmioinfo.pchNext &gt;= mmioinfo.pchEndWrite)
+            { // If at end of output file I/O buffer, flush it.
+                 if (!iWriteBuf())
+                    { MessageBeep(0);  return FALSE; }
+            }
+        if (!mmioinfo.pchNext)  { MessageBeep(0);  return FALSE; }
+        *mmioinfo.pchNext = _byte;
+        mmioinfo.pchNext++;
+        return TRUE;
+        };
+    };
+//--------------------------------------------------------------------------
+class WAVUSR : public RIFFUSR
+    { // User for a .WAV file.
+  public:
+        PCMWAVEFORMAT Fmt;      // format of WAVE file.
+    WORD    sample, left, right;    // average, left and right channels.
+    };
+class WAVRDR : public WAVUSR
+    {
+  public:
+    BOOL mOpenRead(char* _pszInFile);
+    BOOL mNextSample();
+    void mClose();
+  protected:
+    BOOL iReadChanSample(WORD&amp; _sample);
+    };
+class WAVWRT : public WAVUSR
+    {
+  public:
+    BOOL mOpenWrite(char* _pszOutFile, const PCMWAVEFORMAT* _pFmt);
+    BOOL mWriteSample();
+    void mClose();
+  protected:
+    BOOL iWriteChanSample(WORD _sample);
+    };
+typedef struct
+    { // Play waveform output
+    HWAVEOUT    hwaveout;
+    HANDLE      hHdr;
+    LPWAVEHDR   lpHdr;
+    HANDLE      hBuf;       // current waveform buffer.
+    // accum buffer for feeding in a sample at a time...
+    HANDLE      hBufS;
+    LPSTR       lpBufS;
+    unsigned    countS;
+    BOOL mOpen(LPWAVEFORMAT _pFmt);
+    void mClose();
+    void mPlaySample(WORD _sample);
+  protected:
+    inline void iCloseoutBuffer();
+    inline void iCloseoutSampleBuffer();
+    inline void iPlay(MMIOINFO* _pInfo);
+    inline void iPlay(HANDLE _hbuf, LPSTR _lpBuf, int _len);
+    }
+WAVEPLAYER;
+#endif  //ndef __WAVELIB_H
+
+<a name="01f9_000c"><a name="01f9_000d"></pre><B>[LISTING TWO]</B><pre><a name="01f9_000d">
+
+//****************************** WAVELIB.CPP *******************************
+// Class library for Windows waveforms.
+// Copyright (c) 1993 by Neil G. Rowland, Jr. 04-JUN-93
+#include &quot;wavelib.h&quot;
+//**************************************************************************
+
+void lmemcpy(LPSTR _pszDest, LPSTR _pszSrc, DWORD _len)
+    {
+    if (!_pszDest)  return;
+    if (!_pszSrc)  return;
+    if (!_len)  return;
+    while (_len--)  {
+        *(_pszDest++) = *_pszSrc;
+        _pszSrc++;
+        }
+    }
+//********************************* RIFFUSR ********************************
+#define BUFSIZE 25000
+BOOL RIFFUSR::iOpenRead(char* _pszInFile, char* _pFmt, int _fmtlen,
+                    char _t1, char _t2, char _t3, char _t4)
+    { // open a generic RIFF file for reading.
+      // on success, it is descended into the data chunk,
+      // and *_pFmt holds a copy of the fmt chunk.
+    hmmio = mmioOpen(_pszInFile, NULL, MMIO_ALLOCBUF | MMIO_READ);
+    if (hmmio == NULL)  return FALSE;     // cannot open RIFF file
+
+    mmioSetBuffer(hmmio, NULL, BUFSIZE, 0); // allocate buffers
+    // Descend the input file into the 'RIFF' chunk.
+    if (mmioDescend(hmmio, &amp;ckRIFF, NULL, 0) != 0)
+        goto ERROR_BAD_FORMAT;
+    // Make sure the input file is of the desired type....
+    if ((ckRIFF.ckid != FOURCC_RIFF) ||
+        (ckRIFF.fccType != mmioFOURCC(_t1, _t2, _t3, _t4)))
+        goto ERROR_BAD_FORMAT;
+    // Search the input file for for the 'fmt ' chunk.
+    ck.ckid = mmioFOURCC('f', 'm', 't', ' ');
+    if (mmioDescend(hmmio, &amp;ck, &amp;ckRIFF, MMIO_FINDCHUNK) != 0)
+        goto ERROR_BAD_FORMAT;      // no 'fmt ' chunk
+    // Expect the 'fmt' chunk to be at least as large as _fmtlen;
+    // if there are extra parameters at the end, we'll ignore them
+    if (ck.cksize &lt; (long) _fmtlen)
+        goto ERROR_BAD_FORMAT;      // 'fmt ' chunk too small
+    // Read the 'fmt ' chunk into *_pFmt.
+    if (mmioRead(hmmio, (HPSTR) _pFmt, (long)_fmtlen) != (long)_fmtlen)
+        return FALSE;     // truncated file, probably
+    // Ascend the input file out of the 'fmt ' chunk.
+    if (mmioAscend(hmmio, &amp;ck, 0) != 0)  return FALSE; // truncated file?
+    // Search the input file for for the 'data' chunk, and descend.
+    ck.ckid = mmioFOURCC('d', 'a', 't', 'a');
+    if (mmioDescend(hmmio, &amp;ck, &amp;ckRIFF, MMIO_FINDCHUNK) != 0)
+        goto ERROR_BAD_FORMAT;      // no 'data' chunk
+    mmioGetInfo(hmmio, &amp;mmioinfo, 0);
+    return TRUE;
+  ERROR_BAD_FORMAT:
+    MessageBox(NULL,&quot;Input file must be a RIFF file&quot;, &quot;RIFFUSR::mOpenRead&quot;,
+                                                    MB_ICONEXCLAMATION| MB_OK);
+    iCloseRead();
+    return FALSE;
+    }
+void RIFFUSR::iCloseRead()
+    {
+    if (!hmmio)  return;
+    mmioSetInfo(hmmio, &amp;mmioinfo, 0);   // properly close out input file.
+    mmioClose(hmmio, 0);
+    hmmio = NULL;
+    }
+BOOL RIFFUSR::iReadBuf()
+    { return mmioAdvance(hmmio, &amp;mmioinfo, MMIO_READ) == 0; }
+//--------------------------------------------------------------------------
+BOOL RIFFUSR::iOpenWrite(char* _pszOutFile, const char* _pFmt, int _fmtlen,
+                    char _t1, char _t2, char _t3, char _t4)
+    {
+    // Open the output file for writing using buffered I/O. Note that
+    // if the file exists, the MMIO_CREATE flag causes it to be truncated
+    // to zero length.
+    hmmio = mmioOpen(_pszOutFile, NULL, MMIO_ALLOCBUF| MMIO_WRITE|
+                                                                 MMIO_CREATE);
+    if (hmmio == NULL)  return FALSE;    // cannot open WAVE file
+
+    mmioSetBuffer(hmmio, NULL, BUFSIZE, 0); // allocate buffers
+    // Create the output file RIFF chunk of desired type.
+    ckRIFF.fccType = mmioFOURCC(_t1, _t2, _t3, _t4);
+    if (mmioCreateChunk(hmmio, &amp;ckRIFF, MMIO_CREATERIFF) != 0)
+       goto cantwrite;    // cannot write file, probably
+    // We are now descended into the 'RIFF' chunk we just created.
+    // Now create the 'fmt ' chunk. Since we know the size of this chunk,
+    // specify it in the MMCKINFO structure so MMIO doesn't have to seek
+    // back and set the chunk size after ascending from the chunk.
+    ck.ckid = mmioFOURCC('f', 'm', 't', ' ');
+    ck.cksize = _fmtlen;   // we know the size of this ck.
+    if (mmioCreateChunk(hmmio, &amp;ck, 0) != 0)  goto cantwrite;
+    // Write the *_pFmt data to the 'fmt ' chunk.
+    if (mmioWrite(hmmio, (HPSTR) _pFmt, _fmtlen) != _fmtlen)
+        goto cantwrite;
+    // Ascend out of the 'fmt ' chunk, back into the 'RIFF' chunk.
+    if (mmioAscend(hmmio, &amp;ck, 0) != 0)  goto cantwrite;
+    // Create the 'data' chunk that holds the waveform samples.
+    ck.ckid = mmioFOURCC('d', 'a', 't', 'a');
+    if (mmioCreateChunk(hmmio, &amp;ck, 0) != 0)  goto cantwrite;
+    mmioGetInfo(hmmio, &amp;mmioinfo, 0);
+    return TRUE;
+  cantwrite:
+    iCloseWrite();
+    return FALSE;
+    }
+void RIFFUSR::iCloseWrite()
+    {
+    if (!hmmio)  return;
+    // flush the output RIFF chunk...
+    mmioinfo.dwFlags |= MMIO_DIRTY;
+    if (mmioSetInfo(hmmio, &amp;mmioinfo, 0) != 0)  goto ERROR_CANNOT_WRITE;<P>    // cannot flush, probably
+    // Ascend the output file out of the 'data' chunk -- this will cause
+    // the chunk size of the 'data' chunk to be written.
+    if (mmioAscend(hmmio, &amp;ck, 0) != 0)  goto ERROR_CANNOT_WRITE;<P>    // cannot write file, probably
+    // Ascend the output file out of the 'RIFF' chunk -- this will cause
+    // the chunk size of the 'RIFF' chunk to be written.
+    if (mmioAscend(hmmio, &amp;ckRIFF, 0) != 0)  goto ERROR_CANNOT_WRITE;<P>    // cannot write file, probably
+    goto close;
+  ERROR_CANNOT_WRITE:
+    MessageBox(NULL, &quot;Error closing out output file&quot;, &quot;RIFFUSR::mCloseWrite&quot;, MB_ICONEXCLAMATION| MB_OK);
+  close:
+    mmioClose(hmmio, 0);
+    hmmio = NULL;
+    }
+BOOL RIFFUSR::iWriteBuf()
+    {
+    mmioinfo.dwFlags |= MMIO_DIRTY;
+    if (mmioAdvance(hmmio, &amp;mmioinfo, MMIO_WRITE) != 0)  return FALSE;
+    return TRUE;
+    }
+//**************************************************************************
+BOOL WAVRDR::mOpenRead(char* _pszInFile)
+    {
+    if (!RIFFUSR::iOpenRead(_pszInFile, (char*)&amp;Fmt,
+                                    sizeof(PCMWAVEFORMAT), 'W', 'A', 'V', 'E'))
+        return FALSE;
+    // Make sure the input file is a PCM WAVE file of a variety we support.
+    if ((Fmt.wf.wFormatTag != WAVE_FORMAT_PCM))  goto ERROR_BAD_FORMAT;<P>    // bad input file format
+    if ((Fmt.wBitsPerSample != 8) &amp;&amp; (Fmt.wBitsPerSample != 16))
+        goto ERROR_BAD_FORMAT;      // bad input file format
+    return TRUE;
+  ERROR_BAD_FORMAT:
+    MessageBox(NULL, &quot;Input file must be a PCM WAVE file&quot;,
+                              &quot;WAVUSR::mOpenRead&quot;, MB_ICONEXCLAMATION| MB_OK);
+  ERROR_BAD_FORMAT1:
+    mClose();
+    return FALSE;
+    }
+BOOL WAVRDR::iReadChanSample(WORD&amp; _sample)
+    { // read one sample for one channel.
+    BYTE    c;
+    if (!iReadByte(c))  return FALSE;
+    _sample = c &lt;&lt; 8;
+    if (Fmt.wBitsPerSample &gt; 8)  { // 16 bit
+        if (!iReadByte(c))  return FALSE;
+        _sample |= c;
+        }
+    return TRUE;
+    }
+BOOL WAVRDR::mNextSample()
+    { // read the next sample into fields sample, left and right.
+    if (Fmt.wf.nChannels == 1)  { // mono
+        if (!iReadChanSample(sample))  return FALSE;
+        left = right = sample;
+        }
+    else  { // stereo
+        if (!iReadChanSample(left))  return FALSE;
+        if (!iReadChanSample(right))  return FALSE;
+        sample = left&gt;&gt;1 + right &gt;&gt;1;
+        }
+    return TRUE;
+    }
+void WAVRDR::mClose()
+    { RIFFUSR::iCloseRead(); }
+//**************************************************************************
+BOOL WAVWRT::mOpenWrite(char* _pszOutFile, const PCMWAVEFORMAT* _pFmt)
+    {
+    if (!RIFFUSR::iOpenWrite(_pszOutFile, (const char*)_pFmt,<P>    sizeof(PCMWAVEFORMAT), 'W', 'A', 'V', 'E'))
+        return FALSE;
+    Fmt = *_pFmt;
+    return TRUE;
+  cantwrite:
+    mClose();
+    return FALSE;
+    }
+void WAVWRT::mClose()
+    { RIFFUSR::iCloseWrite(); }
+BOOL WAVWRT::iWriteChanSample(WORD _sample)
+    {
+    if (mmioinfo.pchNext &gt;= mmioinfo.pchEndWrite-1)  {<P>    // If we are at the end of the output file I/O buffer, flush it.
+        if (!iWriteBuf())  { MessageBeep(0);  return FALSE; }
+        }
+    *(mmioinfo.pchNext)++ = HIBYTE(_sample);
+    if (Fmt.wBitsPerSample &gt; 8)  // 16 bit
+        *(mmioinfo.pchNext)++ = LOBYTE(_sample);
+    return TRUE;
+    }
+BOOL WAVWRT::mWriteSample()
+    {
+    if (Fmt.wf.nChannels == 1)  // mono
+        if (!iWriteChanSample(sample))  return FALSE;
+    else  { // stereo
+        if (!iWriteChanSample(left))  return FALSE;
+        if (!iWriteChanSample(right))  return FALSE;
+        }
+    return TRUE;
+    }
+//**************************************************************************
+inline void WAVEPLAYER::iCloseoutBuffer()
+    { // Flush and free the current buffer.
+    if (!lpHdr || !hBuf)  return;
+    if (!(lpHdr-&gt;dwFlags&amp;WHDR_PREPARED))  return;
+    // Finish up with previous buffer...
+    while ((lpHdr-&gt;dwFlags&amp;WHDR_DONE) == 0)  Yield();   // wait
+    waveOutUnprepareHeader(hwaveout, lpHdr, sizeof(WAVEHDR));
+    GlobalUnlock(hBuf);  GlobalFree(hBuf);
+    hBuf = NULL;
+    }
+inline void WAVEPLAYER::iCloseoutSampleBuffer()
+    { // flush buffer for sample mode...
+    if (!hBufS || !lpBufS)  return;
+    if (countS)  iPlay(hBufS, lpBufS, countS); // no longer own old buffer.
+    lpBufS = NULL;  // so will get new buffer.
+    hBufS = NULL;
+    }
+inline void WAVEPLAYER::iPlay(MMIOINFO* _pInfo)
+    {
+    if (!hwaveout)  return;
+    if (!_pInfo)  return;
+    if (!lpHdr)  return;
+    DWORD   len = _pInfo-&gt;pchNext - _pInfo-&gt;pchBuffer;
+    HANDLE  hNewBuf = GlobalAlloc(GMEM_MOVEABLE| GMEM_SHARE, len);
+    LPSTR   lpNewBuf = GlobalLock(hNewBuf);
+    lmemcpy(lpNewBuf, (LPSTR)_pInfo-&gt;pchBuffer, len);
+    iPlay(hNewBuf, lpNewBuf, len);
+    }
+inline void WAVEPLAYER::iPlay(HANDLE _hbuf, LPSTR _lpBuf, int _len)
+    { // the passed buffer will be freed later, not by caller...
+    iCloseoutBuffer();  // finish with previous.
+    // Queue this buffer's worth...
+    hBuf = _hbuf;
+    lpHdr-&gt;lpData = _lpBuf;
+    lpHdr-&gt;dwBufferLength = _len;
+    lpHdr-&gt;dwLoops = 0L;
+    lpHdr-&gt;dwFlags = 0L;    // MPG, p5-28
+    if (0 == waveOutPrepareHeader(hwaveout, lpHdr, sizeof(WAVEHDR)))
+        waveOutWrite(hwaveout, lpHdr, sizeof(WAVEHDR));
+    else MessageBeep(0);
+    }
+//--------------------------------------------------------------------------
+BOOL WAVEPLAYER::mOpen(LPWAVEFORMAT _pFmt)
+    {
+    hwaveout = NULL;  hHdr = NULL;  lpHdr = NULL;
+    hBufS = NULL;  lpBufS = NULL;  countS = 0;
+    if (!_pFmt)  return FALSE;
+    if (0 != waveOutOpen(&amp;hwaveout, WAVE_MAPPER, _pFmt, NULL, NULL, 0))
+                                                                  return FALSE;
+    // allocate the buffer header, but no buffer yet...
+    hBuf = NULL;
+    hHdr = GlobalAlloc(GMEM_MOVEABLE| GMEM_SHARE, sizeof(WAVEHDR));
+    lpHdr = (LPWAVEHDR)GlobalLock(hHdr);
+    lpHdr-&gt;dwFlags = 0;
+    return TRUE;
+    }
+void WAVEPLAYER::mClose()
+    {
+    iCloseoutSampleBuffer();
+    iCloseoutBuffer();
+    if (hwaveout)  waveOutClose(hwaveout);
+    if (hHdr)  { GlobalUnlock(hHdr);  GlobalFree(hHdr); }
+    hwaveout = NULL;
+    hHdr = NULL;  lpHdr = NULL;
+
+    if (hBufS)  {
+        GlobalUnlock(hBufS);  GlobalFree(hBufS);
+        hBufS = NULL;  lpBufS = NULL;
+        }
+    }
+void WAVEPLAYER::mPlaySample(WORD _sample)
+    {
+    if (!lpBufS)  { // need a new buffer...
+        hBufS = GlobalAlloc(GMEM_FIXED, BUFSIZE+1);
+        if (!hBufS)  return;
+        lpBufS = GlobalLock(hBufS);
+        countS = 0;
+        }
+    lpBufS[countS] = HIBYTE(_sample);
+    if (++countS &gt;= BUFSIZE)
+        iCloseoutSampleBuffer();
+    }
+
+
+</PRE>
+
+<h4><a name="01f9_000e"><a name="01f9_000f"><B>[LISTING THREE]</B></H4>
+
+<PRE>
+
+
+//******************************** NYBLIB.H ********************************
+// Main header file for NYB1 compressed waveform utility.
+// Copyright (c) 1993 by Neil G. Rowland, Jr. 24-JUN-93
+
+#include &quot;wavelib.h&quot;
+
+//**************************************************************************
+// Access to NYB1 files. Makes it seem like .WAV files
+// A group has this many nybbles, preceded by a magnitude nybble...
+#define SAMPLESPERGROUP 7
+class NYBUSR : public RIFFUSR
+    { // User for a .NYB file.
+  public:
+    PCMWAVEFORMAT Fmt;      // format of would-be WAVE file.
+    WORD        sample;     // 16-bit .WAV style sample.
+    NYBUSR();
+  protected:
+    int     groupcount;
+    WORD    encprevsample;  // used by iEncode.
+    WORD    decprevsample;  // used by iDecode.
+    BYTE    shrite; // maginitude of current group (shift-right amount)
+    inline void iDecode(WORD&amp; _sample);
+    inline void iEncode(WORD&amp; _sample);
+    };
+class NYBRDR : public NYBUSR
+    {
+  public:
+    unsigned samplespersec;
+    NYBRDR();
+    BOOL mOpenRead(char* _pszInFile);
+    BOOL mNextSample();
+    void mClose();
+  protected:
+    BYTE inbuf; // first nybble is high, second is low.
+    BOOL nyb2;  // true if second nybble
+    inline BOOL iReadNybble(BYTE&amp; _nybble);
+    };
+class NYBWRT : public NYBUSR
+    {
+  public:
+    NYBWRT();
+    BOOL mOpenWrite(char* _pszOutFile, const PCMWAVEFORMAT* _pFmt);
+    BOOL mWriteSample(WORD _sample, WAVEPLAYER* _pOut = NULL);
+    void mClose();
+  protected:
+    BYTE outbuf;    // first nybble is high, second is low.
+    BOOL nyb2w;
+    inline BOOL iWriteNybble(BYTE _nybble);
+    WORD    outsamp, intsamp;   // output and intermediate samples
+    signed  diff;   // compensation, to prevent cumulative error.
+    BOOL iNegFeedbackStage();
+    // internal to mWriteSample (dealing with groups)...
+    WORD groupbuf[SAMPLESPERGROUP];
+    WORD* pgroup;
+    WORD diffmin, diffmax;  // for determining magnitude.
+    WORD prevsample;
+    };
+
+
+</PRE>
+
+<h4><a name="01f9_0010"><a name="01f9_0011"><B>[LISTING FOUR]</B></H4>
+
+<PRE>
+
+
+//******************************** NYBLIB.CPP ******************************
+// Routines to deal with nybble format compressed waveforms.
+// Copyright (c) 1993 by Neil G. Rowland, Jr. 24-JUN-93
+extern &quot;C&quot;
+    {
+    #include &lt;math.h&gt;
+    #include &lt;stdlib.h&gt;
+    #include &lt;string.h&gt;
+    }
+#include &quot;nyblib.h&quot;
+//**************************************************************************
+static WORD PreAdj[12+1] =  {
+                    // table to map delta translating to nybble to 0 to a 0...
+    32768-8,
+    32768-16, 32768-32, 32768-64, 32768-128,
+    32768-256, 32768-512, 32768-1024, 32768-2048,
+    32768-4096, 32768-8192, 32768-16384, 0};
+static BOOL fNagged = FALSE;
+inline void Shrite(WORD&amp; _sample, BYTE _shrite)
+    { // get delta down to a nybble...
+    WORD    orig = _sample;     // helps in clipping.
+    if (_shrite == 0)  { _sample = 8;  return; }
+    _sample -= PreAdj[_shrite];
+    _sample &gt;&gt;= _shrite;
+    if (_sample &gt; 15)  { // overflow/underflow.
+        //D if (!fNagged)
+        //D  { MessageBox((HWND)NULL, &quot;Shrite:overflow&quot;, &quot;NYBLIB&quot;,
+        //D                                         MB_OK);  fNagged = TRUE; }
+        _sample = (orig &amp; 0x8000)? 15:0;
+        }
+    }
+inline void UnShrite(WORD&amp; _sample, BYTE _shrite)
+    { // convert a nybble to a delta...
+    if (_shrite == 0)  { _sample = 32768;  return; }
+    _sample &lt;&lt;= _shrite;
+    _sample += PreAdj[_shrite];
+    }
+inline void Diff(WORD&amp; _sample, WORD&amp; prevsample)
+    { // called once per sample.
+    _sample &gt;&gt;=1; _sample+= 16384;  // halve magnitude to avoid overflow.
+    WORD    sample = _sample;
+    _sample = (sample-prevsample) + 32768;
+    prevsample = sample;
+    };
+inline void Integ(WORD&amp; _sample, WORD&amp; prevsample)
+    { // called once per sample.
+    unsigned    intl;
+    intl = prevsample;  intl +=_sample-32768;
+    _sample = intl;
+    prevsample = _sample;
+    // undo halving and catch overflow...
+    _sample -= 16384;
+    _sample = (_sample&amp;0x8000)? (prevsample-16384)&lt;&lt;1 : _sample&lt;&lt;1;
+    };
+//**************************************************************************
+NYBUSR::NYBUSR()
+     { hmmio = NULL;  groupcount = 0;  encprevsample = decprevsample = 32768; }
+inline void NYBUSR::iEncode(WORD&amp; _sample)
+    { // encode the data. does not include cumulative error prevention.
+    if (shrite &lt; 12)    // otherwise no gain, maybe even loss
+        Diff(_sample, encprevsample);
+    else
+        encprevsample = _sample;    // in case last in group
+    Shrite(_sample, shrite);
+    if (_sample&gt;15)  MessageBox((HWND)NULL, &quot;Bad result&quot;, &quot;NYBUSR&quot;, MB_OK);
+    }
+inline void NYBUSR::iDecode(WORD&amp; _sample)
+    { // decode the encoded data. doubles as cumulative error prevention.
+    //D if (_sample &gt; 15)
+    //D { MessageBox((HWND)NULL, &quot;bad _sample&quot;, &quot;NYBUSR::mDecode&quot;,
+    //D                                                       MB_OK); return; }
+    UnShrite(_sample, shrite);
+    if (shrite &lt; 12)    // otherwise no gain, maybe even loss
+        Integ(_sample, decprevsample);
+    else
+        decprevsample = _sample;    // in case last in group
+    }
+
+//**************************************************************************
+void NYBRDR::NYBRDR()
+    { nyb2 = FALSE; }
+BOOL NYBRDR::mOpenRead(char* _pszInFile)
+    {
+    if (!RIFFUSR::iOpenRead(_pszInFile, (char*)&amp;Fmt, sizeof(PCMWAVEFORMAT),
+                                                          'N', 'Y', 'B', '1'))
+        return FALSE;
+    // Make sure the input file is a mono PCM WAVE file.
+    if ((Fmt.wf.wFormatTag != WAVE_FORMAT_PCM))  goto ERROR_BAD_FORMAT;
+    if (Fmt.wf.nChannels != 1)  { // stereo not supported yet.
+        MessageBox((HWND)NULL, &quot;This is a STEREO wave file header&quot;,
+                                          &quot;NYBRDR&quot;, MB_ICONEXCLAMATION|MB_OK);
+        goto ERROR_BAD_FORMAT1;      // bad input file format
+        }
+    samplespersec = Fmt.wf.nSamplesPerSec;
+    groupcount = 0;
+    return TRUE;
+  ERROR_BAD_FORMAT:
+    MessageBox(NULL, &quot;Input file must be a NYB1 file&quot;,
+                               &quot;NYBRDR::mOpenRead&quot;, MB_ICONEXCLAMATION| MB_OK);
+  ERROR_BAD_FORMAT1:
+    mClose();
+    return FALSE;
+    }
+inline BOOL NYBRDR::iReadNybble(BYTE&amp; _nybble)
+    {
+    if (nyb2)  _nybble = inbuf &amp; 0xf;
+    else  {
+        if (!iReadByte(inbuf))  return FALSE;
+        _nybble = inbuf &gt;&gt; 4;
+        }
+    nyb2 = !nyb2;
+    return TRUE;
+    }
+BOOL NYBRDR::mNextSample()
+    {
+    BYTE    nybble;
+    if (groupcount == 0)
+        if (!iReadNybble(shrite))  return FALSE;
+    if (shrite)
+        { if (!iReadNybble(nybble))  return FALSE; }
+    else  nybble = 8;   // we don't store empty groups.
+    sample = nybble;  iDecode(sample);
+    groupcount++;  if (groupcount == SAMPLESPERGROUP)  groupcount = 0;
+    return TRUE;
+    }
+void NYBRDR::mClose()
+    { RIFFUSR::iCloseRead(); }
+//**************************************************************************
+void NYBWRT::NYBWRT() {
+    nyb2w = FALSE; diff = 0;
+    pgroup = groupbuf;
+    diffmin = diffmax = prevsample = 32768;
+    }
+BOOL NYBWRT::mOpenWrite(char* _pszOutFile, const PCMWAVEFORMAT* _pFmt)
+    {
+    if (!RIFFUSR::iOpenWrite(_pszOutFile, (const char*)_pFmt,
+                                    sizeof(PCMWAVEFORMAT), 'N', 'Y', 'B', '1'))
+        return FALSE;
+    groupcount = 0;
+    return TRUE;
+  cantwrite:
+    mClose();
+    return FALSE;
+    }
+void NYBWRT::mClose()
+    { RIFFUSR::iCloseWrite(); }
+inline BOOL NYBWRT::iWriteNybble(BYTE _nybble)
+    { // write out to file:
+    if (_nybble &gt; 15)  { MessageBox((HWND)NULL, &quot;Bad nybble&quot;,
+                                            &quot;NYBWRT&quot;, MB_OK);  return FALSE; }
+    if (!nyb2w)  outbuf = _nybble &lt;&lt; 4;
+    else {
+        outbuf |= _nybble;
+        if (!iWriteByte(outbuf))  return FALSE; // to the file.
+        }
+    nyb2w = !nyb2w;
+    return TRUE;
+    }
+BOOL NYBWRT::iNegFeedbackStage()
+    { // encode and fight cumulative error
+      // called once per sample.
+    intsamp = sample;
+    iEncode(intsamp);
+    // fight cumulative error by applying a bias to intsamp
+    if (diff &lt; 0)  { if (intsamp &lt; 15)  intsamp ++; }
+    if (diff &gt; 0)  { if (intsamp &gt; 0)  intsamp --; }
+    if (!iWriteNybble(intsamp))  return FALSE;
+    // see what the output would be, and figure compensation...
+    outsamp = intsamp;
+    iDecode(outsamp);
+    if (outsamp &gt; sample)  diff = 1;    // overshot
+    else  if (outsamp &lt; sample)  diff = -1; // undershot
+    else  diff = 0;
+    sample = outsamp;   // in case caller is interested.
+    return TRUE;
+    }
+BOOL NYBWRT::mWriteSample(WORD _sample, WAVEPLAYER* _pOut)
+    { // takes a stream of samples divides it into groups, passes it
+    WORD        diff1;
+    WORD        samp16 = _sample;
+    WORD        samp15 = samp16 &gt;&gt; 1;
+    diff1 = samp16;  Diff(diff1, prevsample);
+    if (diff1 &gt; diffmax)  diffmax = diff1;
+    if (diff1 &lt; diffmin)  diffmin = diff1;
+    if (++groupcount &gt;= SAMPLESPERGROUP)  { // end-of-group processing...
+        //  first determine the magnitude of the group:
+        WORD diffrange = diffmax-diffmin;
+        if (diffrange &lt; 0xF000)  diffrange += diffrange&gt;&gt;4;
+        if (diffrange == 0)  shrite = 0;    // signifies silence
+        else  { // shrite is bits delta shifted right
+            shrite = 12;
+            while (shrite&gt;0 &amp;&amp; !(diffrange&amp;0x8000))
+                { shrite--;  diffrange &lt;&lt;= 1; }
+            }
+        iWriteNybble(shrite);
+        if (shrite)  { // process the group...
+            pgroup = groupbuf;
+            for (groupcount=0; groupcount&lt;SAMPLESPERGROUP;
+                                                   groupcount++) { // 2nd pass.
+                sample = *(pgroup++);
+                if (_pOut)  _pOut-&gt;mPlaySample(sample);
+                if (!iNegFeedbackStage())  return FALSE;
+                //D if (_pOut)  _pOut-&gt;mPlaySample(sample);
+                }
+            }
+        // reset for next group:
+        diffmin = diffmax = 32768;
+        groupcount = 0;
+        pgroup = groupbuf;
+        }
+    *(pgroup++) = samp16;
+    return TRUE;
+    }
+
+
+</PRE>
+
+<h4><a name="01f9_0012"><a name="01f9_0013"><B>[LISTING FIVE]</B></H4>
+
+<PRE>
+
+
+//******************************** NYB1.CPP ********************************
+// Main app for NYB1 compressed waveform utility.
+// Copyright (c) 1993 by Neil G. Rowland, Jr. 04-JUN-93
+extern &quot;C&quot;  {
+    #include &lt;math.h&gt;
+    #include &lt;stdlib.h&gt;
+    #include &lt;string.h&gt;
+    }
+#include &quot;nyblib.h&quot;
+#define IDM_ABOUT       11          // menu items
+#define ID_INPUTFILEEDIT    101     // input file name edit box
+#define ID_OUTPUTFILEEDIT   102     // output file name edit box
+//**************************************************************************
+int PASCAL WinMain(HANDLE hInst, HANDLE hPrev, LPSTR lpszCmdLine,int iCmdShow);
+BOOL FAR PASCAL AboutDlgProc(HWND hwnd, unsigned wMsg,WORD wParam,LONG lParam);
+BOOL FAR PASCAL CvtDlgProc(HWND hwnd, unsigned wMsg, WORD wParam, LONG lParam);
+//**************************************************************************
+char        gszAppName[] = &quot;Waver&quot;;   // for title bar, etc.
+HANDLE      ghInst;                     // app's instance handle
+void PlayIt(char* _pszNybFile)
+    {
+    WAVEPLAYER  Play;               // audio output.
+    PCMWAVEFORMAT   pcmWaveFormat;  // contents of 'fmt' chunks
+    NYBRDR      NybIn;      // for playback of nybble file
+    if (!NybIn.mOpenRead(_pszNybFile))  {
+        MessageBox(NULL, &quot;Cannot read input NYB1 file&quot;, _pszNybFile,
+                                                   MB_ICONEXCLAMATION | MB_OK);
+        return;
+        }
+    Play.mOpen(&amp;NybIn.Fmt.wf);
+    for (;;)  {
+        if (!NybIn.mNextSample())  break;
+        Play.mPlaySample(NybIn.sample);
+        }
+    NybIn.mClose();
+    Play.mClose();
+    }
+void DoIt(char* _pszInFile, char* _pszNybFile)
+    {
+    WAVRDR      In;
+    NYBWRT      Out;
+    WAVEPLAYER  Play;       // audio output.
+    long        lSamples;           // number of samples to filter
+    unsigned char cThis = 0;
+    signed char olddelta = 0;
+    BOOL        lastwasendpoint = TRUE;
+    if (_pszInFile &amp;&amp; *_pszInFile)  {
+        // provide a default:
+        if (!_pszNybFile || !lstrlen(_pszNybFile)) _pszNybFile = &quot;\x.nyb&quot;;
+        // Open the input file for reading using buffered I/O.
+        if (!In.mOpenRead(_pszInFile))
+            goto ERROR_CANNOT_READ;
+        if (!Out.mOpenWrite(_pszNybFile, &amp;In.Fmt))
+            goto ERROR_CANNOT_WRITE;
+        Play.mOpen(&amp;In.Fmt.wf);
+        for (lSamples = In.ck.cksize; lSamples &gt; 0; lSamples--)  {
+            WORD    sample;
+            if (!In.mNextSample())  goto ERROR_CANNOT_READ;
+            sample = In.sample;     // raw input
+            Out.mWriteSample(sample, &amp;Play);
+            }
+        Out.mClose();
+        Play.mClose();
+        }
+    // now play it back...
+    PlayIt(_pszNybFile);
+    goto EXIT_FUNCTION;
+  ERROR_CANNOT_READ:
+    MessageBox(NULL, &quot;Cannot read input file&quot;,
+                                      gszAppName, MB_ICONEXCLAMATION | MB_OK);
+    goto EXIT_FUNCTION;
+  ERROR_CANNOT_WRITE:
+    MessageBox(NULL, &quot;Cannot write output NYB1 file&quot;, gszAppName,
+                                                   MB_ICONEXCLAMATION | MB_OK);
+    goto EXIT_FUNCTION;
+  EXIT_FUNCTION:
+    // Close the files (unless they weren't opened successfully).
+    In.mClose();
+    Out.mClose();
+    Play.mClose();
+    }
+
+//**************************************************************************
+int PASCAL WinMain(HANDLE hInst, HANDLE hPrev, LPSTR lpszCmdLine, int iCmdShow)
+    {
+    FARPROC fpfn;
+    HWND    hwd;
+    MSG     msg;
+    // Save instance handle for dialog boxes.
+    ghInst = hInst;
+    if (lpszCmdLine &amp;&amp; *lpszCmdLine)
+        DoIt(NULL, lpszCmdLine);
+    // Display our dialog box.
+    fpfn = MakeProcInstance((FARPROC) CvtDlgProc, ghInst);
+    if (!fpfn)  goto erret;
+    hwd = CreateDialog(ghInst, &quot;LOWPASSBOX&quot;, NULL, fpfn);
+    if (!hwd)  goto erret;
+    ShowWindow(hwd, TRUE);  UpdateWindow(hwd);
+    while (GetMessage(&amp;msg, NULL, 0, 0))
+        if (!IsDialogMessage(hwd, &amp;msg))
+            DispatchMessage(&amp;msg);
+    DestroyWindow(hwd);
+    FreeProcInstance(fpfn);
+    return TRUE;
+  erret:
+    MessageBeep(0);
+    return FALSE;
+    }
+// AboutDlgProc - Dialog procedure function for ABOUTBOX dialog box.
+BOOL FAR PASCAL AboutDlgProc(HWND hWnd, unsigned wMsg,WORD wParam,LONG lParam)
+    {
+    switch (wMsg)  {
+    case WM_INITDIALOG:
+        return TRUE;
+    case WM_COMMAND:
+        if (wParam == IDOK)
+            EndDialog(hWnd, TRUE);
+        break;
+    }
+    return FALSE;
+    }
+// CvtDlgProc - Dialog procedure function for conversion dialog box.
+BOOL FAR PASCAL CvtDlgProc(HWND hWnd, unsigned wMsg, WORD wParam, LONG lParam)
+    {
+    FARPROC     fpfn;
+    HMENU       hmenuSystem;    // system menu
+    HCURSOR     ghcurSave;      // previous cursor
+    switch (wMsg)  {
+    case WM_INITDIALOG:
+        // Append &quot;About&quot; menu item to system menu.
+        hmenuSystem = GetSystemMenu(hWnd, FALSE);
+        AppendMenu(hmenuSystem, MF_SEPARATOR, 0, NULL);
+        AppendMenu(hmenuSystem, MF_STRING, IDM_ABOUT,
+            &quot;&amp;About LowPass...&quot;);
+        return TRUE;
+    case WM_SYSCOMMAND:
+        switch (wParam)  {
+        case IDM_ABOUT:
+            // Display &quot;About&quot; dialog box.
+            fpfn = MakeProcInstance((FARPROC) CvtDlgProc, ghInst);
+            DialogBox(ghInst, &quot;ABOUTBOX&quot;, hWnd, fpfn);
+            FreeProcInstance(fpfn);
+            break;
+        }
+        break;
+    case WM_COMMAND:
+        switch (wParam)  {
+        case IDOK:          // &quot;Begin&quot;
+               // Set &quot;busy&quot; cursor, filter input file, restore cursor.
+            char        szInFile[200];     // name of input file
+            char        szOutFile[200];    // name of output file
+            // Read filenames from dialog box fields.
+            szInFile[0] == 0;
+            GetDlgItemText(hWnd, ID_INPUTFILEEDIT, szInFile,
+                                                            sizeof(szInFile));
+            szOutFile[0] == 0;
+            GetDlgItemText(hWnd, ID_OUTPUTFILEEDIT, szOutFile,
+                                                           sizeof(szOutFile));
+            ghcurSave = SetCursor(LoadCursor(NULL, IDC_WAIT));
+            DoIt(szInFile, szOutFile);
+            SetCursor(ghcurSave);
+            break;
+        case IDCANCEL:      // &quot;Done&quot;
+            PostQuitMessage(0);
+            break;
+        }
+        break;
+    }
+    return FALSE;
+}
+End Listings<P>
+</pre><HR><P>Copyright &copy; 1994, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

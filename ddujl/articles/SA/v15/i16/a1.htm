@@ -1,0 +1,594 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v15, i16: Using Adaptive Read-Ahead to Improve I/O Throughput on Linux</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><span class="navbarLink"><a href="a1_t1.htm">Table 1</a></span></td>
+		<td><span class="navbarLink"><a href="a1_t2.htm">Table 2</a></span></td>
+		<td><span class="navbarLink"><a href="a1_t3.htm">Table 3</a></span></td>
+		<td><span class="navbarLink"><a href="a1_t4.htm">Table 4</a></span></td>
+	</tr>
+	<tr>
+		<td><span class="navbarLink"><a href="a1_t5.htm">Table 5</a></span></td>
+		<td><span class="navbarLink"><a href="a1_t6.htm">Table 6</a></span></td>
+		<td><span class="navbarLink"><a href="a1_t7.htm">Table 7</a></span></td>
+		<td><span class="navbarLink"><a href="a1_t8.htm">Table 8</a></span></td>
+		<td><span class="navbarLink"><a href="a1_t9.htm">Table 9</a></span></td>
+		<td><a href="../../../../source/SA/2006/nov2006.tar"><b class=codeListing>nov2006.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><img src="a1.gif" width="200" height="206" align="right">Using Adaptive Read-Ahead to Improve I/O Throughput on Linux </h1>
+            <p> Mulyadi Santosa and Fengguang Wu
+          <p> For years, I/O has been a major problem when dealing 
+            with latency. CPU, memory, network connection, and bus are getting faster 
+            in significant way. But what about disk? With the birth of SATA, disk is 
+            getting some acceleration, but the problem with disk access is that it is 
+            so slow compared to memory access. 
+          <p> Disk cache was invented to overcome this. When a read 
+            operation is issued, data is brought to RAM. From there, the CPU can access 
+            it. Furthermore, when data is written to the disk, it is put to buffer and 
+            later pushed to the disk. This is done for two reasons. The first reason is 
+            for reading operations. Here we are caching the data to anticipate further 
+            read requests on the same blocks. As stated in the temporal locality 
+            principle, a program tends to read same data over and over again during a 
+            certain interval. If we apply that to disk access, on the second access, 
+            there is no need to read from the disk, the CPU can just access it through 
+            disk cache. 
+          <p> The second reason is for writing operations. If the CPU 
+            must wait until the data is actually written to the disk, the CPU will be 
+            completely blocked. A solution for this is using buffer as temporary 
+            storage. The CPU just puts the data on buffer and continues to work. 
+            There's no need to wait for lengthy disk access. 
+          <p> Another feature can help you overcome disk latency: 
+            read-ahead. The basic idea is that if you read a block from a file, there is a chance that you will read the next block of the 
+            same file. Thus, if somehow the kernel can predict it, it can "read-ahead" to the next block(s). So, when the data is 
+            needed, it is already on the disk cache. This read-ahead concept is the 
+            focus of this article. 
+          <p>
+
+            <b>Overview of Read-Ahead</b>
+          <p> Let's see how the stock read-ahead logic works. 
+            The kernel performs this job by setting up two areas called 
+            "windows", each of which is related to a certain area inside 
+            the file. One is called the current window, the other is called read-ahead 
+            window. Whenever the kernel recognizes a sequential read access inside the 
+            current window, it will submit I/O request for pages that belong to read-ahead window. However, anytime the kernel detects that it is no longer doing sequential reads, the 
+            read-ahead will be cancelled. This is done to prevent too much bloated 
+            caching. 
+          <p> Adaptive read-ahead (ARA) is the new logic added to the 
+            Linux kernel. One major goal of ARA is to provide support for aggressive 
+            read-ahead. Besides sequential reads, it can also detect some forms of 
+            semi-sequential scanning, such as: 
+          <p>
+
+          <ul>
+            <li> Parallel/interleaved sequential scans on 
+              one file descriptor 
+              
+            <li> Sequential reads across file open/close 
+              lifetime 
+              
+            <li> Mixed sequential/random accesses 
+              
+            <li> Sparse/skimming sequential reads 
+        </ul>
+            <p> To use ARA, you must download the appropriate patches 
+              from: 
+          <p>
+
+
+          <pre>
+http://www.vanheusden.com/ara
+            </pre>
+and do manual patching [1]. Another alternative is to 
+    use the -mm patchset [2]. Use the matching kernel source version to avoid 
+    problems.
+<p> After taking a quick look on read-ahead basic, three 
+  questions arise: 
+<P> 1. How far should we read-ahead? If it is too far, the reader will need less than we have 
+  pre-fetched, and we will be wasting memory and bandwidth. If it's too 
+  little, we experience more latency and, in case of concurrent readers, more 
+  seeks. 
+<p> 2. When do we start read-ahead? Logically, it should 
+  start when recognized patterns are detected, such as sequential 
+  forward/backward reads. Thus, it is up the logic itself to interpret what 
+  kind of disk access the program currently does. Since there are many types, 
+  the logic should just try to catch certain common patterns.  
+<p> 3. When do we stop the read-ahead? If we stop too 
+  soon, the kernel will lose the chance to speed up I/O. If we stop too late, 
+  it will waste precious time seeking and reading on disk (which is really a 
+  disadvantage, since again disk access is so slow compared to memory 
+  access). 
+<p> There are two ways to start read-ahead. First, it is 
+  initiated by the kernel itself when the built-in heuristic says this disk 
+  read will be done sequentially. Second, the user instructs the kernel to do 
+  read-ahead, usually via certain system calls, such as <b>posix_fadvise()</b> on Linux kernel 
+  version 2.6.x. 
+<p> Most often, read-ahead is triggered through the first 
+  method. This is normal because most applications leave the I/O management 
+  completely to the kernel. However, certain applications do interfere in 
+  I/O. An example is a database application, where the kernel is forced to 
+  predict what the user is trying to do, almost without explicit clues. 
+<p> Fortunately, there are implicit clues. Generally, 
+  read-ahead logic will be started on two conditions: the file is freshly 
+  opened and read from first offset, and the first page accessed is the next 
+  page of the previously accessed page. Generally, these rules assume forward 
+  reading. ARA improves this logic by doing backward pre-fetching if the 
+  reader also does backward reading. 
+<p> How many blocks we will read-ahead? This is trivial 
+  work. Conventional read-ahead works somewhat slowly. It normally starts 
+  with 8 pages (32 KB), then doubles until it reaches maximum 32 blocks (128 
+  KB). Whenever the logic detects cache miss, but it believes that the page 
+  has been recently cached, the read-ahead size is subtracted by 2 blocks. 
+  Four blocks (16 KB) is, however, the minimum number of pages in a 
+  read-ahead window. 
+<p> ARA improves this by starting at a larger number (128 
+  KB). For special cases, when a file is freshly opened and read from offset 
+  0, it tries more aggressively and quickly reaches 1MB data to be 
+  read-ahead. 
+<p> If you want to see the current maximum disk read-ahead, 
+  use this command: 
+<p>
+
+<pre>
+# blockdev --getra &lt;device&gt;
+</pre>
+Or manually set it by:
+<p>
+
+<pre>
+# blockdev --setra &lt;sectors&gt; &lt;device&gt;
+</pre>
+Fetching more blocks brings two advantages. First, 
+    speculatively, the kernel might anticipate some patterns of sparse reading. 
+    Second, assuming the file is not terribly fragmented, data can be read in 
+    one head seek. This is more efficient than doing move-read-move-read many 
+    times due to small requests.
+<p> As you might guess, the disadvantage is that RAM is 
+  filled up faster as pages cache and the number of readers increases. 
+  However, the effect is minimal if you have just one concurrent reader. 
+<p> To alleviate this, ARA adds thrashing protection logic -- something that doesn't exist on 
+  stock read-ahead. Simply speaking, the protection is done by careful 
+  computation based on the global available memory and the current reading 
+  speed. It can also detect whether the current stream has suffered from a 
+  read-ahead thrash, and properly handle it. A file page is said to be 
+  "read-ahead thrashed" if it is freshly paged-in by read-ahead, 
+  but falls to the tail of the inactive list (semi-FIFO list for cold cache 
+  pages), and is abandoned before being read. For a task that slowly reads a 
+  file, this is a loss because the block has to be paged-in again. ARA solves 
+  this problem by not reading ahead pages more than the threshing threshold, 
+  and moving pages back to the list head when danger of thrashing is 
+  detected. 
+<p> Finally, we come to the question of when to stop the 
+  read-ahead. Again, there are two conditions: if the reading becomes 
+  non-sequential and if the pages currently being read are already in page 
+  cache. In conventional read-ahead, 256 pages found in cache is the 
+  system-defined maximum value at which to stop read-ahead. 
+<p> Note that read-ahead logic always considers the level 
+  of disk congestion. Under heavy congestion, only necessary read-ahead will 
+  be performed. 
+<p> To control how ARA behaves, two tunable kernel 
+  parameters have been added: 
+<p>
+
+<li> /proc/sys/vm/readahead_ratio -- This 
+  knob limits read-ahead size to a percentage of the thrashing threshold. Set 
+  it to a smaller value if you don't have enough memory for all the 
+  concurrent readers or if the I/O loads fluctuate a lot. But if 
+  there's plenty of memory (&gt;2 MB per reader), a bigger value may 
+  help performance.
+  <p> Readahead_ratio also selects the read-ahead logic, as follows: 
+  <p>
+
+  <pre>
+VALUE	 CODE PATH 
+-------------------------------------------- 
+0	disable read-ahead totally 
+1	select the stock read-ahead logic 
+2-inf	select the adaptive read-ahead logic 
+--------------------------------------------- 
+    </pre>
+  The default value is 50. Reasonable values would be between 50 and 100.
+  <p>
+
+
+<li> /proc/sys/vm/readahead_hit_rate -- This is the maximum value allowed for number of read-ahead pages divided by 
+  the number of accessed pages. This is useful only when readahead_ratio &gt;=
+  1, that is, if ARA logic is selected. If the previous read-ahead request 
+  has a bad hit rate, the kernel will be reluctant to do the next read-ahead.
+  <p> Larger values help catch more sparse access patterns. 
+    Be aware that read-ahead of the sparse patterns sacrifices memory for 
+    speed. The default value is 1. It is recommended to keep the value below 
+    16. 
+  <p>
+
+    <b>Benchmarking </b>
+  <p> So far, we discussed the theory behind read-ahead 
+    logic, now it is the time to test how it performs in the real world. We 
+    will perform these tests on machines with the following specifications: 
+  <p> For the dd and Iozone test: 
+  <p>
+
+  <ul>
+    <li> CPU AMD Athlon XP 1800+ Palomino Core, L1 
+      cache 128 K, L2 cache 256 K 
+      
+    <li> Motherboard MSI KT4V with chipset VIA KT400 
+      
+    <li> Memory 256 MB DDR PC2700 
+      
+    <li> Maxtor Diamond Max Plus 8 Parallel ATA 40 
+      GB, 2-MB buffer cache, 7200 RPM; formatted as ext2 and hosting benchmark 
+      files 
+      
+    <li> Maxtor Diamond Max Plus 9 Parallel ATA 80 
+      GB, 2-MB buffer cache, 7200 RPM; formatted as ext3 and running the OS 
+      together with test program
+</ul>
+    <p> For the NFS (Network File System) test: 
+  <p>
+
+  <ul>
+    <li> Dell PowerEdge 1750 
+      
+    <li> CPU 3.2-GHz Intel Xeon DP processor with 1-MB L3 cache 
+      
+    <li> ServerWorks GC-LE chipset 533-MHz FSB 
+      
+    <li> 2-GB PC2100 ECC SDRAM 
+      
+    <li> Dell PERC 4/Di RAID controller with 128-MB cache memory 
+      
+    <li> 3 x 73-GB Seagate Cheetah 10-K RPM Ultra320 hard disks, configured as hardware RAID 
+      5; disks formatted as reiserfs and set as LVM2 volume 
+</ul>
+    <p> All tests were done using Linux kernel 2.6.17 with -mm6 [2] patch. 
+  <p> Before each of the tests, we did the following pre-conditioning: 
+  <p>
+
+  <ul>
+    <li> System is booted in run level 1. 
+      
+    <li> The deadline scheduler is set as the 
+      default I/O scheduler for all disks. 
+      
+    <li> Swap devices are completely unmounted. 
+      
+    <li> /proc/sys/vm/readahead_hit_rate is set to 1. 
+      
+    <li> Maximum read ahead size is 1MB (according to the output of /proc/sys/&lt;block-device&gt;/queue/read_ahead_kb).
+</ul>
+  The initial test is reading a big file. 
+  "dd" is used as the reader program, and the target file is 2 
+  GB. Note that the file size exceeds the RAM size, thus real disk transfer 
+  speed is also stressed here.
+  <p> The tests are done by issuing ($ is the shell prompt): 
+  <p>
+
+  <pre>
+$ dd if=&lt;test-file&gt; of=/dev/null bs=4k 
+    </pre>
+  and:
+  <p>
+
+<pre>
+$ dd if=&lt;test-file&gt; of=/dev/null bs=2M
+</pre>
+  Reading is done four times, and we grab the user, 
+  system, and the real time of the completion. The results are shown on Table 
+  1. These results show that ARA brings no improvement in overall completion 
+  time. However, it's a good sign that ARA doesn't add any 
+  significant overhead. Also note that ARA profits from a larger block size.
+  <p> More detailed data is available by running Iozone. 
+    Iozone, which is found at: 
+<p>
+
+<pre>
+http://www.iozone.org
+</pre>
+  is a file system benchmark tool that generates and 
+  measures various file operations. We used Iozone version 3.263 compiled 
+  with the <b>make linux</b> command.
+    <p> Since we are focusing on reading operations, several types of tests are selected: 
+  <p>
+
+  <ul>
+    <li> Read -- Simply reading a file 
+      sequentially. 
+      
+    <li> Re-read -- Reading a file that was 
+      recently read. Since the operating system usually caches data from last 
+      read operations, this test also shows how well the caching system works. 
+      
+    <li> Backward read -- Reading a file 
+      backwards. Although perhaps unusual, this is a nice way to see whether 
+      ARA's backward-reading logic really works. 
+      
+    <li> Stride read -- Reading a file using 
+      read-seek-read-seek pattern. This is also known as sparse reading. 
+      
+    <li> Random read -- Reading a file in random locations. It could go forward or backward. 
+      
+    <li> Fread -- File is read using <b>fread()</b> function. This is a 
+      kind of blocking and buffered read. 
+      
+    <li> Re-Fread -- Same as re-read test, 
+      only this time we used <b>fread()</b>. 
+</ul>
+  The above tests are selected to represent real-world 
+  reading processes done by major applications.
+  <p> Iozone is invoked using the following options: 
+  <p>
+
+  <pre>
+./iozone -S 256 -L 64 -E -Ra -i 0 -i 1 -i 2 -i 3 -i 5 -i 7 -i 10 -i 12
+-g 512m -U /mnt/disk-linux/ -f /mnt/disk-linux/test.img \
+  -b ./iozone-result-adaptive.xls 
+    </pre>
+
+    <b>-i</b> option selects the above mentioned tests plus the write test 
+  because it is needed to create the test file. <b>-g</b> defines the maximum size of the test file, which is 512 MB. <b>-U</b> tells Iozone to unmount 
+  the mount point (/mnt/disk-linux) each time a single run of a certain test 
+  is done. By doing unmount, cache is immediately flushed.
+  <p> The <b>-S</b> option tells Iozone how much processor cache we have. Here, we 
+    assume that this is the size of L2 cache that is 256 KB. <b>-L</b> tells Iozone about the 
+    processor cache line size. We set both parameters manually since Iozone 
+    can't automatically probe it. Please note that all the Iozone tests 
+    are done in single-stream mode. 
+  <p> Since Iozone produces bulks of numbers, we have 
+    narrowed the explanation into the following scope: 
+  <p> 1.  Comparison is done head to head between ARA 
+    and conventional read-ahead in the following tests: <br>
+
+  <ul>
+    a. Reader test. <br>
+    b. Re-reader test. <br>
+    c. Backward reader. <br>
+    d. Stride reader. <br>
+    e. Random reader. <br>
+    f. Fread reader.
+  </ul>
+    <p> 2.  Observation is focused on the following file size: <br>
+
+  <ul>
+    a. Equal to L2 cache size. <br>
+    b. Equal to disk cache size. <br>
+    c. Half of RAM size. <br>
+    d. Equal to RAM size. <br>
+    e. Twice RAM size.
+  </ul>
+    <p> The test results shown in Table 2 show that ARA makes 
+      an improvement over stock logic in 43% of sequential reading cases. The 
+      increase is not big for file sizes much greater than on-disk cache (128, 
+      256, 512 MB); in fact it is rather detrimental. For those files, using 
+      512-KB record size (half of maximum read-ahead size) is the best case. But 
+      overall, we would likely see gain if the record size is between L2 cache 
+      size and on-disk cache size. 
+  <p> Theoretically, in Table 3 we should see higher numbers 
+    in re-reader tests (compared to Table 2) for every file size. However, due 
+    to unmounting, memory cache is also flushed, so we get more or less the 
+    same result as with the reader tests. Here, ARA works better in 36% of 
+    cases. We still hardly see improvement for big files (&gt;=128 MB). 
+    Combined with Table 2, the chance to get acceleration for sequential read 
+    is about 40%. 
+  <p> It's hard to define "random read"; therefore what we see in Table 4 is the way 
+    Iozone does random read -- not necessarily "random" in its true nature. In 36% of cases, ARA 
+    works better, and in big files (&gt;=128 MB) ARA 
+    gave a 600-800 KB/sec boost. Here, we see the best results if the record 
+    size is equal with L1 data cache size. 
+  <p> Table 5 shows a promising result for ARA. We see 
+    acceleration in 68% of cases, and mostly we have the best results if the 
+    record size is either equal to L1 or L2 cache. The boost is around 
+    5000-9000 KB/sec for large file. For both random and stride read, 
+    increasing the readahead_hit_rate might help. Thus, we suggest tweaking 
+    this parameter to get even better performance. 
+  <p> Backward read (see Table 6) is an unusual case and, for 
+    stock logic, we can safely say that read-ahead is disabled. Only ARA still 
+    works here, so what we see is actually ARA versus no read-ahead. ARA makes 
+    reading faster in 48% of cases. We get the best results when using a 64-KB 
+    record size (equal with L1 data-cache size). The gain drops below 1000 
+    KB/sec once we use a record size greater or equal to 1 MB (maximum 
+    read-ahead size). 
+  <p> Fread is the worst case for ARA (see Table 7). ARA 
+    works better in 34% of cases, the lowest compared to the other Iozone test 
+    items. However, we still see gain in file sizes greater or equal to 128 MB, 
+    but only if we use big record sizes (8 MB and 16 MB). This is true since in 
+    blocking operation, it is more efficient to submit requests as big as we 
+    can per read operation. 
+  <p> So far, we can make the following conclusions: 
+  <p> 1. ARA is good for stride reading. Optimal results are 
+    achieved if the record size is equal to L1/L2 cache size. 
+  <p> 2. If your application does backward reads, you should 
+    consider using ARA to improve the performance since stock read-ahead simply 
+    don't do backward read-ahead. 
+  <p> 3. Random read is a guessing game for read-ahead (ARA 
+    and stock). Thus, either simply turn off read-ahead or play with 
+    readahead_hit_rate and see if you get any luck there. Experimentation shows 
+    that reading chunks smaller than the maximum read-ahead size is the best 
+    way to boost performance with ARA. 
+  <p> 4. Forward sequential read is improved with ARA if you 
+    use large record sizes (somewhere between 256 KB and 2 MB). However, even 
+    with large records, ARA is fairly equal with stock logic in performance. 
+  <p> 5. It is better to not use ARA if your application 
+    uses <b>fread()</b>. 
+  <p> Next, we did an NFS test to measure concurrent read 
+    performance. NFS was selected to represent one of the oldest remote file 
+    systems still widely used. NFS server runs with eight working threads. 
+  <p> For this NFS test, untar the Linux kernel 2.6.16 and 
+    2.6.17 source packages and do a recursive "diff" between the 
+    two. Here, the NFS volume is mounted locally, thus no network traffic is 
+    involved. The NFS volume is mounted with the following command for the 
+    first test: 
+  <P>
+
+  <pre>
+mount -o tcp,rsize=32768 localhost:$ROOT $NFSROOT 
+    </pre>
+  And this for the second test:
+  <p>
+
+<pre>
+mount -o tcp,rsize=524288 localhost:$ROOT $NFSROOT 
+</pre>
+  Note that "rsize" is the number of bytes 
+  NFS uses when reading files from an NFS server (in bytes). Looking at the 
+  combined NFS test results in Table 8, we see that increasing 
+  "rsize" makes ARA works faster. This is similar to the Iozone 
+  tests, where increasing the record size brings improvement.
+  <p> However, ARA does not work better than stock logic in 
+    NFS tests. Further investigation shows the suspect. The NFS daemons' 
+    read requests can be out of order, concurrent, and with no read-ahead state 
+    information (internal variables that record the progress of read-ahead 
+    work). They are handled by the context-based read-ahead method, which does 
+    the job in the following steps: 
+  <p> 1. Scan in page cache. 
+  <P> 2. Make read-ahead decisions. 
+  <p> 3. Allocate new pages. 
+  <p> 4. Insert new pages to page cache. 
+  <p> A single read-ahead chunk in the client side will be 
+    disassembled and serviced by many concurrent NFS daemons in the server 
+    side. It is highly possible for two or more of these parallel nfsd 
+    instances to be in steps 1, 2, and 3 at the same time. Without knowing that 
+    others are working on the same file region, they will issue overlapping 
+    read-ahead requests, which lead to many conflicts at step 4. 
+  <p> Finally, we also asked some people from the PostgreSQL 
+    community to test ARA. A few people responded, and you can see the complete 
+    results at the PostgreSQL mailing list archives [3]. (Click on the 
+    "Follow-Ups" links for the details.) 
+  <p> Table 9 is a copy of the relevant test results using 
+    odbc-bench taken from the PostgreSQL mailing list archives [9]. The 
+    odbc-bench results show that ARA increases transactions per second from 
+    around 6 to 30. This is a slight improvement for mixed-read operations 
+    since database can do any type of read at any time. Setting 
+    readahead_hit_rate to 1 works better here, thus giving us an idea that 
+    read-ahead should be done as gently as possible. We didn't get any 
+    information about swapping condition; thus, it's possible that 
+    swapping could be the detrimental factor in the odbc-bench test. 
+  <p>
+
+    <b>How to Achieve the Best Results </b>
+  <p> The kernel only does a good job of reading ahead for 
+    sequential accesses, but since that's the common case, most 
+    applications are well served by the kernel-level read-ahead. However, in 
+    some cases it would be better to bypass a bunch of tricky logic trying to 
+    determine what the application is doing. There are ways to inform the 
+    kernel that you either are or are not doing a sequential read, or even to 
+    explicitly read-ahead/drop pages. 
+  <p> Fengguang Wu, the ARA author, considers the best method 
+    would be to leave obvious patterns to the kernel (i.e., all kinds of 
+    [semi-]sequential reads) and to do <b>fadvise()</b> for non-obvious patterns on critical points (e.g., the 
+    database index scans). 
+  <p> To implement the second item would involve using <b>posix_fadvise(POSIX_FADV_RANDOM)</b> to disable kernel read-ahead and then using <b>posix_fadvise(POSIX_FADV_WILLNEED)</b> to launch application-level 
+    read-ahead. Here are some code snippet examples: 
+  <p> This call will disable read-ahead totally for a file descriptor: 
+  <p>
+
+  <pre>
+posix_fadvise(fd, any, any, POSIX_FADV_RANDOM); 
+    </pre>
+  Or, to do so for a whole file system:
+  <p>
+
+<pre>
+# blockdev --setra 0 /dev/hda1 
+</pre>
+  This one will re-enable read-ahead:
+  <p>
+
+<pre>
+posix_fadvise(fd, any, any, POSIX_FADV_NORMAL); 
+</pre>
+  This one will enable read-ahead and set the maximum 
+  read-ahead window to 2 times the default size:
+  <p>
+
+<pre>
+posix_fadvise(fd, any, any, POSIX_FADV_SEQUENTIAL); 
+</pre>
+  The ARA works fine with user level read-ahead via the <b>readahead()</b> or <b>posix_fadvise()</b> syscall. That is, if a 
+  program does the necessary <b>readahead()</b> calls to cover all the file pages requested by the following <b>read()</b> calls, it avoids triggering unnecessary kernel read-aheads.
+  <p> If you see that you still have plenty of free RAM, try 
+    to increase both readahead_hit_rate and readahead_ratio. This will consume 
+    more memory but might increase performance as well. 
+  <p>
+
+    <b>Conclusions</b>
+  <p> Read-ahead is one nice feature implemented in Linux to 
+    help reading performance. With ARA, it works especially well for sequential 
+    forward/backward and stride reading. Applications such as databases, file 
+    servers, and Web servers could also benefit from it. 
+  <p> As always, manual tuning is needed if you think the 
+    reading pattern is somewhat unpredictable. It is suggested that you 
+    temporarily disable any read-ahead logic if you believe reading is too 
+    random or that only small portions of files are ever read, thus you can 
+    save precious disk seek time. 
+  <p> The authors would like to thank Chakravarthi Pasumarthy 
+    for reviewing the manuscript. 
+  <p>
+
+
+    <b>Resources </b>
+  <p> 1. Latest adaptive read-ahead patches -- <b>http://www.vanheusden.com/ara</b> 
+  <p> 2. Andrew Morton's -mm patchset -- <b>http://kernel.org/pub/linux/kernel/people/akpm/</b>
+  <p> 3. Announcement from Fengguang Wu about adaptive read-ahead on pgsql-performance mailing list. 
+    The "Follow-Ups" link contains several test results done by the 
+    community -- <b>http://archives.postgresql.org/pgsql-performance/2006-04/msg00635.php</b>
+  <p> 4. Scripts and source code to test several aspects of file systems -- <b>http://www.zip.com.au/~akpm/linux/patches/stuff/ext3-tools.tar.gz</b>
+  <p> 5. Articles on LinuxWeeklyNews that describe how adaptive read-ahead works -- <b>http://lwn.net/Articles/155510/</b>; <b>http://lwn.net/Articles/176279/</b>
+  <p> 6. A Linux Symposium 2004 paper explaining Linux 2.6 
+    performance improvement through read-ahead optimization -- <b>http://www.linuxsymposium.org/proceedings/reprints/Reprint-Pai-OLS2004.pdf</b>
+  <p> 7. Iozone Web site -- <b>http://www.iozone.org</b>
+  <p> 8. Bonnie++, yet another filesystem benchmark suite -- <b>http://bonnie.sourceforge.net/</b>
+  <p> 9. Odbc test results from PostgreSQL mailing list archives -- <b>http://archives.postgresql.org/pgsql-performance/2006-04/msg00613.php</b>
+  <p>
+
+    <i>Mulyadi Santosa is a freelance writer and freelance IT 
+      consultant and currently resides in Indonesia. His interests include 
+      clustering, process management, and scheduling. He also runs a startup 
+      company that teaches Linux courses for audiences ranging from newbies to 
+      experts. He can be reached at: <b>mulyadi.santosa@gmail.com</b>.</i> 
+  <p>
+
+    <i>Fengguang Wu is a Ph.D. student at University of 
+      Science and Technology China. One of his research topics is I/O 
+      optimization. Contact Wu at: <b>wfg@mail.ustc.edu.cn</b>.</i> 
+  <p>
+
+</table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

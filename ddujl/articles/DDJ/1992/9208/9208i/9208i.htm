@@ -1,0 +1,439 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>AUG92: PARALLEL C EXTENSIONS</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>PARALLEL C EXTENSIONS<a name="01cb_0003"></h1><P>
+<h2><a name="01cb_0001"><a name="01cb_0000">Parallelized code retains its serial structure</h2><P>
+<h3>Barr E. Bauer</h3><P>
+<p><i><a name="01cb_0002"><a name="01cb_0000">Barr uses high-performance computers to design pharmaceuticals for Schering-Plough Research Institute.  He can be reached at 60 Orange Street B1-3-85, Bloomfield, NJ 07003.</i></p><hr><P>
+Silicon Graphics has implemented parallel extensions to the C compiler for the 4D Power Series computers that enable both SIMD (loop) and MIMD (independent block) parallelization.  Code containing these extensions can be ported into serial C environments, recompiled, and executed without change.  In direct contrast to older methods of parallelization that generally involved heavy use of platform-specific system calls combined with code restructuring, parallelized code using IRIS Power C retains its serial structure. In this article, I will introduce you to the basics of parallelizing C code with IRIS Power C, discuss data dependence as an important limitation, and end with two program examples to convince you that the phrase &quot;portable parallel C&quot; is not an oxymoron.<P>
+<h3><a name="01cb_0004">Parallelization<a name="01cb_0004"></h3><P>
+I'll start this discussion by describing in general terms how SGI does parallelism on a shared-memory multiprocessor workstation.  A parallelized program is a serial program that contains regions of parallel execution.  On entering a parallel region, the serial program is transformed from a single process to multiple processes, each running one of the parallel-execution threads.  These regions and their parallel-execution behavior are determined by #pragma directives included in the code and interpreted by the compiler with the -mp option; otherwise they are ignored.<P>
+At the system level, changes have been made to UNIX to support process-based parallelism on one hand and multiple processors on the other, while maintaining system generality.  A parallel program's processes (threads) are allowed access to shared memory.  They maintain data structures that transparently coordinate interprocess data access and process synchronization.  Otherwise, they behave like other processes in the scheduler's queue. Parallel execution itself is done in sched, the UNIX preemptive-multitasking scheduler, which has been modified to distribute processes over multiple processors rather than the usual one. A parallelized program's threads timeshare with other tasks run by the system, either parallel or serial, resulting in a flexible execution environment.  On an eight-processor system, this environment can execute eight serial programs in the time of one, a single parallelized program up to eight times faster, or a mix of serial and parallel programs significantly faster.<P>
+<h3><a name="01cb_0005">Parallel Models<a name="01cb_0005"></h3><P>
+SGI implements the SIMD and MIMD parallel models.  SIMD is the easiest to understand and implement.  In a for loop that processes members of an array, all threads execute the same code on different array elements.  The individual iterations of the loop are divided between the available threads and executed on them.  For instance, if four threads are available, a 1000-iteration loop is parallelized by executing iterations 0-249 by thread 0, 250-499 by thread 1, and so forth.  If each iteration has the same execution time, a four-thread system can be close to four times faster than serial execution.  IRIS Power C currently limits loop parallelization to the for-loop construct because it is the only loop construct within C which lets you define an index, a maximum number of iterations, and an increment.<P>
+MIMD is implemented as independent-block parallelism.  A block of code within a function can be executed on its own thread, independent of other blocks.  In contrast to loop parallelization, the code in each block may operate differently on global and local (private) data.  Program speedups are less easily determined, being highly dependent on the nature of the code.  Implementation of MIMD parallelization is limited by the lack of a suitable programming landmark, such as a loop, to attract attention.<P>
+The two models can be mixed and matched in a program either in separate parallel regions or even within a single parallel region.  Two threads might execute independent blocks of code using the MIMD model, while six threads execute a for loop using the SIMD model.  The limiting factor seems to be keeping the program structure straight.  To avoid confusion, I use one model per parallel region.<P>
+<h3><a name="01cb_0006">Parallel Data Types and Data Dependence<a name="01cb_0006"></h3><P>
+Variables within code executed in parallel are either shared between threads or local to a specific thread.  Shared means just that: Each execution thread points to a single location in shared memory associated with that variable.  The values within the variable persist past the parallel region of the program.  Unless access to the code containing the shared variable is restricted, all threads can read or write to the variable.  Shared array variables are common in loop parallelism.<P>
+Local variables within the thread point only to a private copy of the variable.  The local variable exists in all threads created within the parallel region.  The values within a local variable are not defined beyond the parallel region.  Local variables are used exclusively within the parallel region and can be of any data type.  Loop indexes and temporary variables are often local.<P>
+For parallelism to work correctly, the code in each thread must not modify the values of variables in use by other threads.  If this happens, the variable becomes dependent on more than one thread, its value becomes unpredictable, and the results possibly incorrect.  An example in SIMD parallelization is when each iteration processes a unique array element, such that the iteration's execution order does not affect the results: Iteration i processes shared variable a[i], iteration i+1 does a[i+1], and so forth.<P>
+Two specific situations lead to dependencies: modification of shared scalar variables during parallel execution, and recurrence.  (There are other situations, but these two are the most troublesome.)  The shared scalar-variable sum appearing in the sum reduction (see <a href="#01cb_0007"> Example 1</A>) might have thread 0 reading one value of sum, while thread 1 writes a new value, and the like.  The value of sum is not systematically determined, leading to wrong results.  Controlling thread access to the statement containing the dependence will prevent this type of dependence, which can occur in both loop and block parallel constructs.<P>
+<h4><a name="01cb_0007">Example 1: Shared scalar-variable sum.</h4><P>
+<pre>
+  for (sum=i=0; i&lt;max; i++)
+      sum += a[i];</pre><P>
+<P>
+Recurrence happens when one iteration of a loop depends on a previous iteration; see <a href="#01cb_0008">Example 2</A>.  There is no good way to correct it besides rewriting the code or running the loop in serial.  Generally, the i - 1 (or i + 1) indexing identifies a recurrence.<P>
+<h4><a name="01cb_0008">Example 2: Typical case of recurrence, where one iteration of a loop depends on the previous iteration.</h4><P>
+<pre>
+  for (i=1; i&lt;max; i++)
+      a[i] = b[i] * a[i-1];</pre><P>
+<P>
+To test for dependence in loop parallelization, index the for loop backwards during serial execution.  If the result is correct, there are probably no dependencies.<P>
+<h3><a name="01cb_0009">Fundamentals<a name="01cb_0009"></h3><P>
+You introduce parallelism into a program in two steps.  First, define the region in the source code in which parallelism will be active and declare the parallel behavior of all variables for the region.  Second, select for loops or blocks located within the parallel region for parallelization.  The first step establishes the environment and the second speeds up execution.  Multiple for loops, independent blocks, or combinations can be established within a single parallel region, and a program can have as many parallel regions as necessary.<P>
+The most time-consuming part of the program is the best place to introduce the parallel region.  Speedup of this block will generally result in a dramatic improvement in overall program performance, even if it is a relatively small amount of code.  Parallelization of less-sensitive blocks may yield little if any performance return.  Profiling serial execution locates the desired &quot;hot spots.&quot;<P>
+The format of a typical parallel region is shown in <a href="#01cb_000a">Example 3</A>. Place the parallel-region code into a code block preceded by #pragma parallel and its modifiers.  The main directive and its modifiers can be spread out or placed on one line.  I prefer the spread-out version because it handles long variable lists better.<P>
+<h4><a name="01cb_000a">Example 3: Format of a typical parallel region.</h4><P>
+<pre>
+  Code Block
+
+  becomes
+
+  #pragma parallel
+  #pragma shared (arrayvar1, arrayvar2..., grandtotal)
+  #pragma local (index1, index2, subtotal1,...)
+  #pragma byvalue (shared_constant1,...)
+  {
+     Code Block
+  }
+  or, the equivalent
+
+  #pragma parallel shared (list) local (list) byvalue (list)
+  {
+     Code Block
+  }</pre><P>
+<P>
+Declare the behavior of variables within the parallel region with the modifiers to #pragma parallel.  The lists consist of the variables of any given type, separated by commas.  The byvalue modifier is a special shared type used for scalars that maintain constant value within the parallel region, such as a for loop bounds limit, yielding a net savings on overhead.  All values not declared are assumed to be shared, but fully declaring all variables helps clarify intent.<P>
+The parallel region treats code outside the loop or block parallel constructs as local to each thread.  Local code is duplicated in and executed by all threads.  Local code is useful, but can result in incorrect execution.  For instance, the for loop in <a href="#01cb_000b"> Example 4</A> is part of the local code resulting in sum = 50000 four times using four threads, which may not be what you intended.  Also, the value of i outside the parallel region is not defined.<P>
+<h4><a name="01cb_000b">Example 4: Local code can result in unexpected execution.</h4><P>
+<pre>
+  /* strictly local code */
+  #pragma parallel
+  #pragma local (i, j)
+  {
+      for (i=sum=0; i&lt;1000; i++)
+           sum += i;
+      printf (&quot;sum = %d\n&quot;, sum);
+  }</pre><P>
+<P>
+<h3><a name="01cb_000c">The pfor Block<a name="01cb_000c"></h3><P>
+Within the parallel region, one or more for loops can be set for loop parallelization.  Only those for loops in which the exact number of iterations is known at compile time can be parallelized.  To take advantage of loop parallelization, while and do while loops must be rewritten into for loops, if possible.<P>
+The general format for parallelizing a simple for loop is shown in <a href="#01cb_000d"> Example 5</A>.  The #pragma pfor directive precedes the unchanged for loop placed within a code block.  The pfor directive takes the mandatory modifier iterate, which identifies the index variable, the starting value of the index, the maximum number of iterations, and the value of the increment.  Note that iterate syntax looks like, but is not the same as the for statement syntax.<P>
+<h4><a name="01cb_000d">Example 5: Parallelizing a simple for loop.</h4><P>
+<pre>
+  for (i=0; i&lt;max; i++)
+           b[i] = const*a [i];
+
+  becomes
+
+  #pragma parallel shared (a,b) local (i) byvalue (max, const)
+  {
+  #pragma pfor iterate (i=0; max; 1)
+      for (i=0; i&lt;max; i++)
+          b[i] = const*a [i];
+  }</pre><P>
+<P>
+The above transformations can be ported from the Power Series environment to other serial environments.  In a serial environment, the compiler ignores the two pragmas (typically with warning messages), as well as the additional code block created by the added braces, and compiles the original for loop.  The resulting code executes as expected without removal of the parallelism directives.  The compiler on a Power Series machine, with multiprocessing (-mp) active, transformed the code for parallel execution.<P>
+<h3><a name="01cb_000e">The Independent Block<a name="01cb_000e"></h3><P>
+Block parallelization allows for parallelization of C constructs like linked-list manipulation and other operations not amenable to loop parallelization.  The principal weakness is a lack of an attention-drawing landmark, such as a for loop, to provide hints as to the parallelization approach.<P>
+Independent blocks are created by placing the selected block code within a code block preceded by #pragma independent.  Each independent block created executes on a single thread. Any number of blocks can be created in a single parallel region.  If the available threads outnumber the blocks, each executes on its own thread and the remaining threads move on to the next parallel construct in the parallel region.  If blocks outnumber threads, then the independent blocks execute as threads become available.  If a pfor block follows a group of independent blocks in a single parallel region, the execution behavior can potentially become complex.<P>
+In <a href="#01cb_000f">Example 6</A>, code blocks 1 and 2 will execute simultaneously, while any additional threads, such as would be found on a four-processor machine, will idle.<P>
+<h4><a name="01cb_000f">Example 6: Code blocks 1 and 2 will execute simultaneously.  Any additional threads will idle.</h4><P>
+<pre>
+  code block 1
+  code block 2
+
+  becomes
+
+  #pragma parallel shared (list) local (list) byvalue (list)
+  {
+
+      #pragma independent
+      {
+          code block 1
+      }
+      #pragma independent
+      {
+          code block 2
+      }
+  }</pre><P>
+<P>
+Independent-block parallelization is also portable.  A serial compiler ignores the pragmas (again with warning messages) and the added code blocks created by the braces and processes the original two code blocks.  The serial execution behavior remains block 1, then block 2. Block order is important for maintaining portability: If, for instance, block 1 adds elements to a linked list, and block 2 removes elements off the same linked list, parallel execution may be correct regardless of the starting order.  However, serial behavior will be wrong if block 2 tries to remove elements from a linked list not yet filled with elements by block 1.<P>
+<h3><a name="01cb_0010">Critical Blocks<a name="01cb_0010"></h3><P>
+Shared scalar variables present a problem when used within a parallel region.  Any thread can write to the scalar in any order.  This behavior can be particularly chaotic for sum-reduction loops.  For instance, the parallelized loop in <a href="#01cb_0011">Example 7</A> will execute incorrectly.  One thread could be reading the value of sum while others are writing, making the value of sum unpredictable.<P>
+<h4><a name="01cb_0011">Example 7: Using a shared scalar variable within a parallel region.</h4><P>
+<pre>
+  sum = 0.0;
+  #pragma parallel shared (sum, a) local (i) byvalue (max)
+  {
+      #pragma pfor iterate (i=0; max; 1)
+          for (i=0; i &lt;max; i++)
+              sum += a[i];
+  }</pre><P>
+<P>
+Isolate data dependencies by placing the statement containing the dependence within a code block preceded by #pragma critical.  Only one thread at a time has access to the code within the critical block; threads that arrive at the critical block while it is occupied wait until it is free.  The code within the critical block is ultimately executed by all threads.<P>
+Portability for the critical block into the serial environment is maintained.  The serial compiler ignores both #pragma critical and the additional code blocking and sees only the simple for loop conducting a summation.  Critical blocks make it possible to parallelize code afflicted with dependencies.  This mechanism can also be applied to independent blocks, local code, and mixed constructs.<P>
+Applications such as a sum reduction containing a critical block may perform poorly if more than one thread waits during execution, as is often the case for simple code.  The problem and an effective cure are presented in <a href="#01cb_0016">Listings One</A> and <a href="#01cb_0018">Two</A> (page 124).<P>
+<h3><a name="01cb_0012">Examples<a name="01cb_0012"></h3><P>
+The first case is an expanded version of the sum-reduction example that demonstrates how to both manage a dependence and use local code to improve performance.  These are &quot;before&quot; (<a href="#01cb_0016">Listing One</A>) and &quot;after&quot; (<a href="#01cb_0018">Listing Two</A>) examples, both of which fill arrays that are then used in a sum reduction.  The kth loop takes the place of real code and lengthens the execution time of each thread enough to overcome parallelization overhead.  In <a href="#01cb_0016">Listing One</A>, the dependence is isolated within a critical block located within the deepest (jth) loop nest.  In <a href="#01cb_0018"> Listing Two</A>, the reduction was rewritten to determine a dependence-free subtotal for each thread, followed by a dependent grand summation in local code isolated within a critical block.  <a href="#01cb_0013">Table 1</A> shows the effect on performance of moving the critical block out of the innermost loop and into local code on a four-processor 4D/240.<P>
+<h4><a name="01cb_0013">Table 1: Sum-reduction execution results.</h4><P>
+<pre>
+  Case            Execution times      % CPU    Speedup  Sum
+                  user  sys  total  utilization
+  -------------------------------------------------------------------------
+
+  1. Example 1
+     (serial)     73.8  3.4     77      100       1.00   6039797.7653373638
+  2. Example 1
+     (parallel)  147.9  5.0     46      326       1.67   6039797.7643598625
+  3. Example 2
+     (serial)     74.0  3.2     77       99       1.00   6039797.7653373638
+  4. Example 2
+     (parallel)   77.7  3.4     27      295       2.85   6039797.7641029358</pre><P>
+<P>
+Each example was compiled without change into serial and parallel versions.  Both parallel versions exhibit speedups over the serial versions, with close but not identical results (read on, please).  Moving the critical block out of the pfor block results in a substantially faster parallel version of <a href="#01cb_0018">Listing Tw</A>.  The high CPU utilization relative to an actual speedup in the parallel version of <a href="#01cb_0016">Listing One</A>  reveals the time threads spent in contention for the critical block.  There is a small discrepancy in the computed sum between the parallel and serial versions.  This is a result of different summation sequences, which produce different round-off error accumulations. Round-off error is a problem for parallel reductions; precision-sensitive calculations cannot be done in parallel if identical results between parallel and serial calculations are required--a limitation to portability.<P>
+<a href="#01cb_001a">Listing Three</A>, page 124, shows a more elaborate use of independent blocks to process a linked list in the producer-consumer problem.  In this example, a single producer fills a pipe (FIFO queue) with &quot;products&quot; consumed by multiple &quot;consumers&quot; running in their own independent blocks.  The product is a data structure.  In this case, it holds an int, but it could hold more complicated data.  Critical blocks limit access to the root pointer of the linked-list to one producer/consumer(s) at a time.  The producer and consumers all begin at the start of the simulation.  The simulation ends when the consumers each receive a stop token sent with the product.  The producer loads three tokens into the queue before quitting.  Use of stop tokens instead of a null pointer to terminate the simulation allows the pipe to occasionally run dry when, for instance, the consumers are faster than the producer.<P>
+The execution results of <a href="#01cb_001a">Listing Three</A> are shown in <a href="#01cb_0014">Table 2</A>.  The execution threads were varied while retaining the four independent blocks.  Execution results of the serial version are identical to those of the single-thread version.  Note that even the two-thread case (one active consumer, the other two wait) achieves substantial speedups relative to the serial version, although performance substantially improves with more active consumers.<P>
+<h4><a name="01cb_0014">Table 2: Execution results for the producer-consumer problem.</h4><P>
+<pre>
+                                     Employed Threads
+                                  4     3      2       1
+  --------------------------------------------------------
+
+                   Consumer 1  3,333  3,863  5,913  10,000
+  Distribution*    Consumer 2  3,333  3,863  4,087
+                   Consumer 3  3,334  2,274
+  List depth*                  6,001  6,826  8,178  10,000
+  Time                (s)         26     31     47      94
+  CPU utilization     (%)        362    294    198      99
+  Speedup             (x)       3.62   3.03   2.00    1.00
+
+   *Units are &quot;products.&quot;</pre><P>
+<P>
+Independent block ordering is critical for successful portability.  The producer (the first independent block) completely fills the queue, then quits.  The first consumer (the second independent block) then consumes all the products in the queue, then quits.  The remaining two consumers are left only with their stop tokens.<P>
+<a href="#01cb_001a">Listing Three</A> is an example of heteroparallelism, the most complicated form of parallelism, portable into the serial environment.  Program structure remains clear, and parallel performance gains are substantial.  Nonobviousness will be the main barrier to implementing block parallelization.<P>
+All three examples compile in the CONVEX C200 and 386-PC environments.  All executed correctly as serial programs with the exception of <a href="#01cb_0016">Listings One</A> and <a href="#01cb_0018">Two</A> on the PC, which lacked 38 Mbytes of available memory.<P>
+<h3><a name="01cb_0015">Additional Reading<a name="01cb_0015"></h3><P>
+Bauer, B.E. Practical Parallel Programming.  San Diego, CA: Academic Press, 1992.<P>
+
+<PRE>
+
+
+_PARALLEL C EXTENSIONS_
+by Barr E. Bauer
+
+<a name="01cb_0016">
+<a name="01cb_0017"></pre><B>[LISTING ONE]</B><pre><a name="01cb_0017">
+
+/* Loop parallelism sum reduction critical block within loop nest
+ * B. E. Bauer 1992 -- compiled using the following on the IRIS:
+ *     parallel: cc -O2 -o example1p -mp example1.c
+ *     serial: cc -O2 -o example1 example1.c  */
+#include &lt;stdio.h&gt;
+#define MAX 1536
+double a[MAX][MAX], b[MAX][MAX];
+main()
+{
+    int i, j, k, k1;
+    double sum=0.0, temp;
+    /* shared arrays filled; values not important, just order */
+    for (i=0; i&lt;MAX; i++) {
+        for (j=0; j&lt;MAX; j++) {
+            a[i][j] = (double)i;
+            b[i][j] = (double)j;
+        }
+    }
+    k1 = 256; /* inner loop delay factor */
+    /* start of parallel region */
+    #pragma parallel shared(a,b,sum) local(i,j,k,temp) byvalue(k1)
+    {
+        /* pfor block */
+        #pragma pfor iterate(i=0; MAX; 1)
+            for (i=0; i&lt;MAX; i++) {
+                for (j=0; j&lt;MAX; j++) {
+                    temp = a[i][j]-b[i][j];
+                    for (k=0; k&lt;k1; k++) /* lengthen execution time */
+                        temp += 0.01;
+                    #pragma critical
+                    {
+                        sum += temp;  /* summation in inner loop */
+                    }
+                }
+            }
+    }
+    printf(&quot;\nDone! sum = %24.15f\n&quot;, sum);
+}
+
+
+
+
+
+<a name="01cb_0018">
+<a name="01cb_0019"></pre><B>[LISTING TWO]</B><pre><a name="01cb_0019">
+
+/* Loop parallelism sum reduction critical block moved into local code
+ * B. E. Bauer 1992 -- compiled using the following on the IRIS:
+ *     parallel: cc -O2 -o example2p -mp example2.c
+ *     serial: cc -O2 -o example2 example2.c  */
+
+#include &lt;stdio.h&gt;
+#define MAX 1536
+double a[MAX][MAX], b[MAX][MAX];
+main()
+{
+    int i, j, k, k1;
+    double sum=0.0, temp, st;   /* st = local code subtotal */
+    /* shared arrays filled; values not important, just order */
+    for (i=0; i&lt;MAX; i++) {
+        for (j=0; j&lt;MAX; j++) {
+            a[i][j] = (double)i;
+            b[i][j] = (double)j;
+        }
+    }
+    k1 = 256; /* inner loop delay factor */
+    /* start of parallel region */
+    #pragma parallel shared(a,b,sum) local(i,j,k,temp,st) byvalue(k1)
+    {
+        st = 0.0;   /* st initialized in each thread */
+        /* pfor block */
+        #pragma pfor iterate(i=0; MAX; 1)
+            for (i=0; i&lt;MAX; i++) {
+                for (j=0; j&lt;MAX; j++) {
+                    temp = a[i][j]-b[i][j];
+                    for (k=0; k&lt;k1; k++) /* lengthens execution time */
+                        temp += 0.01;
+                    st += temp;
+                }
+            }
+        /* local code grand summation */
+        #pragma critical
+        {
+            sum += st;
+        }
+    }
+    printf(&quot;\nDone! sum = %24.15f\n&quot;, sum);
+}
+
+
+
+
+<a name="01cb_001a">
+<a name="01cb_001b"></pre><B>[LISTING THREE]</B><pre><a name="01cb_001b">
+
+/* Block parallelism, producer-consumer problem
+ * B. E. Bauer 1992 -- Taken from &quot;Practical Parallel Programming&quot; pp 214-225
+ * (C) 1992 Academic Press, Inc. All Rights Reserved. Used with permission. */
+
+#include &lt;stdio.h&gt;
+#define MAXCONSUMERS 3
+#define MAXPRODUCTS 10000
+#define STOP_TOKEN -1
+#define NULL_ITEM (node_t *)NULL
+/* the product is defined here */
+struct node
+{
+    int productid;
+    struct node *next;
+};
+typedef struct node node_t;  /* the typedef is convenient */
+node_t *root = NULL_ITEM;  /* linked list root */
+int max_depth = 0;
+/* ----- create a new &quot;product&quot; -------------------------------- */
+node_t *make_product(node_t *item, int prodid)
+{
+    item = (node_t *)malloc(sizeof(node_t));
+    if (item != NULL_ITEM) {
+        item-&gt;productid = prodid;
+      item-&gt;next = NULL_ITEM;
+    }
+    else
+      printf(&quot;problems with production, boss...\n&quot;);
+      return (item);
+}
+/* ----- add a &quot;product&quot; to the end of the list ---------------- */
+node_t *ship_product(node_t *new)
+{
+    int cur_depth = 0;
+    node_t *list = root;
+
+    if (root == NULL_ITEM)
+        root = new;
+    else
+    {
+        while (list-&gt;next != NULL_ITEM)
+        {
+            list = list-&gt;next;
+            cur_depth++;
+        }
+        cur_depth++;
+        list-&gt;next = new;
+    }
+    if (cur_depth &gt; max_depth)
+        max_depth = cur_depth;
+}
+/* ----- pop the product off the beginning of the list --------- */
+node_t *receive_product()
+{
+    node_t *item = root;
+    if (root != NULL_ITEM)
+        root = root-&gt;next;
+    return(item);
+}
+/* ----- consume the product by freeing its memory ------------- */
+void consume_product(node_t *item)
+{
+    if (item != NULL_ITEM)
+        free (item);
+}
+/* ----- the producer ------------------------------------------ */
+void producer(int cnt)
+{
+    node_t *temp;
+    int i;
+    /* make &quot;products&quot; cnt times (limits simulation) */
+    for (i=0; i&lt;=cnt; i++)
+    {
+        if ((temp = make_product(temp,i)) == NULL_ITEM)
+            break;
+        #pragma critical
+        {
+            ship_product(temp);
+        }
+    }
+    /* load on stop tokens */
+    for (i=0; i&lt;MAXCONSUMERS; i++)
+    {
+        if ((temp = make_product(temp, STOP_TOKEN)) == NULL_ITEM)
+            break;
+        #pragma critical
+        {
+            ship_product(temp);
+        }
+    }
+    printf(&quot;producer calls it quits\n&quot;);
+}
+/* ----- the consumer (created 3 times) ------------------------ */
+long consumer(int myid)
+{
+    /* local variables */
+    int consuming = 1, j;
+    long consumed = 0;    /* count of &quot;products&quot; */
+    node_t *item;
+    double temp;
+    printf(&quot;consumer %d starts the shopping day\n&quot;, myid);
+    while (consuming)     /* loop until stop token seen */
+    {
+        for (j=0; j&lt;32000; j++)
+            temp *= (double)j;
+
+        #pragma critical
+        {
+            item = receive_product();
+        }
+        if (item != NULL_ITEM)
+        {
+            if (item-&gt;productid != STOP_TOKEN)
+            {
+                if (item-&gt;productid)
+                    ++consumed;
+                printf(&quot;consumer %d consuming product %d\n&quot;,
+                                                     myid, item-&gt;productid);
+            }
+            else
+            {
+                consuming = 0;
+                printf(&quot;consumer %d ran out of products\n&quot;, myid);
+            }
+            consume_product(item);
+        }
+    }
+    printf(&quot;consumer %d consumed %d products\n&quot;, myid, consumed);
+    return(consumed);
+}
+main()
+{
+    long total, sum[MAXCONSUMERS];
+    int i;
+    printf(&quot;business starts with %d products\n&quot;,MAXPRODUCTS);
+    #pragma parallel shared(sum)
+    {
+        #pragma independent
+        {
+            producer(MAXPRODUCTS); /* start producer */
+        }
+        #pragma independent
+        {
+            sum[0] = consumer(1);  /* start consumer 1 */
+        }
+        #pragma independent
+        {
+            sum[1] = consumer(2);  /* start consumer 2 */
+        }
+        #pragma independent
+        {
+            sum[2] = consumer(3);  /* start consumer 3 */
+        }
+    }
+    for (i=0, total = 0L; i&lt;MAXCONSUMERS; i++)
+        total += sum[i];  /* sum up the products consumed by each */
+    printf(&quot;business over, %d products exchanged\n&quot;, total);
+    printf(&quot;maximum products in list = %d\n&quot;, max_depth-MAXCONSUMERS);
+}
+
+
+
+
+<HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

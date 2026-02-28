@@ -1,0 +1,494 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE><title>v04, i04: Listing 1: utc.c--Sets the UNIX time from the USNO atomic clock</title></TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#990000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink><a href="a10.htm">Article</a></span></td>
+		<td><span class=navbarLink><a href="a10_f1.htm">Figure 1</a></span></td>
+		<td><span class=navbarLink>Listing 1</span></td>
+		<td><span class=navbarLink><a href="a10_s1.htm">Sidebar 1</a></span></td>
+		<td><a href="../../../../source/SA/1995/jul95.tar"><b class=codeListing>jul95.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<H1>Listing 1: utc.c--Sets the UNIX time from the USNO atomic clock</H1><p>
+<PRE>
+/*
+* utc.c
+*
+*      This program was originally written by Michael Scott Baldwin at
+*      AT&amp;T Bell Labs and heavily rewritten by Steve Friedl.
+*
+*      This program sets the UNIX time from the US Naval Observatory
+*      atomic clock in Washington DC.  It calls up the observatory at
+*      1-202-653-0351 with cu(1), parses the output of the data stream,
+*      and optionally sets the UNIX system time.
+*
+*      The options are:
+*      -s              specify to set system time via stime() (root only)
+*      -c sysn         specify system name to dial via Systems file
+*      -D nn           specify debug level
+*      -d              don't route cu's stderr to /dev/null (for debug)
+*
+*/
+#include        &lt;stdio.h&gt;
+#include        &lt;ctype.h&gt;
+#include        &lt;string.h&gt;
+#include        &lt;time.h&gt;
+#include        &lt;signal.h&gt;
+#include        &lt;errno.h&gt;
+#include        &lt;sys/types.h&gt;
+/*
+* cu takes one of these two options to enable full debug -- pick one.
+*
+*      SCO UNIX        -x9
+*/
+/*#define               CUDEBUG         &quot;-d&quot;*/
+#define         CUDEBUG         &quot;-x9&quot;
+
+/*------------------------------------------------------------------------
+* definitions for ANSI C.
+*/
+#ifdef  __STDC__
+#  include      &lt;stdlib.h&gt;
+#  define       PROTO(name, args)       name args
+#else
+#  define       PROTO(name, args)       name ( )
+#  define       const                   /*nothing*/
+#endif
+
+/*------------------------------------------------------------------------
+* arguments to the exit(2) system call.
+*/
+#ifndef EXIT_SUCCESS
+#  define       EXIT_SUCCESS    0
+#  define       EXIT_FAILURE    1
+#endif
+
+#define         TRUE            1
+#define         FALSE           0
+
+#define         pr              (void)printf
+#define         fpr             (void)fprintf
+#define         spr             (void)sprintf
+
+#define         PLURAL(s)       (((s) == 1) ? &quot;&quot; : &quot;s&quot;)
+#define         ABS(a)          (((a) &lt; 0)  ? (-(a)) : (a))
+
+/*
+* &quot;EPOCH&quot; is the number of days since the beginning of Julian time
+* (probably around 4517 BC) modulo the number above.
+*/
+#define EPOCH           (2440587%2400000)       /* 01/01/1970           */
+
+#define leap(y, m)      ((y+m-1 - 70%m) / m)    /* also known as 1/1/70 */
+#define TONE            '*'
+#define TIME_FMT        &quot;\n%05ld %03d %02d%02d%02d UTC&quot;
+
+static int              setflg = 0,     /* TRUE = set the time          */
+cudebug = 0,    /* TRUE = enable cu debug       */
+debuglevel = 0; /* level of debug               */
+
+static char const       *ProgName,      /* program name - argv[0]       */
+*sysname = 0;   /* system name to dial with cu  */
+static int              pgrp;           /* current process group        */
+
+extern char             *optarg;
+
+static PROTO(void set_time, ( void ) );
+static PROTO(void show_time, ( void ) );
+static PROTO(time_t convert_to_time, ( const char * ) );
+static PROTO(char *strip, ( char * ) );
+
+main(argc, argv)
+int     argc;
+char    *argv[];
+{
+int     c;
+
+ProgName = argv[0];             /* save command name for err msgs */
+
+while ((c = getopt(argc, argv, &quot;dsc:D:&quot;)) != EOF)
+{
+switch (c)
+{
+default:
+fpr(stderr, &quot;usage: %s [-d] [-s] [-c sysn] [-D lvl]\n&quot;,
+argv[0]);
+exit(EXIT_FAILURE);
+
+case 's':             /* -s means set the time        */
+setflg++;
+break;
+
+case 'c':             /* -c means call ### via cu     */
+sysname = optarg;
+break;
+
+case 'D':
+debuglevel = atoi(optarg);
+break;
+
+case 'd':             /* -d means debug for cu        */
+cudebug++;
+break;
+
+}
+}
+
+if (setflg || sysname)
+set_time();
+else
+show_time();
+
+exit(EXIT_SUCCESS);
+}
+
+/*
+*      This function is called when the alarm times out.
+*      no input was received from USNO and it is time
+*      to hang up.  kill any cu processes and exit.
+*/
+static void onsig(signo)
+int     signo;
+{
+int     rv;
+
+if (sysname)
+{
+(void) kill(-pgrp, SIGHUP);     /* kill children        */
+(void) wait(&amp;rv);               /* wait for the child   */
+}
+
+fpr(stderr, &quot;%s: nothing from cu\n&quot;, ProgName);
+exit(EXIT_FAILURE);
+}
+
+/*
+*      Given a system name, execute a cu process to that system and return
+*      a FILE pointer for that process's standard output.  By default,
+*      any debugging output is rerouted to standard error.  If the global
+*      debugging flags are on, cu information is routed to the terminal.
+*
+*/
+static FILE *cu_open(sysn)
+char    *sysn;
+{
+FILE    *ifp;                   /* input FILE pointer (for cu process)  */
+char    cu_cmdbuf[80],          /* buffer for the cu command            */
+phonebuf[80],           /* buffer for squeezed phone number     */
+*p;
+
+/*--------------------------------------------------------
+* first, make this current program its own process
+* group.  cu does not die on SIGPIPE, so
+* we have to kill it ourselves.  We can't directly get the
+* child and child-of-child pids, so we have to kill all
+* processes in this pgrp.
+*/
+pgrp = setpgrp();
+(void)signal(SIGHUP, SIG_IGN);  /* ignore hangup        */
+(void)signal(SIGALRM, onsig);   /* catch alarm call     */
+
+/*--------------------------------------------------------
+* Execute the cu program and terminate if not found.
+* add the debug option to cu and rely on this
+* information being rerouted to /dev/null if the user
+* doesn't want to see it.
+*/
+sprintf(cu_cmdbuf, &quot;cu %s %s %s&quot;,
+cudebug ? CUDEBUG : &quot;&quot;,
+sysn,
+cudebug ? &quot;&quot; : &quot; 2&gt;/dev/null&quot;);
+
+if (debuglevel &gt; 0)
+printf(&quot;about to popen(%s)\n&quot;, cu_cmdbuf);
+
+if (ifp = popen(cu_cmdbuf, &quot;r&quot;), ifp == NULL)
+{
+fpr(stderr, &quot;%s: cannot open cu\n&quot;, ProgName);
+exit(EXIT_FAILURE);
+}
+return(ifp);
+}
+
+#define MAX_NTIMES      5
+/*
+*      Fire up cu (or read the standard input).  Once a
+*      connection is made, read lines of input validating for a
+*      format, and simply ignore invalid input.  To prevent the program
+*      from totally trashing the system time, loop until we receive several
+*      correct times in a row: &quot;correct&quot; is defined as the previous time
+*      plus one second.  Once we receive MAX_NTIMES (defined just above)
+*      correct times in a row, we are sure we have it right.
+*
+*      Once a valid time is obtained, either set it as the new system time
+*      or just print it depending on the user's requests.  If time
+*      is set, report the old and new times to note clock drift.
+*/
+static void set_time()
+{
+time_t  lasttime = 0;
+int     ntimes = 0;
+int     got_valid_time = FALSE;
+FILE    *ifp;
+char    ibuf[200];              /* input line buffer            */
+
+if (sysname)
+ifp = cu_open(sysname);
+else
+ifp = stdin;
+
+/*----------------------------------------------------------------
+* Read lines from USNO.  after reading the line,
+* parse it in USNO format and ignore lines that don't match.
+* activate an alarm so the program doesn't sit
+* forever.  The popen above returns immedately, so the
+* &quot;fgets&quot; is where everything waits.  If nothing is received
+* for 60 seconds, terminate with an error.
+*/
+(void)alarm(60);        /* set an alarm for one minute          */
+
+got_valid_time = FALSE;
+
+while ( !got_valid_time &amp;&amp;  fgets(ibuf, sizeof ibuf, ifp) )
+{
+time_t  now;
+
+if (debuglevel &gt; 0)
+printf(&quot;\r\n------&gt; %s\r\n&quot;, strip(ibuf));
+
+if (  (now = convert_to_time(ibuf)) &lt; 0 )
+{
+ntimes = 0;
+if (debuglevel &gt; 1)
+printf(&quot;\r(ignoring line)\n\r&quot;);
+}
+else if (now == 0)              /* got the little &quot;mark&quot; */
+{
+if (ntimes &gt;= MAX_NTIMES)
+got_valid_time = TRUE;
+}
+else if ( ntimes &gt; 0  &amp;&amp;  (now-1) != lasttime)
+{
+if (debuglevel &gt; 0)
+{
+printf(&quot;\rgot bad time: %s&quot;, ctime(&amp;now) );
+printf(&quot;\r       expect %s&quot;, ctime(&amp;lasttime));
+printf(&quot;\r\n&quot;);
+}
+ntimes = 0;
+}
+else
+{
+if (debuglevel &gt; 1)
+printf(&quot;\rgot time %s\r&quot;, ctime(&amp;now));
+ntimes++;
+lasttime = now;
+}
+}
+
+(void)alarm(0);         /* cancel the alarm      */
+
+/*
+* All finished, so clean up.  If calling with cu,
+* kill the child process(es).
+*/
+if (sysname)
+{
+(void) kill(-pgrp, SIGHUP);     /* kill children        */
+(void) pclose(ifp);
+}
+else
+(void) fclose(ifp);
+
+/*
+* If no valid time was received, defer on all the rest.
+*/
+if (! got_valid_time)
+{
+pr(&quot;\rCould not get valid time\r\n&quot;);
+return;
+}
+
+/*
+* If the system time is actually be set, grab the current time
+* and print the old/new time to stdout
+*/
+if (setflg)
+{
+int     tdiff;
+time_t  oldtime;
+
+(void) time(&amp;oldtime);
+
+/* if the time did not change, don't do anything.  */
+if (oldtime == lasttime)
+{
+pr(&quot;System clock is correct!\n&quot;);
+(void) fputs(ctime(&amp;lasttime), stdout);
+return;
+}
+if (stime(&amp;lasttime) &lt; 0)
+{
+fpr(stderr, &quot;%s: can't set the time (errno=%d)&quot;,
+ProgName, errno);
+exit(EXIT_FAILURE);
+}
+
+pr(&quot;Changed time from USNO\r\n&quot;);
+pr(&quot;   was %s\r&quot;, ctime(&amp;oldtime));
+pr(&quot;   now %s\r&quot;, ctime(&amp;lasttime));
+
+tdiff = oldtime - lasttime;
+
+pr(&quot;\nThe clock was %d second%s %s\n&quot;,
+ABS(tdiff),
+PLURAL(ABS(tdiff)),
+(oldtime &gt; lasttime) ? &quot;fast&quot; : &quot;slow&quot;);
+}
+else
+(void)fputs(ctime(&amp;lasttime), stdout);
+}
+
+/*
+*      This function prints the time in USNO format for one minute.
+*/
+static void show_time()
+{
+int     c;
+
+for (c = 0; c &lt; 60; c++)
+{
+time_t  now;
+int     s, m, h, d, j, y;
+
+/*--------------------------------------------------------
+* grab the UNIX time and compute the various pieces in
+* USNO format.  Note that we do not just take the last
+* time and add one second -- it's always better to go right
+* to the kernel for the proper time every time.
+*/
+(void)time(&amp;now);               /* get current time     */
+s = (now % 60);                 /* seconds              */
+m = (now /= 60) % 60;           /* minutes              */
+h = (now /= 60) % 24;           /* hours                */
+d = (now /= 24) % 365;          /* years                */
+j = now + EPOCH;                /* add in 1/1/1970      */
+y = (now /= 365);
+
+d += 1 - leap(y, 4) + leap(y, 100) - leap(y, 400);
+
+(void) putchar(TONE);
+(void) printf(TIME_FMT, j, d, h, m, s);
+(void) putchar('\n');
+(void) fflush(stdout);
+(void) sleep(1);
+}
+}
+
+/*
+*      Given a line received from the remote end, see if it's a UNIX
+*      time.  We have two types of lines that we get from the USNO for
+*      each time: the time and a marker.  The time is the full details
+*      of the current minute, second, etc., and the marker says &quot;now&quot;.
+*
+*      return either:
+*
+*              0       marker
+*              &lt;0      error of some kind
+*              &gt;0      the UNIX time
+*
+*      The format of a marker line is:
+*
+*              YYYYY DDD HHMMSS UTC
+*                  \   \  \ \ \  \
+*                   \   \  \ \ \  \---- literal &quot;UTC&quot;
+*                    \   \  \ \ \------ second
+*                     \   \  \ \------- minute
+*                      \   \  \-------- hour
+*                       \   \---------- days since start of year
+*                        \------------- Julian date modulo 240000
+*/
+
+static time_t convert_to_time(buf)
+const char      *buf;
+{
+int     rv;
+long    jyear = 0;
+int     i, yday, hour, minute, second;
+time_t  now;
+
+if (buf[0] == '*')
+return 0;
+
+if (*buf == '\r')
+buf++;
+
+rv = sscanf(buf, &quot;%05ld %03d %02d%02d%02d UTC&quot;,
+&amp;jyear,
+&amp;yday,
+&amp;hour,
+&amp;minute,
+&amp;second);
+if (rv != 5)
+return -1;
+
+/* calculate the UNIX time and return it */
+return (((jyear - EPOCH) * 24 + hour) * 60 + minute) * 60 + second;
+}
+
+/*
+* strip()
+*
+*      Remove trailing whitespace from the given string.
+*/
+static char *strip(str)
+char    *str;
+{
+char            *old = str;     /* save ptr to original string          */
+register char   *p = str;
+
+while (*str)
+if (!isspace(*str++))
+p = str;
+
+*p = '\0';
+
+return old;
+}
+</pre><p>
+<p>
+
+
+<P>
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

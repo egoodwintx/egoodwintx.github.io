@@ -1,0 +1,284 @@
+<html>
+<head>
+<title>Dec01: Synchronization Monitors for Win32</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Synchronization Monitors for Win32</h1>
+<p><i>Dr. Dobb's Journal</i> December 2001</p>
+<h2>Java-style monitors for Win32</h2>
+
+<h3>By Thomas Becker</h3>
+
+<I> Thomas is a senior software engineer at Zephyr Associates. He can be reached 
+at <a href="mailto:thomas@styleadvisor.com">thomas@styleadvisor.com</a>.</I> 
+<hr>
+
+<p>In theory, there is no difference between multithreaded programming in Java and multithreaded programming under Win32. All the basic tenets of concurrent programming apply equally. In practice, however, there are differences. For example, the Java Virtual Machine may use its own user-mode thread scheduler rather than native threads provided by the operating system. This distinction is largely irrelevant to programmers, except when it comes to subtle considerations such as scheduling fairness guarantees. Another difference is that Java, being a single-paradigm language centered around the object paradigm, tightly couples its synchronization model with its object model. Being a C API for a family of operating systems, on the other hand, Win32 uses handles and C functions to provide access to synchronization objects that live in the kernel of the operating system. If you move between the two worlds, this difference amounts to a certain learning effort, but there are no major difficulties here &#151; except for the implementation of synchronization mechanisms. </p>
+<p>Java offers two basic idioms to implement synchronization mechanisms. </p>
+<DDJADVERTISEMENT INLINE>
+
+
+<ul>
+  <li>"Mutual" exclusion, provided by locks that are associated with classes and objects, and are exposed to you via the <i>synchronized</i> keyword. 
+  <li>"Condition" synchronization, provided by monitors associated with objects and exposed to you via the <i>synchronized</i> keyword in conjunction with the methods <i>wait()</i>, <i>notify()</i>, and <i>notifyAll()</i>. 
+
+</ul>
+
+<p>Win32, on the other hand, offers a zoo of synchronization objects &#151; the mutex and its cousin the critical section, two types of events, and the semaphore.</p>
+
+<p>From an academic perspective, the Java approach is more satisfactory than Win32's: The lock and monitor idioms form a pair of simple synchronization primitives from which everything else can be derived. From an applied software engineering perspective, however, this is an advantage only if there is a class library that provides a collection of at least the most common synchronization idioms (semaphores, exchangers, and the like) implemented on the basis of the lock and monitor idioms. Fortunately, at least one such library exists. It was written by Doug Lea in conjunction with his book <i>Concurrent Programming in Java</i>, Second Edition, (Addison-Wesley, 1999). The library (<a href="http://gee.cs.oswego.edu/dl/cpj/">http://gee.cs.oswego.edu/dl/cpj/</a>) contains production-quality implementations of many commonly used synchronization objects. </p>
+
+<p>Reading Lea's book and using his library led me to wonder whether a similar library existed for Win32. While I know of several isolated Win32 synchronization utilities that have been put in the public domain, I am not aware of any systematic attempt at such a collection. Consequently, in this article, I explore the territory for such a project and present what is perhaps the most important Win32 synchronization utility &#151; a Java-style monitor.</p>
+
+
+
+<h3>Win32 Synchronization Utilities</h3>
+
+
+<p>Win32 is a C API. The way Win32 treats its operating-system resources is, in a manner of speaking, an imitation of object-oriented programming in C. Objects are created by calling a "constructor function" such as <i>CreateMutex()</i>. Such a function returns a handle to the newly created object. To use the object, you call global functions that take the handle as an argument, much like the hidden <i>this-argument</i> of a C++ member function. Finally, the object is destroyed by closing the handle. Since most Win32 programmers code in C++ (usually in the context of some class library such as MFC), the Win32 synchronization utilities I have in mind should be written as C++ classes whose member functions have the look and feel of Win32 functions, such as <i>ReleaseSemaphore()</i>.</p>
+
+
+<p>In the earlier days of object-oriented programming, the extensive use of inheritance was widely considered to be the hallmark of good software design: The more inheritance, the better; and if it does not have inheritance, it's not OO. More recently, the OO and C++ communities have been promoting a trend in the opposite direction &#151; go easy on inheritance. Regardless, a library of classes intended for general use should be written in such a way that it does not imply the use of inheritance. While client programmers may derive their own class from one of the provided classes, they should not be forced to do so, as this may conflict with their philosophy or impose a restriction on them.</p>
+
+<p>Similar considerations apply on the subject of exceptions. For good reasons, the use of exceptions is notoriously restricted and regulated in C++ development shops. Therefore, library-style utility classes should indicate failure by appropriate return values. Users of these classes may translate these return codes into exceptions at their discretion. This could, for example, be done by using some sort of wrapping technique (such as in the Adapter pattern), or by modifying the source code. As a consequence of this ban on exceptions, the constructors of my proposed classes must do only elementary initialization that cannot fail. All nontrivial, failure-prone initialization must be done in a separate method that the client must call before using the object. To give the class a Win32 look and feel, this method should be called <i>Create()</i>. Most Win32 programmers will not find this style of object creation unusual as it is widespread in the MFC.</p>
+
+<p>In many multithreaded applications, it is important to be able to terminate threads currently in a wait state. For example, in a desktop application that has one or more background worker threads associated with each document, these background threads must be terminated when users close the document, and it is possible that the threads are in a wait state when that happens. In Java, this problem is solved via thread interruption: When the <i>interrupt()</i> method is called on a thread and that thread is currently in a wait state, the <i>wait()</i> method throws the <i>InterruptedException</i>. In its handler block of this exception, the <i>thread</i> function can then take appropriate action; for example, it can return and thereby terminate the thread in a clean way.</p>
+
+<p>Although Win32 provides the <i>TerminateThread()</i> function that lets one thread terminate another at any time, the use of this function is not safe, as it does not guarantee proper cleanup of operating-system resources. For my Win32 synchronization utilities, this means that their wait operations must be such that the client can interrupt the wait in much the same way as the Java <i>interrupt()</i> method. There are basically three ways of achieving this under Win32. </p>
+
+
+<ul>
+  <li>Write all waits in such a way that they return periodically and check an interrupt flag. As a general solution, this option is not acceptable: If you make the timeout significantly longer than a thread's typical time slice, then the response to an interruption becomes noticeably slow. If you make the timeout short enough, then you are looking at the abominable busy wait that burns processor time for nothing.
+  <li>The second method to imitate Java thread interruption under Win32 applies whenever you are waiting on just one Win32 synchronization object; for example, you are calling <i>WaitForSingleObject()</i>, or you are waiting for several objects in such a way that the wait completes as soon as at least one of the objects becomes signaled. In these cases, wait interruption can be achieved by adding an additional object &#151; namely, a Win32 event &#151; to the collection of objects to be waited on. To interrupt, a client simply sets this event. The waiting thread can infer from the return value of <i>WaitForMultipleObjects()</i> which object it was that caused the wait to complete, and it can take appropriate action in case that object was the interrupt object. This method is simple and efficient, and should be the preferred way of thread interruption under Win32. However, it is obviously not general enough to be elevated to the official method used by my Win32 synchronization utilities. These utilities must use the third way.
+
+  <li>Use the extended functions <i>WaitForSingleObjectEx()</i> and <i>WaitForMultipleObjectsEx()</i> for all wait operations. These functions, when called with the <i>bAlertable</i> flag set to True, put a thread into an "alertable" wait state under Win32. Alertable wait states have the property that they complete when another thread calls or has previously called the Win32 function <i>QueueUserApc()</i> to queue an asynchronous procedure call (APC) to the waiting thread. The first thing the thread does upon completing the wait is to call the user-defined APC. Moreover, the return value of <i>WaitForSingleObjectEx()</i> and <i>WaitForMultipleObjectsEx()</i> indicates that it was an APC that caused the wait to complete. This makes for a nice way to imitate Java's way of breaking out of <i>wait()</i> via an <i>InterruptedException</i>.
+
+</ul>
+
+<h3>Java Monitors</h3>
+
+
+<p>There are several ways to implement the Java-style monitor idiom in Win32. The ingredients of Java's implementation are the <i>synchronized</i> keyword and the methods <i>wait()</i>, <i>notify()</i>, <i>notifyAll()</i>, and <i>interrupt()</i>. The key to the <i>synchronized</i> keyword is that Java associates a lock with each defined class, and a separate one with each instantiated object. When a method is declared as synchronized, as in</p>
+
+
+<pre><p>
+synchronized foo() {
+ // do something
+}</p>
+
+</pre><p>then the lock that is associated with the <i>this-object</i> is acquired upon entering the method and released upon leaving the method. When a block of code is preceded by the <i>synchronized</i> keyword, as in</p>
+
+
+<pre><p>
+synchronized {
+ // do something
+}</p>
+
+</pre><p>then the lock that is associated with the <i>this-object</i> is acquired upon entering the block and released upon leaving the block. Rather than acquiring and releasing the lock associated with the <i>this-object</i>, you may explicitly specify an object whose lock is to be used, as in</p>
+
+
+<pre><p>
+MyClass myObject = new MyClass();
+myObject.synchronized {
+ // do something
+}<br>
+
+</pre>
+
+<p>A similar syntax applies to use the class-wide lock:</p>
+
+<pre><p>
+MyClass.synchronized {
+ // do something
+}</p>
+
+</pre>
+
+<p>As for the <i>wait()</i> method, consider a typical example of its use in condition synchronization. Here, <i>bCond</i> is a Boolean flag indicating some condition.</p>
+
+<pre><p>
+synchronized {
+ while( ! bCond ) {
+ wait();
+ }
+}</p>
+
+</pre>
+
+<p>First of all, the <i>wait()</i> method must be called within a synchronized block or method; otherwise, it throws an <i>IllegalMonitorStateException</i>. The first thing that happens when <i>wait()</i> has been called correctly is that the current thread is placed into a set of threads (called the "wait set") associated with the <i>this-object</i>. Next, the lock for the <i>this-object</i> is released. The release is full, meaning that the lock is released as many times as it has previously been acquired. After that, the thread remains in the blocked state until a notification or interruption will happen.</p>
+
+<p>The methods <i>notify()</i> and <i>notifyAll()</i> are typically used as follows:</p>
+
+<pre><p>
+synchronized {
+ bCond = true;
+ notify();
+}<br>
+
+synchronized {
+ bCond = true;
+ notifyAll();
+}</p>
+
+</pre>
+
+<p>The <i>notify()</i> method selects one of the threads, if any, which are currently in the object's wait set and unblocks it. The Java specification contains no guarantees whatsoever about the policy of selecting a thread for unblocking. The selected thread will reacquire the object's lock (more precisely, it fully restores the lock status to what it was upon entering the <i>wait()</i> method), and it will then return from the <i>wait()</i> method. The <i>notifyAll()</i> method differs from <i>notify()</i> insofar as it releases all threads that are currently in the object's wait set, rather than selecting one. If the object's wait set is empty at the time when <i>notify()</i> or <i>notifyAll()</i> are called, then these methods have no effect. In Java, there is no such thing as a "notification status" that would persist after a call to <i>notify()</i> or <i>notifyAll()</i>.</p>
+
+<p>In coding the wait/notify mechanism, it is absolutely correct (although not exactly pretty) to replace the code:</p>
+
+<pre><p>
+synchronized {
+ bCond = true;
+ notify();
+}</p>
+
+</pre><p>with </p>
+
+
+<pre><p>
+synchronized {
+ notify();
+ bCond = true;
+}</p>
+
+</pre>
+
+<p>The reason is that the <i>wait()</i> method reacquires the lock before it returns. Therefore, from the client programmer's perspective, the notification does not take effect until the synchronized block surrounding the call to <i>notify()</i> and the setting of the condition variable has been left.</p>
+
+<p>The other way to free a thread from a wait set is the <i>interrupt()</i> method. When <i>interrupt()</i> is called on a thread currently in some object's wait set, the thread is unblocked and it reacquires the respective object's lock. After that, the <i>InterruptedException</i> is thrown. An important difference between notification and interruption is that each thread maintains an interruption status. Calling <i>interrupt()</i> sets the interruption status to True, and throwing the <i>InterruptedException</i> resets it to False. When a thread calls the <i>wait()</i> method and the interruption status is True, then <i>wait()</i> immediately exits, throwing the <i>InterruptedException</i>. It is important to understand that notification does not work that way. There is no notification status in Java &#151; the <i>notify()</i> and <i>notifyAll()</i> methods affect only those threads that are currently in the object's wait set.</p>
+
+
+
+<h3>Win32 Monitor Utility Classes</h3>
+
+
+<p><A NAME="rl1"></a><A HREF="#l1">Listing One</A> is the interface of a C++ Win32 utility class that provides condition synchronization in a way that mimics Java's monitors as closely as possible. Clearly, the class must have a locking mechanism (that is, a data member that is a Win32 mutex or critical section), and functions to acquire/release that lock. I call these methods <i>BeginSynchronized()</i> and <i>EndSynchronized()</i> to emphasize the analogy to synchronized blocks when using monitors in Java.</p>
+
+
+<p>The nontrivial question is how to implement waiting and notification. Conceptually, the class must have a wait set. A thread that calls <i>Wait()</i> must be added to that wait set, then release the lock. The preferred way to implement this mechanism is to have all that happening atomically; for example, by making a single call into a kernel mode function that releases the lock and puts the thread in a wait state as an atomic, uninterruptible operation. Win32 does indeed provide a function that does just that, namely, <i>SignalObjectAndWait()</i>, which takes handles to two Win32 synchronization objects as arguments. It signals one and makes the calling thread wait on the other as an atomic operation. This suggests that, in addition to the lock (mutex or critical section), you should give the class a Win32 event as a data member, and the <i>Wait()</i> method should essentially look like this:</p>
+
+<pre><p>
+Wait()
+{
+release lock and wait on event atomically
+acquire lock
+}</p>
+
+</pre><p>The first line of this pseudocode can be implemented using <i>SignalObjectAndWait()</i>, the second using <i>WaitForSingleObject()</i>. So far, Win32 appears to lend itself easily to implementing the monitor idiom. Unfortunately, a problem arises with notification. Notification must cause one or all of the threads, as the case may be, that are currently blocking on the event to complete their wait. Win32 has a function that does just that, namely, <i>PulseEvent()</i>. It is true that <i>PulseEvent()</i> can operate in the two ways that you need for <i>Notify()</i> and <i>NotifyAll()</i>; that is, it can release one of the currently waiting threads or all of them. Unfortunately, the decision of which one of the two modes of operation applies is made not when <i>PulseEvent()</i> is called, but when the event is created. Autoreset events pulse just one of the waiting threads, while manual reset events pulse all of them. (The terms "autoreset" and "manual reset" refer to the Win32 function <i>SetEvent()</i> rather than <i>PulseEvent()</i>.) Therefore, a monitor object implemented this way can support either <i>Notify()</i> or <i>NotifyAll()</i> &#151; but not both. There would be a workaround if there were a Win32 function that atomically signals one object and then waits on a whole collection of objects, as in <i>WaitForMultipleObjects()</i>. But there isn't.</p>
+
+
+<p>The bottom line is that at this point it isn't possible to have one Win32 utility class that implements Java-style monitors with optimal efficiency. All is not lost, however. First of all, when using monitors in concurrent programming, it frequently happens that only one <i>Notify()</i> and <i>NotifyAll()</i> is needed. Therefore, the source code that accompanies this article (see "Resource Center," page 5) has two classes called <i>NotifyMonitor</i> and <i>NotifyAllMonitor</i> that use the efficient implementation just described at the cost of supporting only one <i>Notify()</i> and <i>NotifyAll()</i>. </p>
+
+<p>Second, while it is desirable to have an efficient implementation that uses <i>SignalObjectAndWait()</i>, it isn't necessary to use an atomic operation for adding threads to the wait set and releasing the lock. What matters is the order of things. By the time the lock gets released, the thread must be in the wait set, ready to respond to notifications. Doing this the wrong way results in the possibility of the so-called "missed signal," where a notification takes place but the thread misses it because it released the lock before it was in a position to respond to the notification. The class <i>FairMonitor</i> (available electronically) provides a full implementation of the Java-style monitor, including <i>Notify()</i> and <i>NotifyAll()</i>, at the cost of being less efficient. The class has a data member of type STL <i>deque</i> that serves as the wait set. This <i>deque</i> holds handles to Win32 events. Furthermore, the class holds a second lock that protects concurrent access to the <i>deque</i>. Acquiring and releasing this lock is indicated in <A NAME="re1"></a><A HREF="0112de1.htm">Example 1</A> (which implements the <i>Wait()</i> and <i>Notify()</i> methods) by the opening and closing square bracket. </p>
+
+<p>At first glance, the implementation of <i>Wait()</i> seems to be erroneous because the lock is released before the thread blocks on the event. However, by the time the lock is released, the event handle is already in the wait set, eligible for notification. Moreover, the implementations of <i>Notify()</i> and <i>NotifyAll()</i> signal the events (using the Win32 function <i>SetEvent()</i>) rather than pulsing them (Win32 function <i>PulseEvent()</i>). Suppose a thread is preempted inside <i>Wait()</i> just after releasing the lock, and a call to <i>Notify()</i> or <i>NotifyAll()</i> signals the event. Then this signal is not missed, because upon being rescheduled, the thread finds the event in the signaled state and it, therefore, completes the wait on the event immediately. I call this monitor <i>FairMonitor</i> because it guarantees that <i>Notify()</i> selects the oldest thread in the wait set for notification, a guarantee that neither Java's <i>notify()</i> method nor my <i>NotifyMonitor</i>'s <i>Notify</i> method make.</p>
+
+<p>At this point, I have efficiently implemented Win32 monitors that only support either <i>Notify()</i> or <i>NotifyAll()</i>, and a much less efficient one that is an exact analogue to Java monitors. There is one more version of the monitor idiom that you can implement efficiently in Win32 &#151; one that supports several wait sets. This is a concept well known in the theory of concurrent programming. Rather than maintaining a single wait set, such a monitor maintains several wait sets. The <i>Wait()</i>, <i>Notify()</i>, and <i>NotifyAll()</i> methods let the client specify which wait set should be used for the wait, or be the target of the notification, respectively. Using a monitor with several wait sets is substantially different from using several monitors because the waiting and notifying methods all use the same lock, regardless of the wait set they are targeting. The advantage of using several wait sets lies in the fact that you can often avoid gratuitous notifications; that is, you can avoid notifying threads that are known to find their monitored condition to be false. (The reader-writer lock example illustrates this situation.)</p>
+
+<p>The class <i>MultiSetMonitor</i> (available electronically) has the efficient implementation of waiting, using the Win32 function <i>SignalObjectAndWait()</i>. Instead of holding a single event that conceptually represents the wait set, it holds several such events. Due to the limitations of Win32's <i>PulseEvent()</i>, each wait set can only support <i>Notify()</i> or <i>NotifyAll()</i>. Upon creation of the monitor, the client specifies the number of wait sets of each type.</p>
+
+
+
+<h3>Reader-Writer Lock Example</h3>
+
+
+<p>A reader-writer lock is a synchronization object that exposes two locks &#151; the read lock and write lock. The two locks are mutually exclusive in that no thread can own the read lock while some thread owns the write lock, and vice versa. Only one thread at a time can own the write lock, while the read lock can be owned by an arbitrary amount of threads at a time. There are several issues concerning priorities between reading/writing and the problem of readers starving all writing or vice versa. Once the basic monitoring mechanism is in place, any desired policy is straightforward to implement. In my example class, I have chosen a policy where waiting writers have priority over waiting readers, but no measure is taken against heavy writing starving all reading.</p>
+
+
+<p><A NAME="rl2"></a><A HREF="#l2">Listing Two</A> is pseudocode for the relevant methods of class <i>ReadWriteLock</i> (available electronically). The class has integer members <i>m_nNumberOfActiveReaders</i> and <i>m_nNumberOfWaitingWriters</i> and a Boolean member <i>bWriteInProgress</i> to monitor the relevant conditions. Moreover, it has a member that is a multiset monitor with two sets, the reader set, which supports <i>NotifyAll()</i>, and the writer set, which supports <i>Notify()</i>.</p>
+
+
+
+<h3>Acknowledgment</h3>
+
+
+<p>Thanks to Christopher Baus for many interesting conversations on the subject of concurrent programming, and for bringing Doug Lea's book (and Java library) to my attention.</p>
+
+
+<p></p>
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1"></a>Listing One</H4>
+
+
+<pre>Interface to generic Win32 monitor class
+class Monitor
+{
+public:
+  // Default constructor.
+  Monitor();
+  // Destructor
+  ~Monitor();
+  // Aquires the lock.
+  void BeginSynchronized();
+  // Releases the lock.
+  void EndSynchronized();
+  // Waits for a notification.
+  DWORD Wait(DWORD dwMillisecondsTimeout = INFINITE);
+  // Notifies one of the waiting threads, if any.
+  BOOL Notify();
+  // Notifies all of the waiting threads, if any.
+  BOOL NotifyAll();
+  private:
+  // ...
+};
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+<H4><A NAME="l2"></a>Listing Two</H4>
+
+
+<pre>Reader-writer lock pseudocode
+ReadWriteLock::EnterRead()
+{
+  acquire monitor lock;
+  while( 0 &lt; m_nNumberOfWaitingWriters || m_bWriteInProgress ) {
+    wait in monitor's reader set;
+  }
+  ++m_nNumberOfActiveReaders;
+  release monitor lock;
+}
+ReadWriteLock::LeaveRead()
+{
+  acquire monitor lock;
+  if( 0 == --m_nNumberOfActiveReaders ) {
+    notify on monitor's writer set;
+  }
+  release monitor lock;
+}
+ReadWriteLock::EnterWrite()
+{
+  acquire monitor lock;
+  ++m_nNumberOfWaitingWriters;
+  while( 0 &lt; m_nNumberOfActiveReaders || m_bWriteInProgress ) {
+    wait in monitor's writer set;
+  }
+  --m_nNumberOfWaitingWriters;
+  m_bWriteInProgress = true;
+  release monitor lock;
+}
+ReadWriteLock::LeaveWrite()
+{
+  acquire monitor lock;
+  m_bWriteInProgress = false;
+  if( 0 == m_nNumberOfWaitingWriters ) {
+    notify-all on monitor's reader set;
+  }
+  else {
+    notify on monitor's writer set;
+  }
+   release monitor lock;
+}
+
+</pre>
+<P>
+<A HREF="#rl2">Back to Article</A>
+</P>
+
+
+</body>
+</html>

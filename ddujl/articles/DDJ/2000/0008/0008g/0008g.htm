@@ -1,0 +1,230 @@
+<html>
+<head>
+<title>Aug00: A Linux IEEE 1394 Configuration  ROM Decoder</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>A Linux IEEE 1394 Configuration  ROM Decoder</h1>
+
+<p><i>Dr. Dobb's Journal</i> August 2000</p>
+<h2>A Linux utility  for 1394 developers</h2>
+
+<h3>By William F. Alexander</h3>
+
+<I>
+Bill is a senior software engineer at LSI Logic (formerly Symbios Logic). His current responsibilities include developing 1394 device drivers, software, and utilities. He can be contacted at http://www .geocities.com/BillAlexander/.</I>
+
+<hr>
+
+<p>This is the third in a series of articles on decoding IEEE 1394 configuration ROMs. In the first article, "IEEE 1394 Configuration ROM Decoder" (<i>DDJ</i>, August 1999), I discussed how to read and decode the configuration ROM of 1394 peripherals on Windows 95 using the TI TSBKPCI 1394 controller and TI LynxSoft drivers. In the second article, "A WDM IEEE 1394 Configuration ROM Decoder" (<i>DDJ</i>, December 1999), I presented a port of the Windows 95 DumpRom program into the Windows 98/2000 WDM architecture. In this article, I'll present the implementation of the DumpRom program under Linux using an OHCI 1394 controller. The source code and related files that implement this utility are available electronically; see "Resource Center," page 5.</p>
+
+
+<h3>IEEE 1394 and Linux</h3>
+
+
+<p>Currently, Linux has no official 1394 device architecture. However, there is an ongoing 1394 Linux project (see http://eclipt .uni-klu.ac.at/ieee1394). The lack of an official interface creates a void that some programmers crave -- a virtually untouched frontier in which to explore. No driver stack to get in your way, no dogmatic architecture to limit possibilities, and no existing API to make life a little easier. In short, roll your own driver and application.</p>
+<DDJADVERTISEMENT INLINE>
+
+
+<p>As <A NAME="rt1"><A HREF="0008gt1.htm">Table 1</A> shows, the DumpRom utility for Linux consists of four files. The ohci.o file is a module driver that sets up the OHCI 1394 adapter resources, allocates system memory, and initializes the low-level interface. The ohcitest file is a user-level program that loads ohci.o, then maps the OHCI register space and DMA space into process memory space in order to manipulate the hardware directly. It also provides an interactive command interface for the user to perform certain operations on the hardware and the 1394 bus. The dodumprom file is intended to be redirected as the standard input of ohcitest to perform the operations needed to decode the configuration ROM of device 0. The dumprom file is a shell script that executes the program.</p>
+
+
+
+<h3>The OHCI Module Driver</h3>
+
+
+<p>The ohci.o file is a module driver that can be loaded and unloaded dynamically. Under Linux, only the root user can load and unload modules using the <i>insmod</i> (install module) and <i>rmmod</i> (remove module) commands, respectively. Once ohci.o is loaded, Linux calls the <i>init_module()</i> routine, which then calls <i>device_init()</i>. The main responsibilities of <i>device_init()</i> are:</p>
+
+
+<p></p>
+
+<p>1. Read the resources (that is, vendor ID, device ID, IRQ number, and memory base address) assigned to the card by PCI.</p>
+
+<p>2. Allocate DMA memory.</p>
+
+<p>3. Map DMA memory.</p>
+
+<p>4. Map the OHCI register memory.</p>
+
+<p>5. Set up the interrupt handler.</p>
+
+<p>6. Register the logical OHCI register and OHCI DMA devices with the kernel as a character driver.</p>
+
+<p></p>
+
+<p>Because ohci.o is a "do nothing" driver, the most important service <i>device_init()</i> renders is mapping the register and DMA memory spaces. This lets an application map these spaces into its local memory and manipulate the OHCI registers and DMA structures directly. The driver does not attempt to assert any control over the hardware.</p>
+
+<p>Both memory spaces have a logical device wrapped around them. When the ohci.o module registers with the kernel, it actually registers two logical devices. The first logical device is the OHCI register device. The second is the OHCI DMA device. Through the use of the <i>open()</i> and <i>mmap()</i> functions, an application can call the driver to map these logical device memories into local memory space.</p>
+
+
+
+<h3>The Ohcitest Program</h3>
+
+
+<p>The ohcitest application serves two functions. First, it controls the OHCI adapter hardware. It does this through the register and DMA memory spaces that are mapped from the driver to the local memory space. To achieve this, ohcitest first loads the module ohci.o and then uses <i>mknod</i> to create "special files" \dev\ohci0 and \dev\ohci1. Each of these files corresponds to the logical OHCI and DMA devices registered by the driver. The special file \dev\ohci1 corresponds to the OHCI register driver and \dev\ohci1 corresponds to the OHCI DMA driver. Ohcitest calls <i>open()</i> on each of these special files to open the interface to the logical devices. Using the handles returned by <i>open()</i>, ohcitest next calls <i>mmap()</i> to map the respective memory spaces into local space.</p>
+
+
+<p>Ohcitest uses the register space to initiate 1394 packet transmissions and receptions. The DMA memory is where the actual 1394 packets reside. When a packet is to be transmitted, the program creates the packet in the DMA memory, points the transmit DMA register to it, and then starts the transmit DMA. When a packet is to be received, the program points the receive DMA register to DMA memory, starts the receive DMA, and waits until a packet arrives.</p>
+
+<p>After the memories have been mapped, ohcitest spawns a process to monitor the interrupt register. It does this through the <i>EventProcess()</i> routine, which is nothing more than a large loop that examines the OHCI <i>IntEvent </i>register. If any bits are set, it processes the events one at a time. After all events are processed, the loop starts all over. After so many iterations through the loop without processing any events, the child process puts itself to sleep for a short time so that the main process can run. This is important because the child process runs at a slightly higher priority than the main process. Without putting itself to sleep, the child process would prevent the main process from running.</p>
+
+<p>The second function that ohcitest provides is an interactive user interface. After starting the child process, ohcitest displays a prompt for users to manually input commands. The commands that are needed to decode a configuration ROM are: <i>InitCard</i>, <i>BusReset</i>, <i>DumpRom</i> &lt;node number&gt;, and <i>Quit</i>. The <i>InitCard</i> command causes the <i>InitCard()</i> routine to be called. This routine resets the OHCI adapter and gets it ready for normal operation. However, <i>InitCard()</i> does not enumerate the devices on the bus. This is the job of the <i>BusReset</i> command. When <i>BusReset</i> is issued, the <i>BusReset()</i> routine is executed. <i>BusReset()</i> resets the 1394 bus and then waits for <i>EventProcess()</i> to receive the self ID packets generated by all of the nodes on the bus. Once the topology map of all devices on the bus has been created, <i>BusReset()</i> returns.  </p>
+
+<p>When the OHCI adapter is ready, the <i>DumpRom</i> command can be issued. The node number of the target device is specified on the command line. For example, the command <i>DumpRom </i>0 causes the configuration ROM of node 0 to be dumped and decoded. The first thing the <i>DumpRom </i>command does is call <i>ReadConfigRom()</i>. This reads the entire configuration ROM from the specified device and places it into a buffer. Next, the <i>DumpConfigRom()</i> routine is called, which displays the contents of the buffer in raw hexadecimal quadlets. Last, <i>DumpRom </i>calls <i>DecodeConfigRom()</i>, which decodes the buffer according to the 1394 specifications.</p>
+
+<p>The <i>Quit</i> command exits the ohcitest program. The OHCI board is reset, all structures are deallocated, and the driver is unloaded.</p>
+
+
+
+<h3>Running the Program</h3>
+
+
+<p>Before running the ohcitest program, you need to log in as root. The reason for this is that ohcitest will first attempt to install the ohci.o module via the Linux <i>insmod</i> command. Only the root user has privileges to run the <i>insmod</i> command. Some UNIX and Linux veterans will reel back in horror at the thought of a program calling root commands such as <i>insmod</i>, but this is an initial development tool intended for rapid changes in both the driver and the program. If you start your 1394 development with this source, you will grow to appreciate the speed at which you can change and reload the driver using this method.</p>
+
+
+<p>Once you are logged in as root, you can run the ohcitest program manually. However, you must enter the <i>InitCard</i>, <i>BusReset</i>, <i>DumpRom</i>, and <i>Quit</i> commands yourself. To make things easier, I've provided a shell script that will automatically decode the configuration ROM of node 0. The dumprom script:</p>
+
+<blockquote><p>
+ ./ohcitest &lt; dodumprom</p>
+
+</blockquote><p>As you can see, <i>DumpRom </i>redirects the standard input of <i>ohcitest </i>with the dodumprom file. The dodumprom file is nothing more than the commands you need:</p>
+
+
+<blockquote><p>
+ initcard</p>
+
+<p>
+ busreset</p>
+
+<p> dumprom 0</p>
+
+<p>
+ q</p>
+
+</blockquote>
+
+<p>When the <i>DumpRom </i>shell script is executed, the output is similar to the two previous versions of my utility. If I plug in a Sony CCM-DS250 1394 camera and run the script, the result is <A NAME="rl1"><A HREF="#l1">Listing One</A>.</p>
+
+
+
+<h3>Conclusion</h3>
+
+
+<p>The Linux version of DumpRom is an excellent place to start 1394 development. It provides the means to experiment. Unlike Windows 2000, you have raw, direct access to the hardware, which has many advantages to developers like myself. On the other hand, if you don't want to wade through the details of programming the OHCI card directly, you might want to start with the latest code from Emanuel Pirker's Linux IEEE 1394 Subsystem web page at http://eclipt.uni-klu.ac.at/ieee1394.</p>
+
+
+<p></p>
+
+
+<p><b>DDJ</b></p>
+<H4><A NAME="l1">Listing One</H4>
+
+
+<pre>OHCI Register Memory Map = 40014800
+OHCI DMA Memory Map = 40017000
+OHCI DMA Memory Physical Address = 00E3A000
+**************** EVENT OCCURRED *****************
+Event = busReset
+timeStamp = 000000A0
+selfIDGeneration = 00000001
+0 40017004 phy_ID 00,L 1,gap_cnt 3F,sp 1,del 0,c 0,pwr 6,p0 1,p1 1,p2 2
+1 4001700C phy_ID 01,L 1,gap_cnt 00,sp 2,del 0,c 0,pwr 4,p0 3,p1 1,p2 1
+**************** EVENT OCCURRED *****************
+Event = phyRegRcvd
+**************** EVENT OCCURRED *****************
+Event = selfIDComplete
+**************** EVENT OCCURRED *****************
+Event = RSPkt
+**************** EVENT OCCURRED *****************
+Event = RSPkt
+  ...
+**************** EVENT OCCURRED *****************
+Event = RSPkt
+**************** EVENT OCCURRED *****************
+Event = RSPkt
+OHCI Register Memory Map = 40014800
+OHCI DMA Memory Map = 40017000
+OHCI DMA Memory Physical Address = 00E3A000
+Raw Data Dump of the Configuration ROM
+
+1394 Addr Off    Data
+-------------    --------  --------  --------  -------- 
+FFFF:F0000400    041F40AA  31333934  20FF4000  08004602  
+FFFF:F0000410    000003BD  0004C80A  03080046  0C0083C0  
+FFFF:F0000420    8D000002  D1000004  00029E8D  08004602  
+FFFF:F0000430    000003BD  0003D7FE  1200A02D  13000100  
+FFFF:F0000440    D4000001  00034FEA  403C0000  81000002  
+FFFF:F0000450    82000005  00033A64  00000000  00000000  
+FFFF:F0000460    534F4E59  0006010B  00000000  00000000  
+FFFF:F0000470    43434D2D  44533235  3020312E  30380000  
+
+Decode of the Configuration ROM
+
+1394 Addr Off Quadlet  Meaning
+------------- -------- --------------------------------------------------
+
+Confiruation ROM Header
+FFFF:F0000400 041F40AA info_length=04, crc_length=1F, rom_crc_value=40AA
+
+Bus_Info_Block
+FFFF:F0000404 31333934 bus_name=31333934 ("1394")
+FFFF:F0000408 20FF4000 irmc=0, cmc=0, isc=1, bmc=0, cyc_clk_acc=FF, max_rec=4
+FFFF:F000040C 08004602 node_vendor_id=080046, chip_id_hi=02
+FFFF:F0000410 000003BD chip_id_lo=000003BD
+
+Root_Directory
+FFFF:F0000414 0004C80A length=0004, crc=C80A
+FFFF:F0000418 03080046 Module_Vendor_Id 080046
+FFFF:F000041C 0C0083C0 Node_Capabilities spt 64 fix lst drg 
+FFFF:F0000420 8D000002 Node_Unique_Id leaf ind_off=000002 (FFFF:F0000428)
+FFFF:F0000424 D1000004 Unit_Directory directory ind_off=000004 (FFFF:F0000434)
+
+Node_Unique_Id leaf referenced from FFFF:F0000420
+FFFF:F0000428 00029E8D length=0002, crc=9E8D
+FFFF:F000042C 08004602 ..F.
+FFFF:F0000430 000003BD ....
+
+Unit_Directory directory referenced from FFFF:F0000424
+FFFF:F0000434 0003D7FE length=0003, crc=D7FE
+FFFF:F0000438 1200A02D Unit_Spec_Id 00A02D
+FFFF:F000043C 13000100 Unit_Sw_Version 000100
+FFFF:F0000440 D4000001 Unit_Dependent_Info directory 
+                                               ind_off=000001 (FFFF:F0000444)
+
+Unit_Dependent_Info directory referenced from FFFF:F0000440
+FFFF:F0000444 00034FEA length=0003, crc=4FEA
+FFFF:F0000448 403C0000 key=40 (UNKNOWN) crc_offset=3C0000 (FFFF:F0F00000)
+FFFF:F000044C 81000002 Textual_Descriptor leaf ind_off=000002 (FFFF:F0000454)
+FFFF:F0000450 82000005 Bus_Dependent_Info leaf ind_off=000005 (FFFF:F0000464)
+
+Textual_Descriptor leaf referenced from FFFF:F000044C
+FFFF:F0000454 00033A64 length=0003, crc=3A64
+FFFF:F0000458 00000000 ....
+FFFF:F000045C 00000000 ....
+FFFF:F0000460 534F4E59 SONY
+
+Bus_Dependent_Info leaf referenced from FFFF:F0000450
+FFFF:F0000464 0006010B length=0006, crc=010B
+FFFF:F0000468 00000000 ....
+FFFF:F000046C 00000000 ....
+FFFF:F0000470 43434D2D CCM-
+FFFF:F0000474 44533235 DS25
+FFFF:F0000478 3020312E 0 1.
+FFFF:F000047C 30380000 08..
+
+
+
+
+
+
+
+</pre>
+<P>
+<A HREF="#rl1">Back to Article</A>
+</P>
+
+
+</body>
+</html>

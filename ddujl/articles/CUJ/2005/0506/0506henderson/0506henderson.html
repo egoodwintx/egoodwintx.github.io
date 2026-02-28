@@ -1,0 +1,192 @@
+
+
+
+<html>
+<head>
+<title>June, 2005: String Concatenation &amp; Expression Templates</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<h1>String Concatenation &amp; Expression Templates</h1>
+<p><i>C/C++ Users Journal</i> June, 2005</p>
+<h2>A powerful technique for delayed  evaluation of expressions</h2>
+
+
+<h3>By Craig Henderson</h3>
+
+
+<I>Craig Henderson has been a professional software engineer for more than 11 years, and is currently studying for a Ph.D. in medical imaging. Craig can be contacted at craig2 .henderson@uwe.ac.uk.</I>
+
+<hr>
+
+
+
+
+
+<p>Concatenating text strings is a common task, but generally an expensive one because it involves dynamic (heap) memory allocation, copying, and deallocation. For instance, consider an example where a series of STL string objects hold fragments of text that need to be joined together and returned from a function.</p>
+
+<pre>
+std::string get_message(void)
+{
+  std::string hello("Hello");
+  std::string space(" ");
+  std::string world("World");
+  std::string exclamation("!");
+  return (hello + space + world + ' ' 
+   + exclamation + space + exclamation);
+}
+
+</pre>
+
+<p>This perfectly legal implementation generates the result that is required, but what of its efficiency? To understand the performance of this, look at how the return expression is evaluated. </p>
+
+<p>The compiler evaluates the expression as a series of subexpressions from left-to-right, examining each addition in turn and matching an appropriate operator, so the expression is equivalent to:</p>
+
+<pre>
+return ((((((hello + space) + 
+    world) + ' ') + exclamation) + 
+            space) + exclamation);
+
+</pre>
+
+<p>The STL <b>basic_string</b> class defines an <b>operator+()</b> free function that is invoked by each of these additions.</p>
+
+<pre>
+21.3.7.1 operator+
+template
+  &lt;class charT, class traits, class Allocator&gt;
+     basic_string&lt;charT,traits,Allocator&gt;
+      operator+(const basic_string
+         &lt;charT,traits,Allocator&gt;&amp; lhs,
+           const basic_string
+             &lt;charT,traits,Allocator&gt;&amp; rhs);
+Returns: basic_string&lt;charT,traits,Allocator&gt;
+        ( lhs).append( rhs)
+
+</pre>
+
+<p>While the implementation of the function is dependent on the STL implementation you're using, the library I use (the Dinkumware STL that ships with Microsoft Visual C++ 7.0) implements the function exactly as shown, for instance:</p>
+
+<pre>
+template
+  &lt;class charT, class traits, class Allocator&gt;
+inline basic_string
+     &lt;charT, traits, Allocator&gt;
+operator+(const basic_string
+     &lt;charT, traits, Allocator&gt; &amp;lhs,
+   const basic_string
+     &lt;charT, traits, Allocator&gt; &amp;rhs)
+{ return (basic_string
+   &lt;charT, traits, Allocator&gt;(lhs) += rhs); }
+
+</pre>
+
+<p>While functional, this isn't very efficient. First, the <b>lhs</b> parameter is copied to another <b>basic_string</b>, which involves memory allocation and a memory copy. Then <b>operator+=()</b> is invoked on the new object, which ultimately calculates the length of the resulting string, allocates a buffer for it, copies the string into the new buffer, and then copies the parameter (the second string) onto the end of the first. When <b>operator+=()</b> returns, the temporary object that now holds the result is returned to the caller by value, invoking another object copy. That's a lot of copying, and with a nonoptimized build of the aforementioned test, no fewer than 14 memory allocations are performed.</p>
+
+<p>It's not necessarily as bad as that in the real world though, as some optimizations can be&#151;and are&#151;made in different implementations. Over-allocating the size of the array to a block size beyond what is actually required in anticipation of another concatenation is a common technique used by library writers. Other authors use the copy-on-write (COW) technique to reference count the actual string and only perform a memory allocation and copy if the buffer is going to be written to [1]. Regardless of what optimizations can be made, the fundamental problem still exists, and the optimizations just reduce the impact to some degree. The real problem is the creation of lots of temporary objects to hold the result of each <b>operator+()</b> and to be fed into the next <b>operator+()</b>. Look again at the original expression in a construction of a new string.</p>
+
+<pre>
+std::string result (hello + space + world + 
+  ' ' + exclamation + space + exclamation);
+
+</pre>
+
+<p>This produces five temporary objects that cannot be omitted through optimizations.</p>
+
+<pre>
+hello + space <img src="arrow14.gif"> temporary basic_string1
+ temporary basic_string1 + world <img src="arrow14.gif"> 
+               temporary basic_string2
+  temporary basic_string2 + ' ' <img src="arrow14.gif"> 
+               temporary basic_string3
+   temporary basic_string3 + exclamation <img src="arrow14.gif">
+              temporary basic_string4
+    temporary basic_string4 + space <img src="arrow14.gif"> 
+               temporary basic_string5
+     temporary basic_string5 + exclamation <img src="arrow14.gif">
+              std::basic_string
+        result
+
+</pre>
+
+<p>Whenever possible, optimization techniques should be transparent to users. Techniques such as over-allocation and COW can be encapsulated within the class implementation and therefore have no usability issues for the programmers using the library. There are times, though, when this goal is not achievable within the language constraints, but a small requirement on programmers can yield great performance results. </p>
+<h3>Expression  Templates</h3>
+
+<p>I was introduced to the intricacies of expression templates by David Vandevoorde and Nicolai Josuttis in their book <i>C++ Templates</i> [2]. They used the technique to implement delayed evaluation of matrix arithmetic. The basic idea is that, instead of <b>operator+()</b> performing the concatenation and returning the result, it "records" the operation and its parameters and returns an abstraction of the operation. The entire expression is represented by a series of abstractions and it is not until the assignment to the result type is evaluated that the entire expression extraction is evaluated in full. At this time, the abstraction can provide more information about what the result of the entire expression is going to be, specifically the length of the resulting string, and one memory allocation can be made that will host the result.</p>
+
+<p>The requirement for programmers is a small change to the expression. The expression "<b>hello + world</b>," where the two parameters are <b>std::string</b> types, invokes the STL <b>operator+()</b> from 21.3.7.1. I need to force my own <b>operator+()</b> to be called so that I can create the abstraction and delay the evaluation. To do that, I introduce a simple wrapper class, <b>concat_string</b>, and rewrite the expression:  </p>
+
+<pre>
+std::string str(hello + world);
+
+</pre>
+
+<p>to read: </p>
+
+<pre>
+std::string str(concat_string
+   &lt;std::string&gt;(hello) + world);
+
+</pre>
+
+<p>The compiler creates a call to: </p>
+
+<pre>
+operator+(concat_string&lt;std::string&gt; 
+        const &amp;, std::string const &amp;)
+
+</pre>
+
+<p>which I define later.</p>
+
+<p>First, I need an abstraction class for the addition of two character-based data types so that I can add string classes, character pointers, and single characters in any combination that language rules allow. I call it <b>addition</b>; see <a href="0506hendersonl1.html" target="_BLANK">Listing 1</a>. No surprises there, just a simple constructor to store the two values and a couple of access functions. I use a <b>traits</b> class to determine how to store the values. Literal constants and pointers to literal constants need to be stored by value as the parameters' lifetimes may be shorter than the addition object. All other data are stored as reference-to-const to avoid copying objects&#151;after all that's the whole point of the exercise. So the <b>traits</b> class is straightforward, too; see <a href="0506hendersonl2.html" target="_BLANK">Listing 2</a>.</p>
+
+<p>There are seven operators to handle combinations of <b>char</b>, <b>char *</b>, <b>std::string</b>, and other <b>concat_string&lt;&gt;</b> parameters. Each operator constructs a <b>concat_string</b> object to store an addition object that in turn references or stores the operator parameter; see <a href="0506hendersonl3.html" target="_BLANK">Listing 3</a>. Each of these operators returns a <b>concat_string</b> object, so each subsequent subexpression also uses these operators and not the STL string operators.</p>
+
+<pre>
+concat_string(hello) + space <img src="arrow14.gif"> concat_string&lt; addition&lt;&gt; &gt;1
+ concat_string&lt; addition&lt;&gt; &gt;1 + world <img src="arrow14.gif"> concat_string&lt; 
+      addition&lt;&gt; &gt;2
+  concat_string&lt; addition&lt;&gt; &gt;2 + ' ' <img src="arrow14.gif"> concat_string&lt; 
+      addition&lt;&gt; &gt;3
+   concat_string&lt; addition&lt;&gt; &gt;3 + exclamation <img src="arrow14.gif"> concat_string&lt; 
+      addition&lt;&gt; &gt;4
+    concat_string&lt; addition&lt;&gt; &gt;4 + space <img src="arrow14.gif"> concat_string&lt; 
+      addition&lt;&gt; &gt;5
+     concat_string&lt; addition&lt;&gt; &gt;5 + exclamation <img src="arrow14.gif"> concat_string&lt; 
+      addition&lt;&gt; &gt;6
+      concat_string&lt; addition&lt;&gt; &gt;6 <img src="arrow14.gif"> std::basic_string 
+          [invoking evaluation]
+
+</pre>
+
+<p>The <b>concat_string</b> class needs to store a copy of the abstraction object because the lifetime of the <b>concat_string</b> object extends beyond the lifetime of the temporary abstraction object returned by the operators. Aside from the constructor and an accessor function to return a reference-to-const of the abstraction object stored within, there is only one other member function in the class, and this is where the full evaluation of the expression is performed. The member function is a template conversion operator to a <b>basic_string</b> type [3], and this is called when a <b>concat_string</b> object is assigned to a <b>basic_string </b>type (<a href="0506hendersonl4.html" target="_BLANK">Listing 4</a>). In the conversion operator, a <b>basic_string</b> object is created locally and <b>reserve()</b> is called to preallocate enough memory to hold the entire result string (see later for calculating the length of the new string). The text from the abstraction objects is then appended into this string using a helper class, <b>appender</b>, which can handle copying single characters, string types, and abstraction objects into a <b>basic_string</b> class. The local <b>string</b> object is then returned from the conversion operator, by value. If the compiler supports named return value optimizations (NRVO), then no more temporaries will be created here.</p>
+<h3>Bits and Pieces</h3>
+
+<p>The <b>appender</b> class provides a generic means of copying data into a <b>basic_string</b> object. This is needed because the STL <b>basic_string</b> class knows nothing of the <b>addition</b> class. The <b>appender</b> class provides three function call operators&#151;one for a single character, one for a <b>basic_string</b> object, and the third for an <b>addition</b> object (<a href="0506hendersonl5.html" target="_BLANK">Listing 5</a>).</p>
+
+<p>The final piece of scaffolding is the mechanism for calculating the length of the result string. This is done by recursively totaling the sum of the lengths of the component strings. This is done through a series of free functions that know about the length of a specific type&#151;one for a single character, a point to characters, a <b>basic_string</b> object, and an <b>addition</b> object (<a href="0506hendersonl6.html" target="_BLANK">Listing 6</a>).</p>
+<h3>Results</h3>
+
+<p>The success of this technique is difficult to measure accurately as a runtime performance saving, so instead I measured the number of requests to the heap manager for memory allocation. Using <a href="0506hendersonl7.html" target="_BLANK">Listing 7</a>, I ran the tests with <b>T1</b> and <b>T2</b> both as <b>std::string</b> types, and again with <b>T1</b> as <b>concat_string&lt;std::string&gt;</b> and <b>T2</b> as <b>std::string</b>.</p>
+
+<p>Using Microsoft Visual C++ 7.0, the first test compiled without optimizations with native <b>std::string</b> types resulted in 14 memory allocation requests, and the second test using the new technique results in three allocation requests.</p>
+<h3>Conclusion</h3>
+
+<p>Expression templates are a powerful technique for delayed evaluation of expression, and we can take advantage of the delay and allocate just one buffer that is large enough to contain the string that results from the entire expression. The expression is evaluated only when it is assigned to a <b>basic_string</b> object, so if the expression is never assigned, then the expression is never evaluated. This is contrary to the normal behavior that would create a host of temporary strings and then just throw them away. The support scaffolding is fairly extensive, but the end result is worth it. I have shown a saving of 11 memory allocations in the running example, and this is just the start of the savings. By eliminating the temporary objects that are created during normal evaluation of a string concatenation expression, I have prevented not only the heap allocations that I've already demonstrated, but the associated memory copying and deallocation, too. Perhaps more importantly, the new allocation measure is a constant value&#151;regardless of the number of additions in the expression, the same number of memory allocations will be performed.</p>
+<h3>References</h3>
+
+<ol>
+  <li>[1]	The STL shipped with this compiler employs an optimization for small strings that use an internal buffer until the string exceeds the buffer length and then moves to heap allocation. For the testing, I added a length of text to the <b>"Hello"</b> string to exceed the internal buffer limit immediately.</li>
+  <li>[2]	Vandevoorde, David and Nicolai Josuttis. <i>C++ Templates</i>, Addison-Wesley, 2003, ISBN 0201734842.</li>
+  <li>[3]	Microsoft Visual C++ 7.0 fails to compile with this template conversion operator, so an <b>std::string</b> operator is provided for this compiler. </li></ol>
+
+
+
+
+
+
+</body>
+</html>

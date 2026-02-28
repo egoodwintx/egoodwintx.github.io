@@ -1,0 +1,320 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i04: Coordinating Multi-Host Backups Using Perl Sockets</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><a href="../../../../source/SA/2003/apr2003.tar"><b class=codeListing>apr2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b><img src="a1.gif" width="200" height="167" align="right">Coordinating 
+              Multi-Host Backups Using Perl Sockets</b></h1>
+            <p> <i>A. Clay Stephenson</i>
+            <p> Systems administrators are often tasked with cleaning up someone 
+              else's mess. I encountered such a situation when I started working 
+              with my current employer. The company's newly installed Enterprise 
+              Resource Planning (ERP) system needed a backup, and the system integrator 
+              had configured an Oracle "hot" backup as the perfect solution. After 
+              looking at the situation, I found a serious problem with this "perfect" 
+              solution -- the backups were essentially useless. The problem was 
+              that this ERP system utilized a split architecture -- meaning that 
+              the application servers hosted metadata that described the actual 
+              database data hosted by additional servers. Unless the metadata 
+              exactly matched the described data, the backups, no matter how reliable, 
+              were useless.
+            <p> A method was needed to halt or freeze the application servers 
+              and to then halt the databases. Then, the backups would be taken 
+              and, finally, databases and applications would be restarted in reverse 
+              order. At this point, the system integrator's answer was to shut 
+              down everything and do a traditional "cold" backup -- not very practical 
+              for a production environment.
+            <p> An alternative to these long downtimes was quite simple -- snapshot 
+              mounts of the filesystems. The backups could then be made at leisure 
+              using these snapshots. The entire system would only need to be down 
+              briefly (in practice less than two minutes per day, which was deemed 
+              acceptable). However, I still had to address the problem of coordinating 
+              the shutdown and restart of this group of processes on multiple 
+              hosts in the correct order.
+            <p> In an ideal world, nothing more complicated than the following 
+              would be required of a simplified system consisting of two ERP application 
+              servers connecting to a database on another dedicated server:
+            <p> 1. Shut down the ERP servers and wait until all background processes 
+              finish.
+            <p> 
+            <pre>
+remsh erp_server1 shutdown_erp.sh &amp;
+remsh erp_server2 shutdown_erp.sh &amp;
+wait
+</pre>
+            2. Create filesystem snapshots or split mirrors and wait for these 
+            tasks to complete.
+            <p> 
+            <pre>
+remsh erp_server1 create_snapshots.sh  &amp;
+remsh erp_server2 create_snapshots.sh &amp;
+wait
+</pre>
+            3. Shut down the database, snapshot the filesystems, and restart the 
+            database.
+            <p> 
+            <pre>
+remsh db_server shutdown_db.sh
+remsh db_server create_snapshots.sh
+remsh db_server startup_db.sh
+</pre>
+            4. Restart the ERP applications and wait until all are restarted.
+            <p> 
+            <pre>
+remsh erp_server1 start_erp.sh &amp;
+remsh erp_server2 start_erp.sh &amp;
+wait
+</pre>
+            At this point, all applications are available, and we can safely begin 
+            the backup using the snapshots. This simple solution should work quite 
+            well, but in practice, the <b>remsh</b>'s often fail to finish because 
+            of the way some of the startup daemons are written. Typically, the 
+            remote <b>remsh</b> daemons (<b>remshd</b>) never terminate, so the 
+            "wait" statements are never satisfied.
+            <p> One answer to synchronizing these tasks would be to have all the 
+              backup pre- and post-exec scripts write data to a network file, 
+              but I didn't want to deal with file locking and cleaning up old 
+              files. A second approach would have been to use a commercial product 
+              like BMC Software's "CONTROL-M", but I realized that this was the 
+              perfect time to hone my Perl skills to fashion a sockets-based client-server 
+              pair that would essentially create a set of semaphores accessible 
+              by multiple hosts.
+            <p> All that really needed to happen was that each backup task would 
+              wait until a semaphore reached a given value before proceeding. 
+              For example, the pre-exec shell script to shut down the database 
+              would use the semaphore client to check on the status of the ERP 
+              semaphore before proceeding. When the ERP application pre-exec script 
+              finished shutting down the application, it would set the ERP semaphore 
+              and then loop, waiting for a semaphore indicating that the database 
+              has been restarted. As is typical of most commercial backup packages, 
+              HP's OmniBack II (now called DataProtector) allows one to write 
+              pre-exec scripts that are executed at the start of the entire multi-host 
+              backup as well as pre-exec scripts, which execute on each host. 
+              Homegrown solutions can use cron and <b>remsh</b>'s to do much the 
+              same thing.
+            <p> I actually starting writing the pseudo-code scripts to utilize 
+              the semaphore client/server pair before tackling the problem of 
+              coding the semaphore applications themselves. I realized that I 
+              needed a few primitive request codes for each semaphore set:
+            <p> 
+            <p> <b>SET</b> -- Set the value of a semaphore.<br>
+              <b>GET</b> -- Get the current value of a semaphore.<br>
+              <b>INC</b> -- Increment the value of a semaphore.<br>
+              <b>DEC</b> -- Decrement the value of a semaphore.<br>
+              <b>SET_LIMIT</b> -- Set the limit of a semaphore.<br>
+              <b>GET_LIMIT</b> -- Get the limit of a semaphore.
+            <p> 
+            <p> In essence, each semaphore would have both a "value" and a "limit", 
+              which could be manipulated by the client. I used case-insensitive 
+              string "tags" to identify each semaphore (e.g., "Resource_1", "Resource_2", 
+              etc.). The request_codes would also be case-insensitive strings 
+              so that "Set", "SET", and "set" would all be recognized as valid 
+              arguments. The basic command-line structure of the client-side began 
+              to take shape. Each request would need three arguments (besides 
+              optionally identifying the server host and port) and would take 
+              this form:
+            <p> 
+            <pre>
+RSLT=$(client.pl tag  request_code value)
+STATUS=${?}
+</pre>
+            Here is a more concrete example assuming that the current value of 
+            Resource_1 is 2:
+            <p> 
+            <pre>
+RSLT=$(client.pl -h remotehost -P 7777 -t 5 Resource_1 INC 1)
+STATUS=${?}
+</pre>
+            This would make a request of the semaphore server running on host 
+            remotehost, using port 7777 with a timeout of 5 seconds. It would 
+            increment the current value (2) by 1 and return a new value of 3 in 
+            ${RSLT} and set an exit status of 0 indicating success. The tag values 
+            (Resource_1 through Resource_8) could mean anything you like. For 
+            example, Resource_2 might be used to indicate the status of a database 
+            instance.
+            <p> As part of the design, I decided that all of the values and limits 
+              would be initialized at 0 when the server component was started. 
+              I also chose to shut down the server component when it received 
+              a SIGTERM or when a client sent a special "STOP" request code. It 
+              was my intention to hide all the details of setting up bi-directional 
+              sockets, host and port name lookups, dealing with timeouts, and 
+              argument parsing so that all that was needed to manipulate the Perl 
+              black-boxes was a bit of shell scripting ability.
+            <p> To get a feel for how these routines work, I suggest loading both 
+              server.pl (Listing 1) and client.pl (Listing 2) on one host (named 
+              "boss" below) and just the client.pl script on another host. Perl 
+              version 5.005 or later should be installed. If you are running them 
+              on the same host, then:
+            <p> 
+            <pre>
+$ server.pl -P 7777 # or any other available tcp port
+</pre>
+            Now, let's use the client to increment the initial value, 0:
+            <p> 
+            <pre>
+$ client.pl -P 7777 Resource_1 INC 1
+1
+</pre>
+            Repeat the command and note that the value increases to 2:
+            <p> 
+            <pre>
+$ client.pl -P 7777 Resource_1 INC 1
+2
+</pre>
+            Decrement the value by 1:
+            <p> 
+            <pre>
+$ client.pl -P 7777 Resource_1 DEC 1
+1
+</pre>
+            If you now execute the client on a different host, you will see the 
+            real power of this approach. Note the additional <b>-h</b> argument 
+            to designate the server hostname. On a different host:
+            <p> 
+            <pre>
+$ client.pl -h boss -P 7777 Resource_1 INC 1
+2
+</pre>
+            Finally, to shut down the server process:
+            <p> 
+            <pre>
+$ client.pl -h boss -P 7777 Resource_1 STOP 0
+</pre>
+            You can invoke both server.pl and client.pl with a <b>-u</b> argument 
+            for full usage.
+            <p> The sequence to synchronize the shutdown of two ERP applications 
+              servers and a database server and then restart them in reverse order 
+              now becomes:
+            <p> "Resource_1" will be the tag that is associated with the ERP application. 
+              "Resource_2" will be associated with the database.
+            <p> 
+            <pre>
+#1) This is run on a server called 'boss'; it is the first 
+#     activity started. Start the semaphore server; use the tcp port 7777.
+server.pl -P 7777
+STAT=${?}
+exit ${STAT} 
+
+#2) Code to be run on both of the ERP application servers.
+#     Shutdown the ERP application and increment the 'Resource_1' semaphore.
+shutdown_erp.sh
+STAT=${?}
+if [[ ${STAT} -eq 0 ]]
+  then
+     RSLT=$(client.pl -h boss -P 7777 Resource_1 INC 1)
+     STAT=${?}
+     # create the snapshot mounts of the ERP filesystems
+     create_snapshots.sh
+  fi
+# Now loop until the database is back up; indicated by Resource_2 set  to &gt; 0.
+RSLT=$(client.pl -h boss -P 7777 Resource_2 GET 0)
+STAT=${?}
+while [[ ${STAT} -eq 0 &amp;&amp; ${RSLT} -eq 0 ]]
+   do
+       sleep 10
+       RSLT=$(client.pl -h boss -P 7777 Resource_2 GET 0)
+       STAT=${?}
+  done
+# Now we can restart the ERP applications.
+if [[ ${STAT} -eq 0 ]]
+   then
+       start_erp.sh
+       STAT=${?}
+   fi
+# At this point, the ERP application is restarted and snapshots have been made.
+exit ${STAT}
+
+#3) Code to be executed on the database server; it is started at 
+#     the same time as the #2) above.
+#     Loop until ERP applications are down indicated by Resource_1 being set to 2.
+RSLT=$(client.pl -h boss -P 7777 Resource_1 GET 0)
+STAT=${?}
+while [[ ${STAT} -eq 0 &amp;&amp; ${RSLT} -lt 2 ]]
+    do
+        sleep 10
+        RSLT=$(client.pl -h boss -P 7777 Resource_1 GET 0)
+        STAT=${?}
+    done
+if [[ ${STAT} -eq 0 ]]
+   then     #shutdown database and snapshot
+      shutdown_db.sh   
+      create_db_snapshots.sh
+      startup_db.sh
+      STAT=${?}
+      if [[ ${STAT} -eq 0 ]]
+        then  # set Resource_2 semaphore to 1
+            RSLT=$(client.pl -h boss -P 7777 Resource_2 SET 1)
+            STAT=${?}
+        fi
+   fi
+exit ${STAT}
+</pre>
+            At this point, all backups can be made safely using the snapshots. 
+            When completed, the snapshots can be removed, and a final call to 
+            the semaphore server can be made to shut it down.
+            <p> 
+            <pre>
+RSLT=$(client.pl -h boss -P 7777 Resource_1 STOP 0)
+</pre>
+            If you are interested in the details of the Perl semaphore server 
+            and client, examine Listings 1 and 2. The key feature of the server 
+            is that it is intentionally single-threaded and thus the operations 
+            are atomic. By default, a named tcp port "omnisync" is used; an entry 
+            in the services file or map can be made for it. With very small changes 
+            (Windows lacks the <b>alarm()</b> system call), the client can also 
+            be executed on a Windows platform after installing one of the freely 
+            available Perl implementations for Windows. The minor changes necessary 
+            are indicated in the client code. It thus becomes possible to coordinate 
+            tasks not only among UNIX hosts but also among Windows platforms.
+            <p> The examples shown in this article demonstrate how to coordinate 
+              a backup among multiple hosts, but there are potentially many uses 
+              for these tools. I was pleased with the ease with which Perl handles 
+              sockets. It was remarkably similar to the way that I would have 
+              done this in C or C++.
+            <p> <i>A. Clay Stephenson has been a UNIX developer and systems administrator 
+              for more than 20 years. With a background in Physics, he has been 
+              employed in the aerospace and chemical manufacturing industries 
+              for several years. He is the current leading contributor to HP's 
+              ITRC Forums and can be reached at: <b>cstephen@chemfirst.com</b>.</i>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

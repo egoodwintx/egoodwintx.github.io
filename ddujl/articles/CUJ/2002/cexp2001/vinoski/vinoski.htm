@@ -1,0 +1,303 @@
+<HTML>   
+     <HEAD>
+<TITLE>January 2002 C++ Experts Forum/Object Interconnections</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../../20.01/tocjan.htm"></A><FONT COLOR="#FF0000">   C++ Experts Forum</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">Object Interconnections: Real-time CORBA, Part 2: Applications and Priorities</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Douglas C. Schmidt and Steve Vinoski</FONT></H3>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>This is the second in a series of columns that illustrate how CORBA is evolving to support DRE (distributed real-time and embedded) applications. DRE applications constitute an important class of distributed systems where predictability, efficiency, and fine-grained control over system resources are essential for success. Historically, these types of applications have not been well supported by CORBA or any other mainstream distributed-object computing middleware. To address this problem, the OMG adopted the Real-time CORBA specification into CORBA 2.4 in October 2000 <a href="#1">[1]</a>. This specification included standard interfaces and policies designed to allow DRE applications to configure and control the following system resources:</p>
+
+<UL>
+<LI><i>Processor resources</i> via priority mechanisms, thread pools, intraprocess mutexes, and a global scheduling service for real-time applications with fixed priorities</LI>
+<LI><i>Communication resources</i> via protocol properties and explicit bindings to server objects using priority bands and private connections</LI> 
+<LI><i>Memory resources</i> via buffering requests in queues and bounding the size of thread pools</LI>
+</UL>
+
+<p>Our first column in this series <a href="#2">[2]</a> motivated the need for the capabilities offered by Real-time CORBA. This column shows C++ code examples that illustrate how to program the Real-time CORBA priority mechanisms. Subsequent columns will show how to program many other Real-time CORBA features.
+
+<H3><FONT COLOR="#000080">Time Application Overview</FONT></H3>
+
+<p>We'll focus on a planetary mapping system to illustrate key Real-time CORBA capabilities. This application is based on various semi-autonomous vehicle use cases, such as the Mars Sojourner or unmanned ground vehicle robots used to clean-up toxic waste spills. The key elements in this application are shown in <a href="fig1.htm">Figure 1</a>.</p>
+<p>In this system, semi-autonomous drones are involved in a distributed computation to map a planetary surface. The drones explore the planet's surface and periodically report its properties (e.g., its color, texture, and elevation). The data collected by drones is aggregated and delivered to mission operators, who can update the mission dynamically by redirecting drones and their actions. To keep the system affordable, drones aren't particularly &quot;smart.&quot; They can therefore fall off the edges of planetary surfaces, such as boulders or cliffs, if they aren't stopped by an operator that coordinates their actions (e.g., by ordering them to a new position). </p>
+<p><a href="fig2.htm">Figure 2</a> illustrates the relationships among the various CORBA clients and servers in our planetary mapping application.</p>
+<p>Mission operators define high-level exploration goals for the drones via a <b>Base_Station</b> object, which provides set points for <b>Controller</b> objects. <b>Controller</b> objects control the drones remotely using </b>Drone</b> objects, which reside on the drone vehicles. <b>Drone</b> objects expose operations for controlling and monitoring individual drone behavior. Each drone sends information obtained from its sensors back to the <b>Base_Station</b> via its <b>Controller</b> object.</p>
+<p>The IDL interfaces for these objects are described next. We first show the <b>Drone</b> interface:</p>
+
+<pre>
+interface Drone {
+  void turn (in float degrees);
+  void speed (in short mph);
+  void reset_odometer ();
+  short odometer ();
+  // ...
+};</pre>
+
+<p>Each drone talks to one controller, whose interface is shown next:</p>
+
+<pre>
+interface Controller {
+  void edge_alarm ();
+  void battery_low ();
+  // ...
+};
+</pre>
+
+<p>When a drone detects an edge, it sends high priority <b>edge_alarm()</b> requisitions to its controller, which is responsible for taking corrective action. The <b>Base_Station</b> interface is shown below:</p>
+
+<pre>
+interface Base_Station {
+  exception Lack_Resources {};
+  Controller new_controller (in string name)
+    raises (Lack_Resources);
+  void set_new_target (in float x, in float y,
+    in float w, in float h);
+  // ...
+};
+</pre>
+
+<p>A <b>Base_Station</b> plays several roles:</p>
+
+<UL><LI>It's a <b>Controller</b> factory (i.e., drones use this interface to create their controllers during power up)</LI>
+<LI>End-user operators use this interface to set their high-level mobility targets</LI></UL>
+
+<p>When implementing the <b>Base_Station</b>, <b>Controller</b>, and <b>Drone</b> interfaces in our planetary mapping application, we must address the following design challenges associated with controlling DRE system resources and providing adequate end-to-end real-time QoS (quality of service):</p>
+
+<table border=1 cellpadding=3 width=85%>
+<tr><td><b>System Resources</b></td><td><b>QoS-Related Design Challenges</b></td></tr>
+<tr>
+<td>CPU Utilization and Priorities</td>
+<td><OL><LI>Ensuring portable ORB end-system priorities</LI>
+<LI>Preserving priorities end-to-end</LI>
+<LI>Simplify scheduling of end-to-end priorities</LI></OL>
+</tr>
+<tr>
+<td>Threads and Synchronizers</td>
+<td><OL><LI>Supporting thread pools effectively</LI>
+<LI>Prevent exhaustion of threads by low priority requests</LI>
+<LI>Prevent bursts or long-running requests from exhausting maximum number of static and dynamic threads</LI>
+<LI>Buffering client requests</LI>
+<LI>Synchronizing objects correctly</LI></OL></td>
+</tr>
+<tr>
+<td>Network Protocols and Connections</td>
+<td><OL><LI>Configuring custom protocols to obtain adequate QoS</LI>
+<LI>Controlling network and end-system resources to minimize priority inversion</LI>
+<LI>Avoiding dynamic connections since jitter can be detrimental to time-critical applications</LI>
+<LI>Minimizing priority inversions by ensuring applications don't share a connection between multiple threads running at different priorities</LI></OL></td>
+</tr>
+</table>
+
+<p>These QoS-related design challenges are similar to those of other DRE applications, such as avionics mission computing, telecom call processing, and hot rolling mill control systems. In particular, strict control over the priorities of threads that share processor resources is essential for many real-time applications. Earlier versions of CORBA provided no standard way for clients to indicate the relative priorities of their requests to ORB end systems.  This feature is necessary, however, to minimize end-to-end priority inversion, as well as to bound latency and jitter for applications with deterministic real-time QoS requirements. The Real-time CORBA specification therefore defines platform-independent features to address the following design challenges associated with controlling the priority of operation invocations: </p>
+
+<table border=1 cellpadding=3 width=85%>
+<tr><td><b>Design Challenge</b></td>
+  <td><b>Example from Application</b></td>
+  <td><b>Real-time CORBA Feature</b></td>
+</tr>
+<tr>
+  <td>Ensuring portable ORB priorities</td>
+  <td>ORB must map heterogeneous native OS host thread priorities consistently from client to server</td>
+  <td>Use standard Real-time CORBA priority mapping interfaces</td>
+</tr>
+<tr>
+  <td>Preserving priorities end-to-end</td>
+  <td>ORB must ensure that requests don't run at the wrong priority on the server (e.g., major problems can occur if <b>edge_alarm()</b> operations are processed too late)</td>
+  <td>Use the Real-time CORBA <b>CLIENT_PROPAGATED</b> or <b>SERVER_DECLARED</b> priority models</p>
+  </td>
+ </tr>
+</table>
+
+<p>The remainder of this column illustrates how to apply the Real-time CORBA features outlined in the table above to address key thread-priority design challenges that arise in our planetary mapping application. </p>
+
+<H3><FONT COLOR="#000080">Ensuring Portable ORB Priorities</FONT></H3>
+
+<p>To maximize flexibility and select the best solution for different tasks, our planetary mapping application uses different types of hardware and software. As this heterogeneous computing infrastructure evolves over the lifecycle of the system, a recurring challenge is to ensure that the priorities of CORBA operations map correctly and efficiently onto the native OS host thread priorities consistently end-to-end. In earlier versions of CORBA, there was no way to designate priorities, much less map them portably across diverse real-time OS platforms.</p>
+<p>Fortunately, the Real-time CORBA specification defines a <i>priority mapping</i> feature that supports heterogeneous real-time OS platforms. This feature defines two types of priorities &#151; <i>CORBA</i> and <i>native</i> &#151; to handle OS heterogeneity. Each one-way or two-way CORBA operation can be assigned a <i>CORBA priority</i>, which is an OS-independent value ranging between 0 and 32,767.  Real-time CORBA allows each ORB end system along the path from source client to sink server to map these CORBA priorities onto <i>native priorities</i> that are appropriate for the underlying OS threading mechanisms. Applications can customize this mapping differently on different ORB end systems.  For example, <a href="fig3.htm">Figure 3</a> illustrates how CORBA priorities can be mapped onto two different ORB end systems with different native priority ranges.</p>
+<p>The following C++ code example illustrates how to extend the standard <b>RTCORBA::PriorityMapping</b> class to define a pair of hook methods that convert to and from CORBA priorities to native priorities. This example is targeted for the LynxOS platform (e.g., the <b>to_native</b> method only uses native priorities in the range [128-255), which is the top half of LynxOS thread priorities).</p>
+
+<pre>
+class LynxOS_Priority_Mapping : 
+  public RTCORBA::PriorityMapping {
+  CORBA::Boolean to_native 
+   (RTCORBA::Priority corba_prio,
+    RTCORBA::NativePriority &amp;native_prio) {
+    native_prio = 128 + (corba_prio / 256);
+    return true;
+  }
+
+  CORBA::Boolean to_corba 
+   (RTCORBA::NativePriority native_prio,
+    RTCORBA::Priority &amp;corba_prio) {
+    if (native_prio &lt; 128) return false;
+
+    corba_prio = (native_prio - 128) * 256;
+    return true;
+  }
+};
+</pre>
+
+<p>The Real-time CORBA priority mapping feature enables DRE developers to program their applications with minimal concern for low-level details of the thread priorities in their underlying ORB end systems. In turn, this feature makes it easier to configure the various ORB instances in their DRE systems to take maximal advantage of the underlying OS, network, and hardware resources. It's important to recognize, however, that Real-time CORBA's priority mapping feature can't work miracles (i.e., no ORB middleware can magically imbue a non-real-time OS or communication infrastructure with completely deterministic behavior).</p>
+<p>There are also some deficiencies with the Real-time CORBA priority mapping feature. In particular, the specification doesn't define a standard way to install a <b>PriorityMapping</b> object. The official rationale for not standardizing this installation process is to maximize ORB implementer options (e.g., to install the mapping at link time or at run time, whichever is most efficient for a particular use case). The following C++ code illustrates how to install a <b>PriorityMapping</b> using the TAO ORB <a href="#3">[3]</a>, which is an open-source implementation of Real-time CORBA. TAO implements the priority mapping feature via a locality-constrained object called the <b>PriorityMappingManager</b>. We first show the standard CORBA code, which starts by obtaining a reference to an ORB and creating an instance of the LynxOS priority mapping object:</p>
+
+<pre>
+CORBA::ORB_var orb = 
+  CORBA::ORB_init (argc, argv);
+RTCORBA::PriorityMapping *lynxos_mapping = 
+  new LynxOS_Priority_Mapping;
+</pre>
+
+<p>We next show the TAO-specific code. We use the standard CORBA <b>resolve_initial_references</b> feature to get an object reference to TAO's <b>PriorityMappingManager</b> and then narrow this to a reference to the TAO-specific <b>PriorityMappingManager_var</b> helper class:</p>
+
+<pre>
+CORBA::Object_var obj = 
+  orb-&gt;resolve_initial_references (&quot;PriorityMappingManager&quot;);
+TAO::PriorityMappingManager_var manager = 
+TAO::PriorityMappingManager::_narrow (obj);
+</pre>
+
+<p>Finally, we install the new priority mapping for LynxOS:</p>
+
+<pre>
+manager-&gt;mapping (lynxos_mapping);
+</pre>
+
+<p>Although the TAO-specific code that installs the priority mapping can be localized in a small section of the application, it would be nice if Real-time CORBA standardized this procedure because it would simplify portability between ORBs.</p>
+
+<H3><FONT COLOR="#000080">Preserving Priorities End-to-End</FONT></H3>
+
+<p>Assuming that we've installed the appropriate <b>PriorityMapping</b>s throughout our planetary mapping system, our next challenge is to ensure that operations run at the right priority within their servers. For example, it's important that <b>edge_alarm()</b> operations run at a higher priority than other operations since otherwise drones may get stuck in awkward situations. To preserve priorities end-to-end, the Real-time CORBA specification defines a <b>PriorityModel</b> policy with two values, <b>SERVER_DECLARED</b> and <b>CLIENT_PROPAGATED</b>, which we describe below.</p>
+<p>The <b>SERVER_DECLARED</b> model allows a server to dictate the priority at which an invocation made on a particular object will execute. In this model, a server designates the priority <i>a priori</i> when the object is activated. A single priority is encoded into the object reference, which is then published to the client as a tagged component in an object reference, as shown in <a href="fig4.htm">Figure 4</a>.</p>
+<p>Although the server declares the priority, the client ORB is aware of the selected priority model policy and can use this information internally to ensure that invocations access client-side resources at the appropriate priority.</p>
+<p>To illustrate the <b>SERVER_DECLARED</b> model, we'll show how to create and activate a <b>Base_Station</b> object. Since its operations are not time-critical, they run at lower priority than <b>Controller::edge_alarm()</b> operations. We start by using the standard <b>CORBA::ORB_init</b> factory operation to obtain an object reference to the ORB:</p>
+
+<pre>
+CORBA::ORB_var orb = CORBA::ORB_init (argc, argv);
+CORBA::Object_var obj =
+  orb-&gt;resolve_initial_references (&quot;RTORB&quot;);
+</pre>
+
+<p>We then use <b>obj</b> to obtain an object reference to the Real-time CORBA ORB:</p>
+
+<pre>
+RTCORBA::RTORB_var rt_orb =
+  RTCORBA::RTORB::_narrow (obj);
+</pre>
+
+<p>We need to obtain a real-time ORB in order to access certain operations that aren't available to non-real-time ORBs. Assuming that the <b>RTCORBA::RTORB::_narrow</b> operation succeeds, we can henceforth use Real-time CORBA features. The steps above are an example of the <i>Extension Interface</i> pattern <a href="#4">[4]</a>, which allows <span style='color:black'>multiple interfaces to be exported by a component to prevent bloating of interfaces and breaking of client code when developers extend or modify the functionality of the component. </p>
+<p>After we initialize the <b>rt_orb</b>, we create a policy list initialized with the <b>SERVER_DECLARED</b> policy by calling an operation that's specific to Real-time CORBA.</p>
+
+<pre>
+CORBA::PolicyList policies (1);
+policies.length (1);
+policies[0] = rt_orb-&gt;create_priority_model_policy 
+  (RTCORBA::SERVER_DECLARED, LOW_PRIORITY);
+</pre>
+
+<p>We then use this <b>PolicyList</b> to create a POA that contains <b>Base_Station</b> objects:</p>
+
+<pre>
+PortableServer::POA_var base_station_poa = 
+  root_poa-&gt;create_POA (&quot;Base_Station_POA&quot;,
+    PortableServer::POAManager::_nil (),
+    policies);
+</pre>
+
+<p>The <b>LOW_PRIORITY</b> argument to <b>create_priority_model_policy</b> is the default CORBA priority of objects that are activated in <b>&quot;Base_Station_POA&quot;</b>. We next activate a <b>Base_Station</b> servant in the <b>base_station_poa</b>:</p>
+
+<pre>
+Base_Station_i *base_station = new Base_Station_i;
+base_station_poa-&gt;activate_object (base_station);
+</pre>
+
+<p>We can now export the object reference for <b>base_station</b> to clients using a Naming Service or some other type of location discovery service or factory operation.</p>
+<p>By default, <b>SERVER_DECLARED</b> objects inherit the priority of the POA in which they're created, as shown above. This behavior can be controlled by using the <b>activate_object_with_priority</b> operation defined in the <b>RTPortableServer::POA</b> interface. For example, we can activate <b>another_server</b> at <b>ANOTHER_PRIORITY</b>, as shown below:</p>
+
+<pre>
+RTPortableServer::POA_var rt_poa =  
+  RTPortableServer::POA::_narrow (base_station_poa);
+rt_poa-&gt;activate_object_with_priority 
+  (another_servant, ANOTHER_PRIORITY);
+</pre>
+
+<p>Note that Real-time CORBA once again uses the Extension Interface pattern to obtain the real-time POA from an object reference to a non-real-time POA.</p>
+<p>Although the <b>SERVER_DECLARED</b> model is useful for certain types of real-time applications, it's not suited for others. For instance, one way a server can avoid priority inversions is to process incoming requests at a priority equivalent to the client thread that invoked the operation originally. To support this use case, Real-time CORBA also defines a <b>CLIENT_PROPAGATED</b> model that allows clients to invoke operations whose priorities must be honored by servers. In this model, each invocation carries the CORBA priority of the operation in the service context list that's included as part of its GIOP request. Each ORB along the path between the client and server maps this end-to-end CORBA priority to a native OS priority and processes the request at this priority. If the client invokes a two-way operation, its CORBA priority will determine the priority of the reply.</p>
+<p><a href="fig5.htm">Figure 5</a> depicts the case where an invocation from a client on one ORB end system to a server on another ORB end system results in an invocation on an intervening ORB end system, each running real-time operating systems with different native priority ranges for their threads.</p>
+<p>Since we're using the <b>CLIENT_PROPAGATED</b> model, the CORBA priority of the client is transmitted along with the request.  Each server along the invocation path maps the client's CORBA priority to a native priority that's appropriate for its host platform and end-to-end global priority. For example, on QNX the global CORBA priority could be mapped to a native OS priority of 16, whereas on LynxOS the same global CORBA priority could be mapped to a real-time thread with a priority of 128, and on Solaris this CORBA priority could be mapped to a priority of 136.</p>
+<p>In our planetary mapping system, drones invoke critical operations on controllers in the base station.<b> </b>The <b>Controller::edge_alarm()</b> operation runs at the highest priority in the system, whereas the <b>Controller::battery_low()</b> operation runs at a lower priority in the system. The <b>CLIENT_PROPAGATED</b> policy is set on the server and exported to the client along with an object reference, as shown below. Assuming we've already obtained a reference to a real-time ORB as shown earlier, <span style='color:black'>we create a policy list initialized with the <b>CLIENT_PROPAGATED</b> policy using an operation that's specific to Real-time CORBA:</p>
+
+<pre>
+CORBA::PolicyList policies (1); 
+policies.length (1);
+policies[0] = rt_orb-&gt;create_priority_model_policy 
+  (RTCORBA::CLIENT_PROPAGATED, DEFAULT_PRIORITY);
+</pre>
+
+<p><b>DEFAULT_PRIORITY</b> is the CORBA priority used to process requests from non-Real-time CORBA clients. We use the <b>policies PolicyList</b> to create a POA that contains <b>Controller</b> objects:</p>
+
+<pre>
+PortableServer::POA_var controller_poa = 
+  root_poa-&gt;create_POA (&quot;Controller_POA&quot;,
+    PortableServer::POAManager::_nil (),
+    policies);
+</pre>
+
+<p>Next, we activate a <b>Controller</b> servant in the <b>controller_poa</b>:</p>
+
+<pre>
+Controller_i *controller = new Controller_i;
+controller_poa-&gt;activate_object (controller);
+</pre>
+
+<p>As with the <b>base_station</b> example above, we can now export the object reference for controller using a Naming Service or a similar location discovery service.</p>
+<p>Although servers determine whether an object is created with the <b>CLIENT_PROPAGATED</b> priority model, clients ultimately determine the CORBA priority at which operations on an object are invoked. To select the CORBA priority at which an operation is invoked, a client uses its thread-specific <b>RTCurrent</b> object to change the priority of a thread explicitly. To illustrate this in C++, we first get the real-time ORB's <b>RTCurrent</b> object:</p>
+
+<pre>
+obj = orb-&gt;resolve_initial_references (&quot;RTCurrent&quot;);
+RTCORBA::Current_var rt_current =
+  RTCORBA::Current::_narrow (obj);
+</pre>
+
+<p>We then change the current thread's CORBA priority:</p>
+
+<pre>
+rt_current-&gt;the_priority (VERY_HIGH_PRIORITY);
+</pre>
+
+<p>This call will use the <b>to_native</b> hook method described earlier to map the <b>VERY_HIGH_PRIORITY</b> CORBA priority to the appropriate native OS thread's priority and set the thread to run at that priority. The <b>RTCurrent</b> object can also be used to query the current thread's priority. Now that we've set the right priority, we'll invoke the <b>edge_alarm()</b> operation in the client thread running at the <b>VERY_HIGH_PRIORITY</b> native thread priority:</p>
+
+<pre>
+controller-&gt;edge_alarm ();
+</pre>
+
+<p>Since the <b>controller</b> object reference was created in a server POA configured with the <b>CLIENT_ PROPAGATED</b> policy, its CORBA priority will be sent along with the <b>edge_alarm()</b> request.</p>
+<p>Each server along the end-to-end operation path will use the Real-time CORBA priority mapping mechanism to convert the CORBA priority into the corresponding OS native priority and process the operation at that priority. By applying the appropriate real-time analysis tools, such as TimeWiz from TimeSys or RAPID RMA from Tri-pacific, it's possible to determine the feasibility of scheduling all the time-critical operations in our planetary mapping application. </p>
+
+<H3><FONT COLOR="#000080">Concluding Remarks</FONT></H3>
+
+<p>The Real-time CORBA specification enhances regular CORBA by adding capabilities that control process, communication, and memory resources. These capabilities enable standard COTS middleware to improve the determinism of DRE applications by bounding their priority inversions and managing their system resources more predictably end-to-end. This column illustrates how to program the Real-time CORBA features that provide portable priority mapping and end-to-end priority preservation. Our next column will explore Real-time CORBA features that support threading and synchronization.</p>
+<p>A PowerPoint tutorial version of our columns on the Real-time CORBA specification can be downloaded at &lt;http://www.cs.wustl.edu/~schmidt/TAO/RT-CORBA.ppt&gt. We appreciate the help of Irfan Pyarali, Carlos O'Ryan, and Angelo Corsaro for co-authoring this tutorial and providing comments on this column. If you have comments, questions, or suggestions regarding Real-time CORBA or our columns, please let us know at <b>object_connect@cs.wustl.edu</b>.</p>
+
+<H3><FONT COLOR="#000080">References</FONT></H3>
+
+<p><a name="1"></a>[1] Object Management Group. &quot;The Common Object Request Broker: Architecture and Specification Revision 2.4,&quot; OMG Technical Document formal/01-02-33, October 2000, &lt;www.omg.org/cgi-bin/doc?formal/01-02-33&gt;.</p>
+<p><a name="2"></a>[2] D.C. Schmidt and S. Vinoski. &quot;Object Interconnections: Real-time CORBA, Part 1: Motivation and Overview,&quot; <i>C/C++ Users Journal C++ Experts Forum</i>, December 2001, &lt;www.cuj.com/experts/1912/vinoski.htm&gt;.</p>
+<p><a name="3"></a>[3] The ACE ORB (TAO), &lt;www.cs.wustl.edu/~schmidt/TAO.html&gt;.</p>
+<p><a name="4"></a>[4] D. Schmidt, M. Stal, H. Rohnert, and F. Buschmann. <i>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects</i> (Wiley and Sons, 2000), &lt;www.cs.wustl.edu/~schmidt/POSA/&gt;.</p>
+<p><a name="5"></a>[5] Richard E. Schantz and Douglas C. Schmidt &quot;Middleware for Distributed Systems: Evolving the Common Structure for Network-centric Applications,&quot; <i>Encyclopedia of Software Engineering</i> (Wiley and Sons, 2002), &lt;www.cs.wustl.edu/~schmidt/PDF/middleware-chapter.pdf&gt;.</p>
+
+<p><i><B>Steve Vinoski</B> is chief architect and vice president of Platform Technologies for IONA Technologies and is also an IONA Fellow. A frequent speaker at technical conferences, he has been giving CORBA tutorials around the globe since 1993. Steve helped put together several important OMG specifications, including CORBA 1.2, 2.0, 2.2, and 2.3; the OMG IDL C++ Language Mapping; the ORB Portability Specification; and the Objects By Value Specification. In 1996, he was a charter member of the OMG Architecture Board. He is currently the chair of the OMG IDL C++ Mapping Revision Task Force. He and Michi Henning are the authors of </i>Advanced CORBA Programming with C++<i>, published in January 1999 by Addison Wesley Longman.</i></p> 
+<p><i><B>Doug Schmidt</B> is an associate professor member at the University of California, Irvine. His research focuses on patterns, optimization principles, and empirical analyses of object-oriented techniques that facilitate the development of high-performance, real-time distributed object computing middleware on parallel processing platforms running over high-speed networks and embedded system interconnects.  He is the lead author of the book </I>Pattern-Oriented Software Architecture: Patterns for Concurrent and Networked Objects<I>, published in 2000 by Wiley and Sons. He can be contacted at <b>schmidt@uci.edu</b>.</i></p>
+
+</BLOCKQUOTE>
+</body>
+</html>
+

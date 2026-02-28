@@ -1,0 +1,499 @@
+<HTML>
+<META NAME="year" CONTENT="1992">
+<HEAD>
+<TITLE>NOV92: GARBAGE COLLECTION FOR C PROGRAMS</TITLE></HEAD>
+<BODY BGCOLOR="#ffffff">
+<h1>GARBAGE COLLECTION FOR C PROGRAMS<a name="025f_0002"></h1><P>
+<h2><a name="025f_0001"><a name="025f_0000">There's no need to explicitly free memory</h2><P>
+This article contains the following executables: GARBAGE.ARC<P>
+<h3>Giuliano Carlini and Susan Rendina</h3><P>
+<p><i><a name="025f_0000">Giuliano and Susan, the authors of Alloc-gc, run the Codewright's Toolworks, where they can be contacted at 310-514-3151.</i></p><hr><P>
+Garbage collection liberates you from needing to explicitly free memory.  This leads to faster development cycles, cleaner code, and (hopefully) fewer bugs.  Garbage collection has been used for years by languages that depend on interpreters (Lisp and Smalltalk), specialized hardware (the Lisp machine), or a carefully controlled runtime environment (Algol-68).  However, &quot;conservative&quot; collection techniques make it possible for you to use garbage collection even when the environment does not provide support.<P>
+Programs that allocate blocks of memory must return unused blocks so that they may be used again.  Most often, they do so by explicitly deallocating blocks with calls to a deallocation routine.  An alternative is implicit deallocation using a garbage collector.  In this case, a block is implicitly available to be returned whenever there are no references to it.  From time to time, a garbage collector scans memory, looking for unreferenced blocks and returning them.<P>
+The primary impediment to using garbage collection is that most garbage collectors require help from the programming language, operating system, and/or runtime system.  Many environments don't (or can't) provide such help.  Conservative garbage collectors, however, require no help.  The allocator of an existing program may be replaced with a conservative collector, usually with no other changes required.<P>
+Another reason for the infrequent use of garbage collectors is the mistaken belief that they are too slow.  While once true, this is no longer the case.  The very best garbage collectors use about 3 to 5 percent of the CPU.  Conservative collectors use more of the CPU, but are still reasonably efficient.<P>
+The design and code of explicitly deallocating programs are convoluted by the need to deallocate blocks both under normal conditions and when erroneous or unusual conditions happen.  The design of a garbage-collected program is simple, and the code is clear.  The result is an easier-to-understand program which takes less time to design, code, and debug. The program is more likely to be correct, since fewer errors will have been made, debugging them will have been easier, and formal proofs (if used) are easier to construct.  Lastly, maintenance will be easier.<P>
+The basic elements of this garbage-collecting replacement for C's malloc() will run on 80x86s under DOS.  The code, which has been compiled with Microsoft C 5.1, works only with small model programs.  However, we do discuss how to extend it to work with large-model programs.<P>
+<h3><a name="025f_0003">Theory<a name="025f_0003"></h3><P>
+An allocator satisfies dynamic requests for memory by returning the address of a block of memory, which can be used by the client to store data.  A deallocator returns a block of memory to the allocator, which may reuse the memory to satisfy a later request.  A garbage collector determines which previously allocated memory blocks are still in use and returns the rest to the allocator.<P>
+There are two principal methods of garbage collection: Mark and Sweep, and Stop and Copy. Both begin collecting by starting at locations known to contain references to allocated blocks.  These locations are called &quot;roots,&quot; and usually include the stack and hardware registers.<P>
+Mark and Sweep examines the roots.  When it finds a reference to an allocated block, it marks the block as referenced.  If the block was unmarked, the block is recursively examined for references.  When all referenced blocks have been marked, a linear scan of all allocated memory is made, sweeping unreferenced blocks into the allocator's free list(s).<P>
+Stop and Copy compacts memory by copying referenced blocks to lower memory locations that were occupied by unreferenced blocks.  It then updates references to point to the new locations for the allocated blocks.<P>
+Nonconservative garbage collectors receive help in recognizing a value in memory as a reference to a block.  Often this is done by tagging values.  Some subset of the bits in a value indicates the type of the value.  For example, the low-order two bits might be used for the tag, with the value 00 representing a memory reference, 01 an integer, and 02 a float.<P>
+A conservative garbage collector requires no such help.  Rather, it slithers through memory looking at values, operating on the &quot;conservative&quot; assumption that if a value, when interpreted as an address, refers to an allocated block, then the block must be treated as referenced and not be collected.  Occasionally, random values may be incorrectly interpreted as a block reference.  In these cases, an unreferenced block is not collected.  An example may be helpful.  On the PC, a C integer is two bytes, and a long address is two bytes of segment plus two bytes of offset.  Suppose two successive integers in memory contain the following as their values: an integer which happens to be a valid segment, and an integer which happens to be the offset within the segment of an allocated block.  When the garbage collector examines memory, the two integers appear to be a reference to the block, and so the block is treated as referenced.  Such cases of mistaken identity are rare, and their effects usually innocuous: A limited amount of memory is not reclaimed.  Sometimes the effects are more severe, but generally there are workarounds.  Usually, however, as the misidentified value changes, subsequent collections will pick up the previously uncollected block.<P>
+Because random values are being examined, the conservative collector must be careful.  It has the following constraints:<P>
+<UL>
+<li>The garbage collector must not change a value.  It may not actually be a pointer, but instead a value of some other type.  This constraint eliminates Stop and Copy as the basis of conservative garbage collection.</li>
+<li>Before treating the value as a pointer, the garbage collector must validate the value.  On 80x86s this means verifying that the segment of a far pointer is valid, and that the offset corresponds to a previously allocated block.  If the segment check isn't done, we might generate an address error in a protected-mode program.</li>
+<li>Until the value is validated, the garbage collector may only change its own data, and not, for example, the data at the value interpreted as an address.</li>
+</UL>
+The offset check implies that the allocator's clients must also be careful.  They must keep a pointer to the block's start address until they are done with the block.  <a href="#025f_0004">Example 1</A>, for instance, could lead to disaster.  If a garbage collection occurs during process(), there is no reference to the start of the allocated block, and so the collector will move the block to the allocator's free list.  If process() allocates memory, the block may end up being reallocated.  Very likely the strain would be too much for process(), which would soon die.<P>
+<h4><a name="025f_0004">Example 1: A pointer to the front of the block must be maintained.</h4><P>
+<pre>
+     for ( p = malloc(Nbr0fBytes); p &lt; p + Nbr0fItems; p++ )
+  {
+     process ( p );
+  }</pre><P>
+<P>
+<h3><a name="025f_0005">Design<a name="025f_0005"></h3><P>
+In designing the garbage-collection library presented here, we've followed an object-oriented design philosophy.  The two principal classes are the allocation segment and garbage collector.  The segment class knows about how to manage memory blocks in an 80x86 segment. Since the code runs only under small model, there is only a single-segment object.  This segment class must therefore be aware that global data and the stack are also located within the segment.  The garbage collector is responsible for marking all blocks reachable from the root.  The garbage collector knows nothing about the internals of an allocation segment.  The allocation segment provides routines to: validate that a value represents a valid block; return the length of a block; and sweep all unused blocks within it, so they can be reused.<P>
+Other major parts of the library are the replacements for malloc() and its related routines.  The malloc() function, see <a href="#025f_0010">Listing Five</A>, Page 129, asks the segment for a block.  If there is no free block large enough, the segment will return null; malloc() will subsequently request the garbage collector to run, then again ask the segment for a block.  If a large enough unused block now exists, the segment will return some part of it.  If not, it will again return NULL, which malloc() will in turn return to its client.<P>
+In the segment, memory is allocated in units of eight bytes.  In addition to the memory used for blocks to return to clients, free list heads and a flag vector are stored at the end of the segment.  Each element in the free list-head array points to the first free block of a particular size.  The flag vector maintains two flags per unit: allocated block start and referenced.  Allocated is set True for the unit which starts a block returned by the allocator.  Allocated is cleared if the block starting at the unit is swept up.  Referenced is set True if allocated is True, and the garbage collector asks the segment to validate a value which points to the unit.  When sweeping, the segment looks for allocated blocks with clear referenced flags.  Rather than free each such block in turn, the allocator merges contiguous free and unreferenced blocks, and then places the merged blocks onto their free lists.<P>
+The allocation segment uses a simple buddy-system allocator.  All blocks -- both allocated and free -- are a power of two in size.  A separate free list is kept for each block size.  At startup, the free space in the segment is broken up into blocks of the appropriate size, and these are placed onto the free lists.  To allocate we find the first free block of size greater or equal to that requested.  We then split off any unneeded space from the end of this block, break it up into power-of-two sized pieces, and attach these to the free lists.<P>
+<h3><a name="025f_0006">Code Discussion<a name="025f_0006"></h3><P>
+The garbage collector's header files do the following: array.h defines some useful macros for dealing with arrays; bool.h defines an enumeration to represent Booleans rather than the usual usage of macros for True and False; power2.h declares some tables used to quickly perform calculations, the result or operand of which is a power of two.  The input of the function is used as the array's index.  The value of that array element is the function's result.  The input must be in the range 1 to 255.  The file pwr2gen.c is the source of a program which generates power2.h; BumpUp computes the first power of two greater or equal to its input, and Log2 computes the ceiling of the log base 2 of its input.<P>
+The source code that implements the garbage collector consists of Gc.h and Gc.c ( <a href="#025f_0008">Listings One</A> and <a href="#025f_000a">Two</A>, page 128).  Calling GcPickup() runs the garbage collector.  It in turn calls ASegClearMarks() to clear marks, GcMark() to set the mark of used blocks, followed by ASegSweep() to sweep up unused blocks.  To start, GcMark() is called first to mark the global data and then again to mark the stack.  It steps through the segment, passing each value in memory to ASegMarkValue().  If the value corresponds to a block that should be examined for pointers, ASegMarkValue() returns the size of that block.  In this case, GcMark() calls itself recursively.<P>
+Aseg.h ( <a href="#025f_000c">Listing Three</A>, page 128) and ASeg.c ( <a href="#025f_000e">Listing Four</A>, page 128) are the interface and implementation of allocation segments, respectively.  These functions are all prefixed with ASeg.  Most of them are straightforward; only ASegVegamatic() is tricky.  A free block may not be just any power of two.  It must be less than or equal to the greatest power of two that can evenly divide the start address.  The expression Size=FreeOffset &amp; ( -(int)FreeOffset ); sets &quot;Size&quot; to the maximum size of a block starting at FreeOffset.  On a two's complement machine, -X=!X+ 1--the definition of two's complement.  Due to this definition, X and -X have the same least significant bits up to and including the first 1 bit.  More significant bits are cleared. ASegMarkValue() first validates that its argument value could be a pointer returned by the allocator.  If it is, and the block pointed to has not been marked, then it marks it and returns the size of the block.  Otherwise it returns 0 for the size.<P>
+Supplemental test files that put the system through its paces, as well as array.h, bool.h, power2.h, and pwr2gen.c are available electronically; see page 5.<P>
+<h3><a name="025f_0007">Enhancements<a name="025f_0007"></h3><P>
+While the code is limited to running under small model with a single segment, we've designed the interfaces to support multiple segments so that compact, large, and mixed-memory model programs can be supported.  The major problem is that when presented with a value, we must validate that its segment portion corresponds to a valid segment before calling ASegMarkValue().  The easiest way to do this is to maintain a bit table in Gc.c.  When we get a segment from the operating system, we turn on the corresponding bit in the table.  To validate a value we extract the segment portion and look it up in the table.  If the bit is off, we know the value can't be a pointer and proceed.  Otherwise, we pass the value on to ASegMarkValue() for further validation and processing.  Logic must be added in several other places.  We need to allocate and initialize segments.  We need to traverse all allocated segments to clear their marks and sweep them.  Lastly, malloc() becomes more complicated since it needs to have a policy for deciding when to garbage collect to try to free up some space vs. allocating another segment to create more space.<P>
+We've argued that garbage collecting is usually better than explicit deallocation -- and it is.  Just as you often program in a high-level language while using assembler to write critical code, you can use garbage collection in most places, but when necessary, call a deallocator.  But to do this, the garbage collector must supply one.  While most deallocators try to coalesce adjacent blocks, it's probably better to just add the block to its free list and let the next garbage collection handle the coalescing.<P>
+No single allocation strategy is best all the time.  Buddy-system allocators are fast, but they waste memory.  Next fit is usually slower, but doesn't waste as much memory.  Best fit is slow, but wastes very little memory.  If we support multiple segments, we can have each support a different allocation scheme.  Then, based on requested block size, or some other hint, malloc() can ask the segment with the best strategy for a block.<P>
+It's sometimes useful for the client program to know when a block is about to be reclaimed. The garbage collector could do this by calling a client callback function when it finds an unused block.  For example, if the file I/O library stored the state data for open files in dynamic memory, then I/O clients would not need to call close.  If the client ever let go of all references to a file, it would eventually be garbage collected.  This would trigger a call of the callback function, which could then close the file.<P>
+
+<PRE>
+
+
+_GARBAGE COLLECTION FOR C PROGRAMS_
+by Giuliano Carlini and Susan Rendina
+
+<a name="025f_0008">
+<a name="025f_0009"></pre><B>[LISTING ONE]</B><pre><a name="025f_0009">
+
+/* Garbage Collector - Free memory blocks that aren't referenced. A garbage
+collector deduces which memory blocks are in use. When memory runs low, it
+reclaims those blocks which are no longer used. That memory can then be reused
+to satisfy further requests for memory. */
+
+#ifndef GC_Defn
+#define GC_Defn
+
+void GcPickUp( void );
+/* Reclaim blocks of unused memory from the segments being watched. */
+
+#endif
+
+
+
+<a name="025f_000a">
+<a name="025f_000b"></pre><B>[LISTING TWO]</B><pre><a name="025f_000b">
+
+/* GC - Garbage Collector */
+
+#include &quot;aseg.h&quot;
+#include &quot;array.h&quot;
+#include &quot;bool.h&quot;
+#include &quot;gc.h&quot;
+
+#ifndef BitsPerByte
+#define BitsPerByte 8
+#endif
+
+void GcMark(
+    unsigned*   Block,
+    unsigned    Length
+) {
+    unsigned    Bit;
+    unsigned    Idx;
+    unsigned*   Last;
+    unsigned*   Next;
+    unsigned    Value;
+    Last = (unsigned*)((char*)Block + Length ) - 1;
+    for ( Next = Block; Next &lt;= Last; Next = (unsigned*)((char*)Next+1) ) {
+        Value  = *Next;
+        Length = ASegMarkValue(
+            0,
+            (unsigned*)Value
+        );
+        if ( Length != 0 ) {
+            GcMark( (unsigned*)Value, Length );
+        }
+    }
+}
+void GcPickUp()
+{
+    extern unsigned end;
+    AllocSeg    Seg;
+    /* Algorithm: Clear the mark bits; mark blocks reachable from roots
+        (the stack and global data); Sweep all watched segments. */
+    Seg = 0;
+    ASegClearMarks(Seg);
+    GcMark( 0, end );
+    GcMark(
+        (unsigned*)&amp;Seg,
+        (unsigned)&amp;Seg - (unsigned)Seg-&gt;FirstFreeOfSize[0]
+    );
+    ASegSweep(Seg);
+}
+
+
+
+<a name="025f_000c">
+<a name="025f_000d"></pre><B>[LISTING THREE]</B><pre><a name="025f_000d">
+
+/* AllocSeg - Segments used for memory allocation. Allocation segments are
+80x86 segments used for memory allocation. Clients may request or return
+pointers to blocks of memory.  */
+#ifndef ASeg_Defn
+#define ASeg_Defn
+#include &quot;stdio.h&quot;
+typedef struct AllocSegTg*  AllocSeg;
+void* ASegAllocBlock(
+    AllocSeg    Seg,
+    unsigned    Size
+);
+/* Returns block of &lt;Length&gt; bytes from &lt;Seg&gt;. Returns NULL if no block. */
+void ASegDumpSeg(
+    AllocSeg    Seg,
+    FILE*       F
+);
+/* Write a debugging dump of &lt;Seg&gt; to &lt;F&gt;. */
+void ASegInitSeg(
+    AllocSeg    Seg
+);
+/* Initialize &lt;Seg&gt; for use. */
+/* GARBAGE COLLECTOR INTERFACE: Only a garbage collector should use this. */
+void ASegClearMarks(
+    AllocSeg    Seg
+);
+/* Clear all marks from &lt;Seg&gt;. */
+unsigned ASegMarkValue(
+    AllocSeg    Seg,
+    void*       Value
+);
+/* If &lt;Value&gt; corresponds to a block allocated from &lt;Seg&gt; mark it as being in
+use. Return the size of the block (not the actual size, but the size requested
+by creator). Returns 0 if Value isn't valid, or if block was already marked. */
+void ASegSweep(
+    AllocSeg    Seg
+);
+/* Sweep all unmarked blocks in &lt;Seg&gt; into &lt;Seg's&gt; free lists. */
+/* INTERNALS: An Allocation Segment is an 80x86 segment. The programs global
+data and its stack are at the start. The middle is used for client memory
+requests. It's tail is used for bookkeeping. A client may request a block of
+any size. Internally however, all blocks lengths are a power of two between 8
+bytes and 32K bytes. Block lengths are represented by their Log base 2, which
+is the number of 0 bits to the right of the 1 bit in the length.  */
+typedef unsigned            UnsignedLog2;
+   /* UnsignedLog2 - An unsigned power of 2 represented by it's Log base 2. */
+#define BitsPerByte     8
+#define SegSize         0x10000L  /* 64K byte segments */
+#define UnitSize        8    /* Allocations are in units of 8 bytes */
+#define UnitMask        0xFFF8
+#define UnitsPerSeg     (SegSize/UnitSize) /* Nbr of Units/segment */
+#define FlagsPerUnit        2 /* 2 flags for each unit */
+    #define UnitAlloc   1  /* Unit is the start of an alloc'd block */
+    #define UnitMark    2  /* Mark bit for garbage collection */
+#define FlagBytesPerSeg     (UnitsPerSeg * FlagsPerUnit / BitsPerByte)
+#define ASegOverhead FlagBytesPerSeg
+#define UnitsPerFlagByte ( BitsPerByte / FlagsPerUnit )
+#define BFUnused     (FlagBytesPerSeg / UnitSize * FlagsPerUnit / BitsPerByte)
+  /* Flag bytes are at tail of the segment; will never be allocated. Flags that
+  represent flag bytes are needed. Calculate how much of the tail isn't needed
+  for flag bytes. UnitsInFlagBytes = FlagBytesPerSeg/UnitSize = 512;
+  BFUnused = UnitsInFlagBytes * FlagsPerUnit/BitsPerByte */
+typedef unsigned    BlockFlags[ (ASegOverhead - BFUnused) / sizeof(int) ];
+#define NbrOfBlockSizes 15
+   /* Number of block lengths supported. */
+#define ASegPadSize  ( BFUnused - NbrOfBlockSizes * sizeof(FreePtr) - 2 )
+   /* Number of bytes to pad segment structure to 2 bytes less than 64K. */
+typedef struct FreeBlockTg* FreePtr;
+    /* Pointer to a free block */
+/* Representation of an AllocSeg */
+typedef struct AllocSegTg {
+    int         Well[ (SegSize - ASegOverhead) / sizeof(int) ];
+    BlockFlags  Flags;
+                #define ASegFlagIdx(S, P) ( (unsigned)P / ( UnitSize *
+                           BitsPerByte * sizeof(S-&gt;Flags[0]) / FlagsPerUnit ) )
+        #define ASegFlagAddr(S, P) ((unsigned*)&amp;S-&gt;
+                                                    Flags[ ASegFlagIdx(S, P) ])
+        #define ASegFlagShift(S, P) ( ( (unsigned)P / UnitSize ) %
+                     ( UnitsPerFlagByte * sizeof(S-&gt;Flags[0]) ) * FlagsPerUnit)
+        #define ASegFlagAllocBits 0x5555
+        #define ASegFlagMarkBits 0xAAAA
+        #define ASegAllocClr(S, P) \
+           *ASegFlagAddr(S, P) &amp;= ~( UnitAlloc &lt;&lt; ASegFlagShift(S, P) )
+        #define ASegAllocSet(S, P) \
+           *ASegFlagAddr(S, P) |=  ( UnitAlloc &lt;&lt; ASegFlagShift(S, P) )
+        #define ASegIsAllocSet(S, P) \
+         ( *ASegFlagAddr(S, P) &amp; ( UnitAlloc &lt;&lt; ASegFlagShift(S, P) ) )
+        #define ASegMarkClr(S, P) \
+            *ASegFlagAddr(S, P) &amp;= ~( UnitMark &lt;&lt; ASegFlagShift(S, P) )
+        #define ASegMarkSet(S, P) \
+            *ASegFlagAddr(S, P) |=  ( UnitMark &lt;&lt; ASegFlagShift(S, P) )
+        #define ASegIsMarkSet(S, P) \
+          ( *ASegFlagAddr(S, P) &amp; ( UnitMark &lt;&lt; ASegFlagShift(S, P) ) )
+    FreePtr     FirstFreeOfSize[ NbrOfBlockSizes ];
+    char        Pad[ ASegPadSize - 1 ];
+};
+/* FirstFreeOfSize[0] is not used. */
+/* Representation of an allocated block */
+typedef struct BlockTg* BlockPtr;
+typedef struct BlockTg {
+    UnsignedLog2    Size;   /* The actual size */
+    unsigned        Used;   /* The size requested */
+} AllocBlock;
+/* Note: Block returned by ASegAllocBlock must have struct BlockTg. */
+/* Representation of a free block */
+typedef struct FreeBlockTg {
+    UnsignedLog2        Size;
+    FreePtr             Next;
+};
+#endif
+
+
+
+<a name="025f_000e">
+<a name="025f_000f"></pre><B>[LISTING FOUR]</B><pre><a name="025f_000f">
+
+/* AllocSeg -- Allocation Segment -- ALGORITHM &amp; DATA STRUCTURES: This is a
+buddy system allocator; see KNUTH, Vol 1, pg 442. */
+
+unsigned Junk;
+
+#include &quot;array.h&quot;
+#include &quot;aseg.h&quot;
+#include &quot;bool.h&quot;
+#include &quot;power2.h&quot;
+#include &quot;stdio.h&quot;
+
+#ifndef NULL
+#define NULL 0
+#endif
+
+#define NULL_OFS 0xFFFF
+void* ASegAllocBlock(
+    AllocSeg        Seg,
+    unsigned        Size
+) {
+    BlockPtr        Block;
+    UnsignedLog2    BlockSize;
+    FreePtr         Buddy;
+    FreePtr         Free;
+    UnsignedLog2    FreeSize;
+    unsigned long*  ZeroPtr;
+    Size += 4;
+        /* Add in the space for the block header */
+    /* Set BlockSize to the first power of 2 equal or larger to Size */
+    if ( Size &lt; 256 ) {
+        BlockSize = Log2[ BumpUp[Size] ];
+    } else {
+        BlockSize = (Size + 255) &gt;&gt; 8;
+        BlockSize = Log2[ BumpUp[BlockSize] ] + 8;
+    }
+    /* Set Free to the first free block of length &gt;= Size */
+    /* If there is no such block return NULL */
+    Free = NULL;
+    FreeSize = BlockSize;
+    while (True) {
+        if (NbrOfBlockSizes &lt; FreeSize) {
+            return NULL;
+        }
+        Free = Seg-&gt;FirstFreeOfSize[FreeSize];
+        if (Free != NULL) break;
+        FreeSize++;
+    }
+    Block = (BlockPtr)Free;
+         /* Returned block will be split from Free. */
+     /* Unlink Free from its list */
+    Seg-&gt;FirstFreeOfSize[FreeSize] = Free-&gt;Next;
+    /* Split Free until it is of the requested size. */
+    while (FreeSize != BlockSize) {
+        FreeSize--;
+        Buddy = (FreePtr)( (char*)Free + (1 &lt;&lt; FreeSize) );
+        Buddy-&gt;Size = FreeSize;
+        Buddy-&gt;Next = Seg-&gt;FirstFreeOfSize[FreeSize];
+        Seg-&gt;FirstFreeOfSize[FreeSize] = Buddy;
+    }
+    Free-&gt;Size = BlockSize;
+    ASegAllocSet(Seg, Block);
+    Block-&gt;Used = Size - 4; /* Subtract off header length that we added */
+    /* Zero out memory before returning it */
+    for (
+        ZeroPtr = (unsigned long*)(Block + 1);
+        ZeroPtr &lt; (unsigned long*)( (char*)Block + (1 &lt;&lt; BlockSize) );
+        ZeroPtr++
+    ) {
+        *ZeroPtr = 0L;
+    }
+    return Block + 1;
+}
+void ASegVegamatic(
+    AllocSeg        Seg,
+    FreePtr         First,
+    FreePtr         End
+) {
+    FreePtr         Free;
+    unsigned        FreeSize;
+    unsigned        Size;
+    UnsignedLog2    SizeLog2;
+    for (
+        Free = First;
+        Free &lt; End;
+        Free = (FreePtr)( (char*)Free + Size )
+    ) {
+   /* Calculate size for block. */
+        FreeSize = (char*)End - (char*)Free;
+        Size = MaxPwr2Div((unsigned)Free);
+        if ( (unsigned)Free &amp; 0xFF ) {
+            SizeLog2 = Log2[Size];
+        } else {
+            SizeLog2 = Log2[Size&gt;&gt;8];
+            SizeLog2 += 8;
+        }
+        while ( FreeSize &lt; Size ) {
+            Size &gt;&gt;= 1;
+            SizeLog2--;
+        }
+        Free-&gt;Size = SizeLog2;
+        /* Link Free into the free list for blocks of Size */
+        Free-&gt;Next = Seg-&gt;FirstFreeOfSize[SizeLog2];
+        Seg-&gt;FirstFreeOfSize[SizeLog2] = Free;
+    }
+}
+void ASegInitSeg(
+    AllocSeg        Seg
+) {
+    extern unsigned _atopsp;    /* Start of heap and stack */
+    UnsignedLog2    BlockSize;  /* The size of Free */
+    FreePtr         Free;   /* A free block */
+    unsigned        Idx;
+    /* Notes: atopsp is set by C startup to start of stack. The stack
+        grows down from there, and the heap (that's us) up. */
+    _atopsp = (_atopsp + UnitSize - 1) &amp; UnitMask;
+    Seg-&gt;FirstFreeOfSize[0] = (FreePtr)_atopsp;
+    for (Idx = 1; Idx &lt; ArrayLength(Seg-&gt;FirstFreeOfSize); Idx++) {
+        Seg-&gt;FirstFreeOfSize[Idx] = 0;
+    }
+    for (Idx = 0; Idx &lt; ArrayLength(Seg-&gt;Flags); Idx++) {
+        Seg-&gt;Flags[Idx] = 0;
+    }
+    ASegVegamatic( Seg, (FreePtr)_atopsp, (FreePtr)(Seg-&gt;Flags) );
+}
+/* GARBAGE COLLECTING OPERATIONS */
+void ASegClearMarks(
+    AllocSeg    Seg
+) {
+    int         Pos;
+   /* Notes: This is faster than traversing chain of blocks in segment, and
+   then computing the bit to clear. This executes loop about 2K times; block-
+   by-block could take 8K times. */
+    for (Pos = 0; Pos &lt;= ArrayLast(Seg-&gt;Flags); Pos++) {
+        Seg-&gt;Flags[Pos] &amp;= ~ASegFlagMarkBits;
+    }
+}
+unsigned ASegMarkValue(
+    AllocSeg    Seg,
+    void*       Value
+) {
+    unsigned*   FlagPtr;
+    unsigned    Shift;
+    unsigned*   SizePtr;
+    if ( (FreePtr)Value &lt; Seg-&gt;FirstFreeOfSize[0] ) return 0;
+      /* Value represents an address in the global data or stack, and
+          couldn't have been returned by the allocator. */
+    if ( (unsigned)Value % UnitSize != 4 ) return 0;
+      /* Allocator always returns address 4 bytes after unit which starts
+          block. If value doesn't start 4 bytes after a Unit, it can't have
+          been returned from allocator. */
+    FlagPtr = ASegFlagAddr(Seg, Value);
+    Shift   = ASegFlagShift(Seg, Value);
+    if (
+         (
+            ( (*FlagPtr) &gt;&gt; Shift ) &amp; (UnitAlloc|UnitMark)
+         ) != UnitAlloc
+    ) {
+        /* Unit is Unallocated or already marked */
+        return 0;
+    }
+    *FlagPtr |= UnitMark &lt;&lt; Shift;
+    /* HACK: Assumption that requested size is 1 word before the value. */
+    SizePtr = (unsigned*)Value - 1;
+}
+    return *SizePtr;
+}
+void ASegSweep(
+    AllocSeg        Seg
+) {
+    FreePtr         End;
+    FreePtr         First;
+    UnsignedLog2    SizeLog2;
+    FreePtr         WellWall;
+    WellWall = (FreePtr)&amp;Seg-&gt;Well[ ArrayLength(Seg-&gt;Well) ];
+    /* Zap the free list headers */
+    for ( SizeLog2 = 1; SizeLog2 &lt;= NbrOfBlockSizes; SizeLog2++) {
+        Seg-&gt;FirstFreeOfSize[ SizeLog2 ] = NULL;
+    }
+    First = (FreePtr)Seg-&gt;FirstFreeOfSize[0];
+    while ( True ) {
+        /* Find the start of a free region */
+        while (
+            First &lt; WellWall
+          /* end the loop when we get past the segments memory well */
+            &amp;&amp; ASegIsMarkSet(Seg, First)
+                /* or when we find an unreferenced block */
+        ) {
+            SizeLog2 = First-&gt;Size;
+            First = (FreePtr)( (char*)First + ( 1 &lt;&lt; SizeLog2 ) );
+        }
+        if ( WellWall &lt;= First ) break;
+           /* end the loop when we get past the segments memory well */
+        ASegAllocClr(Seg, First);
+           /* First is unreferenced, but may be allocated.  It's about
+           to be swept into the free list, so clear it's alloc flag. */
+        /* Find the end of the free region */
+        SizeLog2 = First-&gt;Size;
+        End = (FreePtr)( (char*)First + ( 1 &lt;&lt; SizeLog2 ) );
+        while (
+            End &lt; WellWall
+           /* end the loop when we get past the segments memory well */
+            &amp;&amp; ! ASegIsMarkSet(Seg, End)
+                /* or when we find a referenced block */
+        ) {
+            ASegAllocClr(Seg, End);
+                /* About to be swept up.  Clear alloc flag */
+            SizeLog2 = End-&gt;Size;
+            End = (FreePtr)( (char*)End + ( 1 &lt;&lt; SizeLog2 ) );
+        }
+        ASegVegamatic( Seg, First, End );
+           /* Split free region into free blocks and put into free lists */
+        First = End;
+        /* Set First to End rather than block following End. */
+    }
+}
+
+
+
+<a name="025f_0010">
+<a name="025f_0011"></pre><B>[LISTING FIVE]</B><pre><a name="025f_0011">
+
+/* Alloc -- A garbage collecting memory allocator. */
+#include &quot;stdio.h&quot;
+
+#include &quot;array.h&quot;
+#include &quot;aseg.h&quot;
+#include &quot;alloc.h&quot;
+#include &quot;gc.h&quot;
+
+void free(
+    void*    Ptr
+) {
+    return;
+}
+void* malloc(
+    unsigned    Length
+) {
+    void*   Result;
+    Result = ASegAllocBlock( 0, Length );
+    if ( Result == NULL ) {
+        GcPickUp();
+        Result = ASegAllocBlock( 0, Length );
+    }
+    return Result;
+}
+
+
+
+<P>
+<P>
+</pre><HR><P>Copyright &copy; 1992, <I>Dr. Dobb's Journal</I></P></BODY></HTML>

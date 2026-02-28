@@ -1,0 +1,146 @@
+
+<html>
+<head>
+<title>July, 2004: C++ and the Perils of Double-Checked Locking: Part I</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>C++ and the Perils of Double-Checked Locking: Part I</h1>
+<p><i>Dr. Dobb's Journal</i> July, 2004</p>
+<h2>Multithreading is one thing after, before, or simultaneously with another</h2>
+
+
+<h3>By Scott Meyers and  Andrei Alexandrescu</h3>
+
+
+<I>Scott is author of Effective C++ and consulting editor for the Addison-Wesley Effective Software Development series. He can be contacted at http://aristeia.com/. Andrei is the author of Modern C++ Design and a columnist for the C/C++ Users Journal. He can be contacted at http://moderncppdesign.com/.</I>
+
+<hr>
+
+
+
+
+
+<p>Google the newsgroups or Web for the names of design patterns, and you're sure to find that one of the most commonly mentioned is Singleton. Try to put Singleton into practice, however, and you're all but certain to bump into a significant limitation: As traditionally implemented, Singleton isn't thread safe. </p>
+
+<p>Much effort has been put into addressing this shortcoming. One of the most popular approaches is a design pattern in its own right, the Double-Checked Locking Pattern (DCLP); see Douglas C. Schmidt et al., "Double-Checked Locking" and Douglas C. Schmidt et al., <i>Pattern-Oriented Software Architecture, Volume 2</i>. DCLP is designed to add efficient thread safety to initialization of a shared resource (such as a Singleton), but it has a problem&#151;it's not reliable. Furthermore, there's virtually no portable way to make it reliable in C++ (or in C) without substantively modifying the conventional pattern implementation. To make matters even more interesting, DCLP can fail for different reasons on uniprocessor and multiprocessor architectures. </p>
+
+<p>In this two-part article, we explain why Singleton isn't thread safe, how DCLP attempts to address that problem, why DCLP may fail on both uni- and multiprocessor architectures, and why you can't (portably) do anything about it. Along the way, we clarify the relationships among statement ordering in source code, sequence points, compiler and hardware optimizations, and the actual order of statement execution. Finally, in the next installment, we conclude with some suggestions regarding how to add thread safety to Singleton (and similar constructs) such that the resulting code is both reliable and efficient.</p>
+<h3>The Singleton  Pattern and Multithreading</h3>
+
+<p>The traditional implementation of the Singleton Pattern (see Erich Gamma et al., <i>Design Patterns: Elements of Reusable Object-Oriented Software</i>) is based on making a pointer point to a new object the first time the object is requested. In a single-threaded environment, <a name="re1"></a><a href="0407fe1.html">Example 1</a> generally works fine, though interrupts can be problematic. If you are in <i>Singleton::instance</i>, receive an interrupt, and invoke <i>Singleton::instance</i> from the handler, you can see how you'd get into trouble. Interrupts aside, however, this implementation works fine in a single-threaded environment.</p>
+
+<p>Unfortunately, this implementation is not reliable in a multithreaded environment. Suppose that Thread <i>A</i> enters the instance function, executes through line 14, and is then suspended. At the point where it is suspended, it has just determined that <i>pInstance</i> is null; that is, no Singleton object has yet been created.</p>
+
+<p>Thread <i>B</i> now enters <i>instance</i> and executes line 14. It sees that <i>pInstance</i> is null, so it proceeds to line 15 and creates a Singleton for <i>pInstance</i> to point to. It then returns <i>pInstance</i> to <i>instance</i>'s caller.</p>
+
+<p>At some point later, Thread <i>A</i> is allowed to continue running, and the first thing it does is move to line 15, where it conjures up another <i>Singleton</i> object and makes <i>pInstance</i> point to it. It should be clear that this violates the meaning of a Singleton, as there are now two <i>Singleton</i> objects. </p>
+
+<p>Technically, line 11 is where <i>pInstance</i> is initialized, but for practical purposes, it's line 15 that makes it point where we want it to, so for the remainder of this article, we'll treat line 15 as the point where <i>pInstance</i> is initialized.</p>
+
+<p>Making the classic Singleton implementation thread safe is easy. Just acquire a lock before testing <i>pInstance</i>, as in <a name="re2"></a><a href="0407fe2.html">Example 2</a>. The downside to this solution is that it may be expensive. Each access to the Singleton requires acquisition of a lock, but in reality, we need a lock only when initializing <i>pInstance</i>. That should occur only the first time <i>instance</i> is called. If <i>instance</i> is called <i>n</i> times during the course of a program run, we need the lock only for the first call. Why pay for <i>n</i> lock acquisitions when you know that<i> n</i>-1 of them are unnecessary? DCLP is designed to prevent you from having to.</p>
+<h3>The Double-Checked Locking Pattern</h3>
+
+<p>The crux of DCLP is the observation that most calls to <i>instance</i> see that <i>pInstance</i> is not null, and not even try to initialize it. Therefore, DCLP tests <i>pInstance</i> for nullness before trying to acquire a lock. Only if the test succeeds (that is, if <i>pInstance</i> has not yet been initialized) is the lock acquired. After that, the test is performed again to ensure <i>pInstance</i> is still null (hence, the "double-checked" locking). The second test is necessary because it is possible that another thread happened to initialize <i>pInstance</i> between the time <i>pInstance</i> was first tested and the time the lock was acquired. </p>
+
+<p><a name="re3"></a><a href="0407fe3.html">Example 3</a> is the classic DCLP implementation (see Douglas C. Schmidt et al., "Double-Checked Locking" and Douglas C. Schmidt et al.,<i> Pattern-Oriented Software Architecture, Volume 2</i>). The papers defining DCLP discuss some implementation issues (that is, the importance of <i>volatile</i>-qualifying the Singleton pointer and the impact of separate caches on multiprocessor systems, both of which we address later; as well as the need to ensure the atomicity of certain reads and writes, which we do not discuss in this article), but they fail to consider a much more fundamental problem: Ensuring that the machine instructions executed during DCLP are executed in an acceptable order. This is the fundamental problem we focus on here.</p>
+<h3>DCLP and Instruction Ordering</h3>
+
+<p>Consider again <i>pInstance = new Singleton;</i>, the line that initializes <i>pInstance</i>. This statement causes three things to happen:</p>
+
+<ol>
+  </ol>
+
+<ul>
+  <li>Step 1. Allocate memory to hold a <i>Singleton</i> object.</li>
+  <li>Step 2. Construct a <i>Singleton</i> object in the allocated memory.</li>
+  <li>Step 3. Make <i>pInstance</i> point to the allocated memory.</li>
+</ul>
+
+<ol>
+  </ol>
+
+<p>Of critical importance is the observation that compilers are not constrained to perform these steps in this order! In particular, compilers are sometimes allowed to swap Steps 2 and 3. Why they might want to do that is a question we'll address in a moment. For now, let's focus on what happens if they do. </p>
+
+<p>Consider <a name="re4"></a><a href="0407fe4.html">Example 4</a>, where we've expanded <i>pInstance</i>'s initialization line into the three constituent tasks just mentioned and where we've merged Steps 1 (memory allocation) and 3 (<i>pInstance</i> assignment) into a single statement that precedes Step 2 (<i>Singleton</i> construction). The idea is not that a human would write this code. Rather, it's that a compiler might generate code equivalent to this in response to the conventional DCLP source code that a human would write.</p>
+
+<p>In general, this is not a valid translation of the original DCLP source code because the <i>Singleton</i> constructor called in Step 2 might throw an exception. And, if an exception is thrown, it's important that <i>pInstance</i> has not yet been modified. That's why, in general, compilers cannot move Step 3 above Step 2. However, there are conditions under which this transformation is legitimate. Perhaps the simplest such condition is when a compiler can prove that the <i>Singleton</i> constructor cannot throw (via postinlining flow analysis, for instance), but that is not the only condition. Some constructors that throw can also have their instructions reordered such that this problem arises. </p>
+
+<p>Given the above translation, consider the following sequence of events:</p>
+
+
+
+<ul>
+  <li>Thread <i>A</i> enters <i>instance</i>, performs the first test of <i>pInstance</i>, acquires the lock, and executes the statement made up of Steps 1 and 3. It is then suspended. At this point, <i>pInstance</i> is not null, but no <i>Singleton</i> object has yet been constructed in the memory <i>pInstance</i> points to.</li>
+  <li>Thread <i>B</i> enters instance, determines that <i>pInstance</i> is not null, and returns it to <i>instance</i>'s caller. The caller then dereferences the pointer to access the <i>Singleton</i> that, oops, has not yet been constructed. </li>
+</ul>
+
+
+
+<p>DCLP works only if Steps 1 and 2 are completed before Step 3 is performed, but there is no way to express this constraint in C or C++. That's the dagger in the heart of DCLP&#151;you need to define a constraint on relative instruction ordering, but the languages give you no way to express the constraint. </p>
+
+<p>Yes, the C and C++ Standards (see ISO/IEC 9899:1999 International Standard and ISO/IEC 14882:1998(E), respectively) do define sequence points, which define constraints on the order of evaluation. For example, paragraph 7 of Section 1.9 of the C++ Standard encouragingly states: </p>
+
+<blockquote>
+At certain specified points in the execution sequence called sequence points, all side effects of previous evaluations shall be complete and no side effects of subsequent evaluations shall have taken place. <br>
+
+</blockquote>
+
+
+
+<p>Furthermore, both Standards state that a sequence point occurs at the end of each statement. So it seems that if you're just careful with how you sequence your statements, everything falls into place.</p>
+
+<p>Oh, Odysseus, don't let thyself be lured by sirens' voices; for much trouble is waiting for thou and thy mates! </p>
+
+<p>Both Standards define correct program behavior in terms of the "observable behavior" of an abstract machine. But not everything about this machine is observable. For example, consider function <i>Foo</i> in <a name="re5"></a><a href="0407fe5.html">Example 5</a> (which looks silly, but might plausibly be the result of inlining some other functions called by <i>Foo</i>).</p>
+
+<p>In both C and C++, the Standards guarantee that <i>Foo</i> prints "<i>5,_10</i>". But that's about the extent of what we're guaranteed. We don't know whether statements 1-3 will be executed at all and, in fact, a good optimizer will get rid of them. If statements 1-3 are executed, we know that statement 1 precedes statements 2-4 and&#151;assuming that the call to <i>printf</i> isn't inlined and the result further optimized&#151;we know about the relative ordering of statements 2 and 3. Compilers might choose to execute statement 2 first, statement 3 first, or even to execute them both in parallel, assuming the hardware has some way to do it. Which it might well have. Modern processors have a large word size and several execution units. Two or more arithmetic units are common. (For example, the Pentium 4 has three integer ALUs, PowerPC's G4e has four, and Itanium has six.) Their machine language allows compilers to generate code that yields parallel execution of two or more instructions in a single clock cycle. </p>
+
+<p>Optimizing compilers carefully analyze and reorder your code so as to execute as many things at once as possible (within the constraints on observable behavior). Discovering and exploiting such parallelism in regular serial code is the single most important reason for rearranging code and introducing out-of-order execution. But it's not the only reason. Compilers (and linkers) might also reorder instructions to avoid spilling data from a register, to keep the instruction pipeline full, to perform common subexpression elimination, and reduce the size of the generated executable (see Bruno De Bus et al., "Post-pass Compaction Techniques").</p>
+
+<p>When performing these kinds of optimizations, C/C++ compilers and linkers are constrained only by the dictates of observable behavior on the abstract machines defined by the language standards, and&#151;this is the important bit&#151;those abstract machines are implicitly single threaded. As languages, neither C nor C++ have threads, so compilers don't have to worry about breaking threaded programs when they are optimizing. It should, therefore, not surprise you that they sometimes do.</p>
+
+<p>That being the case, how can you write C and C++ multithreaded programs that actually work? By using system-specific libraries defined for that purpose. Libraries such as POSIX threads (pthreads) (see ANSI/IEEE 1003.1c-1995) give precise specifications for the execution semantics of various synchronization primitives. These libraries impose restrictions on the code that library-conformant compilers are permitted to generate, thus forcing such compilers to emit code that respects the execution ordering constraints on which those libraries depend. That's why threading packages have parts written in assembler or issue system calls that are themselves written in assembler (or in some unportable language): You have to go outside Standard C and C++ to express the ordering constraints that multithreaded programs require. DCLP tries to get by using only language constructs. That's why DCLP isn't reliable.</p>
+
+<p>As a rule, programmers don't like to be pushed around by their compilers. Perhaps you are such a programmer. If so, you may be tempted to try to outsmart your compiler by adjusting your source code so that <i>pInstance</i> remains unchanged until after Singleton's construction is complete. For example, you might try inserting use of a temporary variable, as in <a name="re6"></a><a href="0407fe6.html">Example 6</a>. In essence, you've just fired the opening salvo in a war of optimization. Your compiler wants to optimize. You don't want it to, at least not here. But this is not a battle you want to get into. Your foe is wiley and sophisticated, imbued with strategems dreamed up over decades by people who do nothing but think about this kind of thing all day long, day after day, year after year. Unless you write optimizing compilers yourself, they are way ahead of you. In this case, for example, it would be a simple matter for the compiler to apply dependence analysis to determine that <i>temp</i> is an unnecessary variable, hence, to eliminate it, thus treating your carefully crafted "unoptimizable" code if it had been written in the traditional DCLP manner. Game over. You lose.</p>
+
+<p>If you reach for bigger ammo and try moving <i>temp</i> to a larger scope (say, by making it file <i>static</i>), the compiler can still perform the same analysis and come to the same conclusion. Scope, schmope. Game over. You lose. So you call for backup. You declare<i> temp extern</i> and define it in a separate translation unit, thus preventing your compiler from seeing what you are doing. Alas, some compilers have the optimizing equivalent of night-vision goggles: They perform interprocedural analysis, discover your ruse with <i>temp</i>, and again optimize it out of existence. Remember, these are <i>optimizing</i> compilers. They're supposed to track down unnecessary code and eliminate it. Game over. You lose.</p>
+
+<p>So you try to disable inlining by defining a helper function in a different file, thus forcing the compiler to assume that the constructor might throw an exception and, therefore, delay the assignment to <i>pInstance</i>. Nice try, but some build environments perform link-time inlining followed by more code optimizations (see Bruno De Bus et al., "Post-pass Compaction Techniques;" Robert Cohn et al., "Spike: An Optimizer for Alpha/NT Executables;" and Matt Pietrek, "Link-Time Code Generation"). Game over. You lose.</p>
+
+<p>Nothing you do can alter the fundamental problem: You need to be able to specify a constraint on instruction ordering, and your language gives you no way to do it.</p>
+<h3>Next Month</h3>
+
+<p>In the next installment of this two-part article, we'll examine the role of the <i>volatile</i> keyword, see what impact DCLP has on multiprocessor machines, and conclude with a few suggestions.</p>
+<h3>References</h3>
+
+<p>Bruno De Bus, Daniel Kaestner, Dominique Chanet, Ludo Van Put, and Bjorn De Sutter. "Post-pass Compaction Techniques." <i>Communications of the ACM, </i>46(8):41-46, August 2003. ISSN 0001-0782. http://doi.acm.org/10.1145/859670.859696.</p>
+
+<p>Robert Cohn, David Goodwin, P. Geoffrey Lowney, and Norman Rubin. "Spike: An Optimizer for Alpha/NT Executables." http://www.usenix.org/publications/ library/proceedings/usenix-nt97/ presentations/goodwin/index.htm, August 1997.</p>
+
+<p>ANSI/IEEE 1003.1c-1995, 1995. IEEE Standard for Information Technology. Portable Operating System Interface (POSIX)&#151;System Application Program Interface (API) Amendment 2: Threads Extension (C Language). </p>
+
+<p>Erich Gamma, Richard Helm, Ralph Johnson, and John Vlissides. <i>Design Patterns: Elements of Reusable Object-Oriented Software.</i> Addison-Wesley, 1995. </p>
+
+<p>Matt Pietrek. "Link-Time Code Generation."<i> MSDN Magazine</i>, May 2002. http://msdn.microsoft.com/msdnmag/issues/02/05/Hood/.</p>
+
+<p>Douglas C. Schmidt and Tim Harrison. "Double-Checked Locking." In Robert Martin, Dirk Riehle, and Frank Buschmann, editors,<i> Pattern Languages of Program Design 3,</i> Addison-Wesley, 1998. http://www.cs.wustl.edu/~schmidt/PDF/DC-Locking.pdf.</p>
+
+<p>Douglas C. Schmidt, Michael Stal, Hans Rohnert, and Frank Buschmann.<i> Pattern-Oriented Software Architecture, Volume 2. </i>Wiley, 2000. Tutorial notes based on the patterns in this book are available at http://cs.wustl.edu/~schmidt/posa2.ppt.</p>
+
+<p>ISO/IEC 14882:1998(E) International Standard. Programming languages&#151;C++. ISO/IEC, 1998.</p>
+
+<p>ISO/IEC 9899:1999 International Standard. Programming languages&#151;C. ISO/IEC, 1999.</p>
+
+
+
+
+<p><b>DDJ</b></p>
+
+
+
+
+</body>
+</html>

@@ -1,0 +1,249 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v09, i04: Automatically Performing and Monitoring Backups</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink>Article</a></span></td>
+		<td><a href="../../../../source/SA/2000/apr2000.tar"><b class=codeListing>apr2000.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+<! -- Insert Content ------ >
+
+<H1>Automatically Performing and Monitoring Backups</H1><p>
+<P>William David
+<P>
+Performing routine backups and ensuring their reliability are essential tasks for most systems administrators. Besides eliminating the sinking feeling an administrator gets when asked to restore files from corrupt or nonexistent tapes, good backups can mean life or death for an entire organization. Unfortunately, as computing environments grow beyond a few machines, coordinating and adequately monitoring backups can become a full-time job. There are a number of good commercial products that will help, but if they are unavailable to you for budgetary, political, or other reasons, a lot can be done to automate the process using standard and free UNIX tools.<P>
+This article describes a procedure to automatically perform a large number of independent nightly backups, look for errors, sort the results, and present a summary each morning to a systems administrator. I've used this technique to successfully manage a collection of approximately 200 UNIX servers, distributed across a nationwide WAN, with limited resources in the remote locations. Each server had enough tapes on hand to do a full backup every day. Each daily backup was kept for a week, after which it was overwritten. Tapes were occasionally sent off-site for long term storage. A few assumptions are made -- notably that entire backups can be performed on a single tape, and that there is someone at the remote location to insert a tape once a day.<P>
+The procedure requires several elements: a backup script that runs on each server and reports its results via e-mail to a central location, a mail filter script to process the incoming reports, a reporting script to summarize results for human consumption, and cron jobs to make everything happen.<P>
+Each server has a script that performs a nightly backup. This can be done with a UNIX utility, such as <B>tar</B>, <B>dump</B>, or <B>cpio</B>. The script invokes the backup and watches for errors, saves the results to a local directory, and also mails the results to a central location. This redundancy could be eliminated, but I've found it useful to have a local copy of the output from the backup on each machine in case problems arise that need further investigation. A sample script using <B>tar</B> is:<P>
+
+<pre>
+#!/bin/bash
+
+HOSTNAME='/bin/hostname -s'
+DATE='/bin/date +%d%b%Y'
+TAPEDRIVE=/dev/st0
+TO_BACKUP="/"
+LOGDIR=/usr/local/log/backups
+STDOUT=$LOGDIR/backup.stdout.$DATE
+STDERR=$LOGDIR/backup.stderr.$DATE
+ADDRESS=backups@mailserver
+
+/bin/tar -cvf $TAPEDRIVE $TO_BACKUP &gt; $STDOUT 2&gt; $STDERR
+
+if [ $? != 0 ]
+then
+   /usr/bin/Mail -s "$HOSTNAME nightly backup errors" $ADDRESS \
+     &lt; $STDERR
+else
+   /usr/bin/Mail -s "$HOSTNAME nightly backup looks okay" \
+     $ADDRESS &lt;
+/dev/null
+fi
+</pre>
+
+This script simply performs a <B>tar</B> on the specified directories or file systems (listed in the <B>TO_BACKUP</B> variable), capturing the standard output and standard error streams to two different files. Each file name includes a date component for easy reference. The script then checks the exit code of the <B>tar</B> command and, based on what it finds, forwards either the errors or an &#147;all clear&#148; message to the mail address specified by the <B>ADDRESS</B> variable. The address can belong to a human, or it can be a mail alias or an account created specifically to receive backup mail. Keep in mind that the final recipient must have the ability to run the mail filters discussed below. The environment variables make it easy to move the script around to servers with different log directories and to change the address, etc.<P>
+<B>dump</B> presents a slightly more complicated problem. With <B>dump</B>, it is possible to back up each file system individually rather than in one big unit as with <B>tar</B> in the preceding script. I generally prefer this method for ease of restoring, but unfortunately it is possible for one of the file system <B>dumps</B> to fail while the rest succeed. This means that the exit code of each <B>dump</B> must be checked in turn rather than just once at the end of the script. A few extra lines of logic make this easy. The script checks the exit code of each <B>dump</B> and sets a return code variable if the exit value is ever nonzero. At the end of the script, the variable is examined to see if errors occurred anywhere in the process. Doing this, rather than aborting and generating the failure message on encountering the first error, allows the backup process to continue, on the chance that the failure condition is isolated to a particular file system:<P>
+
+<pre>
+#!/bin/bash
+
+HOSTNAME='/bin/hostname -s'
+DATE='/bin/date +%d%b%Y'
+TAPEDRIVE=/dev/nst0
+TO_BACKUP="/ /usr /var /home"
+LOGDIR=/usr/local/log/backups
+STDOUT=$LOGDIR/backup.stdout.$DATE
+STDERR=$LOGDIR/backup.stderr.$DATE
+ADDRESS=wdavid
+RC=0
+
+for files in $TO_BACKUP
+do
+   /sbin/dump 0uf $TAPEDRIVE $files &gt;&gt; $STDOUT 2&gt;&gt; $STDERR
+
+   if [ $? != 0 ]
+   then
+     RC=1
+   fi
+
+done
+
+if [ $RC != 0 ]
+then
+   /usr/bin/Mail -s "$HOSTNAME nightly backup errors&#148; \
+     $ADDRESS &lt; $STDERR
+else
+   /usr/bin/Mail -s "$HOSTNAME nightly backup looks okay" \
+     $ADDRESS &lt;
+/dev/null
+fi
+</pre>
+
+The cron jobs associated with the backups on the individual server are:<P>
+
+<pre>
+30 23 * * 1-5 find /usr/local/log/backups -mtime +7 \
+  -exec \,rm {} \; 2&gt;&amp;1 &gt;
+/dev/null
+45 23 * * 1-5 /usr/local/bin/dump_server 2&gt;&amp;1 &gt; /dev/null
+</pre>
+
+The first entry deletes logs that are more than seven days old before the backup process begins. The second entry invokes the backup at the end of each work day. There are no Saturday or Sunday backups, since our users did not work those days -- your environment may have different requirements.<P>
+On the central server, the mail recipient has a mail filter set up to sort the incoming reports into the appropriate directories. I've used <B>procmail</B> for this purpose. For those unfamiliar with <B>procmail</B>, it allows mail to be processed by a set of rules, called recipes, and sorts it into different mailbox files, selectively deleting or automatically replying to individual messages and much more, based on patterns found in the mail header. A <B>procmail</B> tutorial is beyond the scope of this article, but more information can be found at <B>http://www.procmail.org</B>. There are many other ways to accomplish the same thing, such as other dedicated mail filtering software or shell or Perl scripts.<P>
+The <B>procmail</B> recipes are placed in a .<B>procmailrc</B> file in the home directory of the recipient of all the nightly backup mail. This file contains:<P>
+
+<pre>
+PATH=/bin:/usr/bin:/usr/bin
+MAILDIR=$HOME/Mail
+LOGFILE=$MAILDIR/from
+
+:0
+* ^Subject:\/.*nightly backup errors
+  /usr/local/backuplogs/bad_backups/'echo $MATCH | awk \
+    '{printf("%s", $1);}'
+'
+
+:0
+* ^Subject:\/.*nightly backup looks okay
+  /usr/local/backuplogs/good_backups/'echo $MATCH | awk \
+    '{printf("%s", $1);}' '
+</pre>
+
+The first three lines represent general environment setup recommended in the <B>procmail</B> man pages. The sections beginning with <B>:0</B> are two recipes -- one for handling failures and the other for handling successful reports. Each recipe saves a copy of an incoming backup report in a file named with the host name of the reporting server in either a <B>bad_backups</B> or <B>good_backups</B> directory, depending on whether or not the subject line of the mail message indicates an error.<P>
+After all the backups have finished and reported in, the following job is run from cron on the central server:<P>
+
+<pre>
+00 11 * * 2-6 /usr/local/bin/report_and_rotate 2&gt;&amp;1 &gt; /dev/null
+</pre>
+
+&#147;After all the backups have finished&#148; may seem rather ambiguous; some determination should be made regarding how long to wait for the backup reports in your environment before the missing reports are considered failures. For environments with small individual servers having only a few gigabytes to back up, waiting until the next morning is probably sufficient. Note that this job runs Tuesday through Saturday, the morning after each Monday through Friday nightly backup.<P>
+The <B>report_and_rotate</B> script produces two reports. One is a list of servers that identified problems in their nightly backups, based on exit codes. The other is a list of servers that failed to report. Servers can fail to generate reports for various reasons such as email problems, network problems, power failures, or the cron daemon on a machine dying. The &#147;missing&#148; list is important from a backup perspective, because if a backup has not been reported as successful, it probably should be considered a failure, and remedial action should be taken. It's also interesting for a another reason -- if a server does not appear on the &#147;missing&#148; list, presumably all the elements named above are working properly, and thus you've gotten a sanity check on several pieces of your environment for free. To do this, the <B>report_and_rotate</B> script needs to refer to a master list of servers that ought to generate nightly backup reports, whether the reports themselves are good or bad. The script also moves the individual server reports into an archive directory and deletes those that are more than seven days old. The <B>report_and_rotate</B> script looks like:<P>
+
+<pre>
+#!/bin/bash
+
+DATE='/bin/date +%d%b%Y'
+LOGDIR=/usr/local/backup_archives
+GOODDIR=$LOGDIR/good_backups
+BADDIR=$LOGDIR/bad_backups
+TMPFILE=/tmp/backups.$$
+ARCHIVEDIR=$LOGDIR/archive
+ROTATEDIR=$ARCHIVEDIR/$DATE
+MASTER_LIST=$LOGDIR/master_list
+HUMAN_ADDR=wdavid@mailserver
+
+/bin/ls $BADDIR | /usr/bin/Mail -s "servers with \
+  backup problems last night"
+$HUMAN_ADDR
+
+/bin/ls $BADDIR &gt; $TMPFILE
+/bin/ls $GOODDIR &gt;&gt; $TMPFILE
+
+/bin/grep -v -f $TMPFILE $MASTER_LIST |  \
+   /usr/bin/Mail -s "servers missing from backup \
+     reports last night"
+$HUMAN_ADDR
+
+/bin/mkdir $ROTATEDIR
+/bin/cp -rp $GOODDIR $BADDIR $ROTATEDIR
+/bin/rm -f $GOODDIR/* $BADDIR/* $TMPFILE
+
+/usr/bin/find $ARCHIVEDIR -mtime +7 -exec /bin/rm -rf {} \;
+</pre>
+
+The first line of the script (past the environment section) creates the list of servers that have encountered errors by simply listing the contents of <B>$BADDIR</B>. At this point, that directory contains the <B>stderrs</B> of all the failing backups, one file per server (named after that server) placed there by the <B>procmail</B> filters. This list is mailed to <B>$HUMAN_ADDR</B>, which should be the address for the person who investigates failures in the nightly backups. The script then builds a list of servers reporting either successful or failed backups, and uses an inverted grep to look for entries in the master list of servers that did not appear in either nightly list. Those results are also mailed to <B>$HUMAN_ADDR</B>. Finally, the script moves the nightly reports to an archive directory to get ready for the next wave of incoming reports, and deletes its temporary file as well as all backup records that are more than a week old. Backups that were reported as &#147;good&#148; are not forwarded to <B>$HUMAN_ADDR</B>, presumably because there's no reason to worry about them. Once the nightly summaries are received, an administrator can read them and investigate the causes for failures.<P>
+Combining the scripts listed here helps remove some of the drudgery of daily backups, but there is still an important piece missing -- tape verification. It's no fun, and nobody wants to be stuck doing it, but it's a critical step that must be given proper attention, and one that must be formally recognized as part of the job of the systems administrator who is responsible for backups. It's quite possible for the backup utility to finish its job without detecting any errors and yet have the resulting backup tape be unusable. The only way to ensure recoverability is to periodically do test restores. It would be nice, but not very practical, to test every tape you have, but in the absence of that, choosing several at random from your backup set and testing those will suffice. In the case described here involving remote locations, each office could periodically exchange one of the tapes in their weekly set for one from the central office, allowing tapes to be verified centrally and also providing for an off-site storage component in the tape rotation.<P>
+For example, assume there are five servers performing backups that we place in our master file:<P>
+
+<pre>
+/usr/local/backup_archives/master_list:
+
+morley
+chodo
+garrett
+sethra
+vlad
+</pre>
+
+In this scenario, the nightly script runs on each -- <B>morley</B> and <B>sethra</B> run successfully, <B>chodo</B> and <B>garrett</B> fail, and <B>vlad</B> fails to generate a report. Four pieces of mail are sent to <B>backups@mailserver</B>, with the subject lines:<P>
+
+<pre>
+Subject: morley nightly backup looks okay
+Subject: chodo nightly backup errors
+Subject: garrett nightly backup errors
+Subject: sethra nightly backup looks okay
+</pre>
+
+When these messages come in, the backup account's mail filters take over and sort them into the appropriate directories, eventually producing:<P>
+
+<pre>
+$ ls /usr/local/backuplogs/good_backups
+morley  sethra
+
+$ ls /usr/local/backuplogs/bad_backups
+chodo   garrett
+</pre>
+
+In the morning, the &#147;report and rotate&#148; script runs, sending the following two pieces of mail to the human address:<P>
+
+<pre>
+From backups  Tue Dec 28 13:53:07 1999
+Date: Tue, 28 Dec 1999 13:53:06 -0500
+From: Backup Account &lt;backups@mailserver&gt;
+To: wdavid@mailserver
+Subject:  machines with backup problems last night
+
+chodo
+garrett
+
+From backups  Tue Dec 28 13:53:19 1999
+Date: Tue, 28 Dec 1999 13:53:19 -0500
+From: Backup Account &lt;backups@mailserver&gt;
+To: wdavid@mailserver
+Subject: machines missing from backup reports last night
+
+vlad
+</pre>
+
+Expand the scenario from five machines to five hundred, and imagine the time you could save!<P>
+
+<h1>About the Author</h1><p>
+William David is a UNIX administrator and consultant who has spent the last six years working for major universities and Fortune 1000 companies. He hopes you never need your backups. He can be reached at wdavid@cowford.net.
+
+
+<! -- Begin Content ------ >
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>
+
+
+

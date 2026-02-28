@@ -1,0 +1,715 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v13, i04: Root Disk Mirroring with Linux</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><a href="../../../../source/SA/2004/apr2004.tar"><b class=codeListing>apr2004.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b><img src="a2.gif" width="200" height="167" align="right">Root 
+              Disk Mirroring with Linux</b></h1>
+            <p> <i>Jeff Layton</i>
+            <p> With hard disk drives, you can count on one thing: eventually, 
+              they will fail. Most operating systems have the ability to "mirror" 
+              hard disk data to two (or more) drives, which helps guard against 
+              failure. Linux is no exception and provides a kernel-based software 
+              RAID driver (known as the MD driver) that allows administrators 
+              to mirror devices (among other things).
+            <p> Another part of this problem faced by systems administrators involves 
+              partition sizing. It's often a good idea to put different pieces 
+              of the filesystem tree into separate filesystems. With traditional 
+              hard partitioning, this can mean doing a lot of guesswork when sizing 
+              these partitions at install time and downtime later if those guesses 
+              were wrong. With Linux, though, you can use the Logical Volume Manager 
+              (LVM) to slice up disk space. The LVM allows admins to resize volumes 
+              on the fly. Growing partitions can even be done with them mounted 
+              (as long as you use a filesystem that allows it).
+            <p> In this article, I will suggest a "best practices" approach to 
+              root disk mirroring using the md driver and LVM drivers in Linux. 
+              I'll cover an example machine that has two 10-GB disks on independent 
+              controllers. The operating system used in my example is Debian Linux 
+              with a 2.4 kernel installed on the first hard disk. The second disk 
+              is unused. I'll describe how to convert this machine to a setup 
+              where the disks are mirrored using the md driver and sliced into 
+              volumes using the LVM. I'll also cover booting to the new setup 
+              and resizing volumes.
+            <p> This article focuses on the 2.4.x series of kernels and assumes 
+              that you understand building and installing a new kernel, as well 
+              as building and installing userspace programs. I will focus on Debian 
+              Sarge as a distribution, but the instructions should be applicable 
+              to any Linux distribution as long as the correct software tools 
+              are installed.
+            <p> It goes without saying that setting up disk mirroring is an inherently 
+              dangerous activity. The possibility of making mistakes and losing 
+              data is high, so this should not be attempted without a good backup 
+              (or with the understanding that a mistake could mean loss of data).
+            <p> <b>Initial Setup and Overview</b>
+            <p> Note that you can mirror any two devices in your machine, but 
+              it's always preferable to mirror devices that are on separate controllers. 
+              Not only does this eliminate the controller as a single point of 
+              failure, but it also helps performance.
+            <p> For the initial setup, the base operating system is installed 
+              on the first hard disk (hda) using traditional hard partitioning, 
+              with the second disk (hdc) unused. The root filesystem is on the 
+              first partition (hda1).
+            <p> The goal is to have each disk set up with two partitions that 
+              will be mirrored. The first partition will be a small one containing 
+              the /boot filesystem. The second partition will be a large block 
+              of space encompassing the bulk of the disk. This partition will 
+              be allocated to the LVM.
+            <p> <b>Userspace Programs</b>
+            <p> This rootdisk mirroring setup requires several userspace programs. 
+              If possible, get the prepackaged versions with your operating system. 
+              You'll need the following:
+            <p> 
+            <p> 1. raidtools version 1.00.3 or greater -- With Debian, this package 
+              is known as "raidtools2" (to distinguish it from the version that 
+              deals with the older style on-disk RAID format). If you need to 
+              build these tools from sources, they are available at the following 
+              URL:
+            <p> 
+            <pre>
+http://people.redhat.com/mingo/raidtools/
+</pre>
+            2. LVM software tools -- I will use the 1.0.x set of LVM tools in 
+            this example. Under Debian, these are contained in the "lvm-common" 
+            and "lvm10" packages. The sources for these tools are available at:
+            <p> 
+            <pre>
+http://www.sistina.com/products_lvm_download.htm
+</pre>
+            3. The GRUB bootloader -- Although it is possible to use LILO for 
+            this setup, I highly recommend making the switch to GRUB as a bootloader. 
+            GRUB is much more flexible and forgiving than LILO. In this article, 
+            I'll cover setting up the bootloader using GRUB. Sources are available 
+            at the GRUB homepage at:
+            <p> 
+            <pre>
+http://www.gnu.org/software/grub/
+</pre>
+            4. rsync -- Once the new rootdisk is set up, the data must be copied 
+            from the old rootdisk. There are many tools that can do this, but 
+            I use rsync. It's available in the "rsync" package in Debian. If you 
+            need sources, they're available at:
+            <p> 
+            <pre>
+http://samba.org/rsync/
+</pre>
+            Once you have installed all of the proper userspace tools, you can 
+            begin building and installing a new kernel.
+            <p> <b>Kernel Configuration</b>
+            <p> Most vendor kernels (Debian included) build some of the needed 
+              drivers as modules. We'll be using an initial ramdisk (initrd) image 
+              during the boot process, so it's technically possible to build some 
+              of these options as modules. I find it much easier, however, to 
+              build a kernel that has the drivers needed for booting compiled 
+              in statically.
+            <p> Building and installing a kernel is outside the scope of this 
+              article, but you should make sure you have the following options 
+              set in your kernel configuration:
+            <p> 
+            <pre>
+CONFIG_MD=y
+CONFIG_BLK_DEV_MD=y
+CONFIG_MD_RAID1=y
+CONFIG_BLK_DEV_LVM=y
+</pre>
+            You'll also need initial ramdisk (initrd) support, and it's recommended 
+            to compile in the loop block device:
+            <p> 
+            <pre>
+CONFIG_BLK_DEV_RAM=y
+CONFIG_BLK_DEV_RAM_SIZE=4096
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_BLK_DEV_LOOP=y
+</pre>
+            Additionally, you should build in support for the filesystems you 
+            intend to use. I recommend reiserfs, because it allows you to grow 
+            filesystems while they're mounted, which is very helpful. Also make 
+            sure to build in ext2fs support, as the initial ramdisk image created 
+            later will use that as a filesystem:
+            <p> 
+            <pre>
+CONFIG_EXT2_FS=y
+CONFIG_REISERFS_FS=y
+</pre>
+            Once you get the kernel and modules built, be sure to place the kernel 
+            in the /boot directory and not in the root directory. Rename the existing 
+            kernel to "vmlinuz.old". The new kernel should be named "vmlinuz" 
+            (or make a symlink called that to the real kernel). The kernel modules 
+            should be installed in the normal place (/lib/modules/&lt;kernel version&gt;). 
+            Then, configure GRUB as the bootloader.
+            <p> <b>GRUB Configuration</b>
+            <p> Once your new kernel is installed under /boot, it's time to set 
+              up GRUB. Make the /boot/grub directory and copy all of the grub 
+              drivers to it. With the Debian GRUB package, these files are installed 
+              under /usr/lib/grub/i386-pc:
+            <p> 
+            <pre>
+# mkdir /boot/grub
+# cp /usr/lib/grub/i386-pc /boot/grub
+</pre>
+            Your GRUB installation might put these files in a location different 
+            from "/usr/lib/grub/i386-pc".
+            <p> Next, we'll make a GRUB configuration file. Create a file called 
+              "/boot/grub/menu.lst" and put the following contents in it:
+            <p> 
+            <pre>
+# Boot automatically after 20 secs.
+timeout 20
+
+# By default, boot the first entry.
+default 0
+
+# Fallback to the second entry.
+fallback 1
+
+# For booting Linux
+title  GNU/Linux
+root (hd0,0)
+kernel /boot/vmlinuz root=/dev/hda1
+ 
+# For booting Linux from my old kernel
+title  GNU/Linux (old kernel)
+root (hd0,0)
+kernel /boot/vmlinuz.old root=/dev/hda1
+</pre>
+            Depending on your setup, you may need other options on the kernel 
+            command lines. This is a very basic GRUB config file; there are many 
+            more options. Consult the documentation for more information. As root, 
+            run grub and install the bootloader in the boot sector on the first 
+            disk:
+            <p> 
+            <pre>
+# grub
+grub&gt; root (hd0,0)
+ Filesystem type is reiserfs, partition type 0x83
+
+grub&gt; setup (hd0)
+ Checking if "/boot/grub/stage1" exists... yes
+ Checking if "/boot/grub/stage2" exists... yes
+ Checking if "/boot/grub/reiserfs_stage1_5" exists... yes
+ Running "embed /boot/grub/reiserfs_stage1_5 (hd0)"...  18 sectors 
+ are embedded.
+ succeeded
+ Running "install /boot/grub/stage1 (hd0) (hd0)1+18 p (hd0,0)
+ /grub/stage2 /grub/menu.lst"... succeeded
+ Done.
+</pre>
+            Next, reboot the box to the new kernel to ensure that it works.
+            <p> <b>Partitioning the New Disk</b>
+            <p> Presuming you have a working kernel when you reboot, you can next 
+              lay out partitions on the second disk. Run <b>fdisk</b> on the unused 
+              second disk:
+            <p> 
+            <pre>
+# fdisk /dev/hdc
+</pre>
+            Remove any existing partitions from the disk, and create two new partitions. 
+            Make one fairly small partition (128M-512M is usually plenty) at the 
+            beginning of the disk that will be mounted on "/boot". The other partition 
+            should encompass the rest of the disk and will be allocated as space 
+            for the LVM.
+            <p> Note that if you are working with two disks of different size, 
+              you'll need to make sure that both partitions will fit on the smaller 
+              of the disks. The example server for this article has identical 
+              disks.
+            <p> Set the partition types on both partitions to "fd" (Linux RAID 
+              autodetect). This will tell the kernel that these partitions hold 
+              software RAID partitions, and it will start them early in the boot 
+              process (which is what we want).
+            <p> Here's the partition table on /dev/hdc on the example machine 
+              (from the "p" command in <b>fdisk</b>):
+            <p> 
+            <pre>
+# fdisk /dev/hdc
+Command (m for help): p
+ 
+Disk /dev/hdc: 10.0 GB, 10005037056 bytes
+16 heads, 63 sectors/track, 19386 cylinders
+Units = cylinders of 1008 * 512 = 516096 bytes
+ 
+   Device Boot  Start     End      Blocks   Id  System
+/dev/hdc1           1     249      125464+  fd  Linux raid autodetect
+/dev/hdc2         250   19386     9645048   fd  Linux raid autodetect
+</pre>
+            Once you allocate the partitions and set the types, write the new 
+            partition table to the disk with the "w" command.
+            <p> The Linux kernel will not recognize partition table changes without 
+              being told to do so, so you'll need to either reboot the machine 
+              so it will see the new partition table, or use the <b>hdparm -z</b> 
+              command:
+            <p> 
+            <pre>
+# hdparm -z /dev/hdc
+</pre>
+            <b>Converting the Partitions into RAID Devices</b>
+            <p> The first step is to set up /etc/raidtab. This file serves as 
+              the configuration file for the <b>mkraid</b> command. We need to 
+              set up a stanza for both partitions, and declare any partitions 
+              on hda as a "failed-disk" for now. This will keep the md driver 
+              from trying to use them at this time.
+            <p> 
+            <pre>
+ # md1 is the /boot array
+ raiddev                 /dev/md1
+ raid-level              1
+ nr-raid-disks           2
+ nr-spare-disks          0
+ persistent-superblock   1
+ device                  /dev/hdc1
+ raid-disk               0
+ # this is our old disk, mark as failed for now
+ device                  /dev/hda1
+ failed-disk             1
+ 
+ # md2 is the LVM array
+ raiddev                 /dev/md2
+ raid-level              1
+ nr-raid-disks           2
+ nr-spare-disks          0
+ persistent-superblock   1
+ device                  /dev/hdc2
+ raid-disk               0
+ # mark this device as failed for now
+ device                  /dev/hda2
+ failed-disk             1
+</pre>
+            Next, we can set up the RAID devices:
+            <p> 
+            <pre>
+# mkraid /dev/md1
+handling MD device /dev/md1
+analyzing super-block
+disk 0: /dev/hda1, failed
+disk 1: /dev/hdc1, 125464kB, raid superblock at 125376kB
+ 
+# mkraid /dev/md2
+handling MD device /dev/md2
+analyzing super-block
+disk 0: /dev/hda2, failed
+disk 1: /dev/hdc2, 9645048kB, raid superblock at 9644928kB
+</pre>
+            <b>Setting up the LVM</b>
+            <p> To initialize the larger RAID partition as an LVM physical volume, 
+              do the following:
+            <p> 
+            <pre>
+# pvcreate /dev/md2
+pvcreate -- physical volume "/dev/md2" successfully created
+</pre>
+            Next, create a volume group, using the physical volume as the underlying 
+            device:
+            <p> 
+            <pre>
+# vgcreate rootvg /dev/md2
+vgcreate -- INFO: using default physical extent size 32 MB
+vgcreate -- INFO: maximum logical volume size is 2 Terabyte
+vgcreate -- doing automatic backup of volume group "rootvg"
+vgcreate -- volume group "rootvg" successfully created and activated
+</pre>
+            Note that the LVM tools are finicky about symbolic links. Be sure 
+            that the devices passed to it are actual block device files and not 
+            symlinks.
+            <p> <b>Creating and Initializing Volumes</b>
+            <p> At this point, you can lay out volumes within the volume group. 
+              This part of the process is pretty arbitrary. Make sure you allocate 
+              enough space in each volume for the existing contents of these directories, 
+              but there is no need to make any of them greatly oversized as it's 
+              very easy to grow them later.
+            <p> Here's how I set up the volumes on my machine:
+            <p> 
+            <pre>
+# lvcreate -n swap -L 1024M rootvg
+lvcreate -- doing automatic backup of "rootvg"
+lvcreate -- logical volume "/dev/rootvg/swap" successfully created
+ 
+# lvcreate -n root -L 512M rootvg
+# lvcreate -n usr -L 2048M rootvg
+# lvcreate -n var -L 2048M rootvg
+</pre>
+            This leaves 4.5 GB of disk space in reserve that can be added to any 
+            of the above volumes as needed.
+            <p> The next step is to initialize each logical volume and the /boot 
+              filesystem. As before, I used reiserfs for each of them:
+            <p> 
+            <pre>
+# mkfs -t reiserfs /dev/rootvg/root
+# mkfs -t reiserfs /dev/rootvg/usr
+# mkfs -t reiserfs /dev/rootvg/var
+# mkfs -t reiserfs /dev/md1
+# mkswap /dev/rootvg/swap
+</pre>
+            <b>Copying Data</b>
+            <p> Mount all the new filesystems under a directory under the root 
+              directory:
+            <p> 
+            <pre>
+# mkdir /newdisk
+# mount /dev/rootvg/root /newdisk
+# mkdir /newdisk/usr
+# mkdir /newdisk/var
+# mkdir /newdisk/boot
+# mount /dev/rootvg/usr /newdisk/usr
+# mount /dev/rootvg/var /newdisk/var
+# mount /dev/md1 /newdisk/boot
+</pre>
+            Next, we use rsync to do a preliminary copy of the data from hda to 
+            hdc. This can be done with the machine fully operational to minimize 
+            downtime. We'll exclude the contents of /tmp and /proc from the copy, 
+            but will copy the directories themselves. We'll skip copying the directory 
+            of /newdisk, however:
+            <p> 
+            <pre>
+# cd /
+# rsync -avH --exclude='/tmp/**' --exclude='/proc/**'
+  --exclude='/newdisk**' * /newdisk
+  </pre>
+            <b>Create Initial RamDisk Image</b>
+            <p> We next will create an initial ramdisk image. The LVM software 
+              includes a script for doing just this. Run:
+            <p> 
+            <pre>
+# lvmcreate_initrd
+Logical Volume Manager 1.0.7 by Heinz Mauelshagen  05/03/2003
+lvmcreate_initrd -- make LVM initial ram disk /boot/initrd-lvm-2.4.24.gz
+lvmcreate_initrd -- finding required shared libraries
+lvmcreate_initrd -- stripping shared libraries
+lvmcreate_initrd -- calculating initrd filesystem parameters
+lvmcreate_initrd -- calculating loopback file size
+lvmcreate_initrd -- making loopback file (3184 kB)
+lvmcreate_initrd -- making ram disk filesystem (84 inodes)
+lvmcreate_initrd -- mounting ram disk filesystem
+lvmcreate_initrd -- creating new /etc/modules.conf
+lvmcreate_initrd -- creating new modules.dep
+lvmcreate_initrd -- copying initrd files to ram disk
+lvmcreate_initrd -- copying shared libraries to ram disk
+lvmcreate_initrd -- creating new /linuxrc
+lvmcreate_initrd -- creating new /etc/fstab
+lvmcreate_initrd -- ummounting ram disk
+lvmcreate_initrd -- creating compressed initrd /boot/initrd-lvm-2.4.24.gz
+</pre>
+            Once your initrd image has been created, copy it to /newdisk/boot 
+            and create a symlink to it called "initrd":
+            <p> 
+            <pre>
+    # cp /boot/initrd-lvm-2.4.24.gz /newdisk/boot
+    # cd /newdisk/boot
+    # ln -s initrd-lvm-2.4.24.gz initrd
+	</pre>
+            <b>Reconfigure GRUB</b>
+            <p> Before we set up GRUB for booting to the new filesystem, I'll 
+              explain how booting works when you have your root filesystem on 
+              LVM. The boot process works like this:
+            <p> 
+            <p> 1. The BIOS starts and loads GRUB from the primary boot device. 
+            <p> 2. GRUB loads the kernel from the /boot partition and passes information 
+              to the kernel about the location of the initial ramdisk (initrd) 
+              image.
+            <p> 3. The kernel boots and eventually loads the md driver. The md 
+              driver scans all the hard disks looking for partitions of type "fd". 
+              When it sees them, it attempts to activate them as RAID devices.
+            <p> 4. The kernel then mounts the initrd image as the root file system, 
+              and runs the script on it named /linuxrc. /linuxrc has instructions 
+              in it to start the LVM volume groups.
+            <p> 5. It mounts its "real" root filesystem (/dev/rootvg/root in this 
+              example) and then continues booting.
+            <p> 
+            <p> At this point, the grub configuration file (menu.lst) should look 
+              something like this:
+            <p> 
+            <pre>
+# For booting Linux from our old rootdisk
+title  GNU/Linux
+root (hd0,0)
+kernel /boot/vmlinuz root=/dev/hda1
+ 
+# For booting Linux from our old rootdisk (single user)
+title  GNU/Linux (single user mode)
+root (hd0,0)
+kernel /boot/vmlinuz root=/dev/hda1 single
+
+# For booting Linux from our new LVM mirror
+title  GNU/Linux (LVM mirror disk)
+root (hd1,0)
+kernel /vmlinuz root=/dev/rootvg/root
+initrd /initrd
+</pre>
+            So, when we boot from the /dev/hda1, we simply load the kernel from 
+            /boot/vmlinuz on the root filesystem (/dev/hda1).
+            <p> When booting from hdc, things are a little more confusing. /dev/hdc1 
+              (which is one half of the /boot md device) is the "root" as far 
+              as GRUB is concerned, so we list the kernel as /vmlinuz instead 
+              of /boot/vmlinuz like we did with the first boot option. The same 
+              goes for the initrd image (/initrd).
+            <p> Note that GRUB doesn't need to understand "md" partitions. Because 
+              the metadata for "md" devices lies at the end of the partition, 
+              it can work with the filesystem that exists on the partition, without 
+              worrying about the fact that it's half of a mirrored pair.
+            <p> Once you create this file, copy it onto both the old and new rootdisks:
+            <p> 
+            <pre>
+# cp menu.lst /boot/grub/menu.lst
+# cp menu.lst /newdisk/boot/grub/menu.lst
+</pre>
+            <b>Install Boot Sector on /dev/hdc (Optional)</b>
+            <p> A GRUB boot sector on /dev/hdc is really most helpful if your 
+              BIOS is capable of booting from it. If it isn't, then I highly recommend 
+              building a GRUB boot floppy or CD; otherwise, you will not be able 
+              to boot if /dev/hda fails.
+            <p> To install a boot sector on /dev/hdc, run GRUB and enter the following 
+              commands to install a boot sector on the secondary disk:
+            <p> 
+            <pre>
+# grub
+grub&gt; root (hd1,0)
+ Filesystem type is reiserfs, partition type 0xfd
+
+grub&gt; setup (hd1)
+ Checking if "/boot/grub/stage1" exists... no
+ Checking if "/grub/stage1" exists... yes
+ Checking if "/grub/stage2" exists... yes
+ Checking if "/grub/reiserfs_stage1_5" exists... yes
+ Running "embed /grub/reiserfs_stage1_5 (hd1)"...  18 sectors are
+ embedded.
+ succeeded
+ Running "install /grub/stage1 (hd1) (hd1)1+18 p (hd1,0)/grub/stage2
+/grub/menu.lst"... succeeded
+Done.
+</pre>
+            I usually install a boot sector on all the disks in the system regardless 
+            of whether the BIOS supports booting from it. That way, at worst, 
+            I could physically move the disk to the other controller and boot 
+            from it.
+            <p> <b>Reboot and Do Final Copy</b>
+            <p> Reboot to the /dev/hda in single-user mode (option 2 of our current 
+              GRUB menu). When you get to a shell, mount the volumes in rootvg 
+              and /boot:
+            <p> 
+            <pre>
+# mount /dev/rootvg/root /newdisk
+# mount /dev/rootvg/usr /newdisk/usr
+# mount /dev/rootvg/var /newdisk/var
+# mount /dev/md1 /newdisk/boot
+</pre>
+            Rerun the copy with <b>rsync</b> to transfer any files that have changed 
+            since the original copy:
+            <p> 
+            <pre>
+# cd /
+# rsync -avH --exclude='/tmp/**' --exclude='/proc/**'
+  --exclude='/newdisk**' * /newdisk
+</pre>
+            This should ensure that all files are transferred intact by doing 
+            a final copy with most programs not running.
+            <p> <b>Fix fstab</b>
+            <p> Once this step is done, edit /newdisk/etc/fstab and set it up 
+              to mount the new LVM volumes in place of the old partitions, and 
+              to mount the /boot partition. We would change it to the following 
+              on the example machine:
+            <p> 
+            <pre>
+# &lt;file_system&gt;   &lt;mountpt&gt;   &lt;fstype&gt;   &lt;options&gt; &lt;dump&gt; &lt;pass&gt;
+/dev/rootvg/root  /           reiserfs   defaults  1      1
+/dev/md1          /boot       reiserfs   defaults  1      1
+/dev/rootvg/var   /var        reiserfs   defaults  1      1
+/dev/rootvg/usr   /usr        reiserfs   defaults  1      1
+/dev/rootvg/swap  none            swap   defaults  0      0
+proc              /proc         procfs   defaults  0      0
+</pre>
+            <b>Boot to hdc and Start Mirroring</b>
+            <p> Next, reboot the box:
+            <p> 
+            <pre>
+# reboot
+</pre>
+            When the GRUB menu comes up after the reboot, select the third option 
+            (the boot from /dev/hdc). The machine should boot to /dev/hdc and 
+            mount its partitions as LVM volumes. The /dev/hda should be unused 
+            at this point.
+            <p> When you get to a login prompt, log in as root and repartition 
+              /dev/hda with identical partitions to that of /dev/hdc. If the disks 
+              are of identical types (as on our example machine) and you have 
+              "sfdisk" installed, you can do the following to copy the partition 
+              table verbatim:
+            <p> 
+            <pre>
+# sfdisk -d /dev/hdc | sfdisk /dev/hda
+</pre>
+            Otherwise, you'll need to partition /dev/hda by hand with <b>fdisk</b> 
+            (or another program). Make sure both partitions on the /dev/hda are 
+            identical in size to, or slightly larger than, those on /dev/hdc. 
+            Once the /dev/hda has been partitioned, cue the kernel to reread the 
+            partition table from the disk:
+            <p> 
+            <pre>
+# hdparm -z /dev/hda
+</pre>
+            Next, attach the partitions to the metadevices and start them synchronizing:
+            <p> 
+            <pre>
+# raidhotadd /dev/md1 /dev/hda1
+# raidhotadd /dev/md2 /dev/hda2
+</pre>
+            Now you can watch the progress on the mirror synchronization via the 
+            /proc/mdstat pseudo-file:
+            <p> 
+            <pre>
+# cat /proc/mdstat
+Personalities : [raid1]
+read_ahead 1024 sectors
+md1 : active raid1 hda1[0] hdc1[1]
+      125376 blocks [2/2] [UU]
+       
+md2 : active raid1 hda2[2] hdc2[1]
+      9644928 blocks [2/1] [_U]
+      [&gt;....................]  recovery =  0.1% (11696/9644928) \
+        finish=13.7min speed=11696K/sec
+unused devices: &lt;none&gt;
+</pre>
+            <b>Finalize GRUB Configuration</b>
+            <p> Next, we'll edit the GRUB menu.lst file into its final configuration. 
+              We dispose of the stanzas relating to the non-LVM rootdisk and add 
+              a stanza for booting to the old rootdisk as an LVM disk. Here's 
+              the final GRUB configuration:
+            <p> 
+            <pre>
+# Boot automatically after 30 secs.
+timeout 15
+
+# By default, boot the first entry.
+default 0
+
+# Fallback to the second entry.
+fallback 1
+
+# For booting Linux from our old rootdisk as a LVM mirror disk
+title  GNU/Linux (LVM primary disk)
+root (hd0,0)
+kernel /vmlinuz root=/dev/rootvg/root
+initrd /initrd
+
+# For booting Linux from our new LVM mirror
+title  GNU/Linux (LVM mirror disk)
+root (hd1,0)
+kernel /vmlinuz root=/dev/rootvg/root
+initrd /initrd
+</pre>
+            This only needs to be copied to /boot/grub/menu.lst. Once the /boot 
+            mirror finishes sync'ing, it's safe to reboot the box (if necessary).
+            <p> <b>Monitoring and Maintenance</b>
+            <p> One thing that is often overlooked with disk mirroring is the 
+              need to monitor it. Disk mirroring won't save you if both disks 
+              fail, so with a setup like this, you must monitor the status of 
+              the /proc/mdstat pseudo-file, looking for any disks that are marked 
+              as having failed. If any have failed, replace them in a timely manner.
+            <p> If possible, you should integrate this type of check into your 
+              existing monitoring software, or write a script to email you if 
+              any part of your RAID set shows up as faulty.
+            <p> In this excerpt from /proc/mdstat, /dev/hdc2 is showing errors, 
+              so the md driver has marked it faulty and taken it out of the md2 
+              RAID set:
+            <p> 
+            <pre>
+md2 : active raid1 hda2[0] hdc2[1](F)
+      9644928 blocks [2/1] [U_]
+	  </pre>
+            <p> In the event of a complete disk failure (or more commonly of a 
+              disk showing errors), you'll need to complete the following steps 
+              to replace it:
+            <p> 
+            <p> 1. Make sure that all the partitions on the physical disk are 
+              marked as faulty. Commonly, the second partition will show errors 
+              (simply because it is larger and has more blocks that can fail), 
+              but the first still seems to be fine. If this is the case, mark 
+              any partitions on the problem disk as faulty. Here, we're marking 
+              /dev/hdc1 as a faulty partition:
+            <p> 
+            <pre>
+# raidsetfaulty /dev/md1 /dev/hdc1
+</pre>
+            2. Shut down the machine and put in the new disk.
+            <p> 3. Boot to the other disk in the machine (or to your GRUB floppy 
+              or CD if the other disk isn't bootable from the BIOS).
+            <p> 4. Partition the disk as before, and then use the <b>raidhotadd</b> 
+              command to start sync'ing mirrors to the new disk.
+            <p> 
+            <p> If you have hot-swappable disks, you can likely skip bringing 
+              the machine down. Simply set the disk to be swapped as faulty and 
+              replace the disk while the machine is running. Once the new disk 
+              is in place, partition it and use the <b>raidhotadd</b> command 
+              to start the mirror synchronization.
+            <p> In either case, this is much easier and quicker than rebuilding 
+              the machine from backups.
+            <p> <b>Growing Filesystems</b>
+            <p> Because we have several gigabytes of disk space in reserve, we 
+              can now grow filesystems as needed (except for the /boot filesystem, 
+              which isn't an LVM volume). And, because we used reiserfs for all 
+              filesystems, we can grow them while they're mounted and in use. 
+              If, for example, we start running out of space in /var, we can add 
+              another gigabyte to it with the following commands:
+            <p> 
+            <pre>
+# lvextend -L +1G /dev/rootvg/var
+# resize_reiserfs /dev/rootvg/var
+</pre>
+            The first command extends the volume by 1GB, and the second grows 
+            the filesystem to fill the new space.
+            <p> <b>Conclusion</b>
+            <p> I've found the process described here very useful for mirroring, 
+              and I use it on all my production Linux machines. The ability to 
+              grow volumes and filesystems online really makes the Linux offerings 
+              competitive with those of proprietary versions of Unix. With the 
+              introduction of the SATA standard for disks, I hope we can look 
+              forward to hot-swappable disks even in low-end machines.
+            <p> Although this article focuses on a relatively specific configuration, 
+              the techniques used in it are applicable to many alternate situations 
+              (for instance, using SCSI disks instead of IDE, or having the LVM 
+              based on a RAID 5 or striped setup). It's also possible to set up 
+              a similar configuration using the 2.6 kernel series with the same 
+              md driver and LVM2 (the successor to the 2.4 kernel's LVM driver).
+            <p> <i>Jeff Layton has been working with computers since he got his 
+              paws on a TRS-80 in 1981 at age 10. After working in the Macintosh 
+              and PC realm for more than a decade and attaining a degree in Physics 
+              Education, he came to his senses and made the jump to Unix administration 
+              in 1996. He is currently employed as a Senior Unix Systems Administrator 
+              at Bowe Bell and Howell.</i>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

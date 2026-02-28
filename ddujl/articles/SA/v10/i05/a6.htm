@@ -1,0 +1,300 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v10, i05: Virtual Hosting, FTP, and LDAP</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink">Article</span></td>
+		<td><a href="../../../../source/SA/2001/may2001.tar"><b class=codeListing>may2001.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <H1><img src="a6.gif" width="200" height="174" align="right">Virtual 
+              Hosting, FTP, and LDAP</h1>
+            <p> <i>Tristan Greaves</i>
+            <p> Virtual hosting (serving more than one domain from a single server) 
+              is a prime area of development for many ISPs, with Apache generally 
+              being the Web server of choice. However, the Web hosting is just 
+              one side of the story -- customers must also be granted whatever 
+              access is appropriate to maintain their sites. Recently, we performed 
+              a move of all the domains that our ISP division (Argonet) hosts 
+              to a new architecture. We saw this as an opportunity to re-evaluate 
+              our approach to solving the problem.
+            <p> We had two primary requirements:
+            <p> 
+            <p> 1. Customer information had to be stored in a flexible way, for 
+              maintenance purposes.
+            <p> 2. We needed a secure, stable <b>ftp</b> server that would "lock 
+              down" customers to their home directories, using our specified 
+              information store. Only <b>ftp</b> was to use this resource, thus 
+              denying customers any other control over the machine (<b>telnet</b>, 
+              etc.)
+            <p> 
+            <p> Previously, the account details for customers were being stored 
+              in a typical UNIX password fashion, and we wanted to get away from 
+              this approach. We decided upon LDAP as a mechanism for storing account 
+              details. LDAP is well-used for authentication purposes, and modules 
+              exist for many languages to interface with it. The aim was to develop 
+              the management tools in Perl.
+            <p> <b>Getting OpenLDAP Up and Running</b>
+            <p> LDAP is a client-server protocol for accessing a directory service. 
+              It harks back to the days of X.500, but now may be used with other 
+              directory services. We required an "all-in-one" LDAP package, 
+              that implemented the protocols as well as the database storage mechanisms. 
+              Specifically, we chose the latest stable version of OpenLDAP (1.2.11), 
+              to be deployed in a Linux 2.2.x environment. The system's sole 
+              purpose was to authenticate <b>ftp</b> accounts, and so the database 
+              design is deliberately simplistic. Integration into an existing 
+              LDAP database would take a little more thought.
+            <p> The installation process followed the standard documentation, 
+              which can be found at <b>http://www.openldap.org/</b>, along with 
+              the relevant source downloads. <b>slapd.conf</b> is the core configuration 
+              file for <b>slapd</b> (the OpenLDAP project's LDAP server). 
+              There are three core directives to be looking at:
+            <p> 
+            <pre>
+suffix          "dc=your-domain, dc=com"
+rootdn          "cn=Admin, dc=your-domain, dc=com"
+rootpw          your-secret-password
+</pre>
+            The <b>rootdn</b> and <b>rootpw</b> are the effective user name and 
+            passwords that will be used by systems that access the database, which 
+            I will cover later. The above is a very simple example, and it is 
+            recommended that you employ encrypted passwords for authentication, 
+            and again, the documentation will point you in the right direction. 
+            Listing 1 shows a complete sample <b>slapd.conf</b>. (All listings 
+            for this article are avaiable at: <b>http://www.sysadminmag.com</b>.)
+            <p> Please be sure to look fully into the security of your set-up. 
+              By default, your database will be world readable by any host that 
+              can see it on the Internet! So, make good use of the "access" 
+              parameter and firewalling elsewhere in your network to lock things 
+              down to your preference.
+            <p> After <b>slapd</b> was up and running, the key issue was to implement 
+              the object class to store account information in. The OpenLDAP schema 
+              may be extended in this way to customize the database (LDAP uses 
+              concepts of objects and classes, instead of items like fields and 
+              tables in relational databases).
+            <p> It was important to implement a format that our <b>ftp</b> daemon 
+              can understand. As discussed in detail later, we based it upon the 
+              recommended configuration for John Morrissey's <b>mod_ldap</b> 
+              ProFTPD module.
+            <p> As a result, the following was created in <b>local.oc.conf</b>:
+            <p> 
+            <pre>
+# FTP account object class.
+
+objectclass ftpAccount
+        requires
+                objectclass,
+                cn,
+                uid,
+                homeDirectory
+        allows
+                userPassword,
+                accountStatus,
+                loginShell,
+                uidNumber,
+                gidNumber
+</pre>
+            Most of these attributes will be familiar to systems administrators, 
+            with the possible exception of "cn". This stands for "common 
+            name", and for the purposes of this class, we will utilize it 
+            to store the domain name in. Because our implementation is domain-centric, 
+            any administrative work will most likely use the domain as a search 
+            term, for example.
+            <p> With this schema, every domain that the system knows about has 
+              an associated <b>ftp</b> account (the domain name in "cn", 
+              the <b>ftp</b> account name in "uid"). There is one account 
+              per domain.
+            <p> Here is a quick summary of the class attributes:
+            <p> 
+            <p> objectclass -- The class of the entry (ftpAccount)
+            <p> cn -- Domain name (described above)
+            <p> uid -- <b>ftp</b> account name
+            <p> userPassword -- Password for <b>ftp</b> authentication (see 
+              later)
+            <p> accountStatus -- For administrative use (open?, payment late?, 
+              etc.)
+            <p> loginShell -- Not applicable (users do not have shell access)
+            <p> uidNumber -- UID granted to the user
+            <p> gidNumber -- GID granted to the user
+            <p> 
+            <p> Please note that uidNumber/gidNumber do not apply, as we override 
+              these values as part of our <b>ftp</b> server configuration. Details 
+              are provided later.
+            <p> It was necessary to reference this file in the master <b>slapd</b> 
+              configuration file, <b>slapd.conf</b>, with the line:
+            <p> 
+            <pre>
+include         /usr/local/etc/openldap/local.oc.conf
+</pre>
+            This is all that is required to make our new class "go live", 
+            apart from a quick HUP to the server. Only one issue remained for 
+            us -- the database didn't have any account information in 
+            it yet!
+            <p> <b>Populating the Database</b>
+            <p> First, the existing account information for the hosted domains 
+              was exported to a simple CSV file. A typical line would be:
+            <p> 
+            <pre>
+www.some-domain.com,fred,AaBbCcDdEeFfg,/virtual/www.some-domain.com
+</pre>
+            where the fields indicate the domain's name, the account to use 
+            for <b>ftp</b> uploads, the encrypted password associated with the 
+            account, and the home directory (where the Web pages are stored).
+            <p> A Perl script was then created that would take the data from this 
+              file, and create corresponding entries in our LDAP database. This 
+              is <b>domains2ldap</b> (see Listing 2). The script will need to 
+              be adjusted to suit your needs. Specifically, you'll need to 
+              change the details of the user that has permission to alter the 
+              LDAP database and where the database actually is. Net::LDAP is required. 
+              It is naturally available at CPAN (<b>http://www.cpan.org/</b>) 
+              under the name <b>perl-ldap</b>. I used version 0.22.
+            <p> <b>Manual Manipulation of the Database</b>
+            <p> This script aside, OpenLDAP comes with several tools to assist 
+              in dealing with the database.
+            <p> To add a new account in this manual way, put something like the 
+              following in <b>/tmp/add.tmp</b>:
+            <p> 
+            <pre>
+dn:            uid=ftpfoo, dc=my-domain, dc=com
+objectclass:   ftpAccount
+uid:           ftpfoo
+cn:            www.foobar.com
+homeDirectory: /home/vhosts/www.foobar.com/
+userPassword:  {crypt}AaBbCcDdEeFfg
+</pre>
+            This is for the virtual host <b>www.foobar.com</b>, to be accessed 
+            with the <b>ftp</b> account "ftpfoo". The encrypted form 
+            of their password has been used, but a plain-text one is usable by 
+            prefixing it with <b>{clear}</b> instead. (The configuration issues 
+            involved with this will be discussed later).
+            <p> Next, invoke <b>ldapadd</b> as follows:
+            <p> 
+            <pre>
+ldapadd -D "cn=Admin, dc=your-domain, dc=com" -w &lt;Password&gt; -f /tmp/add.tmp
+</pre>
+            The <b>-D</b> parameter should be the reference for the user with 
+            permissions to perform the addition. This will typically be identical 
+            to the "rootdn" as described in <b>slapd.conf</b> earlier 
+            in this article. Consequently, the <b>-w</b> parameter is the password 
+            associated with the "rootdn", which is stored in "rootpw". 
+            This will perform the addition, binding as Admin for the permissions 
+            required.
+            <p> Deleting entries is easier. The following will remove the previous 
+              entry:
+            <p> 
+            <pre>
+ldapdelete -D "cn=Admin, dc=your-domain, dc=com" -w &lt;Password&gt; "uid=ftpfoo"
+</pre>
+            Refer to the man pages for more information (and for the command <b>ldapmodify</b>).
+            <p> <b>Linking in the ftp Server</b>
+            <p> Our choice of <b>ftp</b> server was ProFTPD (<b>http://www.proftpd.net</b>). 
+              It is secure, with excellent configurability, and (as previously 
+              mentioned) there is a module available that allows user authentication 
+              via LDAP.
+            <p> We employed 1.2.0rc2, but encountered problems with the version 
+              of the <b>mod_ldap</b> module bundled with it -- it simply didn't 
+              work. This was solved by utilizing the latest version from the module's 
+              author; the home page of the module is: <b>http://horde.net/~jwm/software/proftpd-ldap/</b>.
+            <p> The new <b>mod_ldap.c</b> was copied into the "contrib" 
+              directory of the ProFTPD source tree, and the system was compiled 
+              as follows:
+            <p> 
+            <pre>
+./configure --with-modules=mod_ldap
+make
+make install
+</pre>
+            Naturally, your system architecture may require a few tweaks, which 
+            the documentation at the ProFTPD Web site will aid you with.
+            <p> The key elements of ProFTPD's configuration file (<b>proftpd.conf</b>) 
+              to enable LDAP-based authentication are:
+            <p> 
+            <pre>
+LDAPServer               ldap.your-domain.com
+LDAPDNInfo               "cn=Admin,dc=your-domain,dc=com" "your-secret-password"
+LDAPDoAuth               on "dc=your-domain,dc=com" "uid=%u"
+LDAPDefaultAuthScheme    "crypt"
+LDAPDoUIDLookups         off
+LDAPDoGIDLookups         off
+LDAPNegativeCache        on
+LDAPDefaultGID           50
+LDAPDefaultUID           50
+</pre>
+            In our environment, all of the account home directories were owned 
+            by a generic user/group combination -- ProFTPD is handling access, 
+            after all. Thus, Lookups are disabled, and the default GID and UID 
+            configured. Second, encrypted passwords are the default. If you examine 
+            <b>domains2ldap</b> (Listing 2) closely, you will see that the imported 
+            (encrypted) passwords are prefaced by <b>{crypt}</b>. This isn't 
+            strictly necessary, due to the <b>LDAPDefaultAuthScheme</b> line, 
+            but it is good practice to assume anything could happen (i.e., some 
+            plain-text passwords may one day need to be used).
+            <p> At this point, everything should magically work. If not, check 
+              the logs of both ProFTPD and <b>slapd</b> to see if anything obvious 
+              is broken. Unfortunately, in our case of the "bad" <b>mod_ldap</b> 
+              module, the problem wasn't obvious -- the LDAP database 
+              was being successfully searched, it was just that ProFTPD rejected 
+              the user every time. So, persevere!
+            <p> <b>A Note on ftp Virtual Hosting</b>
+            <p> As this article shows, access to the virtual host directories 
+              is performed on a username/password basis. All users were informed 
+              of the host they should use. Additionally, because we host their 
+              DNS too, we added an entry for <b>ftpadmin.their-domain.com</b> 
+              for easy access.
+            <p> It would be useful if separate authentication databases could 
+              be used on a per-domain basis. In most cases, it will not be feasible 
+              to allocate each Web site its own IP address, so a process similiar 
+              to Apache's "Name-Based" virtual hosting is appropriate, 
+              perhaps to allow users to have their own, separate, anonymous <b>ftp</b> 
+              sites for customers to grab content from (but running on one server).
+            <p> Unfortunately, this feature is not available with the <b>ftp</b> 
+              protocol. <b>ftp</b> does not utilize an equivalent of the HTTP 
+              protocol's "Host-Header" system, so there is no way 
+              for a server to determine which specific domain the user is trying 
+              to <b>ftp</b> to, if they share the same IP address.
+            <p> <i>Tristan Greaves works as a systems engineer for Argogroup, 
+              performing customer consultancy duties in the area of wireless Internet 
+              interoperability. He previously worked for ICL, assisting with the 
+              development of the European network for Sega's Dreamcast games 
+              console, after graduating in Computer Science from the University 
+              of Southampton, England. He can be reached at: <b>tristan@extricate.org</b>. 
+              Thanks to Andy Loukes, the other engineer on this project, for his 
+              advice.</i>
+          </table></table><br>&nbsp;<br>
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

@@ -1,0 +1,298 @@
+<html>
+<META NAME="year" CONTENT="1998">
+<head>
+<title>Extending Windows CE 2.0 MFC Database Classes</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Extending Windows CE 2.0 MFC Database Classes</h1>
+
+<p><i>Dr. Dobb's Journal</i> May 1998
+</p>
+<h2>Adding powerful search capabilities</h2>
+
+<h3>By John C. Schettino, Jr.</h3>
+
+<I>John is a developer of Windows CE, Newton, and Macintosh software. He is also a Senior Member of the Technical Staff at GTE Laboratories Inc. He can be contacted at schettino@writeme.com or at http://members.aol .com/pdcjohns/.</I>
+
+<hr>
+
+<p>Windows CE programming is a lot like Win32 programming, since the CE API is a subset of Win32, with some CE-specific extensions. One of those extensions is an API for object databases. The object database API is reasonably rich, including indexed access to records in databases, with up to four indexes supported for each database. Indexes are only on single integer or string properties, in ascending or descending order. There is a <i>seek </i>function in the API that uses the current index for rapid searches. Like its bigger siblings, Windows CE has a version of the Microsoft Foundation Class (MFC) library, which I consider the highway -- or at least the paved road -- for developing CE applications. By comparison, using Win32/C is more like a gravel road. But because MFC in Version 1.0 of the CE SDK did not provide classes for dealing with databases, I hit the gravel road pretty often. </p>
+
+<p>Just when I was about to break down and write my own wrapper classes, the CE SDK Version 2.0 beta was released. Thankfully, the SDK 2.0 adds several classes to MFC that wrap the database API and data structures into a more usable form. While this API is sufficient to accomplish most database tasks, it still lacks a general-purpose searching class. Consequently, in this article, I'll present a set of CE database classes and subclasses of the new 2.0 MFC classes that provide an object-oriented wrapper to the basic database search API. The complete wrapper is available electronically; see "Resource Center," page 3.</p>
+
+<h3>What's New in SDK 2.0</h3>
+
+<p>The main database class is <i>CCeDBDatabase</i>. Objects of this class encapsulate an open database, and support several operations. The operations I'm most interested in for searching are <i>SeekFirst()</i>, <i>SeekFirstEqual()</i>, <i>SeekNext()</i>, <i>SeekNextEqual()</i>, <i>SeekValueSmaller()</i>, and <i>SeekValueGreater()</i>. The <i>SeekFirstEqual()</i> and last two seek methods take a <i>CCeDBProp</i> object as their only parameter, and use the current index to locate the first record equal to, smaller, or larger than the value encapsulated within. <i>CCeDBProp</i> is a wrapper class for both record properties and index properties. It contains a property identifier and value. The <i>CCeDBRecord</i> class encapsulates a record in the database, and consists of a set of <i>CCeDBProp</i> objects. It provides a couple of methods for extracting a property from the record.</p>
+
+<p>While there is a lot more to these classes than I've covered here, it's about all I need to extend the classes to add a more robust search capability. </p>
+
+<h3>Objectives of the Search Classes</h3>
+
+<p>What I'd like to be able to do with MFC is encapsulate a query on an open database in an object, hand that object to a method of a database object, and get back an "iterater." I could then retrieve matching records by simply calling the <i>first()</i> and <i>next()</i> methods of iterater. The query would support the intrinsic queries supported by the database, that is less than, greater than, or equal to tests. Unlike the basic index seek operations, I'd like to be able to use more than one property in the query, as well as supply multiple matching tests for a property. Finally, I'd like to lift the restriction on using nonindexed properties in a query. To top it all off, I'd like the query to be as optimal as possible, including making full use of the correct index to retrieve all the matching records while accessing as few records as possible in the database.</p>
+
+<p>This sounds wonderful, but without a few simplifying assumptions I'd end up coding it for the rest of my life. In addition to the good things I've decided on, I'll make one huge concession -- I'll assume that any query that contains multiple properties, or even multiple tests against a single property, is an implicit AND of all tests. Sure, I could support OR, but then I'd need a more complex representation of the query syntax as well as a query parser. I'll leave that as an exercise for the reader. Also not implemented but equally desirable are more general tests. It would be nice to be able to do regular expression matches or lots of other tests, and it's obvious exactly where those tests could be added, but I'm not doing them now.</p>
+
+<h3>Class Design</h3>
+
+<p>To implement extended searching, I'll first need to create the <i>CEQuery</i> class to encapsulate a query. That will require subclassing the <i>CCeDBProp</i> class so I can store test criteria with a property. Then I'll need to extend the existing <i>CCeDBDatabase</i> class to add the method to create an iterater used to search. Finally, I'll have to do the hard work of actually implementing the iterater class. </p>
+
+<h3>The <i>CEQuery</i> and <i>CCeDBQueryProp</i> Classes</h3>
+
+<p>A query object consists of a <i>CCeDBDatabase</i> object, a number of <i>CCeDBQueryProp</i> objects representing the properties to test, a test value (and the test operation), and a <i>CCeDBQueryProp</i> object representing the desired sort order (if any). <a name="rl1"><a href="9805g.htm#l1">Listing One</A> presents the <i>CEQuery</i> class declaration.</p>
+
+<p>The <i>addField()</i> method adds a new <i>CCeDBQueryProp</i> object to the query. It's expected that <i>CEQuery</i> deletes this object in its destructor. <i>CCeDBQueryProp</i> objects are stored in an array named <i>_fields</i> that is expanded as needed, so any number of tests can be performed in a query.</p>
+
+<p>The <i>setSortField()</i> method takes a <i>CCeDBQueryProp</i> object (which is also deleted in the destructor) that specifies the desired sort order for the query. The <i>numFields()</i> method returns the current number of test fields in the query. </p>
+
+<p>The <i>testOn()</i> method is called during searching. It determines which <i>CCeDBQueryProp</i> value (if any) to use to begin the query when querying the database. Each <i>CCeDBQueryProp</i> is tested against the supplied property ID, which is also saved in the <i>_index</i> member variable. If a matching <i>CCeDBQueryProp</i> uses an Equal test, then that object is selected to begin the query. If it matches and uses a Less Than (on a property with a descending index) or Greater Than (on a property with an ascending index) then it is used if none are found with an Equal test. At this time if a range search is detected (both a Greater Than and Less Than test on the indexed property, for example) then the <i>_range</i> member variable is set to True. The goal of this method is to start the search off using a query value against the selected index that eliminates as many nonmatching records as possible. It also determines (by setting <i>_range</i>) if it is possible to stop the query after a record fails a test on the indexed property.</p>
+
+<p>The <i>match()</i> method is called during searching. It tests every property in the supplied record against the <i>CCeDBQueryProp</i> objects in the query. If a range test is being done, the index property is tested first to see if it falls within the range. If it does not, then False is returned, but also an EOF flag is set indicating that the search is complete. The EOF flag is not set the first time the range test fails, to work around a bug in the MFC <i>SeekValueSmaller()</i> method. When used with a descending index, it actually returns the record larger than the supplied value, so the first time, the range test will fail. It's not too expensive to do a couple of extra tests just to be sure, and it works around this bug just fine. The <i>match()</i> method calls <i>matchField()</i> to do the actual test for each property. Assuming the range test succeeds or is not performed, then each property in the record is tested against its corresponding <i>CCeDBQueryProp</i> objects using <i>matchField()</i>. When doing these tests the index field tests are skipped if range testing was previously done. If all tests pass, <i>match()</i> returns True.</p>
+
+<p>The <i>matchField()</i> method tests the supplied property from a potentially matching record against the specified test object, and returns True or False. It consists of a large case statement that does the appropriate comparison based on the data type and test operation for a property.</p>
+
+<p>The <i>CCeDBQueryProp</i> class is a subclass of <i>CCeDBProp</i> (see <a name="rl2"><a href="9805g.htm#l2">Listing Two</A> for its declaration). It adds an enumerated type that describes the three types of test possible on a property, as well as a member variable to hold the specific test for the property. To create a query, I allocate a new <i>CCeDBQueryProp</i> object for each desired test, set its property ID, type, value, and operation, and then add it to the query object using <i>addField()</i>. </p>
+
+<h3><i>CCeFindDBDatabase</i></h3>
+
+<p>I'd like to be able to hand my query object to a method of a <i>CCeDBDatabase</i> object to begin a query. That's accomplished by subclassing <i>CCeDBDatabase</i> and adding a <i>Find()</i> method; see <a name="rl3"><a href="9805g.htm#l3">Listing Three</A>.</p>
+
+<p>The <i>Find()</i> method accepts a query object and allocates a new <i>CCeFindDBDatabaseIterater</i> object. This object should be deleted when I'm done with a query. To create a new iterater, I call the <i>FindKey()</i> method to determine which key I should use, and then I pass that key and the <i>CEQuery</i> object to the <i>CCeFindDBDatabaseIterater</i> constructor.</p>
+
+<p>The <i>TestFind()</i> method is useful to determine if a particular query will use an index or require a sequential search. It also calls <i>FindKey()</i>, and if no key is found it returns False. This might be handy if I want to warn the user that a query might take some time, since it will be a sequential search.</p>
+
+<p>The <i>FindKey()</i> method examines the <i>CEQuery</i> object against the current indexes defined for the database using the <i>IsIndexed()</i> method. It determines which index (if any) to use when querying the database. If the query includes a sort then that index must be used. If not, then the <i>CCeDBQueryProp</i> objects that use properties that are indexed and weighted to determine the best index to use. If any of them are Equal tests, then that index is heavily weighted. If any are Less Than (on a property with a descending index) or Greater Than (on a property with an ascending index) then they are weighted at half of properties using Equal. The highest weighted index is then chosen. This ends up favoring the index that will require the fewest number of tests to complete the query.</p>
+
+<p>The <i>IsIndexed()</i> method compares the supplied property ID against all property IDs in the database that have an index. If the property ID is indexed, it returns True, and also returns the sort order for the index.</p>
+
+<h3><i>CCeFindDBDatabaseIterater</i></h3>
+
+<p>When I query a database, I want a single object to encapsulate everything having to do with the search in progress. The <i>CCeFindDBDatabaseIterater</i> class holds everything needed to perform a search, including copies of the current query object and the database object. <a name="rl4"><a href="9805g.htm#l4">Listing Four</A> is its declaration.</p>
+
+<p>The constructor stores copies of the <i>CEQuery</i> (query) and <i>CCeDBDatabase</i> (database) objects in the <i>_myQuery</i> and <i>_myDb</i> member variables. It then opens the database object in <i>_myDB</i> using the selected index. It sets <i>_start</i> to True, <i>_eof</i> to False, and zeros out the <i>_hits</i> and <i>_tests</i> member variables. It sets the <i>_primaryQuery</i> member variable to the query property to begin the search by calling the <i>testOn()</i> method of the <i>CEQuery</i> object. The iterater is now ready to retrieve matching records.</p>
+
+<p>The <i>first()</i> method returns the first matching record for the query. It can be used to restart a search in progress, or just to begin a search. It just sets <i>_start</i> to True, clears the search statistics variables, and calls the <i>next()</i> method.</p>
+
+<p>The <i>next()</i> method finds the first (if <i>_start</i> is True) or the next matching record in the database. If _start is True, it begins the query by calling <i>SeekFirst()</i> if there is no appropriate test on an indexed field. If there is an Equal test in <i>_primaryQuery</i> it calls <i>SeekFirstEqual()</i>. If there is a Greater or Less Than test in <i>_primaryQuery</i> it calls <i>SeekValueGreater()</i> or <i>SeekValueSmaller()</i>. If <i>_start</i> is False, then it calls <i>SeekNextEqual()</i> if there is an Equal test in <i>_primaryQuery</i>, or <i>SeekNext()</i> otherwise. In other words, it tries to find the first (or next) value using the index and the test value supplied in the query object. If the seek operation found a record, it's still not ready to return. Instead, the method enters a <i>while </i>loop calling <i>match()</i> with the record. If <i>match()</i> returns False but does not indicate that EOF has been reached, it gets the next record (again using <i>SeekNextEqual(),</i> or <i>SeekNext()</i>) and tries again. This continues until a record matches or EOF is detected. It then return the matching record or NULL if EOF was reached.</p>
+
+<p>The <i>stats()</i> method returns the number of records tested and the number of matching records for the query. It can be called at any time, even during a query, to find out how many records have been examined and matched by the query.</p>
+
+<h3>Example Application</h3>
+
+<p>To test the classes, I wrote a simple MFC application that creates a database with 1000 records containing random string, long, and date (FILETIME) properties and then allows searches on it. The string property has an ascending index, and the long property has a descending index. The application has a simple form (see <a name="rf1"><a href="9805gf1.htm">Figure 1</A>) that accepts one or two strings, longs, and dates with search criteria, as well as a desired sort of none, string, or integer.</p>
+
+<p>Selecting <i>Initialize</i> creates a new test database with 1000 records. The initialize routine uses the CE2.0 database classes to create a database with indexes on a string and integer field, and populate it with records containing random data; see <a name="rl5"><a href="9805g.htm#l5">Listing Five</A>.</p>
+
+<p>The database is created and if the <i>Create()</i> method fails, the existing database is deleted and then recreated. It's created with the two indexes (on property 1 -- an ascending sort on strings, and property 2 -- a descending sort on longs) I use to test the query classes. Finally, 1000 records are added with random strings, longs, and dates that fall between 1/1/1900 and 12/28/2100. </p>
+
+<p>To perform a search, users fill in the desired criteria and select <i>Search</i>. The <i>OnSearch()</i> method extracts the current criteria, builds a <i>CEQuery</i> object, opens the database using a <i>CCeFindDBDatabase</i> object, and then uses the <i>Find()</i> method to get an iterater for the results. <a name="rl6"><a href="9805g.htm#l6">Listing Six</A> is the portion of the search routine that creates one of the query properties in the query object and then performs the query.</p>
+
+<p>For each query operation and test value in the form, it tests to see if the user entered a value. If the user did enter a value, it extracts the desired test and value from the dialog and creates a <i>CCeDBQueryProp</i> object. It then adds this object to the <i>CEQuery</i> object using <i>addField()</i>. Once all the properties are added, it opens the database and calls <i>Find()</i> to get the iterater. A simple <i>for/next </i>loop retrieves the matching records from the iterater. It uses the MFC TRACE() macro to display the properties of the matching records and search statistics in the debugger output window. </p>
+
+<p>To test the classes, I performed a series of queries. The tests consist of doing single and then range searches on the string, long, and date fields, and then equality tests on each. Finally, a query using all three properties is done. For all these tests I tried selecting no sort order, a sort order that did not correspond to the query properties, and finally one that did. The results are encouraging. In cases where I did not select an index, but queried using the string (Greater Than, Equal tests) or integer (Less Than, Equal tests) properties the correct index was selected and the search completed without examining all records. In the case of range tests the fewest possible records were examined. Adding tests on the date property properly excluded nonmatching records. If I did a test using the long property but selected the string sort order, records were returned in the correct order but an exhaustive search was (correctly) performed. In other words, the classes meet all the desired objectives. <a name="rf2"><a href="9805gf2.htm">Figure 2</A> is output from a query including range tests in all three properties.</p>
+
+<h3>Conclusion </h3>
+
+<p>The classes I've presented here add a powerful search capability to the basic database classes found in Windows CE 2.0. They're easy to use, provide fairly optimized searches, and allow for testing on every property in a database -- not just strings and integers as is supported by the base class. The memory overhead of using the classes is reasonably low -- a typical query object and iterater require only one to two KB of memory over the base classes. </p>
+
+<p>There are some obvious enhancements that are possible: I could implement a class that would allow for Boolean operations for combining query properties (AND, OR, NOT) rather than the implicit AND I use now. That would require a more complex <i>match()</i> method. I could add more test operations including substring and regular expression matching. That would expand the <i>matchField()</i> method. There is one additional query optimization possible as well: The case where the query specifies a Less Than (or Greater Than) test on an index that is ascending (or descending) could use the index, and terminate the query as soon as a key value fails. This is basically half the range test I've already implemented, and it would be easy to add to the <i>testOn()</i> and <i>match()</i> methods. Even without these enhancements, the query classes are a powerful addition to my programming toolchest. </p>
+
+<p><b>DDJ</b></p>
+
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>class CEQuery{
+    friend class CCeFindDBDatabaseIterater;
+public:
+    CEQuery();
+    virtual ~CEQuery();
+<p></p>
+    void addField(CCeDBQueryProp *);
+    void setSortField(CCeDBQueryProp *);
+    int numFields(void);
+<p></p>
+    CCeDBQueryProp * testOn(WORD, WORD);
+    bool match(CCeDBRecord*, bool &amp;, int &amp;);
+<p></p>
+    CCeDBQueryProp * sortField();
+    CCeDBQueryProp * operator[](int fieldNo);
+<p></p>
+private:
+    bool matchField(CCeDBProp*, int);
+<p></p>
+    CCeDBQueryProp ** _fields;
+    CCeDBQueryProp * _sortField;
+<p></p>
+    int _numFields;
+    int _maxFields;
+<p></p>
+    WORD _index;
+    bool _range;
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>class  CCeDBQueryProp : public CCeDBProp{
+public:
+    enum FieldOperation {
+        Equal, LE, GE
+    };
+    void setOperation(FieldOperation);
+    FieldOperation getOperation();
+private:
+    FieldOperation _operation;
+}
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three</H4>
+
+<pre>class CCeFindDBDatabase  : public CCeDBDatabase{
+public:
+    CCeFindDBDatabaseIterater * Find (CEQuery &amp; );
+    bool TestFind (CEQuery &amp; );
+private:
+    CCeDBQueryProp * FindKey(CEQuery &amp;);
+    bool IsIndexed(CEPROPID, WORD *);
+};
+</pre>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+<H4><a name="l4">Listing Four</H4>
+
+<pre>class CCeFindDBDatabaseIterater{
+public:
+    CCeFindDBDatabaseIterater(CEQuery *, CCeDBQueryProp *, CCeDBDatabase *);
+    ~CCeFindDBDatabaseIterater();
+    CCeDBRecord * current();
+    CCeDBRecord * first();      // resets search
+    CCeDBRecord * next();
+    void stats(int &amp;, int &amp;, bool &amp;);
+private:
+    bool _start;
+    bool _eof;
+    int _hits;
+    int _tests;
+<p></p>
+    CCeDBQueryProp * _primaryQuery;
+    CCeDBDatabase * _myDb;
+    CEQuery * _myQuery;
+    WORD _keyOrder;
+}
+</pre>
+<P>
+<a href="#rl4">Back to Article</A>
+</P>
+<H4><a name="l5">Listing Five</H4>
+
+<pre>void CExampleDlg::OnInit() {
+    CCeDBDatabase newDB;
+    CCeDBProp sorts[2];
+<p></p>
+    sorts[0].SetType(CCeDBProp::Type_String);
+    sorts[0].SetIdent(1);
+    sorts[0].SetSortFlags(CCeDBProp::Sort_Ascending ); 
+    sorts[1].SetType(CCeDBProp::Type_Long);
+    sorts[1].SetIdent(2);
+    sorts[1].SetSortFlags(CCeDBProp::Sort_Descending ); 
+<p></p>
+    if (newDB.Create(TEXT("JCSExample"), 123, 2, sorts) == NULL)
+    {
+        newDB.Open(TEXT("JCSExample")); 
+        newDB.Delete();
+        newDB.Create(TEXT("JCSExample"), 123, 2, sorts);
+    }
+    newDB.Open(TEXT("JCSExample")); 
+<p></p>
+    CCeDBRecord r; 
+    r.AddProp(&amp;sorts[0]);
+    r.AddProp(&amp;sorts[1]);
+    r.AddProp(new CCeDBProp(CCeDBProp::Type_Filetime, 3));
+    for (int i = 0; i &lt; 1000; i++)
+    {
+        TCHAR string_field[256];
+        FILETIME filetime_field;
+        SYSTEMTIME systemTime;
+        int j;
+        // generate three random values for fields
+        CCeDBProp* p = r.GetPropFromIdent(1);
+        string_field[0] = (TCHAR)('A'+Random()%26);
+        for (j=1; j &lt; (int)(5 + (Random()%10)); j++)
+            string_field[j] = (TCHAR)('a'+Random()%26);
+        string_field[j] = 0;
+        
+        p-&gt;SetString(string_field);
+        p = r.GetPropFromIdent(2);
+        p-&gt;SetLong(Random());
+        p = r.GetPropFromIdent(3);
+<p></p>
+        memset(&amp;systemTime, 0, sizeof(systemTime));
+        systemTime.wYear = (unsigned short) (1900 + Random()%200);
+        systemTime.wMonth = (unsigned short) (1 + Random()%12);
+        systemTime.wDay = (unsigned short) (1 + Random()%28);
+        SystemTimeToFileTime(&amp;systemTime, &amp;filetime_field);
+        p-&gt;SetFiletime(filetime_field);
+        newDB.AddRecord(&amp;r);
+    }
+}
+</pre>
+<P>
+<a href="#rl5">Back to Article</A>
+</P>
+<H4><a name="l6">Listing Six</H4>
+
+<pre>CCeDBQueryProp::FieldOperation _ops[] = {    CCeDBQueryProp::LE, CCeDBQueryProp::GE, CCeDBQueryProp::Equal};
+CCeDBQueryProp * qp;
+CEQuery q;
+if (m_s11val != -1 &amp;&amp; !m_sf11.IsEmpty())
+{
+    qp = new CCeDBQueryProp();
+    qp-&gt;SetType(CCeDBProp::Type_String);
+    qp-&gt;SetIdent(1);
+    qp-&gt;SetString((TCHAR *)(LPCTSTR)m_sf11);
+    qp-&gt;setOperation(_ops[m_s11val]);
+    q.addField(qp);
+}
+// NOTE: other query properties omitted, see listing
+CCeFindDBDatabase theDB;
+theDB.Open(TEXT("JCSExample"));
+CCeFindDBDatabaseIterater *results = theDB.Find(q);
+<p></p>
+TRACE0("\nResults:\n");
+for (CCeDBRecord *r = results-&gt;first(); r; r = results-&gt;next())
+{
+        CCeDBProp* strfield = r-&gt;GetPropFromIdent(1);
+        CCeDBProp* intfield = r-&gt;GetPropFromIdent(2);
+        CCeDBProp* datefield = r-&gt;GetPropFromIdent(3);
+        FILETIME f = (datefield-&gt;GetFiletime());
+        SYSTEMTIME t;
+        FileTimeToSystemTime(&amp;f, &amp;t);
+        TCHAR timeStr[256];
+        GetDateFormat(LOCALE_SYSTEM_DEFAULT,DATE_LONGDATE,&amp;t,0,timeStr,256);
+        TRACE3("\t%s\t%d\t%s\n", strfield-&gt;GetString(),
+            intfield-&gt;GetLong(), timeStr);
+        delete r;
+}
+int hits, tests;
+bool range;
+results-&gt;stats(hits, tests, range);
+TRACE3("Stats\n\tmatches: %d\n\tmisses: %d\n\tTotal: %d\n", 
+                                          hits, tests, hits+tests);
+TRACE1("Range search %s used\n", range ? TEXT("was") : TEXT("was not"));
+<p></p>
+</pre>
+<P>
+<a href="#rl6">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1998, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

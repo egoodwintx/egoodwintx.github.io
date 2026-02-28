@@ -1,0 +1,223 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v14, i08: Listing 3 nessus.pl</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a3.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a3_l1.htm">Listing 1</a></span></td>
+		<td><span class="navbarLink"><a href="a3_l2.htm">Listing 2</a></span></td>
+		<td><span class="navbarLink"><a href="a3_l3.htm">Listing 3</a></span></td>
+		<td><span class="navbarLink">Listing 4</span></td>
+		<td><a href="../../../../source/SA/2005/aug2005.tar"><b class=codeListing>aug2005.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h2><B>Listing 4</B> <I>getbanner.pl</i></h2>
+            <p> 
+            <pre>
+#!/usr/bin/env perl
+
+use Getopt::Std;
+use Net::Nessus::ScanLite;
+use Nmap::Parser;
+
+
+$NESSUS_HOST = "localhost";
+$NESSUS_PORT = 1241;
+$NESSUS_SSL = 1;
+
+$NESSUS_USER = "nessus";
+$NESSUS_PASS = "nessus";
+
+$NMAP_EXE = "/usr/local/bin/nmap";
+$NMAP_ARGS = "-sT ";
+
+&getopts('P:t:n:');
+
+if (defined($opt_P)) {
+    $port = $opt_P;
+}
+
+if ($opt_n) {
+    $plugin_list = $opt_n;
+}
+
+if ($opt_t) {
+    $target_net = $opt_t;
+}
+
+unless ($target_net && ($port >= 0 || $plugin_list)) { 
+    die "$ARGV[0]: -t &lt;target network> -n &lt;plugin list> -P &lt;port>\n";
+}
+
+# get an nmap parser going
+
+$np = new Nmap::Parser;
+
+# add the port to our args
+
+$NEW_NMAP_ARGS = $NMAP_ARGS . "-p " . $port;
+
+# $np -> parse_filters({only_active => 1}); # not needed with Nmap::Parser-1.x
+$np -> callback(\&host_found); # syntax change for Nmap::Parser-1.x
+$np -> parsescan($NMAP_EXE, $NEW_NMAP_ARGS, $target_net);
+
+# the host_found callback will accumulate a list of possible IPs for us
+
+$np -> clean();
+
+if ($plugin_list) {
+    &run_nessus;
+} else {
+    &banners;
+}
+
+
+exit (0);
+
+sub host_found {
+
+    $self = shift;
+    
+    $ip = $self -> ipv4_addr();
+
+    if ($self -> tcp_port_state($port) ne 'closed' &&
+        $self -> tcp_port_state($port) ne 'filtered') {
+        push(@target_list, $ip);
+    }
+    
+    return;
+
+}
+
+sub banners {
+    # now what we'll do is run a full port scan of the host
+    
+    foreach $target (@target_list) {
+        print "Fully scanning $target\n";
+        $newscan = new Nmap::Parser;
+#        $newscan -> parse_filters({only_active => 1}); # not needed with Nmap::Parser-1.x
+        $newscan -> callback(\&grabber); # syntax change for Nmap::Parser-1.x
+        $newscan -> parsescan($NMAP_EXE, $FULL_SCAN, $target);
+        # free up some memory
+        $newscan -> clean();
+    }
+
+}
+
+sub grabber {
+    $self = shift;
+
+    $ip = $self -> ipv4_addr();    
+
+    print "Getting banners from host: $ip\n";
+
+    # ask Nmap::Parser for just the open ports
+
+    foreach $port ($self -> tcp_ports('open')) {
+        # establish a connection
+        $nt = new Net::Telnet (
+                Binmode => 0,
+                Host => $ip,
+                Port => $port,
+                Errmode => 'return',
+                Telnetmode => 0,
+                Timeout => 5
+                );
+
+        if ($nt) {
+            print "Connected to $ip:$port\n";
+            $nt -> put("\n\n");
+            $lines = 0;
+            while ($lines &lt; 5 && $nt) {
+                $line = $nt -> getline();
+                print "$line";
+                $lines++;
+            }
+            # an extra newline, for tidy output
+            print "\n";
+            $nt -> close();
+        } else {
+            print "Unable to contact $ip:$port\n";
+
+        }
+
+    }
+
+    return;
+    
+}
+
+sub run_nessus {
+
+    foreach $ip (@target_list) {
+        # create a new connection to the Nessus server    
+        print "Nessus scanning $ip\n";
+        $nessus = Net::Nessus::ScanLite -> new (host => $NESSUS_HOST,
+                            port => $NESSUS_PORT,
+                            ssl => $NESSUS_SSL);
+        $nessus -> preferences( { host_expansion => 'none',
+                    safe_checks => 'no',
+                    auto_enable_dependencies => 'yes',
+                    checks_read_timeout => 1 } );
+
+        $nessus -> plugin_set($plugin_list);
+        if ($nessus -> login($NESSUS_USER, $NESSUS_PASS)) {
+            $nessus -> attack($ip);
+            print "Total info: " . $nessus -> total_info . "\n";
+            foreach $info ($nessus -> info_list) {
+                print "Info:\n";
+                print "ID: " . $info -> ScanID . "\n";
+                print "Port: " . $info -> Port . "\n";
+                print "Description: " . $info -> Description . "\n";
+            }
+            print "Total holes: " . $nessus -> total_holes . "\n";
+            foreach $hole ($nessus -> hole_list) {
+                print "Hole:\n";
+                print "ID: " . $hole -> ScanID . "\n";
+                print "Port: " . $hole -> Port . "\n";
+                print "Description: " . $hole -> Description . "\n";
+            }
+        } else {
+            die "Nessus login failed!\n";
+        }
+    }
+    return;
+}
+</pre></table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

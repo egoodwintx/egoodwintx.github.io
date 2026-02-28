@@ -1,0 +1,300 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v07, i08:  Listing 1: actgroups</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#990000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center><table width=600 cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+
+<tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class=navbarLink><a href="a2.htm">Article</a></span></td>
+		<td><span class=navbarLink>Listing 1</span></td>
+		<td><a href="../../../../source/SA/1998/aug98.tar"><b class=codeListing>aug98.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+<td valign=top width=440 bgcolor="#ffffff">
+<table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr><td valign=top>
+
+
+
+
+<H1>Listing 1: <tt>actgroups</tt></H1><p>
+<pre>
+#!/usr/bin/perl
+#
+# Active groups -- detecting actively accessed news groups and adjusting
+#         -- expire.ctl so that active groups stay longer
+#
+# Program Name:     actgroups
+#         for INN 1.4, 1.5, 1.7, 1.8, 2.0
+# Author: Yufan Hu ( yufan@recmail.com )
+# Version:     1.0
+# Release:     Jan 28 1998
+#         This is a total rewrite of actgroups version 0.3 and its
+#         modified version activexp.pl floating around the net since 1994
+# Copyright:   by Yufan Hu. Freely redistribution, use and modification
+#         by anybody as long as the author is acknowledged and this
+#         copywrite notice preserved.
+# Disclaim:    Use at your own risk. No Warrantee.
+# Fee:         No. But appreciate an email acknowledge so I know
+#         who is using it.
+#
+#========================= Installation ========================
+# 1. Copy this file to a directory of your choice. I put it in
+#    /usr/local/news/local
+# 2. Change the values of $LastRead, $expire, $newslog according to
+#    your own news configuration
+# 3. pass the path to actgroups to news.daily in your cron job entry,
+#    such as:
+#    30 3 * * * /usr/local/news/bin/news.daily delayrm
+#    /usr/local/news/local/actgroups
+# 4. Setting rules in expire.ctl file
+#
+#========================= expire.ctl configuration =================
+# The expire.ctl file remains almost the same except that the original rules
+# definition act as the default expiration rules for inactive groups.
+# A new set of rules, beginning with "#% " define the adjustment
+# for groups that are actively read.
+# i.e.
+#    *:A:0:1:7
+#    #% *:A:10:30:45
+# means that if a group is not actively read, its expire rule will be
+#    *:A:0:1:7
+# and if a group is being read within 45 days, its expire time will be adjusted
+# to:
+#    *:A:10:30:45
+# The above two lines can be used as the simplest configuration. If you want
+# finer control you can add more, such as:
+#    *:A:0:1:7
+#    #% *:A:10:30:45
+#    comp.*:A:7:7:10
+#    #% comp.*:A:30:60:90
+#    #% alt.binaries*:A:2:2:2
+# You should include at least line "#% *:A:...". If no "#% " rule
+# matches an actively read group it is treat the same as an inactive group.
+# The "active period" of a group is defined by the &lt;purge&gt; field
+# of the last matching "#% " rule. If no read happens with this period
+# of time, the group is removed from the LastRead database
+#
+# actgroups will modify expire.ctl file for adding the adjustment. It must
+# has read/write access to the directory expire.ctl resides. Original
+# expire.ctl will be backuped to expire.ctl.day, where day is the day of
+# the week the actgroups runs.
+#
+# WARNING: It may take a few days to collect the readership information.
+#       it is adviced that you keep the original "*:A:..." line with
+#       larger expire time for a period of time until the readership
+#       information is accumulated in LastRead.log database, if you
+#       use it at the first time.
+#
+# For actgroups version 0.3 and 0.4 users:
+#    The LastRead.log database should be compatible with this version.
+#
+###############################################################
+#
+# Configuration part
+#
+#    $LastRead the DBM database to record the time a group was last
+#              seen read
+#    $expire        the full path to expire.ctl file on your system
+#    $newslog  the full path to news.notice file on your system
+#              this is the file where syslogd log all news.notice
+#              level message
+#
+##############################################################
+
+$LastRead      = "/usr/local/news/etc/LastRead.log";
+$expire   = "/usr/local/news/etc/expire.ctl";
+$newslog  = "/usr/local/news/log/news.notice";
+
+# delimiters in expire.ctl
+$start = "### Actively Accessed Groups Start ###";
+$end = "### Actively Accessed Groups End ###";
+
+# End of Configuration part
+##################### No change needed ###########################
+
+require 'getopts.pl';
+
+# default options
+$debug = 0;
+
+# Get the command line options
+Getopts('l:d');
+
+$newslog = $opt_l if ($opt_l);
+$debug = 1 if ($opt_d);
+$warn .= "Logfile: $newslog\n" if $debug;
+$expire_new = "$expire.new";
+
+# open the database recording the time the group was last read
+# access this database as an associated array
+dbmopen(%LASTREAD, $LastRead, 0600);
+
+# open the tempory expire.ctl.new file
+open(EXP_NEW, "&gt;$expire.new") || die "Cannot create $expire.new: $!\n";
+
+# Seconds in a day
+$day = 3600 * 24;
+$now = time;
+
+$total = $thrown = 0;
+$date = qx{date};
+chop $date;
+
+scan_log();
+scan_expire_ctl();
+
+# now we have detected active group in %LASTREAD database
+# we check the group agains the %rules to find any match.
+# if a match is found, then the corresponding rule part is used
+# for that group. If no match is found, the group is not adjusted
+
+adjust_expire_ctl();
+
+# close the database and the new expire.ctl file
+close(EXP_NEW);
+dbmclose(%LASTREAD);
+
+$debug &amp;&amp; ( $warn .= "##  Total: $total, thrown: $thrown\n");
+
+($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($now);
+
+if( $debug )
+{
+$warn .= "Collecting group information only, $expire intacted.\n" .
+"Expire list is in $expire.new\n";
+}
+else
+{
+system "mv $expire $expire.$wday; mv $expire_new $expire";
+}
+
+$debug &amp;&amp; $warn &amp;&amp;  print "\nMessage from actgroups:\n$warn";
+exit;
+
+# scan the news.notice file and record any detected read group
+# in LastRead DBMS
+sub scan_log {
+
+# open the news log file -- usually the news.notice
+open(LOG, $newslog);
+
+# scan through the log file, detecting any accessed groups within current
+# day and store the current time in the database
+
+while(&lt;LOG&gt;) {
+if(/^(.*\d\d:\d\d:\d\d).*nnrpd.*:\s+(.*) \<br>             \s+group\s+([^\s]+)\s(\d+)/){
+$group = $3;
+$arts = $4;
+($warn .= "Adding:  $group\n")
+if( $debug &amp;&amp; (! 				        $LASTREAD{$group}) );
+# if $arts == 0 then we will add \<br>	     $group in only
+# if it is already there \<br>               ($LASTREAD{$group} = $now) if( $arts \<br>  	      || $LASTREAD{$group});
+}
+}
+
+close(LOG);
+}
+
+# scan the expire.ctl, looking for adjustment ctl
+# line in the format of
+# "#% pat:?:(\d+)|never:(\d+)|never:(\d+)|never"
+
+sub scan_expire_ctl {
+open(EXP, $expire);
+%rules = ();
+@patterns = ();
+while(&lt;EXP&gt;)
+{
+/$start/ &amp;&amp; last;
+print EXP_NEW;
+chop;
+# try to find the #% rules
+/^#%\s*([^:]+)\s*:\s*([^:]+)\s*:\s*([^:]+) \<br>	\s*:\s*([^:]+)\s*:\s*([^:]+)\s*/
+|| next;
+$rule = ":$2:$3:$4:$5";
+$pat = $1;
+$pat =~ s/\./\\./g;
+$pat =~ s/([\*\+\?])/.$1/g;
+$rules{$pat} = $rule;
+push(@patterns, $pat);
+}
+close EXP;
+}
+
+sub adjust_expire_ctl {
+print EXP_NEW "$start
+###############################################
+# Automatically generated by actgroups version<br>     #   1.0
+# Author: Yufan Hu ( yufan\@rightiming.com )
+# Date:        $date
+#
+<br>     # Do not change anything below this line. Any <br>     #   changes will be overwritten
+# the next time actgroups runs
+################################################
+\n";
+for $group ( sort (keys %LASTREAD) )
+{
+$total++;
+# does the group match anything in $rules
+$rule = "";
+# find the last matching rule
+for $pat ( @patterns )
+{
+($group =~ /$pat/) &amp;&amp; ($rule = $rules{$pat});
+}
+if( $rule )
+{
+# we found a match, do the adjustment
+($purge) = $rule =~ /:([^:]+)$/;
+if( int($purge) != 0
+&amp;&amp; ($now - $LASTREAD{$group}) &gt; ($purge * $day) )
+{
+$debug &amp;&amp; ($warn .= "$group inactive for $purge days\n");
+delete $LASTREAD{$group};
+$thrown++;
+}
+else
+{
+print EXP_NEW "$group" . $rule . "\n";
+}
+}
+else
+{
+$debug &amp;&amp; ( $warn .= "No adjustment rule for $group\n" );
+delete $LASTREAD{ $group };
+$thrown++;
+}
+}
+print EXP_NEW "##  Total: $total, thrown: $thrown\n";
+print EXP_NEW "\n$end\n## Do not put anything after this line ###\n";
+}
+
+# End of File</pre><p>
+<p>
+<br>&nbsp;<br>
+</table></center></td>
+<! -- End Content ------ >
+
+</table><!/center>
+<! -- End MASTER TABLE -- >
+
+</body></html>

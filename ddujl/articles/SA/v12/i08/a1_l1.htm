@@ -1,0 +1,259 @@
+<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 4.0//EN">
+
+
+<HTML>
+<HEAD>
+<TITLE>v12, i08: Listing 1 buc_client.ss: Back up check utility, client</TITLE>
+<LINK REL=StyleSheet HREF="../../resource/css/sacdrom.css" TYPE="text/css" TITLE="CSS1">
+</HEAD>
+
+<body bgcolor="#ffffff" text="#000000" link="#000000" alink="#669999" vlink="#333366" topmargin=0 leftmargin=0>
+
+<! -- Begin MASTER TABLE -- >
+<!center>
+<table width=98% cellpadding=0 cellspacing=0 border=0 bgcolor="#ffffff">
+  <tr>
+
+<table cellpadding=5 cellspacing=0 border=0>
+	<tr>
+
+		<td><span class="navbarLink"><a href="a1.htm">Article</a></span></td>
+		<td><span class="navbarLink"><a href="a1_f1.htm">Figure 1</a></span></td>
+		<td><span class="navbarLink">Listing 1</span></td>
+		<td><span class="navbarLink"><a href="a1_l2.htm">Listing 2</a></span></td>
+		<td><span class="navbarLink"><a href="a1_l3.htm">Listing 3</a></span></td>
+		<td><a href="../../../../source/SA/2003/aug2003.tar"><b class=codeListing>aug2003.tar</b></a></td>
+
+	</tr>
+</table>
+
+
+</tr>
+<tr>
+<! -- Begin Content ------ >
+    <td valign=top width=527 bgcolor="#ffffff"> 
+      <table width=100% cellpadding=15 cellspacing=0 border=0>
+<tr>
+          <td valign=top> 
+            <! -- Insert Content ------ >
+            <h1><b>Listing 1 </b><i>buc_client.ss: Back up check utility, client</i></h1>
+            <p> 
+            <pre>
+#!/usr/bin/ksh
+# Listing 1: buc_client.ss: Back Up Check Utility, client:
+# For each server listed in the buc_server_list.txt file, execute 
+# stored procedure sp_spawn_rem which runs the buc_server.ss script
+# on the remote server.  buc_server.ss stores it's output in database
+# table remote_values.  Once the remote program completes, retrieve
+# the data from the remote site, create the backup report, and if
+# the time from the last backup is too great, email the administrators
+# in the buc_mail_list.txt file.
+# author: Ed Schaefer
+# Date: 05/05/2001
+
+# this shell script:
+# 1) Initialize variables, check informix user, set TZ, etc
+# For each current SERVER in the buc_mail_list.txt
+# 2) Executes the stored procedure that buc_server.ss script on remote server.
+# 3) After the remote server completes execute, retrieve the data from the
+#    remote_values table containing the current and backup datetimes.
+# 4) Delete the entry in the remote remote_values table.
+# 5) If there's an error email the DBAs listed in dba_mail_list.txt.
+# 6) Determine the elapsed time between the backup time and the current system time.
+# 7) If the time is to great, email the report to the administrators in
+#    buc_mail_list.txt.
+
+export INFORMIXDIR=/usr/informix
+export PATH=/bin:/usr/bin:/usr/ucb:/etc:$INFORMIXDIR/bin:/usr/local/bin
+export CONFIGFILE=$INFORMIXDIR/config_data.file
+
+# database access variables
+DBNAME="testdb" # database name
+INTERFACE_CMD="dbaccess" 
+DBCOMMAND_REM="$INTERFACE_CMD $DBNAME@$SERVER"
+SRCDIR=/home/eds/buc
+
+# data files
+export dba_mail_name="./dba_mail_list.txt"
+export buc_mail_name="./buc_mail_list.txt"
+export buc_server_name="./buc_server_list.txt"
+
+rem_key="rem_key."$$
+output_file=/tmp/output_file$$.txt
+total_file=/tmp/total_file$$.txt
+trap "rm -f $output_file $total_file" 0
+
+# set the time zone.  Informix commands executed remotely such as 
+# oncheck won't work if the TZ isn't correct.  Solaris 7 specific
+export TZ=$(grep TZ= /etc/TIMEZONE|cut -d= -f2)
+
+# check to see if perl is installed
+( type perl &gt; /dev/null 2&gt;&amp;1 ) || { echo "No perl distribution. \
+ $0 Terminates!"; exit 1;}
+
+# limit to the effective informix user
+[ $(id|sed -e 's,^[^(]*(,,' -e 's,).*$,,' -e 1q) != "informix" ] &amp;&amp; echo "Only \
+user informix executes $0" &amp;&amp; exit 1 
+
+cd $SRCDIR 2&gt; /dev/null || { echo "No $SRCDIR. $0 Terminates!"; exit 1;} 
+
+# This function determines if the database is available.
+# all the arguments to this function are the 
+# database execution string, i.e. database testdb
+# The exit code is set to 0 for a valid connection or non-zero if not
+function database_check {
+   $* 2&gt; /dev/null &lt;&lt;MSG
+MSG
+} # end database_check
+
+# This function gets rid of the - and : formatting 
+# characters in the datetime string
+function strip_dt_chars {
+   echo $*| sed -e 's/[-:]/ /g'
+}
+
+# This function pipes a date time string of the format:
+# YYYY MM DD HH MM SS
+# to perl which autosplits the string and uses timelocal to return 
+# the number of seconds from the Epoch.
+# No error checking!
+function get_epoch_seconds {
+   echo $*| perl -MTime::Local -ane '
+   my $epochseconds = timelocal($F[5], $F[4], $F[3], $F[2], $F[1] - 1, $F[0]);
+   print "$epochseconds\n"; '
+}
+
+# This function sets exit code to zero if the argument is numeric
+function is_digit {
+   expr "$1" + 1 &gt; /dev/null 2&gt;&amp;1
+}
+
+# no configuration file or bad conversion, default to 20
+hours_from_archive=$(grep hours_from_archive $CONFIGFILE 2&gt; /dev/null|cut -d: -f2)
+
+[ -z $hours_from_archive ] &amp;&amp; hours_from_archive=20
+is_digit $hours_from_archive || hours_from_archive=20
+
+totalsecondsinhour=3600.0   # number of seconds in an hour
+# change backup hours to seconds
+seconds_from_archive=$(bc &lt;&lt; EDS
+   scale=1
+   $hours_from_archive * $totalsecondsinhour
+EDS)
+
+# This function executes the remote server shell script.  Check the return 
+# value from the procedure is "1".  If so, get the datetime values from the 
+# remote table.  Change the backup and current datetimes to the number of 
+# seconds from the Epoch.
+function generate_data {
+
+   xret_val=$($DBCOMMAND_REM &lt;&lt; EDS
+      EXECUTE PROCEDURE sp_spawn_rem("/home/eds/buc/buc_server.ss", "$rem_key");
+EDS)
+   #last field has return value
+   xret_val=$(echo $xret_val| awk ' { printf("%s", $NF) } ')
+   # get the output from the remote command table
+   if [ "$xret_val" -eq "1" ]; then
+      $DBCOMMAND_REM &lt;&lt; EDS
+         output to $total_file without headings
+         SELECT remote_values FROM remote_values WHERE remote_key = "$rem_key";
+         DELETE FROM remote_values WHERE remote_key = "$rem_key";
+EDS
+      # get the returned string
+      ret_str=$(sed /^$/d $total_file )
+
+      # backup time is the first two fields
+      backup_dt=$(echo $ret_str|cut -f 1,2 -d " ")
+      # get the number of seconds from the EPOCH
+      backup_epoch_seconds=$(get_epoch_seconds $(strip_dt_chars $backup_dt))
+
+      # current time is the second two fields
+      current_dt=$(echo $ret_str|cut -f 3,4 -d " ")
+      current_epoch_seconds=$(get_epoch_seconds $(strip_dt_chars $current_dt))
+
+      # determine the number of seconds between current and backup
+      numbersecs=$((current_epoch_seconds - backup_epoch_seconds))
+
+      ACCESS_ALLOWED="y"
+   fi
+}
+
+# This function builds the output file to be emailed - either the error 
+# message if access isn't allowed or the Backup Report if processing completed properly.
+function output_data {
+   if [ $ACCESS_ALLOWED = "n" ]; then
+      echo "\n==== $SERVER not accessible ==== $(date)" &gt;&gt; $output_file
+      echo &gt;&gt; $output_file
+      subjectline="Backup Warning $SERVER not accessible ==== $(date)" 
+   else
+      # if the number of seconds between the backup datetime and
+      # the current date time is greater than allowed, create the report
+      if (( numbersecs &gt; seconds_from_archive )); then
+         echo &gt;&gt; $output_file
+         echo "==== Backup Report for "$SERVER" ==== $(date)" &gt;&gt; $output_file
+         echo "Backup Date: "$backup_dt" Current Date: "$current_dt"" &gt;&gt; $output_file
+
+         thrs=$(bc &lt;&lt; EDS
+            scale=1
+            $numbersecs / $totalsecondsinhour
+EDS)
+         interstr="number of hours since backup: "$thrs" $(date)" 
+         echo $interstr &gt;&gt; $output_file
+         subjectline="Backup Warning: $SERVER: $interstr"
+         echo &gt;&gt; $output_file
+      fi
+   fi
+}
+
+# If access is allowed, this function mails the backup report
+# to the administrators.  If access isn't allowed, mail the warning
+# to the DBA only.
+function mail_report {
+typeset filename
+
+   if [ $ACCESS_ALLOWED = "n" ]; then
+      filename=$dba_mail_name
+   else
+      filename=$buc_mail_name
+   fi
+   
+   while read address
+   do
+      # ignore any administrator commented out.
+      [[ $address = "#"* ]] &amp;&amp; continue
+      mailx -s "$subjectline" $address &lt; $output_file
+   done &lt; $filename
+}
+
+# MAIN processing starts here
+while read SERVER
+do
+   # ignore any SERVER commented out.
+   [[ $SERVER = "#"* ]] &amp;&amp; continue
+
+   # build the command string for the remote SERVER
+   DBCOMMAND_REM="$INTERFACE_CMD $DBNAME@$SERVER"
+
+   rm -f $output_file
+   ACCESS_ALLOWED="n" # Bad connection to remote database
+   database_check $DBCOMMAND_REM &amp;&amp; generate_data
+
+   output_data
+   if [ -r $output_file ]; then
+      mail_report
+      rm -f $output_file
+   fi
+done &lt; $buc_server_name</pre>
+          </table></table>&nbsp;
+
+<! -- End Content ------ >
+
+<!/center>
+<! -- End MASTER TABLE -- >
+
+</body>
+
+
+
+<! -- Begin Content ------ >
+</html>

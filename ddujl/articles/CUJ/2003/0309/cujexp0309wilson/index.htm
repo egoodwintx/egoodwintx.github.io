@@ -1,0 +1,296 @@
+<html>
+<head>
+<title>Efficient Integer To String Conversions, Part 2</title>
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
+</head>
+<body bgcolor="#FFFFFF" text="#000000">
+<h2>Efficient Integer To String Conversions, Part 2</h2>
+<h3>By Matthew Wilson</h3>
+<p><i>In this inaugural installment of a new Experts series, Matthew Wilson presents 
+  a fast and useful technique for converting integers to strings.</i></p>
+In a previous article, [1] I described a technique for fast integer to string 
+conversions, based on writing the least significant digit backwards into a caller-supplied 
+buffer, dividing by the base (10) and repeating until all digits are written and 
+the integer is fully converted to string form. 
+<p>While this technique is fast, robust (thread-safe and type-safe) and works 
+  with arbitrary character-encodings (e.g., Unicode), it leaves a little to be 
+  desired in terms of usability and being clear from programmer error. This is 
+  because it requires a caller-supplied buffer within which it writes the converted 
+  integer, as in: 
+<pre>
+uint64_t      i = . . . 
+wchar_t       buff[21];
+wchar_t const *result = stlsoft::integer_to_string(buff, 21, i);
+</pre>
+<p>The second parameter, the buffer length (note: this is length in characters, 
+  not size in bytes), is used to determine the end-point of the resultant string 
+  form. In debug mode, there is an assertion to determine that the given length 
+  was sufficient, but (in release form) it is beholden on the programmer to provide 
+  a buffer of sufficient length. (This is one of the ways in which the technique 
+  derives its extra speed.) Although the required sizes for buffers of the various 
+  types are both small and constant (see <a href="cujexp0309wilson_t1.html">Table 
+  1</a>), and developers who've used the function suite readily comprehend the 
+  idiom, it still has an uneasy sense of fragility. Furthermore, though no one 
+  who's used it has reported any error, there are many complaints regarding the 
+  verbosity of the code [2]. 
+<p>This article examines how we can extend the technique to address these issues. 
+  Three solutions are discussed, which sacrifice only a small part of the performance 
+  advantages of the original solution for substantial gains in usability. (The 
+  first two of these form part of the WinSTL [3] Conversion Library.) 
+<p>The reason that client code of the <b>integer_to_string<>()</b> function family 
+  is verbose is that the buffer (and its length) is caller-supplied. This is to 
+  enable them to be re-entrant -- thread-safe in other words. But if we could 
+  somehow arrange to have a thread-safe internal buffer, then the parameter list 
+  would drop to one: the integer to convert. Sounds like a job for some Thread-Specific 
+  Storage (TSS) [4]. Using TSS, we can extend the original functions in a new 
+  function <b>int_to_string<>()</b> [5], which could be defined as: 
+<pre>
+template&lt; typename C
+        , typename I
+        &gt;
+inline C const *int_to_string(I value)
+{
+  const size_t  CCH     = 21; // fits 64-bit + sign
+  C             *buffer = i2str_get_tss_buffer&lt;C, CCH&gt;();
+
+  return stlsoft::integer_to_string(buffer, CCH, value);
+}
+</pre>
+<p>We make <b>CCH </b>= 21, to provide enough space for any integer type up to 
+  64-bits (signed or unsigned). The implementation relies on the function <b>i2str_get_tss_buffer<>()</b>   to return a buffer, of static linkage, of the given character type C on a thread-specific 
+  basis. It is the implementation of this function that forms the substance of 
+  the article. 
+<h3>__declspec(thread)</h3>
+On the Win32 platform, TSS (or TLS - Thread-Local Storage - as Microsoft calls 
+it) is available in two forms. For executables, and dynamic libraries that are 
+explicitly loaded during application start-up [6], several Win32 compilers provide 
+the Microsoft extension <b>__declspec(thread)</b>, which declares a thread-specific 
+variable. For example, 
+<pre>
+__declspec(thread) int t_index;
+
+DWORD __stdcall ThreadProc(void *)
+{
+	. . .
+</pre>
+<p><b>t_index</b> is a thread-local integer; each thread will get its own copy 
+  of the variable. Using <b>__declspec(thread)</b> we can offer an implementation 
+  of <b>i2str_get_tss_buffer<>()</b> as follows: 
+<pre>
+template&lt; typename C
+        , size_t   CCH
+        &gt;
+inline C *i2str_get_tss_buffer()
+{
+  __declspec(thread) static C s_buffer[CCH];
+
+  return s_buffer;
+}
+</pre>
+<p>(Note that in the actual WinSTL implementation there are eight <b>int_to_string<>()</b>   functions [5], and that they all use 21 as their buffer length. This actually 
+  saves space -- both code and data - since the number of instantiations of <b>i2str_get_tss_buffer<>()</b>   drop from a potential maximum of 8 to just 2. In addition, it also reduces time 
+  costs where the implementation of the function contains non-trivial logic, as 
+  we see with the next implementation.) 
+<p>This implementation has extremely good performance characteristics. Alas, <b>__declspec(thread)</b>   is of largely specious utility, given a serious restriction to its use. Without 
+  delving into the gory details [6], the allocation of space in the <b>.tls</b>   section for all decorated variables can only be carried out at application load 
+  time. What this means is that any DLLs that are loaded dynamically -- which, 
+  given the proliferation of component-based architectures and the trend for delay-loading, 
+  is a lot -- cannot contain <b>__declspec(thread)</b>. If they do, the load fails. 
+<p>This means that <b>__declspec(thread)</b> should not be used in any DLLs whatsoever, 
+  since one can always conceive of scenarios in which a DLL that is link-bound 
+  (i.e., linked via export library, and therefore loaded at start-up) to an application 
+  may later be used in circumstances in which it may be statically loaded (e.g., 
+  it may be linked to an OCX). 
+<h3>Win32 TLS</h3>
+Win32 offers another form of TSS/TLS, in the guise of the TLS API. A TLS "index" is allocated by calling <b>TlsAlloc()</b>, which may subsequently be accessed 
+from any thread by calling <b>TlsGetValue()</b> and <b>TlsSetValue()</b>, where 
+the value (called a "slot") is maintained by the API on a thread-specific basis. 
+(The index is released by calling <b>TlsFree()</b>.) Using Win32 TLS, the implementation 
+of <b>i2str_get_tss_buffer<></b> becomes: 
+<pre>
+template&lt; typename C
+        , size_t   CCH
+        >
+inline C *i2str_get_tss_buffer()
+{
+  static Index&lt;C, CCH>  s_index;
+  Slot&lt;C, CCH>          *slot = s_index.GetSlot();
+
+  if(0 == slot)
+  {
+    slot = s_index.AllocSlot();
+  }
+
+  return slot->buff;
+}
+</pre>
+<p>All the action is carried out by the <b>Index<></b> and <b>Slot<></b> classes, 
+  which are shown in <a href="cujexp0309wilson_l1.html">Listing 1</a>. The <b>Index<></b>   class allocates a TLS index by calling <b>TlsAlloc()</b>, which is then used 
+  in its <b>GetSlot()</b> and <b>AllocSlot()</b> methods. <b>GetSlot()</b> simply 
+  returns the suitably cast return from <b>TlsGetValue()</b>. <b>AllocSlot()</b>   is a little more complicated, since it needs to allocate a <b>Slot<></b> instance 
+  and add it onto <b>Index<></b>'s linked-list of <b>Slot<></b> instances, within 
+  a thread-safe block. This block only needs to guard the integrity of the linked-list 
+  (in the form of the <b>m_top</b> member), hence it does not include the call 
+  to <b>TlsSetValue()</b>. (The <b>Slot<></b> instances are all destroyed in <b>Index<></b>'s 
+  destructor, which occurs at module/process shutdown and does not need to use 
+  any thread-safe measures.) 
+<P>There's a fair bit of code involved, here, but once the <b>Index<></b> has 
+  been constructed the first time through the function (on any thread), and a 
+  <b>Slot<></b> has been allocated the first time through for each thread there 
+  is very little further cost, as we'll see in the performance section. The very 
+  observant among you may have noticed a potential race-condition [7] in that 
+  there is no thread-serialisation protection visible in <b>int_to_string<>()</b>   for the static construction of the <b>Index<></b> instance. It's not terribly 
+  obvious, because we all become accustomed to thinking in C++ and think of statics 
+  as somehow handled for us magically, but remember that local statics are implemented 
+  by a flag plus the C runtime library's <b>onexit()</b>: the first time through 
+  a piece of code with a static class instance the instance is constructed and 
+  the flag is set; subsequent times through the flag is checked and the construction 
+  is skipped. However there is no thread-safety built into the instantiation of 
+  static instances; at least I've never heard of such. Hence, the race condition 
+  is that one thread could be part way through the <b>is-constructed => construct 
+  => mark-constructed</b> cycle, another thread (or threads) enters it. Needless 
+  to say, the minimum badness expected would be leaks, and we're far more likely 
+  to have a crash. I'm not going to go into how this is solved in the WinSTL libraries 
+  because (i) we're getting off topic in this limited space, and (ii) despite 
+  being correct, robust and portable (between Win32 compilers), it's very ugly, 
+  involving lots of in-place construction and spin-locks. (I probably will cover 
+  this in a later column; for now, impatient parties may consult the implementation 
+  in the STLSoft libraries, version 1.7.1 onwards.) 
+<p>So the DLL dynamic-loading issue has been addressed, but the garden's not necessarily 
+  all green. The problem is that the number of slots on a given Win32 system is 
+  finite. On later operating systems this is not a big problem, but on earlier 
+  versions of Windows there are very few TLS slots available. <a href="cujexp0309wilson_t2.html">Table 
+  2</a> shows the number of available slots on the various Win32 operating systems 
+  I had to hand-obtain by a simple utility I wrote for that purpose (included 
+  in the archive). The API makes a guarantee of there being at least 64 slots 
+  available on any system, but it's not difficult to imagine very sophisticated 
+  software having a great many components that utilize TLS, so it is quite conceivable 
+  that exhaustion may occur. 
+<p>Another downside is that this form of TSS is slower than <b>__declspec(thread)</b>. 
+  As noted above, making all the <b>int_to_string<>()</b> overloads use CCH == 
+  21 is efficient in space and time terms. However, there is another benefit. 
+  In light of what we now know about the potential scarcity of slots, we can see 
+  that we will now use a maximum of two TLS slots, rather than up to 8, making 
+  the catastrophic failure to allocate a slot significantly reduced. 
+<p>Nonetheless, there is the issue of what to do if and when a TLS index is unavailable. 
+  From a practical point of view, one can ensure that both <b>char</b> and <b>wchar_t</b>   variants of one of the conversion functions are called in the application initialization. 
+  While not proofing the application from failure, this will at least precipitate 
+  that failure sooner, so it is a significant help with testing of practical robustness. 
+  Naturally it does absolutely nothing to guarantee that exhaustion cannot happen. 
+  Where absolute robustness is required, we must take another approach. 
+<p>One slight flaw with these more usable refinements is that there is no longer 
+  any character-based parameter from which the compiler can deduce the character 
+  type [8], which means that the template function must be explicitly parameterised, 
+  as in 
+<pre>
+uint64_t      i = . . . 
+wchar_t const *result = int_to_string&lt;wchar_t&gt;(i);
+</pre>
+<p>If you don't like that, you can easily define some inline <b>int_to_string_a</b>   and <b>int_to_string_w</b> templates. 
+<h3>Platform-independent APIs</h3>
+The previous two solutions were both variants [9] of the same function(s) in the 
+WinSTL project. In my commercial incarnation as a consultant for Synesis Software, 
+I implemented a platform-independent version of the int-to-string functions, which 
+have been recently updated to use the STLSoft <b>integer_to_string<>()</b> function(s). 
+In one of the Synesis core DLLs exists the function <b>LongToStringA()</b> -- 
+along with its unsigned, Unicode and 64-bit siblings -- defined within the <b>SynesisStd</b> namespace (see <a href="cujexp0309wilson_l2.html">Listing 2</a>). 
+<p>It utilizes a platform-independent TSS API, which works in a logically similar 
+  way to Win32's TLS except that the creation of an "index" also involves specification 
+  of functions that are called when a thread-specific datum (slot) is overwritten 
+  or deleted, and when the index itself is destroyed. These functions enable non-leaking 
+  resource management without the need for explicit Get-delete-Set client code, 
+  and also ensure that the APIs & data associated with indexes are not unloaded 
+  prematurely if they reside in other dynamically loaded modules (a bit like COM's 
+  in-proc server module locking infrastructure). 
+<p>The implementation involves intra-process mutual exclusion synchronisation 
+  objects and ordered thread-identifier slot lists, so it shouldn't come as a 
+  great surprise that the disadvantage with this approach is that it performs 
+  substantially less well than the other two approaches. 
+<h3>Performance</h3>
+We've improved usability and removed any possibility for programmer error (in 
+stipulating an erroneous buffer length), but how has this affected performance? 
+Let's see how the three solutions stack up against <b>stlsoft::integer_to_string<>()</b> and <b>sprintf()</b>. <a href="cujexp0309wilson_l3.html">Listing 3</a> shows an 
+extract from the test program (included in the archive) where, for each function, 
+10 million 32-bit signed integer values are converted to string form. This is 
+done twice, and the time of the second iteration is reported. All tests were carried 
+out on a 2GHz 512MB Pentium IV machine in a single session with no other busy 
+processes. (In fact the program <b>main()</b> contains a thread priority promotion, 
+to further eliminate the effects of any other system activity.) (see <a href="cujexp0309wilson_f1.html">Figure 
+1</a>.) 
+<p>There are a number of interesting facts apparent. First, <b>sprintf()</b> is 
+  undoubtedly the slowest way to convert integers to strings. Second, Borland 
+  and Digital Mars are not very good at optimizing the STLSoft/WinSTL template 
+  functions. Conversely, CodeWarrior, GCC and Intel are all very good at optimising 
+  the template functions. For each of these three compilers, <b>stlsoft::integer_to_string<>()</b>   is between 12% and 25% that of <b>sprintf()</b>. This is in line with our expectations 
+  from the efficiency gains demonstrated in [1]. 
+<p>What we're keen to discover is whether the increases in usability we've effected 
+  in the new functions result in a loss of this performance supremacy. It's clear 
+  that <b>SynesisStd::LongToStringA()</b> has given away a lot of the performance 
+  superiority of <b>stlsoft::integer_to_string<>()</b> over <b>sprintf()</b>. 
+  All that platform-independency has a cost. In defense of this strategy, I would 
+  point out that the <b>TssStore_</b> API has been unchanged for about five years, 
+  and having revisited it for this article, it is hardly what an older, wiser, 
+  me would call "efficiently implemented". I would assert that I could substantially 
+  trim its performance costs - and I probably soon will - which would show this 
+  technique in a much better light. 
+<p>The picture is far better for the two WinSTL <b>int_to_string<>()</b> implementations. 
+  Using <b>__declspec(thread)</b> results in an additional overhead over <b>stlsoft::integer_to_string<>()</b>   of no more than 1% for CodeWarrior, Digital Mars and Intel. For Visual C++ it 
+  is about 25%. Relative to <b>sprintf()</b> this implementation ranges from 12% 
+  to 34%, except for Digital Mars (79%). 
+<p>The <b>TlsAlloc()</b> based version is also impressively efficient, costing, 
+  relative to <b>stlsoft::integer_to_string<>()</b>, between 2% and 11% for all 
+  compilers except CodeWarrior (where it is 51% extra). Relative to <b>sprintf()</b>   it ranges from 13% to 34%, except for Borland (64%) and Digital Mars (80%). 
+  Intriguingly, both Visual C++ 7.0 and 7.1 perform significantly more efficiently 
+  with <b>TlsAlloc()</b> than with <b>__declspec(thread)</b>, though this behavior 
+  is not observed with Visual C++ 6.0. 
+<p>It's worthwhile to take a look at the absolute times. Clearly GCC and Intel 
+  respond very well in partnership with the STLSoft conversion components (with 
+  CodeWarrior somewhat less so), and perform substantially better than any permutation 
+  involving the other compilers. 
+<h3>Conclusion</h3>
+So what is the recommended solution? Well as with most things in software engineering, 
+the answer is: it depends. Where the <b>__declspec(thread)</b> limitations fall 
+within your requirements, it is the most efficient. If you're working with DLLs 
+on Win32, then the<b> TlsAlloc()</b> version probably provides your best mix of 
+performance and an acceptably low risk of failure [9]. If you want platform-independence, 
+or a virtual guarantee against failure (within the limits of available memory) 
+to allocate TSS indexes, then you'll need some equivalent of the TssStore API. 
+(Of course, where it's convenient and appropriate you can stick with the perfectly 
+functional, albeit verbose, original <b>stlsoft::integer_to_string<></b> functions, 
+and get maximum performance.) 
+<h3>Notes and references</h3>
+[1] Matthew Wilson. "Efficient Integer To String Conversions", <I>C/C++ User's 
+Journal</I>, December 2002. 
+<p>[2] I never reuse numeric literals in code, and would always use some <b>dimensionof()</b>   pseudo-operator -- such as <b>(sizeof(X)/sizeof(X[0]))</b> -- so the example 
+  given would actually look like 
+<pre>
+result = stlsoft::integer_to_string(buff, stlsoft_num_elements(buff), i);
+</pre>
+which, though less fragile, is even more verbose. 
+<p>[3] WinSTL is a sub-project of STLSoft and deals with all things Win32 in an 
+  STL fashion. It is available at <a href="http://winstl.org/" target="_blank">http://winstl.org/</a>. 
+  The <b>int_to_string<></b> components will be available with STLSoft v1.7.1, 
+  which is due out in August 2003. 
+<p>[4] Douglas Schmidt, Nat Pryce & Timothy Harrison. "Thread-Specific Storage 
+  for C/C++", 1997, <a href="http://www.cs.wustl.edu/%7Eschmidt/PDF/TSS-pattern.pdf" target="_blank">http://www.cs.wustl.edu/~schmidt/PDF/TSS-pattern.pdf</a> <p>[5] Actually there are 8 functions, corresponding to the eight <b>integer_to_string<></b>   functions, for each numeric integer type (signed and unsigned 8, 16, 32 and 
+  64-bit integers). It's more effort for the poor library writer (sigh), and occasionally 
+  inconvenient for the user, but this way helps ensure that other integral types, 
+  e.g., <b>wchar_t</b> and <b>bool</b>, are not used with these purely numeric 
+  functions. There are actually three choices in this guise. 
+<P>[6] Jeffrey Richter."<I>Advanced Windows</I>", Third Edition, (Microsoft Press, 
+  1997). 
+<p>[7] I'm sure that those of you who spotted it will have reasoned just how incredibly 
+  unlikely this race condition is to be encountered; however "incredibly unlikely"   doesn't cut the mustard in multi-threaded software development, so it must be 
+  rendered impossible. 
+<p>[8] C++ standard ISO/IEC 14882:1998(E). See sections 13.1 and 14.8. 
+<p>[9] The WinSTL implementation actually defaults to the <b>TlsAlloc()</b> version, 
+  but allows you to specify the appropriately ugly <b>_WINSTL_INT_TO_STRING_USE_DECLSPECTHREAD_FOR_EXES</b>   to use <b>__declspec(thread)</b>. If you do so in a DLL build, however, you'll 
+  receive some warnings advising you not to do so. 
+<h3>About the Author</h3>
+Matthew Wilson is a software development consultant for Synesis Software, specializing 
+in robustness and performance in C, C++, C# and Java. Matthew is the author of 
+the STLSoft libraries, and the forthcoming book <i>Imperfect C++</i> (to be published 
+by Addison-Wesley, 2004). He can be contacted via matthew@synesis.com.au or at 
+<a href="http://stlsoft.org/" target="_blank">http://stlsoft.org/</a> .
+</body>
+</html>

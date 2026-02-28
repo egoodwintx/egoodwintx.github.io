@@ -1,0 +1,223 @@
+<html>
+<head>
+<title>October, 2004: The FifoEmbed Library</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; C/C++ Users Journal-->
+
+<p><i>C/C++ Users Journal</i> October, 2004</p>
+<h1>The FifoEmbed Library</h1>
+<h2> A thread-safe basic queue, packet queue, and FIFO allocator library</h2>
+
+
+<h3>By Dan Muresan</h3>
+
+
+<I>Dan Muresan is an engineer in the R&amp;D group of Topex Public Switching in Bucharest, Romania. He can be contacted at <a href="mailto:muresan@stanfordalumni.org">muresan@stanfordalumni.org</a>.</I>
+
+<hr>
+
+
+
+
+
+<p>When programming device drivers and network stacks, you usually need a queue and some form of storage management. In real-time systems, you'd like your queue and storage manager primitives to run in deterministic time. FifoEmbed, the C library I present here, can help. The complete source code for FifoEmbed is available at <a href="http://www.cuj.com/code/">http://www.cuj.com/code/</a>.</p>
+
+<p>FifoEmbed provides three abstract data types (classes), all of which are implemented on top of circular arrays: </p>
+
+
+
+<ul>
+  <li>A basic queue that supports enqueue/dequeue operations, as well as something that I call "direct block access."  </li>
+  <li>A packet queue implemented on top of the basic queue that additionally provides out-of-sequence insertion and packet resequencing. </li>
+  <li>A memory pool queue ("mpoolq") is an allocator optimized for first-in/first-out access patterns. </li>
+</ul>
+
+
+
+<p>The three classes offer constant-time primitives and are inherently thread-safe, requiring (almost) no locks when used in a producer/consumer framework.</p>
+
+<p>FifoEmbed is designed to be used concurrently by one producer and one consumer thread. A typical scenario is a TCP/IP or RTP (real-time protocol) implementation. The producer receives packets from the network, allocates storage out of an mpoolq, and inserts pointers in a packet queue. Packets may arrive out of order&#151;the packet queue will place them into their proper slots. The consumer dequeues pointers from the packet queue, processes the data, and frees up storage.</p>
+
+<p>All classes store data in circular arrays and use two pointers&#151;a head and a tail&#151;to keep track of where the actual queue resides. The two pointers start out at the beginning of the array and increment until they reach the array boundary, at which point they wrap around to the beginning. When the producer enqueues an element, the tail increments; when the consumer dequeues an element, the head increments. The queue is empty when the head and tail coincide, and full when the tail is one slot behind the head (the dummy slot convention). The slots between the head pointer and tail pointer form the active window (the actual queue), while the rest of the array is called the "inactive part;" see <a href="0410muresanf1.html" target="_BLANK">Figure 1</a>.</p>
+
+<p>For flexibility, I have defined the classes as pseudotemplates, basing the underlying arrays on any previously defined type. For example, the mpoolq (<a href="0410muresanl4.html" target="_BLANK">Listing 4</a>) is defined in the mpoolq.h header file as:</p>
+
+<pre>
+typedef struct {
+  MPOOLQ_CELL_T *base, *end,
+                *head, *tail;
+  int size;  // == end - base
+} MPOOLQ_T;
+
+</pre>
+
+<p>Users must define <b>MPOOLQ_CELL_T</b> (and optionally <b>MPOOLQ_T</b>) before including mpoolq.h:</p>
+
+<pre>
+#define MPOOLQ_CELL_T int
+#include "mpoolq.h"
+
+</pre>
+
+<p>In real-time systems, lock-free algorithms are desirable because they avoid the problem of priority inversion. I designed FifoEmbed around the venerable single-reader/single-writer lock-free ring buffer algorithm, which is used in many software packages (audio drivers in particular). Locks are eliminated by partitioning primitives and class members into three categories and enforcing the following restrictions:</p>
+
+
+
+<ul>
+  <li>Producer primitives only modify the tail and the inactive part of the array.</li>
+  <li>Consumer primitives only modify the head and the active window.</li>
+  <li>Thread-unsafe primitives follow no rules and must be called from a critical section.</li>
+</ul>
+
+
+
+<p>Access to the head and tail pointers is routed via a special union type that prevents the compiler from optimizing inappropriately (cache writes in registers or reorder stores):</p>
+
+<pre>
+union {
+  volatile T * volatile w;
+  volatile T * volatile const r;
+  volatile T * const l;
+} head, tail;
+
+</pre>
+
+<p>Here, <b>T</b> is the appropriate cell type. The syntax means that for the <b>r</b> and <b>w</b> fields, both the address and the pointed cells are volatile, while for <b>l</b>, only the pointed cells are volatile. Primitives always write via the <b>w</b> field and read via:</p>
+
+
+
+<ul>
+  <li>The <b>l</b> field for a pointer that they own (that is, the producer reading the tail); this lets the compiler cache the pointer between consecutive reads.</li>
+  <li>The <b>r</b> field for a pointer that they do not own. </li>
+</ul>
+
+
+
+<p>On the hardware side, the lock-free implementation requires CPU/compiler support for sequentially coherent, atomic access to pointers and array slots. In particular, multiprocessor systems may present an inconsistent view of the memory in the absence of explicit synchronization instructions (memory barriers); for such targets, FifoEmbed requires extra porting effort.</p>
+
+<p>In simple systems, in which both the consumer and producer are polled alternately from an endless main loop, there might be no need for synchronization. In most systems, however, the consumer and producer must sleep when the queue is empty/full and signal each other when changes occur. <a href="0410muresanl5.html" target="_BLANK">Listing 5</a>, which presents the solution implemented in pthreads_framework.c, uses:</p>
+
+
+
+<ul>
+  <li>A POSIX semaphore, <b>q_count</b>, to signal incoming data to the consumer.</li>
+  <li>A flag (<b>more_space</b>), a POSIX condition variable (<b>more_space_cv</b>), and a mutex (<b>more_space_lock</b>), to signal the availability of space to the producer.</li>
+</ul>
+
+
+
+<p><a href="0410muresanl5.html" target="_BLANK">Listing 5</a> uses the basic queue. The <b>pthread_cond_wait()</b> operation takes a mutex and a condition variable and atomically unlocks the mutex and waits for the condition variable to be signaled; right before <b>pthread_cond_wait()</b> exits, it locks the mutex again [1].</p>
+<h3>Implementation</h3>
+
+<p>FifoEmbed is implemented in four C header files (see <a href="0410muresant1.html" target="_BLANK">Table 1</a>). Most primitives are defined as both macros (<a href="0410muresanl1.html" target="_BLANK">Listing 1</a>) and inline functions; the inline function is often a trivial stub that references the corresponding macro. The partial listings show only one of the versions.</p>
+
+<p>Function and macro names are prefixed with the name of the pertinent class (<b>mpoolq_alloc()</b> and <b>pktq_ins_at()</b>, for instance); in discussion, I often omit the prefix when the class is clear from context. I also use the following suffixes frequently:</p>
+
+
+
+<ul>
+  <li><b>_chk</b> designates a primitive that checks and reports error conditions via its return code.</li>
+  <li><b>_ds</b> stands for the dummy slot convention.</li>
+</ul>
+
+<p>Instances of all FifoEmbed classes are initialized by passing the base address and the size of the underlying array to the appropriate <b>init()</b> primitive; you must allocate the array beforehand.</p>
+
+<p>The size of the active window should be checked using the:</p>
+
+
+
+<ul>
+  <li><b>full()</b>, <b>avail()</b>, and <b>lavail()</b> primitives from the producer thread (see <a href="0410muresanl2.html" target="_BLANK">Listing 2</a>). <b>avail()</b> counts the size of the inactive part of the array (excluding the dummy slot); <b>lavail()</b> counts the number of contiguous slots available starting at the tail pointer, without wraparound and without crossing the dummy slot (the mpoolq version is a little different).</li>
+  <li><b>empty()</b>, <b>used()</b>, and <b>lused()</b> primitives from the consumer thread. <b>used()</b> counts the size of the active window, while <b>lused()</b> counts the number of contiguous slots available starting at the head pointer (without wraparound).</li>
+</ul>
+
+
+
+<p>To minimize code duplication, all primitives related to circular arrays are defined as C macros in one header file, circ_arr.h. The macros fall into three categories:</p>
+
+
+
+<ul>
+  <li>Macros related to moving pointers around the circular array (increment-and-wrap, decrement-and-wrap, and so on).</li>
+  <li>Counting macros determine whether the circular array is full or empty (<b>FULL()</b>, <b>EMPTY()</b>), count how many slots are used (<b>USED()</b>, <b>LUSED()</b>), and determine how many are available (<b>DS_AVAIL()</b>, <b>DS_LAVAIL()</b>). Counting primitives in the three classes are all based on these macros.</li>
+  <li>Special versions of the aforementioned macros for the case when the size of the array is a power of two. These versions usually translate to more efficient code, but waste memory by forcing the developer to round up queue sizes to the next power of two. The basic queue can be made to prefer these macros by defining <b>FIFO_P2_SIZE</b>; other classes will not use them.</li>
+</ul>
+<h3>Basic Queues</h3>
+
+<p>Basic queues (<a href="0410muresanl3.html" target="_BLANK">Listing 3</a>) support two access models: copying access and direct access. With copying access, elements are copied into and out of the queue using the <b>ins()</b> and <b>read()</b> primitive families.</p>
+
+<p>With direct access, the producer and/or consumer access data in the circular array directly, and call the <b>swallow()</b> and <b>drop()</b> primitives to commit the changes when done. For example, here's how a producer can insert 10 elements into a queue <b>q</b> using direct access:</p>
+
+
+
+<ul>
+  <li>Call <b>lavail()</b> to check that 10 contiguous slots are indeed available.</li>
+  <li>Write to the first 10 slots of the inactive part of the array, <b>q.tail [0]</b> to <b>q.tail [9]</b>.</li>
+  <li>Call <b>fifo_swallow (&amp;q, 10)</b>, which moves the tail pointer up by 10 positions, incorporating the new elements into the queue.</li>
+</ul>
+
+
+
+<p>Similarly, to sum up the oldest 10 elements from <b>q</b> using direct access, the consumer would:</p>
+
+
+
+<ul>
+  <li>Call <b>lused()</b> to ensure that the 10 elements are available as a contiguous block.</li>
+  <li>Compute <b>q.head [0] + ... + q.head [9]</b>.</li>
+  <li>Call <b>fifo_drop (&amp;q, 10)</b>, which increments the head pointer by 10, eliminating the 10 oldest slots from the queue.</li>
+</ul>
+
+
+
+<p>An application using fixed-size blocks exclusively should make the queue size a multiple of the block size to ensure that all blocks can be enqueued and/or dequeued with direct access. </p>
+
+<p>The direct-access primitives facilitate zero-copy networking implementations.</p>
+<h3>Packet Queues</h3>
+
+<p>Packet queues are implemented as a basic queue holding pointers to packets; there is no special data structure. Basic queue primitives may still work, but there are also packet queue-specific primitives (their names start with the <b>pktq_</b> prefix).</p>
+
+<p>The packet queue can accommodate empty slots, marked by <b>NULL</b> pointers. This makes out-of-sequence insertion possible: A new primitive, <b>ins_oo()</b>, takes both an offset argument and a value argument. When packets arrive in sequence, the caller should supply an offset of 1. When early packets arrive, the offset should be two or more. When late packets arrive, the offset should be a negative number (see <a href="0410muresant2.html" target="_BLANK">Table 2</a> and <a href="0410muresanf2.html" target="_BLANK">Figure 2</a>).</p>
+
+<p>The rules for converting sequence numbers to offsets follow from the way the insertion primitives modify the data structure. Insertion with a positive offset <b>o</b> amounts to inserting <b>o-1</b> empty slots before performing the actual insertion (the tail pointer increments by <b>o</b> slots overall). The insertion primitives, striving to run in constant time, do not actually clear the <b>o-1</b> newly incorporated slots, but rely on <b>pktq_init()</b> and <b>pktq_read()</b> to keep slots in the inactive part of the array empty at all times.</p>
+
+<p>Insertion with a negative offset <b>o</b> does not change the tail pointer, but overwrites a slot within the active window (the slot <b>o</b> positions behind the tail). Such late insertions are not thread-safe: If they are ever used, you must protect all late insertions and all <b>pktq_read()</b> invocations with critical sections.</p>
+
+<p>The <b>ins_oo()</b> primitive may fail if the target slot is already occupied (the current packet is a duplicate) or if the target slot is outside the active window (the offset is too large or too small). The offset is too small when the packet has arrived too late (its target slot has already been passed up by the consumer). The offset is too large when the insertion would force the tail pointer to cross the dummy slot. In all cases, supplied offsets must be less than the size of the array; the application may need extra logic to handle large gaps in the packet sequence.</p>
+
+<p>Since <b>ins_oo()</b> may fail, applications may end up transferring unusable packets. To avoid this problem, there is a two-step alternative to <b>ins_oo(): ins_valid()</b> returns a pointer to the target slot if the insertion would succeed and <b>NULL</b> otherwise; <b>ins_at()</b> writes to a target slot directly. If <b>ins_valid()</b> fails, the packet can be skipped; if <b>ins_valid()</b> succeeds, the application can transfer the packet and call <b>ins_at()</b>. The two steps must be enclosed in a critical section.</p>
+
+<p>Consumers can call either <b>fifo_read()</b> or, if out-of-sequence insertions are ever used, <b>pktq_read()</b>. The <b>pktq</b> version skips empty slots; thus, <b>pktq_read()</b> runs in linear time with respect to the largest number of contiguous empty slots in the active window. It also fills serviced slots with <b>NULL</b>.</p>
+<h3>Memory Pool Queues</h3>
+
+<p>A memory pool queue (mpoolq) is similar to a regular queue; the difference is that its elements are not slots, but contiguous blocks of slots from the circular array. The circular array is called the "pool;" its slots are called "cells." The user-defined cell type, <b>MPOOLQ_ CELL_T</b>, determines alignment, as well as the maximum possible size of a block. Blocks are aligned on a cell boundary and cover an integer number of cells. Size arguments and return values for the mpoolq primitives are specified in user units instead of cells, unless otherwise implied by the primitive's name; a user unit defaults to a byte (<b>char</b>) but can be redefined if required (<b>MPOOLQ_USER_T</b>).</p>
+
+<p>The first cell of each block is a header storing the length of the block. Each block can be either in use or free (a hole). To distinguish between the two kinds, the header contains a positive number (counted in user units, excluding the header itself) for allocated blocks and a negative number (counted in cells, including the header) for holes; see <a href="0410muresanf3.html" target="_BLANK">Figure 3</a> (where cells are equal to user units for simplicity). <b>MPOOLQ_CELL_T</b> must be a signed type. The maximum size of a block is:</p>
+
+<pre>
+2 ^ (8 * sizeof (MPOOLQ_CELL_T) - 1)
+
+</pre>
+
+<p>The mpoolq combines the roles of a queue and a storage manager. The producer allocates consecutive blocks out of the pool by calling <b>alloc()</b> (the blocks are automatically enqueued). The consumer dequeues blocks with the help of two primitives: <b>oldest()</b> returns the address of the oldest block in the queue, while <b>free()</b> marks blocks as free and possibly dequeues them. If the sequence of <b>free()</b> calls matches the original sequence of <b>alloc()</b> calls, blocks are automatically dequeued. If blocks are freed out of sequence, dequeuing is delayed. When many recent blocks have been freed but an old block is still in use, the pool may appear full.</p>
+
+<p>On the producer side, the <b>alloc()</b> primitive tries to return blocks starting at the tail pointer; if there isn't enough space there, the allocator tries to leave a hole at the end of the pool and wrap around (<a href="0410muresanf4.html" target="_BLANK">Figure 4</a>). In both cases, the resulting block must not cross either the dummy slot or the array boundary.</p>
+
+<p>This algorithm works well only when the requested size is less than half the size of the pool. A request for more may fail even when the pool is empty: If the head and the tail pointer are both at the half-point of the pool, the block cannot be allocated starting at the tail pointer (it would cross outside the pool); neither can the block be allocated at the base of the pool after creating a hole (it would cross the dummy slot). Nothing can be done, short of reinitializing the mpoolq to reset the head and tail pointers.</p>
+
+<p>The mpoolq version of the <b>lavail()</b> primitive, <b>lavail_cells()</b>, returns the maximum number of cells available for allocation without creating a hole at the end of the pool&#151;unless that number is zero. When the tail pointer is exactly one slot behind the end of the array, no block can be allocated without wraparound (the single slot is wasted on the header); rather than return zero, <b>lavail_cells()</b> forces the tail to wrap around by creating a hole of length zero and tries again. The result may still be zero if the pool is full.</p>
+
+<p>On the consumer side, the <b>free()</b> primitive turns a used block into a hole by modifying its header; afterwards, it calls next_blk(), a primitive that sweeps away holes at the beginning of the queue (by moving the head pointer to the beginning of the first allocated block, if any). The other consumer-side primitives (<b>oldest()</b>, <b>used_cells()</b>, and <b>empty()</b>), call <b>next_blk()</b> before examining the active window. Thus, they return accurate results regardless of the structure of the active window.</p>
+
+<p>In specialized applications, an mpoolq is better than a classic heap managed by <b>malloc()</b> and <b>free()</b> because of its deterministic behavior. When accesses occur in a FIFO pattern, <b>alloc()</b>, <b>free()</b>, and all the other primitives run in constant time with respect to the pool size and the number of allocated blocks. When blocks are freed out of order, only consumer-side primitives are impacted (they run in linear time with respect to the largest deviation from FIFO order). No fragmentation occurs after a large number of blocks have been allocated and freed, so performance does not degrade over time. Additionally, mpoolq.h exposes functions (not included in the partial listing) that query the size of a block, free parts of a block, and shrink the most recently allocated block.</p>
+<h3>References</h3>
+
+  <p>[1]	The Open Group, Single Unix Specification (<a href="http://www.opengroup.org/products/publications/catalog/un.htm">http://www.opengroup.org/products/publications/catalog/un.htm</a>). 
+
+
+
+
+</body>
+</html>

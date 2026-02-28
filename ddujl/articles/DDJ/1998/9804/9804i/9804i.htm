@@ -1,0 +1,352 @@
+<html>
+<META NAME="year" CONTENT="1998">
+<head>
+<title>Dynamic Distributed Systems in Java</title>
+</head>
+
+<body bgcolor="FFFFFF">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<h1>Dynamic Distributed Systems in Java</h1>
+
+<p><i>Dr. Dobb's Journal</i> April 1998
+</p>
+<h2>Using agent technology to build flexible systems</h2>
+
+<h3>By Philip Rousselle</h3>
+
+<I>Philip develops systems and network management software for Tivoli Systems in Austin, Texas. He can be reached at philr@tivoli.com.</I>
+
+<hr>
+
+<p>Powerful tools that let you construct distributed applications using models considerably more powerful than traditional client/server systems are beginning to mature. Java's ability to dynamically load, serialize, and reload objects makes it possible for you to construct systems that can change their own configurations and adapt to observed run-time conditions.</p>
+
+<p>In this article, I'll examine dynamic distributed Java programming techniques by describing the implementation of a prototype load-balancing system called "Sojourner." This system (available electronically, see "Resource Center," page 3) monitors the load conditions on a set of workstations and migrates server objects to underutilized hosts. This improves the performance of the servers and reduces competition for resources on busier machines.</p>
+
+<p>Sojourner uses the Voyager distributed computing infrastructure from Objectspace (http://www.objectspace.com/). Voyager, which is free for noncommercial and most commercial uses, provides facilities for remote object instantiation, invocation, and migration. Voyager is intended to support mobile agent systems and, therefore, supports dynamic relocation of running objects. The Sojourner load balancer demonstrates how these facilities can be useful for many dynamic distributed systems -- not just agent-based ones.</p>
+
+<h3>Basics of Distributed Java</h3>
+
+<p>The <i>MonteCarloTest</i> class in <a name="rl1"><a href="9804i.htm#l1">Listing One</A> is a Java application that estimates the area under the curve of the square-root function on the interval from zero to 100. The class computes the area by averaging the value of the function at 1000 random points in the interval. The <i>MonteCarlo</i> class in <a name="rl2"><a href="9804i.htm#l2">Listing Two</A> performs the actual calculations. <i>MonteCarlo</i>'s <i>estimateIntegral()</i> method receives the interval boundaries, desired number of iterations, random-number generator, and function evaluation method from its caller. The class then uses these parameters to produce an estimate of a definite integral.</p>
+
+<p>If <i>estimateIntegral()</i> is called with a complex function and a large number of iterations, its run time can be significant. In such a situation, it may be desirable to implement <i>estimateIntegral()</i> in a remote (server) object. This would permit client applications to continue doing useful work while computations are being performed.</p>
+
+<p>Using Voyager, the only necessary modification to <i>MonteCarlo</i> is that it must implement <i>java.io.Serializable</i> in its declaration. This lets the Voyager run-time system dynamically relocate its instances. Once this modification is made, the Voyager class compiler utility (vcc) can be run against <i>MonteCarlo.class</i>. vcc's output is a "virtualized" version of the <i>MonteCarlo</i> class called <i>VMonteCarlo.java</i>. </p>
+
+<p>Instances of <i>VMonteCarlo</i> serve as proxy objects for <i>MonteCarlo</i> objects running on remote hosts. A Voyager virtual class has all the same methods as the class it is derived from. The only difference is its constructors. The last parameter of every virtual class constructor is a <i>String</i> that indicates the location of the Voyager server that is to host the remote object and a handle that can be used to identify it. Virtual classes also inherit a set of methods from Voyager's <i>VObject</i> that are used to control (destroy, migrate, and so on) remote objects.</p>
+
+<p><a name="rl3"><a href="9804i.htm#l3">Listing Three</A> demonstrates how a Voyager virtual class can be instantiated, accessed, and invoked. <a name="re1"><a href="9804ie1.htm">Example 1</A>(a) creates an instance of the <i>MonteCarlo</i> class in the Voyager server running on the machine tme10.tivoli.com and listening on port 7777. The new object is given the handle <i>MCServer</i>. <i>VMonteCarlo</i> inherits the method <i>liveForever()</i> from <i>VObject</i>. Invoking it allows the remote <i>MonteCarlo</i> instance to persist even when no references to it exist. <a href="9804ie1.htm">Example 1</A>(b), excerpted from <a href="9804i.htm#l3">Listing Three</A>, returns a reference that can be used to communicate with the remote <i>MonteCarlo</i> object created by the aforementioned <i>new </i>operation. <a href="9804i.htm#l3">Listing Three</A> shows all the logic needed to create a remote <i>MonteCarlo</i> server or access it if it is already available. This code, plus a Voyager server, is enough to allow clients anywhere on the Internet to offload computations. <a name="rf1"><a href="9804if1.htm">Figure 1</A> illustrates the interactions between the <i>MonteCarlo</i> client, <i>MonteCarlo</i> server, <i>VMonteCarlo</i> proxy, Voyager server, and the Java environment.</p>
+
+<h3>Basics of Dynamic Load Balancing</h3>
+
+<p>Most distributed-computing systems simply allow clients on remote machines to locate and exploit resources (file systems, databases, processors, printers, and the like) on central servers. To improve scalability and lessen demands on client systems, many client/server architectures are enhanced using a multitier approach. In multitier systems, lightweight clients make requests of nearby gateway machines which, after performing validation or batching of requests from multiple clients, forward them to an actual server for processing.</p>
+
+<p>Both client/server and multitier systems are static. Certain machines are configured as servers or gateways, and they perform this task until an administrator decides to change the configuration. The efficiency of such systems can be improved by adding the capability to automatically relocate components during operation based on the observed conditions of the host systems.</p>
+
+<p>Voyager provides the basic migration facilities for this dynamic architecture. The mechanism for relocating objects is the <i>moveTo()</i> method, which all virtual classes (like <i>VMonteCarlo</i> in <a href="9804i.htm#l3">Listing Three</A>) inherit from <i>VObject</i>. The <i>moveTo()</i> method can take a <i>String</i> indicating a new host Voyager server or a reference to a <i>VObject</i> running on the intended new host server. Invoking <i>moveTo()</i> causes the Voyager server hosting the remote server object to:</p>
+
+<OL TYPE="1" START="1">
+	<LI>Start queueing any remote method calls made to the object being moved.
+	<LI>Allow threads executing in the server object being moved to complete.
+	<LI>Serialize the server object and send it to the new host.
+	<LI>Inform any <i>VObject</i> trying to contact the relocated object (including those whose calls were queued in step 1) of its new location.
+</OL>
+
+
+<p>After such a relocation, a <i>VObject.forObjectAt()</i> call using the old server location and handle still succeeds. The original Voyager server informs the proxy object of the server object's current location. Similarly, existing references to a migrated object will be updated transparently to the client when a method on the corresponding <i>VObject</i> is invoked. </p>
+
+<p>Given the ability to dynamically migrate objects, you need to specify the criteria for determining when and where objects should be moved. The migration criteria for the Sojourner load-balancing system is simple. When a server object is located on a machine with high CPU utilization, it is moved to a host with a low CPU load, if such a host exists.</p>
+
+<h3>Defining and Measuring System Load</h3>
+
+<p>At some point, as CPU load increases, performance decreases to a point where the user's ability to get work done is noticeably hindered. This threshold is subjective, but since the purpose of a computer is to get work done, the load point where users find system performance unacceptable is important. The amount of CPU load where a machine becomes noticeably slow to its user is that computer's "nuisance threshold" (<a name="rf2"><a href="9804if2.htm">Figure 2</A>).</p>
+
+<p>Conversely, a machine might be so underutilized that a small increase in load would be undetectable to users. A computer at or below this load measure is below the "adequate utilization threshold."</p>
+
+<p>Given these definitions, the objective of dynamic-load balancing can be stated as increasing system utilization and performance by moving processes from machines that are over their nuisance threshold to ones that are below their adequate utilization threshold.</p>
+
+<p>Because Java does not provide a means for interrogating a host's CPU load, a native method implementation must be used. <a name="rl4"><a href="9804i.htm#l4">Listing Four</A> shows a native method for measuring the system load on an IBM RS/6000 workstation running AIX (UNIX). The code uses the <i>rstat()</i> function, which returns an indication of the CPU's average run queue length for the preceding 60 seconds. This value is sampled every six seconds and compared to the machine's nuisance and adequate utilization thresholds.</p>
+
+<p>To avoid inadvisable migrations, a smoothed load measure is computed. This measure is changed only if several consecutive samples indicate a new load state. Because it is better to overestimate a machine's load than to underestimate it, it takes fewer consecutive high observations to increase the load measure than consecutive low observations to decrease it. </p>
+
+<p>The values for these thresholds were determined experimentally. Processes were repeatedly added to a machine and the user was asked to rate the system's performance. When the user's response was "poor," the <i>rstat()</i> value corresponding to the number of processes running was recorded as the machine's nuisance threshold. The adequate utilization threshold was set to half the nuisance threshold. This experiment was repeated for several users of each type of machine present in the distributed system.</p>
+
+<p>On nonUNIX machines, a similar methodology can be used to map the load measure exposed by the operating system to the thresholds. Each class of machine to be supported by Sojourner needs a different implementation of the native method for interrogating the host's CPU load. Each of these native methods is encapsulated by the <i>SojournerNode</i> Java class (available electronically). </p>
+
+<h3>Sojourner Implementation</h3>
+
+<p>Sojourner is a prototype dynamic distributed system that demonstrates techniques that can be used to balance the load of Java server processors on small or medium-sized computer clusters. Distributed systems can be used not only to provide remote access to centralized or shared resources, they can also identify idle resources and make them available to constrained or poorly performing applications.</p>
+
+<p>In most workstation clusters a large number of computers will be nearly idle at any given time. This may be because users are away from their computers (vacation, meetings, and so on) or the systems are being used for nonintensive applications (text editing, for instance). At the same time other users may be running resource intensive applications (statistical or numerical applications, simulations, or CAD packages). Performance of these applications could be improved if resources on nearby idle machines could be exploited. Sojourner demonstrates how, in a Java environment, this can be done.</p>
+
+<p>In a cluster running Sojourner, one machine is designated as a "master" node, which serves as a clearing house for remotely enabled Voyager server objects. All other participating machines run a program that monitors the local load condition, registers with the master node and accepts guest objects when the local load is low, and migrates guest objects to other machines when the load becomes high.</p>
+
+<p><a name="rf3"><a href="9804if3.htm">Figure 3</A> shows a Sojourner cluster. The master node runs an object called <i>SojournerMaster</i>. Other nodes run <i>SojournerNodeControl</i>. In <a href="9804if3.htm">Figure 3</A>, the three shaded nodes are busy with local processes and are not hosting guest objects. The two unshaded nodes are lightly loaded and are hosting two or three guest server objects (represented by the shapes attached to the <i>SojournerNodeControl</i> object). Two other server objects are running as guests of <i>SojournerMaster</i> until they can be migrated to other hosts.</p>
+
+<p>The Sojourner components used to maintain a central list of lightly loaded nodes are available electronically. The <i>SojournerCentralRegistry</i> is simply a wrapper class around a <i>Hashtable</i>. The Voyager vcc utility is used to create its <i>VSojournerCentralRegistry</i> proxy object class. One instance of <i>SojournerCentralRegistry</i> resides on the master node and is accessed by nonmaster nodes using the <i>SojournerLocalRegistry</i> class. </p>
+
+<p>The essential logic of Sojourner is contained in the <i>SojournerNodeControl</i> class from which the <i>VSojournerNodeControl</i> proxy class is derived. <i>SojournerNodeControl</i> contains an instance of <i>SojournerLocalRegistry,</i> which is used to communicate load information among participating workstations. It also contains a <i>Vector</i> used to save references to currently running local guest server objects.</p>
+
+<p>The <i>SojournerNodeControl</i> constructor starts a <i>Thread</i> that is used to monitor local processor load conditions and take action when they change. When the observed load becomes low, the machine registers with the central registry as being available to host guest objects. When the load is higher, this registration is rescinded.</p>
+
+<p>If the load on the local processor becomes high, the <i>evictGuests()</i> method is called. It runs through the <i>Vector</i> of guest objects and uses the Voyager <i>moveTo()</i> method to send them directly to available hosts. A round-robin selection method is used so that the guests are dispersed to as many other hosts as possible (rather than potentially overwhelming a single node). If no lightly loaded hosts are registered, then guests are migrated to the master node.</p>
+
+<p>The <i>receiveGuest()</i> method, which is declared in the <i>SojournerHost</i> interface (available electronically), is called by other machines to offload guests. It adds the incoming objects to the <i>Vector</i> of guests. The <i>receiveGuest()</i> method may refuse a migration if the local load is not low. This can happen if the load on a machine changes between the time the <i>Enumeration</i> of available machines is obtained from the registry and an actual migration is attempted.</p>
+
+<p>SojournerMaster, the basis of <i>VSojournerMaster</i>, is simpler than <i>SojournerNodeControl</i>. Its constructor establishes the <i>SojournerCentralRegistry</i>. The master node, being the host of last resort when all other machines are busy, cannot refuse to accept a guest object. Therefore, it does not need to monitor local load conditions or react to load changes. Its <i>run()</i> method simply checks the local guest list once per minute and tries to offload one local guest object to each registered node.</p>
+
+<p>Any <i>Serializable</i> virtual object (such as <i>VMonteCarlo</i>, derived by applying Voyager's vcc utility to the <i>MonteCarlo</i> class) can be managed by the Sojourner system without further modification. Such server objects can simply be instantiated on the Sojourner master node and a reference passed to <i>SojournerMaster</i>'s <i>receiveGuest()</i> method. <a name="rl5"><a href="9804i.htm#l5">Listing Five</A> shows how the <i>VMonteCarlo</i> client of <a href="9804i.htm#l3">Listing Three</A> can be modified to pass a newly created <i>VMonteCarlo</i> object to Sojourner. The client has also been changed so that the name of the master machine can be passed as a command line argument. The Voyager <i>moveTo()</i> method used by Sojourner to relocate objects is transparent to clients of those objects. That is, the <i>forObjectAt()</i> method call in <a href="9804i.htm#l5">Listing Five</A> will return a reference to the correct object even if it has been moved off the master node.</p>
+
+<h3>Conclusion</h3>
+
+<p>The Sojourner system presented here is a working prototype. A production system would require capabilities to restrict the number of server objects depending on the number of nodes participating, to display the location of server objects, to selectively shut down server objects, and to authenticate client applications. The Voyager infrastructure provides mechanisms for implementing these functions, but they are beyond the scope of this discussion. The prototype does demonstrate how a simple construct like Voyager's <i>moveTo()</i> method can be used to build flexible dynamic distributed systems.</p>
+
+<p><b>DDJ</b></p>
+
+
+<H4><a name="l1">Listing One</H4>
+
+<pre>import java.lang.Math;import java.util.Random;
+public class MonteCarloTest implements FofX {
+    public double computeFof(double x)
+    {
+    return Math.sqrt(x);
+    }
+    public static void main(String[] args)
+    {
+      MonteCarlo     estimator = new MonteCarlo();
+      MonteCarloTest function  = new MonteCarloTest();
+      double answer;
+      System.out.print("The area under the curve of the square ");
+      System.out.print("root of x from 0 to 100 is ");
+      answer = estimator.estimateIntegral(0.0, 100.0, 1000, 
+                                                    new Random(), function);
+      System.out.println(answer);
+    }
+}
+</pre>
+<P>
+<a href="#rl1">Back to Article</A>
+</P>
+<H4><a name="l2">Listing Two</H4>
+
+<pre>import java.util.*;public class MonteCarlo {
+    public double estimateIntegral(double intervalStart, double intervalEnd, 
+                              long iterations, Random random, FofX function)
+    {
+      double intermediate = 0.0;
+      double intervalLength = intervalEnd - intervalStart;
+      double x;
+    for (int i = 0; i &lt; iterations; i++)
+    {
+        x = intervalStart + (random.nextDouble() * intervalLength);
+            intermediate += function.computeFof(x);
+    }
+    return (intermediate / iterations) * intervalLength;
+    }
+}
+</pre>
+<P>
+<a href="#rl2">Back to Article</A>
+</P>
+<H4><a name="l3">Listing Three</H4>
+
+<pre>import java.lang.Math;import java.util.Random;
+import java.io.Serializable;
+import COM.objectspace.voyager.*;
+<p></p>
+public class RemoteMonteCarloTest implements FofX, Serializable {
+    public double computeFof(double x)
+    {
+        return Math.sqrt(x);
+    }
+    public static void main(String[] args)
+      throws VoyagerException
+    {
+        VMonteCarlo estimator = null;
+        try
+        {
+            estimator = (VMonteCarlo)
+            VObject.forObjectAt("tme10.tivoli.com:7777/MCServer");
+        }
+        catch(ObjectNotFoundException e) { }
+        if (estimator == null) 
+        {
+       estimator = new VMonteCarlo("tme10.tivoli.com:7777/MCServer");
+           estimator.liveForever();
+        }
+        RemoteMonteCarloTest function  = new RemoteMonteCarloTest();
+        double answer;
+    System.out.print("The area under the curve of the square ");
+    System.out.print("root of x from 0 to 100 is ");
+    answer = estimator.estimateIntegral(0.0, 100.0, 1000,
+                                              new Random(), function);
+        System.out.println(answer);
+    Voyager.shutdown();
+    }
+}
+</pre>
+<P>
+<a href="#rl3">Back to Article</A>
+</P>
+<H4><a name="l4">Listing Four</H4>
+
+<pre>/* C implementation of a Java native method to determine if * the load on an IBM AIX workstation is LOW, MEDIUM or high
+ */
+#include &lt;stdio.h&gt;
+#include &lt;stdlib.h&gt;
+#include &lt;string.h&gt;
+#include &lt;time.h&gt;
+#include &lt;rpcsvc/rstat.h&gt;
+#include &lt;sys/param.h&gt;
+#include "SojournerNode.h"
+<p></p>
+#define LOW 0
+#define MEDIUM 1
+#define HIGH 2
+<p></p>
+int determine_instant_threshold(char *);
+<p></p>
+int determine_smooth_threshold(int, int, int, int *);
+/*                             instant_threshold, old_instant_threshold, 
+                               old_threshold, consecutive_change_cnt */  
+void call_rstat(char *, float *);
+/*              hostname, cpu_level                    */
+<p></p>
+<p></p>
+/* Global data */
+float cpu_limit = 200.0;
+int current_threshold;
+JNIEXPORT void JNICALL Java_SojournerNode_runNode
+   (JNIEnv *env, jobject obj)
+{
+    char hostname[256];
+    int old_threshold, instant_threshold, 
+        old_instant_threshold, threshold_count;
+    int loop_cnt;
+    jclass clazz;
+    jfieldID fid;
+    threshold_count = 0;
+    gethostname(hostname, sizeof(hostname));
+    clazz = (*env)-&gt;GetObjectClass(env, obj);
+    fid = (*env)-&gt;GetFieldID(env, clazz, "machineLoadLevel", "I");
+    current_threshold = (*env)-&gt;GetIntField(env, obj, fid);
+    while(1)
+      {
+        sleep(6);
+        old_threshold = current_threshold;
+        old_instant_threshold = instant_threshold;
+        instant_threshold = determine_instant_threshold(hostname);
+        current_threshold = determine_smooth_threshold(instant_threshold,
+                    old_instant_threshold, old_threshold, &amp;threshold_count);
+        if (current_threshold != old_threshold)
+          (*env)-&gt;SetIntField(env, obj, fid, current_threshold);
+      }
+}
+int determine_instant_threshold(char *hostname)
+{
+    float new_cpu_level;
+    call_rstat(hostname, &amp;new_cpu_level);
+    if ((new_cpu_level &lt; (cpu_limit / 2.0))) return LOW;
+    if (new_cpu_level &lt; cpu_limit)           return MEDIUM;
+    return HIGH;
+}  
+int determine_smooth_threshold(int instant_threshold, 
+                        int old_instant_threshold, int old_smooth_threshold,
+                        int *threshold_change_count)
+{
+    if (instant_threshold == old_smooth_threshold) 
+      {
+       *threshold_change_count = 0;
+<p></p>
+       return instant_threshold;
+      }
+    if (instant_threshold  == old_instant_threshold) 
+                                              (*threshold_change_count)++;
+    else {
+           if (old_smooth_threshold == MEDIUM &amp;&amp; 
+                    (((instant_threshold == LOW) &amp;&amp;
+                          (old_instant_threshold == HIGH)) ||
+                     ((instant_threshold == HIGH) &amp;&amp;
+                          (old_instant_threshold == LOW))))
+             {
+              *threshold_change_count = 1;
+              return MEDIUM;
+             }
+           else *threshold_change_count++;
+     }
+<p></p>
+     if (instant_threshold &gt; old_smooth_threshold)
+       {
+        if (*threshold_change_count &gt; 1)
+          {
+           *threshold_change_count = 0;
+           return ++old_smooth_threshold;
+          }
+        else return old_smooth_threshold;
+       }
+<p></p>
+     if (*threshold_change_count &gt; 10) 
+       {
+        *threshold_change_count = 0;
+        return --old_smooth_threshold;                    
+       }
+     return old_smooth_threshold;
+} 
+void call_rstat(char *hostname, float * cpu_queue_length)
+{
+   struct statstime rstat_output;
+   rstat(hostname, &amp;rstat_output);
+   *cpu_queue_length = rstat_output.avenrun[0];
+}
+</pre>
+<P>
+<a href="#rl4">Back to Article</A>
+</P>
+<H4><a name="l5">Listing Five</H4>
+
+<pre>import java.lang.Math;import java.util.Random;
+import java.io.Serializable;
+import COM.objectspace.voyager.*;
+<p></p>
+public class RemoteMonteCarloTest1 implements FofX, Serializable {
+    public double computeFof(double x)
+    {
+   return Math.sqrt(x);
+    }
+    public static void main(String[] args)
+    throws VoyagerException
+    {
+        VMonteCarlo estimator = null;
+        try
+        {
+            estimator = (VMonteCarlo)
+            VObject.forObjectAt(args[0] + ":7777/MCServer1");
+        }
+        catch(ObjectNotFoundException e) { }
+        if (estimator == null) 
+        {
+           VSojournerMaster master = (VSojournerMaster)
+               VObject.forObjectAt(args[0] + ":7777/sojournerNodeControl");
+           estimator = new VMonteCarlo(args[0] + ":7777/MCServer1");
+           estimator.liveForever();
+           master.receiveGuest(estimator);
+        }
+    RemoteMonteCarloTest function  = new RemoteMonteCarloTest();
+        double answer;
+    System.out.print("The area under the curve of the square ");
+    System.out.print("root of x from 0 to 100 is ");
+    answer = estimator.estimateIntegral(0.0, 100.0, 1000,
+                                            new Random(), function);
+        System.out.println(answer);
+    Voyager.shutdown();
+    }
+}
+</pre>
+<P>
+<a href="#rl5">Back to Article</A>
+</P>
+
+<HR><I>Copyright &copy; 1998, Dr. Dobb's Journal</I><BR>
+
+</BODY>
+</html>

@@ -1,0 +1,91 @@
+
+<html>
+<head>
+<title>September, 2004: Debugging,  Message-Oriented Middleware, &amp; Distributed Systems</title>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+
+<h1>Debugging,  Message-Oriented Middleware, &amp; Distributed Systems</h1>
+<p><i>Dr. Dobb's Journal</i> September, 2004</p>
+<h2>Runtime software  modification</h2>
+
+
+<h3>By Paul Pazandak and Steve Ford</h3>
+
+
+<I>Dr. Paul Pazandak (pazandakobjs.com) and Steve Ford (fordobjs.com) are research scientists at Object Services and Consulting (http://www.objs.com/). Distribution Statement A Approved for public release; distribution is unlimited.</I>
+
+<hr>
+
+
+
+
+
+<p>If you are involved in designing and building distributed messaging systems, you are well aware of the problems in tracking down and isolating bugs. A common approach is to log into each of the remote hosts, start the application on each, then watch for exceptions or debug statements you inserted in the code. The problem with this approach is that it doesn't scale well. For one thing, when the distributed system involves tens of computers and hundreds of processes, it is impossible to observe all of the console windows. Furthermore, when the distributed processes are sending hundreds or thousands of messages (and it's your job to find out why a handful of messages out of those thousands aren't making it to their destination), it is impossible to visually track every message through the system by monitoring the debug statements emitted to the screen.  </p>
+
+<p>This is exactly what we were faced with in the Cougaar Agent System. Cougaar (short for "Cognitive Agent Architecture") is a Java-based architecture for the construction of large-scale distributed agent-based applications and the product of a multiyear DARPA research project (UltraLog, http://www.ultralog.net/) into large-scale agent systems. </p>
+
+<p>The Cougaar agent system is big. This year, the largest of the Cougaar test societies will have 50+ host computers running 1000+ agents; a small test society involves about six computers. Therefore, it should not be a surprise that debugging messaging problems in Cougaar is labor intensive. Given the quantity of messages being sent, we simply could not monitor console windows. Instead (in the beginning), we sent all of the debug statements to log files using Log4J (http://logging.apache.org/log4j/docs/), then inspected the files offline after the application had terminated. We improved on this by implementing a console tool to inspect the log files for us and identify what messages had been lost. This tool sorted all messages first by agent, and then by whether the message was sent or received by that agent. A second iteration through these files identified which messages were sent but not received. A problem with this approach was that it was not dynamic&#151;we had to wait for the application to run to completion (for instance, generating a logistics plan, which might be an hour or more). However, an even bigger problem was that it allowed only coarse visibility&#151;it would tell us if a message didn't make it, but it would not tell us how far it had gotten. We would then have to hand inspect the log files to track down debug statements to see where the message was last seen. We should say that we are assuming that the underlying network is not the likely<i> </i>problem, rather we are debugging the multiprotocol sending and receiving message stacks that we wrote. What we did next was to implement a tool that solved both of these problems.  </p>
+<h3>Solving Problem 1: Offline Debugging</h3>
+
+<p>Instead of collecting data into files, we routed all of the message-related Log4J debug statements from every agent to our new centralized collection tool running on one machine. To do this, we defined a Log4J <i>SocketAppender</i> in Cougaar, then passed in the host and port for the tool via each host's command line. The Log4J debug statements were then modified to emit to an event router class that we implemented (in Cougaar), which simply sent them across the socket if it existed (if the command-line arguments were provided); otherwise, we sent them via the default Cougaar logging mechanism. </p>
+
+<p>The centralized tool at the other end collected, organized, and displayed all of the data as soon as it was received (<a name="rf1"></a><a href="0409bf1.html">Figure 1</a>). The main window showed a summary of all known agents, how many messages they had sent, received, and were still outstanding. From here, you can drill-down and look at all of the messages sent by any given agent, and quickly see which messages had made it or had not yet arrived.</p>
+
+<p>While this was a big improvement over the previous tool, we still wanted to pinpoint where a message was being lost.</p>
+<h3>Solving Problem 2: Coarse Visibility</h3>
+
+<p>Rather than just knowing whether a message was received, we wanted to know where it was last seen in the code for the sending/receiving protocol stacks so that we could track down the offending bug. To solve this, we needed the tool to recognize and process debug statements emitted at multiple points in the stacks. This would let us see how far each message traveled through the code. These points, or logpoints, were simply additional Log4J debug statements that we inserted in the protocol stacks (having debug statements at multiple layers in the message stack results in thousands of entries for each agent). With the logpoints in place, our tool lets us drill down further to see the logpoints each message made it to and when it arrived at each logpoint (<a name="rf2"></a><a href="0409bf2.html">Figure 2</a>).</p>
+
+<p>The tool learned about logpoints via an XML-based configuration file (<a name="re1"></a><a href="0409be1.html">Example 1</a>). It defined the logpoints, which stack they belonged to (send or receive), supplied a user-friendly name, and the order they appeared in the stacks. The last receive stack logpoint defined defaults to be treated as the endpoint. Any message having reached this point was considered to have been successfully received. We also permitted the endpoint to be changed at runtime. Since the tool's main window displays the number of messages sent and received, changing the endpoint could affect how many messages were considered to have been successfully received. This lets us quickly see how many messages had made it to a specific logpoint.</p>
+
+<p>Using our tool, we were then able to see (in near real time) the flow of messages through the system and quickly observe when messages were apparently lost in the ether. In the MessageDetail window (<a name="rf2"></a><a href="0409bf2.html">Figure 2</a>), we could examine the logpoints for each individual message and the time it was seen. The send stack logpoints were color-coded in black, receive logpoints in blue, and the final logpoint in red.</p>
+
+<p>When we identified messages disappearing (not making it past some logpoint), the next step was to insert one or more logpoints after the last logpoint the message was seen at. This, of course, required us to stop the application, modify the code, and then restart it. For small applications, or when reaching new debug statements occurs relatively quickly, the run-observe-stop-add_more_logpoints-restart debug cycle might be tolerable. In our situation, testing the various message protocols might take an hour. So, while the tool reduced the time to identify lost messages substantially, we were still left with an expensive debug cycle to track down where the messages were being lost. Fortunately, we had another tool to bring to bear.</p>
+<h3>Inserting Logpoints at Runtime</h3>
+
+<p>The last major hurdle to efficiently debugging our code was to terminate the application to insert new logpoints (Log4J debug statements). What we really needed was to be able to insert (and remove) logpoints into the agents while Cougaar was running. For this feature we turned to ProbeMeister, another tool we had developed (available electronically; see "Resource Center," page 3). ProbeMeister (<a name="rf3"></a><a href="0409bf3.html">Figure 3</a>) is a runtime software instrumentation tool (it was the first tool of its kind to use the advanced distributed debugging facilities introduced in JDK 1.4). ProbeMeister's key strength is that it is capable of inserting Java bytecode into any local or remotely running Java application without stopping it.  </p>
+
+<p>We developed ProbeMeister a few years ago to support ad hoc insertion of software probes into multiple remotely running Java applications. To insert probes into an application, users can either connect to the remote application at will from ProbeMeister or configure the remote application (using additional Java Virtual Machine directed command-line arguments) to connect to ProbeMeister when it starts up. No specialized JVM or modification of the application itself is required.</p>
+
+<p>ProbeMeister supports XML configuration-directed probe insertion as well as drag-and-drop insertion. Using XML-based configuration files, you can specify exactly where to insert a given set of probes into a Java process (the probes can be inserted into application classes as well as core JVM classes). The custom configurations can then be automatically applied when ProbeMeister first attaches to the application or at any point after. While configuration files could be defined by hand, in general, you build up a configuration simply by deploying probes&#151;ProbeMeister records all deployments that  can then be exported to a configuration file (the file can then be edited if desired).  Custom configurations could be used to focus on specific problems such as networking or file I/O, or to define application patches. Probes can be just about any code you might want to write; they are certainly not limited to debugging statements.</p>
+
+<p>Ad hoc deployment of probes involves simply dragging a selected probe to a source-code window and dropping it in between two lines of code. The source-code window displays the decompiled bytecode of the selected class and method, and labeled icons indicate where other probes currently exist in the code. Because ProbeMeister decompiles the current in-memory version of a class's bytecode, no source code files are used by ProbeMeister. Once a probe has been dropped into the source-code window, it is immediately deployed to the remote JVM. Specifically, a copy of the method's code is modified in the remote JVM and it is swapped in as soon as no process is executing the method.</p>
+
+<p>Once a probe is deployed, it remains in existence for the application's execution lifetime (until the application is terminated), or until it is removed. Probe removal is just as simple as insertion&#151;you simply drag a probe out of the source-code window. While currently unimplemented, it would also be possible to support modification of the class files so that probes persisted across executions.</p>
+
+<p>Recall that the purpose of ProbeMeister was to insert probes into remotely running applications. Thus, if you insert debug statements into a remote application, they will by default emit their output to the remote machine's console. However, it won't do much good if you cannot see the output! To solve this, ProbeMeister includes a probe that forwards debug statements to a remote collection facility. We first implemented a basic web server that collected and displayed the data from all probed processes in a web page. We later extended ProbeMeister to act as a collector itself and to display the data within an easily accessible window. Data from multiple processes can be interwoven (the text from each process is color coded) or displayed in separate windows.</p>
+
+<p>ProbeMeister comes with a variety of probes built-in (for instance, one to call a specified method in the remote application, another to emit strings, one to emit a method's arguments, and so on). Other basic probes can be written without excessive trouble using high-level probe-building library calls. More sophisticated probes are implemented in the target application as probe plugs. Using probe plugs, which are written in Java (not in bytecode like the other probes), you can easily and quickly write code capable of accessing and manipulating specific application objects and state. Then, in ProbeMeister, one drags and drops a probe stub onto the source code that is then customized by the user to call one of the predefined probe plugs (ProbeMeister displays a list of all compatible registered probe plugs that could be invoked).</p>
+
+<p>The most verbose probe stub passes several items to a probe plug for its use&#151;the name of the remote JVM, the probe stub name, the name of the instrumented method, a user-supplied message, the current thread, an array containing all of the method's arguments, and the current object (if the instrumented method is not a static method). Recall that the probe stub is executing within the remote application, so it has access to all of this information. Its job is simply to collect it all up and pass it to another method (the probe plug) to do something with it. This might include simply emitting the information, though the method could easily modify the data or object to affect application behavior.</p>
+<h3>Using ProbeMeister  To Solve Our Problem</h3>
+
+<p>Using ProbeMeister, we developed a custom probe plug that would emit new logpoints by calling our event router in Cougaar. Specifically, we used a ProbeMeister-supplied probe stub to make a method call to a custom probe plug that we defined in Cougaar. We could use this plug in any method where a message was accessible. This gave us the ability to inspect the message and to identify the sending and receiving agents, message sequence number, message type, and so on. The probe plug then composed a debug statement containing this information and emitted it to the <i>SocketAppender</i> via our event router. Thus, using ProbeMeister, new logpoints could be added anywhere in the message stack. Our collection tool (see <a name="rf4"></a><a href="0409bf4.html">Figure 4</a>) then automatically identified the new logpoints and correctly organized them. New logpoints appeared as NEW entries in our LogPoint Configuration window. From here, we could identify which ones to pay attention to, essentially indicating whether we cared about them or not. As they appeared in this window, we could redefine the endpoint and immediately see if any new messages were making it past the new logpoints (<a name="rf5"></a><a href="0409bf5.html">Figure 5</a>). This significantly shortened the coding cycle by reducing the need for application restarts required after the insertion of new debug statements.</p>
+
+<p>You might ask why we needed to use ProbeMeister when we could simply place debug statements everywhere. Given the timing sensitivity of Cougaar, and likely most messaging middleware, the main problem with this approach is that it perturbs the behavior of the application such that it behaves differently than it would without all of the debug statements. A secondary problem with this approach, in general, is that of information overload because you may have 50 to 100 or more debug statements emitting data per message.</p>
+<h3>Future Enhancements</h3>
+
+<p>While we found ProbeMeister to suit our needs in some respects, it was never designed to scale to instrument hundreds of processes. It was also not designed with the specific intent to connect to several identical remote processes and to deploy identical probes to each. When we used it with Cougaar, we watched for where specific messages were being lost, and then attached to the host machine(s) that the message was lost on and deployed a probe. Ideally, and potentially in some future version of ProbeMeister, we could instruct a probe to be deployed simultaneously to several or all running JVMs in the agent society.</p>
+
+<p>A second enhancement that we could envision would be to automate the deployment of probes. This would come into play when a message didn't arrive: Our message auditing tool would identify the last logpoint a message was seen at, select a point in the code between that logpoint and the next existing logpoint, and insert a new logpoint via ProbeMeister (via ProbeMeister's existing RMI interface). If a message still didn't make it to the new logpoint, another would be chosen between the last one it made it to and the one that was just inserted. Logpoints not of interest could be removed from the application via ProbeMeister to minimize perturbations.  </p>
+
+<p>To support this capability, our tool would need to understand how messages flow through the application. Automated tools, and potentially user assistance, could be used to analyze the code to construct a data flow description that could then be used to identify logpoint locations.</p>
+
+<p>ProbeMeister is looking for a home. While it is fairly robust, it could use a good home where it could become a widely useful and available debugging tool.</p>
+<h3>Acknowledgments</h3>
+
+<p>Thanks to Dr. John Salasin for funding the development of ProbeMeister (funded under the DARPA DASADA program), as well as Dr. Mark Greaves for funding the tool development under UltraLog. We would also like to thank Tom Bannon for his contributions on this effort. This research is sponsored by the Defense Advanced Research Projects Agency and managed by the Department of the Interior/National Business Center under contract NBCHC010011. The views and conclusions contained in this document are those of the authors and should not be interpreted as representing the official policies, either expressed or implied, of the Defense Advanced Research Projects Agency, Department of the Interior/National Business Center, or the United States Government. </p>
+
+
+
+
+<p><b>DDJ</b></p>
+
+
+
+
+</body>
+</html>

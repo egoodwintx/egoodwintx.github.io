@@ -1,0 +1,471 @@
+<HTML>
+<META NAME="year" CONTENT="1996">
+<HEAD>
+<!-- This document was built using HyperWriter Professional by NTERGAID Inc. -->
+<TITLE>November 1996:  Hot Restarts</TITLE></HEAD>
+<body bgcolor="FFFFFF">
+<h1>Restarting Embedded Systems</h1><P>
+
+<P>
+
+<h2>Minimizing application downtime </h2><P>
+
+<P>
+
+<h3>Fredrik Bredberg, Ola Liljedahl, and Bengt Eliasson</h3><P>
+
+<P>
+
+<P>
+<i>Fredrik (frbr@enea.se) and Ola (olli@ enea.se) are software engineers working
+for Enea OSE Systems. Bengt (bengt@ enea.se) is the chief designer of the OSE
+Delta real-time operating system.</i></p><hr><P>
+
+<P>
+
+There are a number of ways in which you can restart embedded systems, the most
+common being toggling the power on/off switch or pressing reset. However, a
+restart can also be forced by software, either intentionally or unintentionally
+(as in a system crash). <P>
+
+Whatever the cause, there are generally three types of restarts:<P>
+<ul>
+<li>Cold start, when the system is started and all data needs to be initialized.
+This is normal system power up.</li>
+<li>Warm start, when the system is started and remembers data from a previous
+&quot;life.&quot; It checks if the data from that previous life still seems to be
+valid; if so, the system recovers the data and starts to use it in its new
+life.</li>
+<li>Hot start, which is the same as a warm start except that the system will pick
+up at the exact spot where it was before the restart, making the restart totally
+transparent for applications. The easiest way for an operating system to handle
+(and survive) a hot restart it to make sure that the restart is performed in the
+middle of a context switch.</li>
+</ul>
+It is quite easy for a system to realize that it has had a previous life-you
+store an identifier at a known address in memory. When the system is started (or
+restarted), it simply looks at that known address to see if it contains the
+identifier. If you need to force a cold start, the software can check a hardware
+push-button or a special cold-start flag every time the system is started.<P>
+
+The warm-start concept has proved useful in the OSE RTOS from Enea OSE Systems
+(http://www.enea.se/ose). When the system is restarted after a system crash, it
+can recover system traces and other data for use by a postmortem debugger. This
+data can help determine the cause of software crashes. Another example is a load
+module (a separately linked application) in OSE that can survive a warm start
+without needing to be reloaded. This can reduce system downtime considerably.<P>
+
+Hot starts are supported in OSE through the power_fail system call, which tells
+the kernel that it should stop scheduling processes and preserve all of its
+volatile data. After this is done, the kernel calls a user-written handler that
+preserves system states, such as the applications' volatile data and the status
+of I/O devices. This handler finishes by shutting down the CPU to prepare the
+system for a forthcoming loss of power.<P>
+
+When the system is restarted, another user-written handler restores the volatile
+data, reinitializes the I/O devices, then tells the kernel that it should perform
+a hot start. This scheme can also be used to deliberately shutdown the CPU and
+other hardware devices to save power when a system is idle for a period of
+time.<P>
+
+There are other situations where warm or hot starts can be useful. For example,
+this facility lets you update the code of an application during run time. You
+could load a new revision of some application's code into memory, then update the
+restart vectors to point to the new code's entry point. After issuing a
+software-controlled restart of the application, the new version of the
+application should be able to pick up and use the data from the older version.<P>
+
+<h3>A Simple Method</h3><P>
+
+A common way to implement warm-restart recovery is to keep checksums of data and
+code regions in memory. Code checksums are computed when the code is loaded into
+memory, while data checksums must be updated every time the data returns to a
+consistent state. At restart, the checksums are recalculated and checked against
+those stored in memory. If both checksums are correct, you can continue to use
+both the code and the data. If the code checksum is correct, you can restart the
+application without reloading it.<P>
+
+All data to be checked at restart must have a checksum and an accompanying
+invalid flag tied to it. The data with this extra information must be stored at a
+fixed address in memory. <a href="9611f.htm#00d0_02c9">Example 1</A> illustrates
+how this is done in C. The checksum must be recalculated every time the data is
+updated. While the data and the checksum are being updated, the invalid flag is
+set. Usually, changes to a data region are carried out as shown  in<a href="9611f.htm#00d0_02ca"> Example 2</A>.<P>
+
+At restart, all data regions must be checked for validity. If a restart occurs in
+the middle of an update that data region must be discarded. Since a restart can
+only happen in the middle of one data-region update, you will usually lose the
+contents of, at most, one data region. <a href="9611f.htm#00d0_02cb">Example
+3</A> shows one way to perform a validity check after a restart.<P>
+
+This technique is fairly simple to understand and to implement. However, it does
+have some drawbacks:<P>
+<ul>
+<li>All data regions must contain the invalid flag and the checksum.</li>
+<li>If a restart occurs in the middle of an update, you have to discard the whole
+region's contents.</li>
+<li>Code to handle the updates and checks will be scattered throughout the
+application.</li>
+</ul>
+<h3>Persistent Memory with Atomic Updates</h3><P>
+
+To address the problems associated with this simple method, we create stable
+storage with an atomic memory-updating scheme using MMU-controlled regions. A
+standard memory-management unit (MMU) usually does not increase the cost of the
+system since built-in MMUs are fairly common. The MMU is used to implement
+virtual-memory regions that applications can use as if they are ordinary RAM
+storage.<P>
+
+Data modifications to a region are made so that if the system restarts before the
+whole region has been updated, all changes to the region since the last
+synchronization are lost after the restart. The sequence of events that updates
+the contents of a memory region and makes sure it will survive a restart is
+referred to as a &quot;transaction.&quot; The transaction starts when the first
+attempt to modify data is made by the application, such as a write-to-memory
+operation by the CPU. Because the data is stored in a read-only virtual memory
+page, this process will generate an exception (a page fault). When this exception
+occurs, the system will allocate a new memory page that is writable from the
+application, copy the data contents of the read-only original page into the new
+page, and change the MMU's page table to point to the new page. This new page is
+called the &quot;working page&quot; and will contain rapidly changing
+inconsistent data. The application is unaware of the different physical location
+of the data. Information about the change from the old to the new data page is
+registered in a transaction record.<P>
+
+The transaction ends when the application issues a synchronization directive, at
+which time the working page goes from being a writable copy to being a new
+read-only original and the transaction record is discarded. If a restart occurs
+before the synchronization procedure has been issued or finished, a special
+recovery procedure will restore the original data (data present before the first
+attempt to modify the data region occurred).<P>
+
+If this scheme is to be used in a multitasking environment, all transactions have
+to be carried out by one single process because the system does not handle record
+locking or any other synchronization between processes. Our system also does not
+support multiple transactions; one transaction must be finished before the system
+can accept a new one.<P>
+
+<h3>Definition by Example</h3><P>
+
+All data regions to be atomically updated must reside in memory pages managed by
+the MMU. Consider a data structure called S that has members X and Y. Before the
+application attempts to update either X or Y, S is said to be in a consistent
+state. If X has been updated but not Y (or vice versa), S is in an inconsistent
+state. When S resides in an original page it is always in a consistent state. An
+original page is always set to be read only, so that any attempt to update its
+contents will lead to an exception (page fault). The read-only attribute is set
+in the page table, which also maps a page's virtual address to its physical
+address. <a href="19970443.htm">Figure 1</A> shows the page table tracking four
+different pages; the page table itself is stored in volatile memory while the
+actual data pages are stored in persistent memory.<P>
+
+Since the page table is stored in volatile memory, which will be lost at a
+restart, you must find a way to recreate its contents after a restart. For that,
+we have added a data structure called a &quot;region descriptor.&quot; As <a href="19970444.htm">Figure 2</A> illustrates, this data structure contains a copy
+of the page table's physical-address column (P0-P3) along with a checksum for
+each of the pages mentioned in that column (RC0-RC3). The region descriptor also
+contains the first address of the virtual memory (V0). By storing the region
+descriptor along with a checksum of its entire contents (RC) in persistent
+memory, we will be able to restore the page table after a restart.<P>
+
+After a restart, we make sure that we can restore the page table's contents by
+calculating all the checksums of the pages (P0-P3) mentioned in the region
+descriptor. We then make sure that they have the same values as those stored in
+the region descriptor (RC0-RC3). Next, we calculate the region descriptor's
+checksum and make sure that it matches the saved value (RC). A cold start is
+performed if any of these checksums mismatch.<P>
+
+Actually restoring the page table is quite simple. The physical-address column of
+the page table can be restored by copying information from the region descriptor.
+As all pages in the page table should be set up as read only, restoring the
+page-attributes column is easy. Since we have saved the virtual address of the
+first page (V0) and we know that V1 is equal to V0 plus the size of a
+virtual-memory page (and so on), we can now also restore the virtual-address
+column of the page table.<P>
+
+Consider what happens when an application tries to alter the contents of some
+data located in the virtual-address space of V0. As V0 is mapped to the physical
+(and write-protected) page P0 this will lead to a page fault. The page-fault
+handler will then allocate a new page (P4) and copy P1's entire contents to that
+page. The page-fault handler will also (before it returns control to the
+application) update the page table so that V0 is now mapped to the writable page
+P4.<P>
+
+P4 is called a &quot;working page.&quot; Working pages are data pages that are
+changed (written to at least once), but as long as the application has not issued
+a synchronization directive, their contents will be lost in case of a restart.<P>
+
+A data structure called a &quot;transaction record&quot; stores information about
+working pages allocated by the page-fault handler due to a write exception; see
+<a href="19970448.htm">Figure 3</A>. The update flag in <a href="19970449.htm">Figure 3</A> is normally set to False; in this state neither
+of the transaction record's checksums contain a valid value.<P>
+
+If the application changes anything in any of the virtual-address spaces V1-V3,
+the page-fault handler allocates yet another new page (P5 in <a href="19970447.htm">Figure 3</A>) and updates the page table as well as the
+transaction record.<P>
+
+When the application calls the synchronization routine, these data structures
+must be updated carefully so that the maximum amount of information is preserved
+if a restart occurs in the middle. First, all checksums for the working pages are
+calculated and put into the transaction record. After that we calculate the
+checksum for the transaction record itself. Then we set the update-in-progress
+flag to True, copy information about the working pages from the transaction
+record to the region descriptor, and recalculate the region descriptor's
+checksum. We then reset the update-in-progress flag's value back to False, clear
+the transaction log, deallocate the old original pages (P0 and P2), and change
+the attributes of all pages to be read only again. The working pages have now
+become new &quot;original pages.&quot; <P>
+
+<a href="19970446.htm">Figure 4</A> shows how the synchronization routine has
+updated both the page table and the region descriptor to its new revertible
+state.<P>
+
+<h3>The Functions</h3><P>
+
+Three functions are needed to implement our proposed system: WRITE, which is
+called by the page-fault handler; SYNC, which is called by the application; and
+<P>
+
+RECOVER, which is called by the system-startup code. More functions may be needed
+in a more-robust implementation to deal with such problems as memory
+shortfalls.<P>
+
+The synchronizing system has two states, defined by the value of the
+update-in-progress flag. If the flag is False, the region descriptor is unchanged
+and consistent. Changes affect only the page tables and the transaction record. A
+system restart will lose all changes registered in the transaction record and
+revert to the state defined by the region descriptor.<P>
+
+If the update in progress flag is True, the transaction record is consistent and
+frozen. The region descriptor is in the process of being updated from the
+transaction record. A system restart will restart the update process, which
+eventually will lead to a consistent region descriptor. Thus a crash in this
+state will never lose any data.<P>
+
+<a href="9611f.htm#00d0_02cc">Example 4</A> is pseudocode for the WRITE()
+function, which is called by the page-fault handler when a write fault occurs.
+Notice that a restart in the WRITE function will lose all changes made after the
+last SYNC call. This is because the <P>
+
+update-in-progress flag is not set but the region descriptor is still
+unchanged.<P>
+
+<a href="9611f.htm#00d0_02cd">Example 5</A> is pseudocode for the SYNC()
+function, which is called by the application at the end of a transaction. Again,
+the sequence of events has been carefully ordered so that a crash at any step
+will leave the data in a recoverable state. A restart before step 5 will lose all
+changes made after the previous call to SYNC. After step 5, the transaction
+record is consistent and can be used to update the region descriptor. In step 6
+the region descriptor is updated from the transaction record. If a crash occurs
+here (with the <P>
+
+update-in-progress flag set), the RECOVER function will redo the update of the
+region descriptor. In step 8 the update is finished and the region descriptor is
+consistent, as indicated by the cleared update-in-progress flag. In step 9 the
+transaction record is cleared. A restart after step 9 will revert all data to the
+newly synched state.<P>
+
+<a href="9611f.htm#00d0_02ce">Example 6</A> is the RECOVER() function, which
+attempts to recover after a crash. Step 1 changes the region descriptor, which is
+okay since the transaction record is valid. A restart at this point will only
+redo the update of the region descriptor. Steps 2 through 5 check that the region
+descriptor and the data in the original pages are correct, for example, they
+could have been destroyed by a missing DRAM refresh. Steps 6 through 10 do not
+change anything concerned with the atomic-update scheme. They simply rebuild
+volatile system data-structures describing the synchronized state.<P>
+
+<h3>Implementation Issues</h3><P>
+
+Of course there are some issues that must be addressed in a real
+production-strength implementation of our atomic updating scheme. <P>
+
+<P>
+<ul>
+<li>You must decide how to allocate and where to store page tables, region
+descriptors, data pages, and other memory structures.</li>
+<li>You may have to integrate this scheme with existing MMU software. </li>
+<li>You will need to decide how to handle an out-of-memory condition during a
+write fault.</li>
+<li>You need to choose an appropriate checksum algorithm. Keep in mind that the
+error patterns of static data residing in RAM is different from those of
+communications links.</li>
+<li>You will need some method of forcing a cold start.</li>
+</ul>
+<h3>Conclusion</h3><P>
+
+The approach we've presented here is not without its faults. However, we believe
+that the advantages outweigh the disadvantages in large embedded systems, where
+high reliability and minimal down time are important. On the plus side, four
+factors are worth noting:<P>
+
+<P>
+<ul>
+<li>A standard application can be used with only minor changes. Just add a call
+to SYNC() whenever a data region has been updated.</li>
+<li>The application does not need to handle checksums and invalid flags in many
+different places.</li>
+<li>The otherwise complex recovery procedure is simplified and independent of any
+of the application's data structures. The recovery procedure is implemented in
+only one place, not scattered throughout the application's entire code.</li>
+<li>There is no need for a complex database to maintain data through a
+restart.</li>
+</ul>
+<P>
+
+On the downside of our approach, four considerations stand out:<P>
+
+<P>
+<ul>
+<li>The system needs an MMU.</li>
+<li>Every time a page fault occurs the memory contents have to be copied, which
+will reduce the real-time performance.</li>
+<li>It is hard to report errors, such as &quot;out of memory,&quot; because
+applications usually do not realize that they may get an   out-of-memory error
+just by updating an existing memory location (a new working page is allocated on
+a page fault). However, it might be possible to integrate this with the exception
+handling found in some programming languages.</li>
+<li>We have not even thought of implementing record locking for multiple
+clients.</li>
+</ul>
+<P>
+
+<P>
+
+<h4><a name="00d0_02c9">Example 1: Attaching a validity flag to a block of
+data.</h4><P>
+
+<pre>
+typedef struct
+{   int iDataChecksumInvalid;
+unsigned long ulDataChecksum;
+TData tData; /* Actual data */
+}   TDataRegion;
+
+TDataRegion *ptDataRegion = (TDataRegion *) SOME_PHYSICAL_ADDRESS;
+
+
+</pre>
+
+<h4><a name="00d0_02ca">Example 2: Updating a data region.</h4><P>
+
+<pre>
+ptDataRegion-&gt; iDataChecksumInvalid = TRUE;
+ptDataRegion-&gt; tData = tNewData;
+ptDataRegion-&gt; ulDataChecksum = ulChecksum(ptDataRegion-&gt; tData, sizeof(TData));
+ptDataRegion-&gt; iDataChecksumInvalid = FALSE;
+
+</pre>
+
+<h4><a name="00d0_02cb">Example 3: Checking the validity of a region.</h4><P>
+
+<pre>
+/* Return false if the invalid 
+flag is set or if a 
+recalculated checksum 
+does not match the saved one. */
+int iDataRegionIsValid(void)
+{  if (ptDataRegion-&gt; iDataChecksumInvalid ||
+     (ptDataRegion-&gt;
+          ulDataChecksum !=     ulChecksum(ptDataRegion-&gt; 
+     tData, sizeof(TData)))
+          return FALSE; 
+return TRUE;
+} /* iDataRegionIsValid */
+
+</pre>
+
+<h4><a name="00d0_02cc">Example 4: The WRITE() function.</h4><P>
+
+<pre>
+WRITE(logical_address)
+{
+1     Check if the logical_address is valid. If it is not the page fault is of no concern to WRITE.
+2     Allocate a new physical page, the working page. It is currently only accessible through the RAM shadow.
+3     Copy data from the original page (accessible through the logical_address) to the working page.
+4     Log the change of page for this logical_address in the transaction record.
+5     Change the MMU's page table to reflect the fact that the logical_address is now physically located in the working page.
+6     Make the working page writable (i.e, change the MMU's page table).
+}
+</pre>
+
+<h4><a name="00d0_02cd">Example 5: The SYNC() function.</h4><P>
+
+<pre>
+SYNC()
+{
+1     If data pages are cached with copy back-mode then flush these pages.
+2     Compute checksums of all working pages and store them into the transaction record.
+3     Compute the checksum of the transaction record itself.
+4     Save information about what original pages that are to be replaced so that we can deallocate them later.
+5     Set update-in-progress flag.
+6     Update the region descriptor from the transaction record.
+7     Calculate the new checksum of the region descriptor.
+8     Clear the update-in-progress flag.
+9     Clear the transaction record.
+10    Deallocate the old original pages, which have now been replaced by their working pages.
+11    Write protect the new original pages. We now want page faults again whenever some process attempts to write to such a page.
+}
+
+</pre>
+
+<h4><a name="00d0_02ce">Example 6: The RECOVER() function.</h4><P>
+
+<P>
+
+<pre>RECOVER()
+{
+1     If the update-in-progress flag is set then update region descriptor from transaction record and clear update-in-progress-flag.
+2     Compute checksum of the region descriptor and check it against the stored checksum.
+3     Check that all page addresses in the region descriptor are valid.
+4     Compute checksums of all pages addressed by the region descriptor and check them against their checksums stored in the region descriptor.
+5     If any of steps 2, 3 or 4 failed then data integrity is lost. Build a new region descriptor and clear all data pages. Else all of steps 2, 3 and 4 succeeded and data is in a consistent state.
+6     Build a freelist over all physical pages not used by the region descriptor and its data pages.
+7     Build tables for the region's data pages. Pages should be write protected (read only), as they are all original pages.
+8     Build page tables for the RAM shadow.
+9     Build page tables for other memory areas not related to the atomic update scheme (ROM/RAM/IO).
+10    Enable the MMU.
+}</pre>
+
+<P>
+
+<P>
+
+<P>
+
+Figure 1: The page table and some of its memory pages.<P>
+
+<P>
+
+Figure 2: The region descriptor.<P>
+
+<P>
+
+Figure 3: The transaction record.<P>
+
+<P>
+
+Figure 4: Updated page table and region descriptor.<P>
+
+<P>
+
+<P>
+
+For More Information<P>
+
+Enea OSE Systems<P>
+
+P.O. Box 232<P>
+
+S-183 23 Tby<P>
+
+Sweden<P>
+
+http://www.enea.se/ose<P>
+
+<P>
+
+<P>
+
+<P>
+
+</BODY></HTML>

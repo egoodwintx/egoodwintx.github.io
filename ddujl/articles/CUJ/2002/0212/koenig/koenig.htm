@@ -1,0 +1,313 @@
+<HTML>   
+     <HEAD>
+<TITLE>December 2002/C++ Made Easier</TITLE></HEAD>
+<BODY BACKGROUND="" BGCOLOR="#FFFFFF" TEXT="#000000">
+<H2><A HREF="../tocdec.htm"></A><FONT COLOR="#FF0000">   C/C++ Contributing Editors</FONT></H2>
+
+<HR>
+
+<H2 ALIGN="center"><FONT COLOR="#800000">C++ Made Easier: Handles and Exception Safety, Part 3: Non-Intrusive Reference Counting</FONT></H2>
+<H3 ALIGN="center"><FONT COLOR="#800000">Andrew Koenig and Barbara E. Moo</FONT></H3>
+
+<BLOCKQUOTE>
+<p>More wisdom on using abstraction to achieve exception-safe designs.</p>
+</BLOCKQUOTE>
+
+<HR>
+<BLOCKQUOTE>
+
+<H3><FONT COLOR="#000080">Introduction</FONT></H3>
+
+<p>This is the third in a series of articles about handle classes and exception safety.</p>
+<p>The first of these articles explained how handles simplify memory management in object-oriented programs. It presented a simple handle class, which could represent an object of any type that was a member of a particular inheritance hierarchy, and examined the exception-safety problems that such classes can introduce.</p>
+<p>Our initial handle class, while exception safe, had a potentially serious drawback: copying a handle always copied the corresponding object. Our second article showed how to remove this drawback by adding a reference count to the hierarchy&#146;s base class. Interestingly, adding the reference count to the inheritance hierarchy presented almost no exception-safety issues at all.</p>
+<p>However, our reference-counting solution was intrusive, in the sense that it relied on being able to add a reference counter to the hierarchy&#146;s base class. The counter in each object kept track of how many handles were attached to that object.</p>
+<p> Intrusive handles and associated reference counts are fine strategies if we are able to change the class associated with the objects that we are managing. In this article, we&#146;ll show how to implement a non-intrusive reference-counting strategy. In the process, we shall see that achieving exception safety requires rather more attention.</p>
+<p>We will continue to use the classic example of a hierarchy of geometric shapes rooted in a common base class:</p>
+
+<pre>
+// The root of our hierarchy
+class Shape_base {
+public:
+    virtual void draw() const = 0;
+    virtual void clone() const = 0;
+    virtual ~Shape_base();
+};
+</pre>
+
+<p>As before, calling the <B>draw</B> member of a shape displays the shape, and calling <B>clone</B> makes a new copy of the shape and returns a pointer to the copy.</p>
+<p>Each concrete class in the shape hierarchy must define these functions appropriately:</p>
+
+<pre>
+class Circle: public Shape_base {
+public:
+    // Every kind of shape must
+    // define its own draw and
+    // clone functions
+    virtual void draw() const;
+    virtual void clone() const;
+private:
+    double diameter;
+};
+</pre>
+
+<p>Our objective is to define a handle class, named <B>Shape</B>, that will manage objects of classes derived from <B>Shape_base</B>. Our initial outline for this class will look a lot like the design in our previous article:</p>
+
+<pre>
+class Shape {
+public:
+    Shape(Shape_base*);
+    ~Shape();
+
+    void make_unique();
+    void draw() const { p-&gt;draw(); }
+
+    // other functions as needed
+
+    Shape(const Shape&amp;);
+    Shape&amp; operator=(const Shape&amp;);
+
+private:
+    Shape_base* p;
+};
+</pre>
+
+<p>A handle object is attached to an object from the <B>Shape_base</B> hierarchy and provides access to the objects public operations. The <B>make_unique</B> function will generate a unique copy of the associated object from the <B>Shape_base</B> hierarchy; it is intended to be used by functions that need to change that object.</p>
+<p>What remains is to figure out how to add a use count &#151; non-intrusively &#151; and to implement our <B>make_unique</B> function and the associated copy-control members.</p>
+
+<H3><FONT COLOR="#000080">Abstract Reference Counter</FONT></H3>
+
+<p>The problem we&#146;re trying to solve is to avoid having to add a reference counter to our <B>Shape_base</B> class. We can&#146;t just add the counter to the handle, because then there would have to be one counter for each handle. Whenever we changed the number of handles referring to a particular object, we would have to change every counter, which would require us to know where all of the handles are. But if we knew that, we wouldn&#146;t need the counter in the first place!</p>
+<p>If all the handles attached to an object share a single counter, and the counter is not part of the object, then the counter must be somewhere else. The most direct way to solve this problem is to treat the reference counter analogously to the <B>Shape_base</B> object itself, by adding a second pointer to our handle:</p>
+
+<pre>
+class Shape {
+public:
+    // as above
+private:
+    unsigned* refcnt;
+    Shape_base* p;
+};
+</pre>
+
+<p>Then, we can arrange for <B>make_unique</B> and the copy-control functions to manage the counter directly. However, reference counting is a generally useful technique, so we prefer to define a new class to implement our reference counter.</p>
+<p>We&#146;ll call our new class <B>Use</B>; an object of this class will represent a pointer to a reference counter. From our previous article, we know what operations <B>Use</B> needs to support:</p>
+
+<UL><LI>   Each time we create a new <B>Use</B> object, it should represent a newly created counter with an associated count of one.</LI>
+<LI>   Copying a <B>Use</B> object will cause the copy to refer to the same counter as the original and will increment the shared counter appropriately.</LI>
+<LI>   Assigning one <B>Use</B> object to another will detach the target from its old counter and attach it to the source&#146;s counter, adjusting the counts in the process and deleting the old counter if it is no longer shared.</LI>
+<LI>   The destructor needs to decrement the value of the counter; if the counter goes to zero, the destructor must destroy the counter itself.</LI>
+<LI>   In order to support <B>make_unique</B>, we&#146;ll need the ability to fetch, but not modify, the value of a <B>Use</B>&#146;s associated counter.</LI></UL>
+
+<p>From this decription, we can directly write our <B>Use</B> class:</p>
+
+<pre>
+class Use {
+public:
+    Use(): refcnt(new unsigned(1)) { }
+    Use(const Use&amp; u): refcnt(u.refcnt) { ++*refcnt; }
+    ~Use() { if (&#151;*refcnt == 0) delete refcnt; }
+    Use&amp; operator=(const Use&amp;);
+
+    operator size_t() const { return *refcnt; }
+private:
+    unsigned* refcnt;
+};
+
+Use&amp; Use::operator=(const Use&amp; u)
+{
+    ++*u.refcnt;
+    if (&#151;*refcnt == 0)
+        delete refcnt;
+    refcnt = u.refcnt;
+    return *this;
+}
+</pre>
+
+<p>Not surprisingly, this code looks a lot like the code from our previous article that managed the reference count. In that implementation, the <B>refcnt</B> was stored inside the <B>Shape_base</B> object and managed by members of <B>Shape</B>. Here we&#146;ve abstracted the reference counting into its own class, but the operations are the same.</p>
+<p>The constructor allocates and initializes a new counter. The copy constructor arranges for the new object to share the same counter as the object being copied and increments the value of the counter. The assignment operator increments the use count of its right-hand operand and then decrements the one of its left hand. Doing the operations in this order protects against self-assignment. Once the left-hand counter is decremented, we check to see if the left-hand object was the last one pointing to the counter and, if so, delete the counter. Finally, we copy the value of the pointer from the right-hand into the left-hand operand and return. The destructor decrements its counter and, if this is the last object referring to the counter, deletes it.</p>
+<p>The only new operation is the conversion to <B>unsigned</B>. This operation lets us examine the value of the counter and will be used by functions, such as <B>make_unique</B>, that need to know whether a counter is shared. Note that the operation returns the value of the counter, not a reference to it, so that we can read but not write the value in the counter.</p>
+<p>To see how our class works, assume that <B>u1</B> and <B>u2</B> refer to the same <B>Use</B> objects, a state of affairs that we might achieve by executing:</p>
+
+<pre>
+Use u1;
+Use u2 = u1;
+</pre>
+
+<p>In that case, <B>u1</B> and <B>u2</B> will both point to the same <B>unsigned</B> object with a value of <B>2</B>:</p>
+
+<IMG SRC="fig1.gif">
+
+<p>If we destroy <B>u2</B>, then the <B>Use</B> destructor will decrement the reference count; because doing so does not bring the reference count to zero, it will not destroy the shared <B>refcnt</B>:</p>
+
+<IMG SRC="fig2.gif">
+
+<p>At this point, were we to destroy <B>u1</B>, the <B>Use</B> destructor would discover that the reference count is now zero and would delete <B>refcnt</B> accordingly.</p>
+
+<H3><FONT COLOR="#000080">Using the Reference-Counting Class</FONT></H3>
+
+<p>Now we can reimplement our <B>Shape</B> class to hold a <B>Use</B> object as well as a pointer to its associated <B>Shape_base</B>:</p>
+
+<pre>
+class Shape {
+public:
+    Shape(Shape_base*): p(0) { }
+    ~Shape() { if (u == 1) delete p; }
+
+    Shape&amp; operator=(const Shape&amp;);
+    void make_unique();
+    void draw() const { p-&gt;draw(); }
+    // other functions as needed
+
+private:
+    Use u;
+    Shape_base* p;
+};
+</pre>
+
+<p>Before we explain the code that&#146;s here, perhaps you should pause and think about what is not here. There is no explicit copy constructor, nor is there an explicit initializer for the <B>Use</B> member in the default <B>Shape</B> constructor. Why?</p>
+<p>The reason is that the defaults work. In the default constructor, we explicitly initialize <B>p</B> to point to the <B>Shape_base</B> object we&#146;re given. Implicitly, the compiler initializes the <B>Use</B> member by calling the <B>Use</B> default constructor. That constructor allocates a new <B>unsigned</B> object and initializes it to <B>1</B>. For example, we could create a new <B>Shape</B> and attach it to a newly created <B>Circle</B> object by executing:</p>
+
+<pre>
+Shape s = new Circle;
+</pre>
+
+<p>The resulting <B>Shape</B> object will point to <B>Circle</B>, and its <B>Use</B> member will point to a newly created counter initialized to <B>1</B>:</p>
+
+<IMG SRC="fig3.gif">
+
+<p>The compiler-generated <B>Shape</B> copy constructor operates by recursively copying each element of the <B>Shape</B> object being copied. In the case of the <B>Shape_base*</B> member <B>p</B>, this behavior means that we copy the pointer, so that after we copy a <B>Shape</B> object, both <B>Shape</B> objects point to the same underlying <B>Shape_base</B> &#151; precisely the behavior that we want. Copying the <B>Shape</B>&#146;s <B>Use</B> member implicitly calls the <B>Use</B> copy constructor. That constructor in turn arranges for the <B>refcnt</B> member of its object to point to the same counter as the <B>Use</B> member of the <B>Shape</B> we are copying. At the same time it increments the value of the counter to account for the newly created handle.</p>
+<p>In other words, if we make a copy of our previous <B>Shape</B>:</p>
+
+<pre>
+Shape s2(s);
+</pre>
+
+<p>then the newly created <B>Shape</B> will point to the same <B>Shape_base</B> object, and its <B>Use</B> member will point to the same counter. The value of the counter will have been incremented to <B>2</B>:</p>
+
+<IMG SRC="fig4.gif">
+
+<p>The only other member we need to explain is the destructor:</p>
+
+<pre>
+Shape::~Shape() { if (u == 1) delete p; }
+</pre>
+
+<p>The destructor (implicitly) converts its <B>Use</B> member to <B>unsigned</B> and tests whether this is the last object to refer to its associated counter. The conversion is handled by the <B>Use</B> class&#146; operator <B>unsigned</B>, which returns the value of the counter. If that value is <B>1</B>, then this is the last object using the counter, which means that this is the last object attached to our <B>Shape_base</B> object. In this case, the <B>Shape</B> destructor explicitly deletes the <B>Shape_base</B>. There is no need to explicitly delete the counter, because the <B>Use</B> destructor takes care of that. So, once the destructor completes, both the <B>Shape_base</B> and the counter associated with its <B>Use</B> member will be properly destroyed.</p>
+
+<H3><FONT COLOR="#000080">The Assignment Operator</FONT></H3>
+
+<p>Once we understand how the destructor and copy constructor work, assignment is straightforward. As always, we must ensure that we do the right thing in the case of self-assignment. If the two operands are different objects, then we must detach our handle from the left-hand object and reattach to the right-hand object, updating the reference counts appropriately:</p>
+
+<pre>
+Shape&amp; Shape::Shape operator=(const Shape&amp; s)
+{
+    if (this != &amp;s) {
+        if (u == 1)    // are we the last object?
+            delete p;
+        u = s.u;
+        p = s.p;
+    }
+    return *this;
+}
+</pre>
+
+<p>Here we explicitly test that we&#146;re not assigning to ourselves; if that test succeeds, we have to copy values from the right-hand object, first checking whether we need to do any cleanup. As in the destructor, we test the value of the counter to see whether we&#146;re the last object; if so, we delete our <B>Shape_base</B> object. The counter itself will be cleaned up when we assign <B>s.u</B> to <B>u</B>. Recall that the <B>Use</B> assignment operator checks the decremented value of its left-hand operand and deletes the associated counter if that value goes to zero. All that remains is to attach the left-hand <B>Shape_base</B> pointer to the object in the right-hand side, which we do by assigning <B>s.p</B> to <B>p</B>.</p>
+<p>Perceptive readers might wonder at our choice of an explicit test for self-assignment. In our first article in this series, we discussed exception-safety problems that are often present in assignment operators that use an explicit test. In that case, our assignment operator performed actions that might potentially throw:</p>
+
+<pre>
+// Unsafe implementation of assignment for our 
+// first handle class
+Shape&amp; Shape::Shape operator=(const Shape&amp; source)
+{
+    if (this != &amp;source) {
+        delete p;            // problem here
+        p = source-&gt;clone(); // if exception occurs here
+    }
+    return *this;
+}
+</pre>
+
+<p>We needed to call <B>clone</B> in order to create a new copy of the right-hand object. The fact that <B>clone</B> might throw meant that we had to design an assignment operator that would not change the state of the left-hand object before attempting the clone. The easiest way to solve the exception-safety problem also made self-assignment harmless:</p>
+
+<pre>
+// fix for assignment operator for our first handle class
+Shape&amp; Shape::Shape operator=(const Shape&amp; source)
+{
+    Shape_base *new_p = source-&gt;clone();// might throw
+
+    // No exceptions possible beyond this point
+    delete p;
+    p = new_p;
+    return *this;
+}
+</pre>
+
+<p>Here, we start by making a copy of the right-hand operand. Only after that copy succeeds do we delete the original and then attach our pointer <B>p</B> to the newly created copy. This code is safe in the face of self-assignment. At worst an unneeded allocation is made, but the code both correctly handles self-assignment and is exception safe.</p>
+<p>Now let&#146;s return to our current assignment operator. Looking at it, we see there is nothing in it that can throw an exception directly. As we&#146;ll see in the next section, nothing that the <B>Use</B> class does for us could throw either. Thus, in this particular case, the direct test for self-assignment presents no exception-safety issues and is the most direct way to handle the problem.</p>
+
+<H3><FONT COLOR="#000080">Exception Safety, Part 1</FONT></H3>
+
+<p>Before implementing the <B>make_unique</B> member, let&#146;s take a look at the exception safety of the rest of our implementation. Looking back at our <B>Use</B> class, we can see that the only operation that might throw is the allocation of a new reference-count object in the constructor:</p>
+
+<pre>
+Use::Use(): refcnt(new unsigned(1)) { }
+</pre>
+
+<p>As usual, to see whether an exception here might cause a problem, we want to see what, if any, program state has changed. In this case, there is no state aside from <B>refcnt</B>, and, if an exception occurs while creating the object, the compiler will clean up our <B>Use</B> object and propagate the exception to its caller. Thus, the <B>Use</B> class itself is exception safe, but users of <B>Use</B> must be aware that this constructor might throw and deal with any resulting exceptions appropriately.</p>
+<p>Now let&#146;s look at our use of class <B>Use</B> inside our <B>Shape</B> handle class. That handle class does nothing directly that could throw an exception, so its only exception issues occur in the context of creating a new <B>Use</B> member. That, in turn, happens only inside the <B>Shape</B> constructor:</p>
+
+<pre>
+Shape::Shape(Shape_base*): p(0) { }
+</pre>
+
+<p>where we know that the <B>Use</B> default constructor is implicitly used to construct the <B>u</B> member of the new <B>Shape</B> object. An exception here is still harmless, because no program state is changed while constructing a <B>Shape</B>. If the <B>Use</B> constructor throws, then our <B>Shape</B> object will not be created, and the exception will propagate out to our users.</p>
+
+<H3><FONT COLOR="#000080">Completing Our Handle</FONT></H3>
+
+<p>All that remains is to implement our <B>make_unique</B> function. It is here that exception safety will prove much more problematic.</p>
+<p>The purpose of <B>make_unique</B> is to ensure that only one <B>Shape</B> object is attached to the underlying <B>Shape_base</B> object. If necessary, <B>make_unique</B> must create a new, unique copy. The most direct way to code this function is:</p>
+
+<pre>
+// exception unsafe implementation
+void Shape::make_unique()
+{
+    // are there other objects that share this one?
+    if (u &gt; 1) {         
+            u = Use();  // if so, create a new copy
+            p = p-&gt;clone();
+        }
+    }
+</pre>
+
+<p>Unfortunately, the direct implementation fails to be exception safe.  As we know, both the <B>Use</B> constructor and the <B>clone</B> function could throw an exception.  As written, a throw from the <B>Use</B> constructor would be harmless: we haven&#146;t yet changed any state in our object, so an exception here would just cause <B>make_unique</B> to fail, leaving the object in a consistent state.</p>
+<p>What about an exception from <B>clone</B>?  In this case, we&#146;d have said that this object is the only user of its underlying <B>Shape_base</B>, because the assignment to <B>u</B> created a new counter for this object and set the counter to <B>1</B>.  But if <B>clone</B> throws, then the assignment to <B>p</B> is never done &#151; so <B>p</B> still points to the shared copy of the <B>Shape_base</B> object!</p>
+<p>To see what&#146;s happening, let&#146;s assume that both <B>s1</B> and <B>s2</B> were handles referring to the same <B>Shape_base</B> object, and that we had called <B>s2.make_unique</B>.  Given this implementation, if the <B>clone</B> function threw, then our objects would look like this:</p>
+
+<IMG SRC="fig5.gif">
+
+<p>Effectively, there is one more object sharing the <B>Shape_base</B> than our objects know about.  Both <B>s1</B> and <B>s2</B> still share the underlying <B>Shape_base</B> object, but each thinks it has the only copy.</p>
+<p>The problem here is that we have two operations that could potentially throw.  We know that we can ensure exception safety by arranging to do all operations that might throw before doing anything that changes the state of an object in the system.  This principle gives us a way to recode <B>make_unique</B> that is safe in the face of an exception either from the <B>Use</B> constructor or in <B>clone</B>:</p>
+
+<pre>
+void Shape::make_unique()
+{
+    Use new_u;      // might throw
+    p = p-&gt;clone(); // if it throws, no state change yet
+    u = new_u;      // now we can change the state safely
+}
+</pre>
+
+<p>In this version, we perform all actions that might throw before affecting the state of the object. We first create a new <B>Use</B> object, which might throw, and store the object temporarily in a local variable. Then we attempt to clone the <B>Shape_base</B> object. If <B>clone</B> throws, we haven&#146;t changed the current object yet, so no harm is done. If <B>clone</B> succeeds, then we set <B>p</B> to point to the newly created copy &#151; and only then do we set <B>u</B> to refer to the newly allocated counter.</p>
+
+<H3><FONT COLOR="#000080">Discussion</FONT></H3>
+
+<p>Our first article in this series discussed a handle class with the property that copying the handle always copies the corresponding object. Such classes are easy to write and to use, we would rather avoid needless copies if possible. To avoid such needless copies, we next looked at a simple reference-counting scheme that relied on adding a counter to the base class of the inheritance hierarchy. That implementation also added a <B>make_unique</B> function to our handle class. This function creates a new, unique copy of the object to which the handle is attached; the idea is to call it before executing any operation that might change that underlying object. Because <B>make_unique</B> copies an object, we had to take care to design this function to be safe in the face of an exception.</p>
+<p>In this article, we created a new class <B>Use</B> to manage the reference count and stored a <B>Use</B> object directly in our handle class. This design lets us avoid intruding the reference count into our inheritance hierarchy directly. However, the new version of <B>make_unique</B> has two places that might potentially throw exceptions.</p>
+<p>In this context, two is a magic number. It is fairly straightforward to make part of a program exception safe if it acquires a single resource in a way that might throw an exception: all you need to do is be sure that you don&#146;t make any state changes before you might throw the exception. We used this strategy in our previous two articles. However, acquiring a resource is usually a state change, which means that a program that intends to acquire two (or more) resources has to figure out what to do with the first resource if the attempt to acquire the second resource fails.</p>
+<p>We solved the problem in this case by arranging for <B>make_unique</B> to make an extra local copy of the <B>Use</B> object. That way, if an exception came along in <B>p-&gt;clone</B>, the local variable would be automatically destroyed, and the related state changes undone. The code is thus a bit more obscure than we&#146;d like and has the disadvantage that it is now possible for exceptions to come from our handles, rather than coming exclusively from the shape classes. In our next article, we&#146;ll show a more unusual approach to reference counting that will solve this problem.</p>
+
+<p><i><B>Andrew Koenig</B> is a member of the Research Department at AT&amp;T&#146;s Shannon Laboratory, and the Project Editor of the C++ standards committee. A programmer for more than 30 years, 15 of them in C++, he has published more than 150 articles about C++ and speaks on the topic worldwide. He is the author of </I>C Traps and Pitfalls<I> and co-author of </I>Ruminations on C++ <I>and </I>Accelerated C++<I>.</i></p>
+<p><i><B>Barbara E. Moo</B> is an independent consultant with 20 years&#146; experience in the software field. During her nearly 15 years at AT&amp;T, she worked on one of the first commercial projects ever written in C++, managed the company&#146;s first C++ compiler project, and directed the development of AT&amp;T&#146;s award-winning WorldNet Internet service business. She is co-author of </I>Ruminations on C++<I> and </I>Accelerated C++<I> and lectures worldwide.
+
+</blockquote></body></html>

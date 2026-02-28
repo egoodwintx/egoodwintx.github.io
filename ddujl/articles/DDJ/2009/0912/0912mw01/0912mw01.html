@@ -1,0 +1,1106 @@
+<title>recls 100% .NET</title>
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/Layout.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/FontStyles.css" type="text/css">
+<link rel="Stylesheet" rev="Stylesheet" href="../../../../forms/newarticle.css" type="text/css">
+<script src="../../../../forms/popwindow.js"></script>
+</head>
+
+<body BGCOLOR="#ffffff" LINK="#0000ff" VLINK="#330066" ALINK="#ff0000" TEXT="#000000">
+<!--Copyright &#169; Dr. Dobb's Journal-->
+<p><i>Dr. Dobb's Digest</i> December 2009</p>
+
+<h1> recls 100% .NET </h1>
+
+<h2> Implementing a 100% C# implementation of recls for .NET</h2>
+<P>
+<h3>By Matthew Wilson</h3>
+
+<P>
+
+<i>Matthew Wilson is a software development consultant and trainer for Synesis Software who helps clients to build high-performance software that does not break, specializing in C++ and C#/.NET. He is the author of the books Imperfect C++ and Extended STL, a columnist for ACCU, and a resident guru at Dr. Dobb's CodeTalk, focusing on Windows technologies. He can be contacted at matthew@synesis.com.au.</i>
+<P>
+<hr>
+<P>
+
+Several years ago I wrote the column <a href="http://www.ddj.com/cpp/184401727?pgno=3">Positive Integration</a> for <i>C/C++ Users Journal</i> and <i>later Dr. Dobb's Journal</i>, which discussed issues involved in adapting C/C++ libraries to other languages. The main exemplar project used was <a href="http://recls.org/">recls</a> ("recursive ls") &#91;1&#93;, a platform-independent recursive filesystem search library written in C and C++, and with a C API. Adaptation to numerous languages (including Ch, C#/.NET (via <b>P/Invoke</b>), D, Java, Python, and Ruby) was examined, covering the development of the library from versions 1.0 through 1.6. Since that time, the library has continued to evolve, and now stands at 1.8. A new C/C++ version, 1.9, will be released in the coming weeks.
+<P>
+
+<P>
+I have long planned to rework the library implementation. The two main changes will be a substantial refactoring of the source files and packaging for the core library and the C++ layer, and a rewrite of some/all of the language mappings in the form of full "100%" implementations. This article describes the first of these, a 100% C# implementation of recls for .NET. For clarity I'll refer to the original stream of work as recls 1.x and the new .NET library as recls 100% .NET in this article.
+<P>
+
+<P>
+The reasons for these changes are:
+<P>
+<ul>
+<li>The core library has grown to a level of complexity such that I no longer find it easy to make changes
+<li>I wanted to introduce diagnostic logging to the core library; this is included in recls 1.9
+<li>I wanted to ease the burden of deployment. For example, with the .NET mapping in versions up to 1.8, the recls.dll exporting the core C API (for access via <b>P/Invoke</b>) must be manually packaged along with the C# API in recls.NET.dll. Automated tools (such as Visual Studio) do not automatically copy it to working areas. And organisational security policies may prohibit use of assemblies that call into "unmanaged" code.
+<li>I wanted to take advantage of new features of languages over the last five years. As we'll see shortly, aspects of C# 3 make for improved syntax in client code for non-trivial search use cases
+<li>I wanted to implement two long asked-for features: breadth-first search, and search-depth limiting. recls 1.x provides only depth-first search, and always does a full-depth search.
+</ul>
+<P>
+
+<P>
+Despite being written entirely in C#, the implementation of recls 100% .NET is larger than can be fully covered here. So I intend to focus on the interesting design points, language features, and the differences in functionality between recls 1.x and recls 100% .NET.
+<P>
+<h3>API Differences</h3>
+<P>
+
+<P>
+The first difference is a cosmetic one. To placate <a href="http://en.wikipedia.org/wiki/FxCop">FxCop</a> &#91;2&#93;, and also to clearly distinguish the new recls .NET API from the old for anyone who wishes to port their code to it, I changed the old recls namespace to Recls.
+<P>
+
+<P>
+Similarly, the RECLS_FLAG enumeration is now <b>SearchOptions</b> (see Listing 1), and its enumerators are Files not FILES, Directories not DIRECTORIES, and so on. There are also fewer enumerators. Notably absent from the original &#91;3&#93; are RECURSIVE, LINKS, DEVICES, NO_FOLLOW_LINKS, DIRECTORY_PARTS, DETAILS_LATER, PASSIVE_FTP, and ALLOW_REPARSE_DIRS. The changes reflect the intended increase in portability and improvements to discoverability and transparency &#91;4, 5&#93; of the new API, based on user feedback.
+<P>
+<pre  class="code">
+<P>
+ &#91;Flags&#93;
+public enum SearchOptions
+{
+  None                         = 0x00000000,
+  Files                        = 0x00000001,
+  Directories                  = 0x00000002,
+  IgnoreInaccessibleNodes      = 0x00100000,
+  MarkDirectories              = 0x00200000,
+  IncludeHidden                = 0x00000100,
+  IncludeSystem                = 0x00000200,
+  DoNotTranslatePathSeparators = 0x00002000,
+}
+
+</pre>
+<div class="caption">
+<b>Listing 1: The SearchOptions enumeration</b>
+</div>
+<P>
+
+<P>
+The <b>FileEntry</b> class is gone, replaced by the <b>IEntry</b> interface (see Listing 2). The <b>FtpSearch</b> class goes entirely, as the first version of recls 100% .NET does not support FTP search. The <b>DirectoryParts</b> class is no longer externally visible; the <b>DirectoryParts</b> getter-property now returns (an instance implementing) the interface <b>IDirectoryParts</b>; see Listing 3. The <b>FileSearch</b> class goes, and search is now provided by the (static) <b>FileSearcher</b> class.
+<P>
+<pre  class="code">
+<P>
+// in namespace Recls
+public interface IEntry
+{
+  string Path { get; }
+  string SearchRelativePath { get; }
+  string Drive { get; }
+  string DirectoryPath { get; }
+  string Directory { get; }
+  string SearchDirectory { get; }
+  string UncDrive { get; }
+  string File { get; }
+  string FileName { get; }
+  string FileExtension { get; }
+  DateTime CreationTime { get; }
+  DateTime ModificationTime { get; }
+  DateTime LastAccessTime { get; }
+  DateTime LastStatusChangeTime { get; }
+  long Size { get; }
+  FileAttributes Attributes { get; }
+  bool IsReadOnly { get; }
+  bool IsDirectory { get; }
+  bool IsUnc { get; }
+  IDirectoryParts DirectoryParts { get; }
+}
+
+</pre>
+<div class="caption">
+<b>Listing 2: The IEntry interface</b>
+</div>
+<P>
+
+<P>
+
+<P>
+<pre  class="code">
+<P>
+public interface IDirectoryParts
+  : IEnumerable&lt;string&gt;
+{
+  int Count { get; }
+  string this&#91;int index&#93; { get; }
+  bool Contains(string item);
+  void CopyTo(string&#91;&#93; array, int index);
+}
+
+</pre>
+<div class="caption">
+<b>Listing 3: The IDirectoryParts interface </b>
+</div>
+<P>
+<h3>IEntry vs. FileEntry</h3>
+<P>
+
+<P>
+Table 1 compares the public interfaces of the old <b>FileEntry</b> class and recls 100% .NET's <b>IEntry</b> interface. The differences, highlighted in bold, involve changes to both syntax and semantics, and result from lessons learned by users of recls 1.x.
+<P>
+<div>
+<img src="0912mw01t1.gif"> 
+<div class="caption">
+<b>Table 1: Mappings Between Old and New Entry class/interface Methods and Properties</b>
+</div>
+</div>
+<P>
+
+<P>
+<b>Drive</b> changed from a character to a string so that there'd be less hassle when manipulating UNC-based paths: Now users can deal with a single property, rather than a drive letter character in one, and a (UNC) drive string in another. The spellings of <b>UNCDrive</b> and <b>IsUNC</b> changed to follow .NET idiom. The <b>Size</b> property changed from <b>ulong</b> to <b>long</b> to be CLS compatible (for example, to be able to be used from VB.NET and other .NET languages that don't support unsigned integral types). <b>IsLink</b> and <b>ShortFile</b> had to go by the wayside because of the need to be implemented 100% in terms of the CLR facilities (and not go to <b>P/Invoke</b>). The <b>Attributes</b> property was added to allow recls to stay relevant in light of evolution in the CLR of the file attributes that may be made available to managed programmers.
+<P>
+
+<P>
+There are also some semantic changes. The form of the file extension has changed, and now includes the dot, so "abc.net" will have an extension of ".net", rather than "net" as was the case with recls 1.x. Since this is a breaking change, I've removed the previous name, <b>FileExt</b>, and given it a new name <b>FileExtension</b>. (This also fits better with the .NET way of doing things, which is to avoid unnecessary contractions in names.)
+<P>
+
+<P>
+It's useful to be able to paste the extension to another file name without having to pollute client code with logic to determine whether or not to insert the dot. Now, all of the following combinations will reproduce the full path (and, to be useful, may be used in combination with other strings to build correctly-formed new paths):
+<P>
+<ul>
+<li>DirectoryPath + File
+<li>DirectoryPath + FileName + FileExtension
+<li>Drive + Directory + File
+<li>Drive + Directory + FileName + FileExtension
+</ul>
+
+      
+    
+
+    <h3>Specifying Search Criteria</h3>
+<P>
+
+<P>
+The change from instance to class methods has probably the greatest impact on usage, so let's look at a pair of examples illustrating the old and the new. To search for all the font files in the Windows directory and its subdirectories with the old recls 1.x .NET mapping we'd write:
+<P>
+<pre  class="code">
+<P>
+using recls;
+foreach(FileEntry entry in new FileSearch(@"C:\Windows", "*.fon|*.ttf", RECLS_FLAG.RECURSIVE))
+{
+  Console.WriteLine(entry);
+}
+
+</pre>
+<P>
+
+<P>
+With recls 100% .NET, you would write:
+<P>
+<pre  class="code">
+<P>
+using Recls;
+foreach(IEntry in FileSearcher.Search(@"C:\Windows", "*.fon|*.ttf"))
+{
+  Console.WriteLine(entry);
+}
+
+</pre>
+<P>
+
+<P>
+With such a simple example the differences are not huge, which is a good thing. Nonetheless, two of the most significant changes are illustrated:
+<P>
+<ul>
+<li>Recursive search is now the default, so the RECLS_FLAG.RECURSIVE flag is not needed (or available)
+<li>Search sequences are now obtained via static methods on a static class
+</ul>
+<P>
+
+<P>
+A search is conducted from a specified directory, in which all entries (files or directories) that match the given pattern(s) and correspond to the given search options, up to a given depth, are retrieved. A directory may be absolute or relative, but must exist. If null (or the empty string) is specified, the current directory is assumed. A pattern may be a file (or directory) name, or may use wildcards, as in "*.ttf". Furthermore, the library supports multi-part patterns, allowing discovery of entries matching different wildcards within the same string, as in "*.fon|*.ttf". A null argument for the patterns parameter is interpreted to mean the "everything" pattern for the given platform (i.e. "*" on UNIX, and "*.*" on Windows).
+<P>
+
+<P>
+The search options can select <b>Files</b>, <b>Directories</b>, or both; absence of both is interpreted as <b>Files</b>). Other options allow for tailoring the search policy, as follows: 
+<P>
+<ul>
+<li>Searching of Hidden and/or System files, both of which are not normally listed
+<li>Ignoring access-denied conditions, which would otherwise cause the search to be terminated, by specifying <b>IgnoreInaccessibleNodes</b>; this option is ignored if an exception handler is specified. This is often necessary when specifying Hidden and/or System.
+<li>Marking of the <b>Path</b>, <b>SearchRelativePath</b> and <b>File</b> properties of entries that are directories (via <b>MarkDirectories</b>) with a trailing slash
+<li>Preventing the automatic translation of per-platform pattern separators -- ':' for UNIX; ':' for Windows --  into the platform-independent pattern separator '|' (via <b>DoNotTranslatePathSeparators</b>)
+</ul>
+<P>
+
+<P>
+Exceptions that interrupt the processing may be filtered by specifying an exception handler (see Listing 4).
+<P>
+<pre  class="code">
+<P>
+enum ExceptionHandlerResult
+{
+  PropagateException = 0,
+  ConsumeExceptionAndContinue
+}
+interface IExceptionHandler
+{
+  ExceptionHandlerResult OnException(string path, Exception x);
+}
+
+</pre>
+<div class="caption">
+<b> Listing 4: Exception Handler Interface</b>
+</div>
+<P>
+
+<P>
+Returning <b>PropagateException</b> causes the exception to be rethrown, causing the search to be cancelled and the caller to receive the exception. Returning <b>ConsumeExceptionAndContinue</b> consumes the exception (perhaps after logging the condition) and continues the search, skipping the offending directory. Naturally, the purpose of this callback is not to allow users to attempt to suppress unrecoverable conditions, and the library does not invoke the callback in some such cases. Unfortunately, because the .NET exception hierarchy is such an abject mess, discriminating between logical errors, practically unrecoverable conditions, and recoverable runtime conditions is not a simple task, and it is likely that the set of exceptions made suppressible in this regard will change in future implementations. Users are expected to consume only specific expected exceptions; for instance, <b>System.IO.DirectoryNotFoundException</b>, rather than doing anything as unwise as consuming <b>System.Exception</b>. 
+<P>
+
+<P>
+Finally, processing a large directory tree with highly-specific pattern(s) can lead to a user experience with discernible pauses, due to filesystem latencies. Consequently, a progress callback mechanism is also provided, in the form of the <b>IProgressHandler</b> interface (see Listing 5), which allows callers to be notified as each new (sub-)directory is searched, perhaps to log the directory traversal changes to console, status bar, etc. It also affords the opportunity to apply search policy on a location basis, via return of a control code from the <b>ExceptionHandlerResult</b> enumeration: <b>CancelDirectory</b> causes the given directory and all its sub-directories to be excluded from the search; <b>CancelSearch</b> causes exclusion of all remaining directories, even those at a higher level in the tree.
+<P>
+<pre  class="code">
+<P>
+enum ProgressHandlerResult
+{
+  Continue = 0,
+  CancelDirectory,
+  CancelSearch
+}
+interface IProgressHandler
+{
+  ProgressHandlerResult OnProgress(string directory, int depth);
+}
+
+</pre>
+<div class="caption">
+<b>Listing 5: Progress Handler Interface</b>
+</div>
+<P>
+
+<P>
+Given this richness in search specification -- directory, patterns, depth, options, exception-handler, progress-handler -- there is clearly a conflict between flexibility and discoverability &#91;4, 5&#93; in the possible overloads for the file search functions. Ignoring parameter ordering and ambiguities caused by some parameters (directory and patterns) sharing the same type, there are 64 possible combinations of the six parameters. If we add in parameter ordering, it becomes 121. To get  a handle on the problem consider the case for just three parameters, directory (dir), patterns (ptns) and depth, with and without parameter ordering considerations. (In both lists, type ambiguities are marked with a &lt;-X-&gt;.)
+<P>
+
+<P>
+Without considering parameter ordering, we have eight combinations, of which six are viable:
+<P>
+<pre  class="code">
+<P>
+()
+(dir)
+(ptns) &lt;-X-&gt; (dir)
+(depth)
+(dir, ptns)
+(dir, depth)
+(ptns, depth) &lt;-X-&gt; (dir, depth)
+(dir, ptns, depth)
+
+</pre>
+<P>
+
+<P>
+If we add in parameter ordering, we get 16, of which nine are viable:
+<P>
+<pre  class="code">
+<P>
+()
+(dir)
+(ptns) &lt;-X-&gt(dir)
+(depth)
+(dir, ptns)
+(ptns, dir) &lt;-X-&gt(dir, ptns)
+(dir, depth)
+(ptns, depth) &lt;-X-&gt(dir, depth)
+(depth, dir)
+(depth, ptns) &lt;-X-&gt(depth, dir)
+(dir, ptns, depth)
+(ptns, dir, depth) &lt;-X-&gt(dir, ptns, depth)
+(dir, depth, ptns)
+(ptns, depth, dir) &lt;-X-&gt(dir, depth, ptns)
+(depth, dir, ptns)
+(depth, ptns, dir) &lt;-X-&gt(depth, dir, ptns)
+
+</pre>
+<P>
+
+<P>
+You can imagine the complexity when permuting all six parameters! Clearly we need to make some judicious cuts. Since none of the parameters obviate the need for any of the others, the obvious must-have overload is one in which all six are present. The order is somewhat moot, but I'd suggest it should be either of the following:
+<P>
+<pre  class="code">
+<P>
+(dir, ptns, options, depth, progressHandler, exceptionHandler)
+(dir, ptns, options, progressHandler, exceptionHandler, depth)
+
+</pre>
+<P>
+
+<P>
+Let's leave that decision for the moment while we consider the other options.
+<P>
+
+<P>
+Another obvious decision is that we can throw out all permutations that don't have both directory and patterns parameters (and in that order). The utility of being able to specify only directory (to search for all files) or only patterns (to search in the current directory), rather simply specifying null in the stead of the omitted argument is vanishingly small. Not to mention the detraction from discoverability. So we can treat them as a mandatory unit. Furthermore, I think we can also stipulate that they'll always come first in the parameter list.
+<P>
+
+<P>
+A further simplification that I felt was justified was that, as "advanced" options, we could treat the two handler arguments as a pair. The cost is a slight extra effort in specifying null for whichever is not needed, at the gain of reducing the overload set. 
+<P>
+
+<P>
+Given that it can make sense to specify depth independently of options, and them both independently of progress+exception, we can now cut the list down to eight (which ignores parameter ordering for the moment):
+<P>
+<pre  class="code">
+<P>
+(dir, ptns)
+(dir, ptns, options)
+(dir, ptns, depth)
+(dir, ptns, progressHandler, exceptionHandler)
+(dir, ptns, options, depth)
+(dir, ptns, options, progressHandler, exceptionHandler)
+(dir, ptns, depth, progressHandler, exceptionHandler)
+(dir, ptns, options, depth, progressHandler, exceptionHandler)
+
+</pre>
+<P>
+
+<P>
+Another concern is that, so far, we've discussed the handlers in terms of the interfaces <b>IExceptionHandler</b> and <b>IProgressHandler</b>. But C# allows a different callback construct, the delegate, which is particularly useful with the advent of C# 2 and (even more so) with C# 3. recls 100% .NET defines two delegates, for handling exceptions and progress (see Listing 6).
+<P>
+<pre  class="code">
+<P>
+public delegate ExceptionHandlerResult OnException(string path, Exception x);
+public delegate ProgressHandlerResult OnProgress(string directory, int depth);
+
+</pre>
+<div class="caption">
+<b> Listing 6: Handler Delegates</b>
+</div>
+<P>
+
+<P>
+So, even if we thought eight was a survivable number of overloads (which is in doubt), providing for the delegate forms (which are highly convenient, as we'll see later on) would push this out to a minimum of 12. Unequivocally, this is too much choice, one of the enemies of discoverability.
+<P>
+
+<P>
+Consequently, some hard decisions had to be made, and I made the necessary (and somewhat arbitrary) decisions to give the following overload set (where <b>{D}</b> designates a delegate form, as opposed to an interface form):
+<P>
+<pre  class="code">
+<P>
+(dir, ptns)
+(dir, ptns, options)
+(dir, ptns, depth)
+(dir, ptns, options, depth)
+(dir, ptns, options, depth, progressHandler, exceptionHandler)
+(dir, ptns, options, depth, progressHandler{D}, exceptionHandler{D})
+
+</pre>
+<P>
+
+<P>
+Although six may still feel like a lot, the fact that C# discriminates between int and enumeration types makes it pretty easy to live with it without ambiguity. We couldn't do the same in C++.
+<P>
+
+<P>
+There's one final refinement to the overloading. Even though a search involving progress and/or exception handler may not usually require depth, I chose to keep the parameter ordering consistent (i.e. depth follows options) as this is an established principle of interface design &#91;4, 6, 7&#93;. It also fits in better with Visual Studio's Intellisense: when scrolling through the list of options the additional parameters appear naturally at the end of the list, rather than jumping around confusingly. Because of these reasons, I decided to remove the third overload -- (directory, patterns, depth) -- giving a final five. You may demur, but I think these five overloads represent an appropriate balance between flexibility and discoverability.
+<P>
+
+<P>
+The class interface for <b>FileSearcher</b> is shown in Listing 7. 
+<P>
+<pre  class="code">
+<P>
+public static class FileSearcher
+{
+// Properties
+  public static int UnrestricedDepth { get; }
+  public static string WildcardsAll { get; }
+<P>
+// Search Operations
+  public static IEnumerable&lt;IEntry&gt; Search(
+    string directory
+  , string patterns
+  );
+  public static IEnumerable&lt;IEntry&gt; Search(
+    string directory
+  , string patterns
+  , SearchOptions options
+  );
+  public static IEnumerable&lt;IEntry&gt; Search(
+    string directory
+  , string patterns
+  , SearchOptions options
+  , int depth
+  );
+  public static IEnumerable&lt;IEntry&gt; Search(
+    string directory
+  , string patterns
+  , SearchOptions options
+  , int depth
+  , IProgressHandler progressHandler
+  , IExceptionHandler exceptionHandler
+  );
+  public static IEnumerable&lt;IEntry&gt; Search(
+    string directory
+  , string patterns
+  , SearchOptions options
+  , int depth
+  , OnProgress progressHandler
+  , OnException exceptionHandler
+  );
+  public static class BreadthFirst
+  {
+    . . . // Search() x 5 same overloads
+  }
+  public static class DepthFirst
+  {
+    . . . // Search() x 5 same overloads
+  }
+// Utility Operations
+  public static IEntry Stat(string path);
+  public static long CalculateDirectorySize(string directory);
+  public static long CalculateDirectorySize(string directory, int depth);
+}
+
+</pre>
+<div class="caption">
+<b>Listing 7: FileSearcher class interface</b>
+</div>
+<P>
+
+<P>
+The first thing to note is that there are 15 search functions, in three groups of five, representing depth-first, breadth-first, and mechanism-agnostic search; each returns an enumerable type implementing the <b>IEnumerable&lt;IEntry&gt;</b> interface. It would certainly have been possible to include <b>BreadthFirst</b> and <b>DepthFirst</b> flags in the <b>SearchOptions</b> enumeration, but it's unlikely that a choice between depth-first and breadth-first search is one you will need to make at runtime, and expressing design-time choices at runtime is best avoided because it detracts from discoverability.
+<P>
+
+<P>
+Rather than define 15 methods (5 x <b>Search()</b>, 5 x <b>BreadthFirstSearch()</b>, 5 x <b>DepthFirstSearch()</b>) in the same class, they are segregated them into three groups of 5, with the algorithm-specific overloads associated with the nested (static) classes <b>BreadthFirst</b> and <b>DepthFirst</b>. Obviously this transgresses the accepted wisdom that class names be nouns, but in this case it's acceptable because it engenders transparency of client code in the form of human-readable statements, as in:
+<P>
+<pre  class="code">
+<P>
+foreach(IEntry in FileSearcher.BreadthFirst.Search(@"C:\Windows", "*.fon|*.ttf"))
+{
+  Console.WriteLine(entry);
+}
+
+</pre>
+<P>
+
+<P>
+This is a technique that will be familiar to many .NET programmers. The provision of (static) <b>Write()/WriteLine()</b> methods of the <b>Console</b> class offers a syntactic convenience over calling them via its <b>Out</b> (static) property. Similarly, the notionally algorithm-agnostic <b>FileSearcher.Search()</b> methods simply call corresponding <b>FileSearcher.DepthFirst.Search()</b> methods. (This is consistent with recls 1.x, where depth-first was the only algorithm.)
+<P>
+
+<P>
+We've now discussed the nuances of all parameters, with the exception of depth. There are two special values for depth: <b>FileSearcher.UnrestrictedDepth</b> and 0. The former places no restrictions on depth. The latter causes the search to be non-recursive, i.e. it searches only in the specified directory.
+
+      
+    
+
+    <h3>Special Search Functions</h3>
+<P>
+
+<P>
+As UNIX programmers will know, the <b>stat()</b> system call provides status information about a given path, in the form of the struct stat type. The recls core C API provides the function <b>Recls_Stat()</b>, which provides status information about a given path, in the form of the <b>recls_info_t type</b> (a multi-attribute type analogous to <b>IEntry</b>j). Several recls mappings provide a <b>stat()</b>/<b>Stat()</b> method that returns a file entry object, or null/nil if no such entry exists. I have found this a handy tool over the years, particularly when working in Python and Ruby, and I wanted to continue to offer it for .NET users, as <b>FileSearcher.Stat()</b>. This method either returns null if the file does not exist, or an instance implementing <b>IEntry</b> representing the filesystem entry if it can be accessed, or throws an exception if it cannot. (In other words, <b>System.IO.FileNotFoundException</b> and <b>System.IO.DirectoryNotFoundException</b> are caught, and null returned.)
+<P>
+
+<P>
+The other function set, <b>FileSearcher.CalculateDirectorySize()</b>, does exactly what it says on the tin: it calculates the size of a directory, as the sum of the sizes of all files in that directory or in any of its sub-directories (up to a given depth). Since this is an expensive operation, I chose not to have directory size automatically calculated during a b>Search()</b>-based enumeration. But it's a useful thing to have available, as in the following example, which displays the sizes of all immediate subdirectories of the current directory:
+<P>
+<pre  class="code">
+<P>
+foreach(IEntry entry in FileSearcher.Search(
+  null, null, SearchOptions.Directories,
+  0 // Don't recurse
+))
+{
+  Console.WriteLine("{0} : {1}", entry.Path
+        , FileSearcher.CalculateDirectorySize(entry.Path));
+}
+
+</pre>
+<div class="caption">
+<b>Listing 8: Example using CalculateDirectorySize()</b>
+</div>
+<P>
+<h3>Path Utility Functions</h3>
+<P>
+
+<P>
+As well as the <b>FileSearcher</b> methods, recls 100% .NET provides a number of additional utility functions via the static class <b>PathUtil</b> (see Listing 9).
+<P>
+<pre  class="code">
+<P>
+public static class PathUtil
+{
+  public static string DeriveRelativePath(string origin, string target);
+  public static string CanonicalizePath(string path);
+  public static string GetAbsolutePath(string path);
+  public static string GetDirectoryPath(string path);
+  public static string GetFile(string path);
+  public static string GetDrive(string path);
+}
+
+</pre>
+<div class="caption">
+<b>Listing 9: PathUtil class interface</b>
+</div>
+<P>
+
+<P>
+Each of these represents some functionality essential to the proper workings of Recls's searching that is not available in, or corrects defective alternatives in, the CLR's path manipulation facilities:
+<P>
+<ul>
+<li><b>DeriveRelativePath()</b>, <b>CanonicalizePath()</b>, and <b>GetDrive()</b> do not have CLR equivalents
+<li><b>GetAbsolutePath()</b> corrects drive-only UNC paths, i.e. "\\server\share" to append a slash, in the same way that <b>System.IO.Path.GetFullPath()</b> does for drive-only volume paths, such as "C:"
+<li>PathUtil.GetDirectoryPath()</b> yields the directory path -- a recls notion of encapsulating drive (for operating systems that have the concept of a drive) + directory -- and corrects the (in my opinion) defective behaviour of <b>System.IO.Path.GetDirectoryName()</b>, which  returns the empty string when given a root path such as "C:\" or "\\server\share\"
+<li><b>PathUtil.GetFile() </b>yields the file component - file name + extension - of a path and works correctly with UNC paths such as "\\server\share" (for which <b>System.IO.Path.GetFileName()</b> returns "share"!)
+</ul>
+<P>
+<h3>Extension Methods</h3>
+<P>
+
+<P>
+With C# 3 comes the ability to enhance the (apparent) operations available on existing types by the use of Extension Methods &#91;8, 9&#93;. I've taken advantage of this for recls 100% .NET by adding the <b>ForEach</b>, <b>Select</b>, and <b>Where</b> methods, as shown in Listing 10. We'll see an example of how these are used (with LINQ &#91;8, 9&#93;) shortly.
+<P>
+<pre  class="code">
+<P>
+public static class SearchExtensions
+{
+  public static void ForEach(
+    this IEnumerable&lt;IEntry&gt; sequence
+  , Action&lt;IEntry&gt; action
+  )
+  {
+    foreach(IEntry entry in sequence)
+    {
+      action(entry);
+    }
+  }
+  public static IEnumerable&lt;TTarget&gt; Select&lt;TTarget&gt;(
+    this IEnumerable&lt;IEntry&gt; sequence
+  , Func&lt;IEntry, TTarget&gt;    function
+  )
+  {
+    foreach(IEntry entry in sequence)
+    {
+      yield return function(entry);
+    }
+  }
+  public static IEnumerable&lt;IEntry&gt; Where(
+    this IEnumerable&lt;IEntry&gt; sequence
+  , Func&lt;IEntry, bool&gt;       predicate
+  )
+  {
+    foreach(IEntry entry in sequence)
+    {
+      if(predicate(entry))
+      {
+        yield return entry;
+      }
+    }
+  }
+}
+
+</pre>
+<div class="caption">
+<b>Listing 10: Search Extensions</b>
+</div>
+<P>
+
+<P>
+In C++ terms, this is akin to a partial template specialization, because the extension methods are defined only for <b>IEnumerable&lt;IEntry&gt;</b>. 
+<P>
+<h3>Predicates or Functions?</h3>
+<P>
+
+<P>
+There was one interesting twist here, with implementing <b>Where</b>. Since it requires a predicate --  a decision function that returns a Boolean value -- I defined it in terms of <b>System.Predicate</b>, which is a delegate defined as follows:
+<P>
+<pre  class="code">
+<P>
+namespace System
+{
+  public delegate bool Predicate&lt;T&gt;(T arg);
+}
+
+</pre>
+<P>
+
+<P>
+That works fine with <b>IEnumerable&lt;IEntry&gt;</b>, as in Listing 11.
+<P>
+<pre  class="code">
+<P>
+namespace WhereDemo
+{
+  using Recls;
+  using System;
+  class WhereDemo
+  {
+    public static void WhereDemo()
+    {
+      // with lambda expression
+      foreach(IEntry entry in FileSearcher.Search(null, null)
+        .Where((e) =&gt; e.IsReadOnly))
+      {
+        Console.WriteLine(entry);
+      }
+      // with anonymous delegate
+      foreach(IEntry entry in FileSearcher.Search(null, null)
+        .Where(delegate(IEntry e) { return e.IsReadOnly; }))
+      {
+        Console.WriteLine(entry);
+      }
+    }
+  }
+}
+
+</pre>
+<div class="caption">
+<b>Listing 11: Use of Extension Methods with Predicate(s)</b>
+</div>
+<P>
+
+<P>
+However, if we add in a "using System.Linq;" statement to the <b>WhereDemo</b> namespace, we get a compile error (with some namespace qualifications removed for clarity):
+<P>
+<pre  class="code">
+<P>
+error CS0121: The call is ambiguous between the following methods or properties: 'System.Linq.Enumerable.Where&lt;Recls.IEntry&gt;(IEnumerable&lt;IEntry&gt;, System.Func&lt;IEntry,bool&gt;)' and 'Recls.SearchExtensions.Where(IEnumerable&lt;IEntry&gt;, System.Predicate&lt;IEntry&gt;)'
+
+</pre>
+<P>
+
+<P>
+What appears to be happening here is that the compiler resolves the lambda expression <b>(e) =&gt; e.IsReadOnly)</b> (or the equivalent anonymous delegate expression, also shown) to <b>System.Func&lt;IEntry, bool&gt;</b>, rather than <b>System.Predicate&lt;IEntry&gt;</b>.
+<P>
+<pre  class="code">
+<P>
+namespace System
+{
+  public delegate TResult Func&lt;T, TResult&gt;(T arg);
+}
+
+</pre>
+<P>
+
+<P>
+Consequently, the two possible Where (extension) functions each have one precisely matching argument and one possibly matching argument, hence the ambiguity. This is why I had to implement the recls Where extension in terms of <b>System.Func&lt;IEntry, bool&gt;</b>, giving two precisely matching arguments, and removing the ambiguity. Obviously, if the C# team ever decide to change the compiler to interpret one-parameter Boolean-returning anonymous delegates / lambda expressions as <b>System.Predicate&lt;&gt;</b>, any such "partial specialisations" will be broken, so I'm guessing that'll never happen, and we just need to get used to using <b>System.Func&lt;T, bool&gt;</b>, even though a predicate makes more sense.
+
+
+    <h3>Test Drive</h3>
+<P>
+
+<P>
+That's probably enough talk about the design. Let's now take a look at the library in action. We've already seen the Windows Font file search, so now let's look at some of the other simple examples that are included with the recls 100% .NET distribution. (For brevity, I'm going to elide the command-line argument handling and other non-relevant aspects here. Check the distribution for the full program listings.)
+<P>
+
+<P>
+<b>FindEmptySubdirectories</b>
+<P>
+
+<P>
+This example (Listing 12) finds all the empty, accessible subdirectories of the current directory.
+<P>
+<pre  class="code">
+<P>
+SearchOptions all = SearchOptions.IncludeHidden
+                  | SearchOptions.IncludeSystem
+                  | SearchOptions.IgnoreInaccessibleNodes;
+<P>
+foreach(IEntry directory in FileSearcher.Search(null, null
+                               , SearchOptions.Directories | all))
+{
+  bool fileFound = false;
+  foreach(IEntry file in FileSearcher.Search(directory.Path, null
+                               , SearchOptions.Files | all))
+  {
+    fileFound = true;
+    break;
+  }
+  if(!fileFound)
+  {
+    Console.WriteLine(entry);
+  }
+}
+
+</pre>
+<div class="caption">
+<b>Listing 12: Searching for empty directories.</b>
+</div>
+<P>
+
+<P>
+<b>ShowImmediateSubdirectoriesTotalSizes</b>
+<P>
+
+<P>
+This example shows the total sizes of all immediate sub-directories. It is similar to the one above, but it does not recurse.
+<P>
+<pre  class="code">
+<P>
+foreach(IEntry entry in FileSearcher.Search(null, null
+  , SearchOptions.Directories, 0))
+{
+  Console.WriteLine("{0} : {1}", entry
+    , FileSearcher.CalculateDirectorySize(entry));
+}
+
+</pre>
+<P>
+
+<P>
+This is actually a really useful tool when you're trying to find where the space is being consumed on a drive. It can also be written in a single statement:
+<P>
+<pre  class="code">
+<P>
+FileSearcher.Search(null, null,
+  SearchOptions.Directories, 0
+).ForEach((e) =&gt; Console.WriteLine("{0} : {1}", e
+            , FileSearcher.CalculateDirectorySize(e)));
+
+</pre>
+<P>
+
+<P>
+<b>ListInaccessibleDirectories</b>
+<P>
+
+<P>
+This example (Listing 13) uses the exception handler to list all the inaccessible sub-directories.
+<P>
+<pre  class="code">
+<P>
+FileSearcher.Search(null, null
+  , SearchOptions.Directories |
+    SearchOptions.IncludeHidden |
+    SearchOptions.IncludeSystem
+  , FileSearcher.UnrestrictedDepth, 
+  (string directory, int depth) =&gt;
+  {
+    Trace.WriteLine("searching " + directory + " &#91;" + depth + "&#93;");
+    return ProgressHandlerResult.Continue;
+  },
+  (path, x) =&gt;
+  {
+    Console.WriteLine("could not access {0}: {1}", path, x.Message);
+    return ExceptionHandlerResult.ConsumeExceptionAndContinue;
+  }
+).ForEach((e) =&gt; e = null);
+
+</pre>
+<div class="caption">
+<b>Listing 13:  Searching for inaccessible directories.</b>
+</div>
+<P>
+
+<P>
+The hidden and system flags are specified to ensure the best chance of running into inaccessible directories. For good measure, I have it perform some rudimentary diagnostic logging by specifying a progress handler that traces the directory and depth. Also, note the curious lambda expression in the <b>ForEach()</b> call. This is the best I could think of to give a no-op, since we don't need to do anything with the search results, just have it iterate over all the elements accessible in the <b>IEnumerable&lt;IEntry&gt; </b>instance returned from <b>FileSearcher.Search()</b>.
+<P>
+
+<P>
+When run on my work drive, I get the following output:
+<P>
+<pre  class="code">
+<P>
+could not access H:\dev\bin\hidden\inaccessible\: Access to the path 'H:\dev\bin\hidden\inaccessible' is denied.
+could not access H:\dev\bin\hidden\inaccessible\: Access to the path 'H:\dev\bin\hidden\inaccessible' is denied.
+could not access H:\System Volume Information\: Access to the path 'H:\System Volume Information' is denied.
+could not access H:\System Volume Information\: Access to the path 'H:\System Volume Information' is denied.
+
+</pre>
+<P>
+
+<P>
+<b>DirectoryEntryCountFrequencyAnalysis</b>
+<P>
+
+<P>
+The final directory-oriented example (Listing 14) lists the number of files contained in each directory.
+<P>
+<pre  class="code">
+<P>
+foreach(IEntry dir in FileSearcher.Search(null, null
+  , SearchOptions.Directories))
+{
+  int n = 0;
+  foreach(IEntry file in FileSearcher.Search(dir.Path, null
+    , SearchOptions.Files, 0))
+  {
+    ++n;
+  }
+  Console.WriteLine("{0} has {1} file(s)", dir.SearchRelativePath, n);
+}
+
+</pre>
+<div class="caption">
+<b>Listing 14: Directory contents frequency analysis.</b>
+</div>
+<P>
+
+<P>
+<b>FindLargestMatchingFile</b>
+<P>
+
+<P>
+This example (Listing 15) finds the largest file matching the given pattern(s). I'm including the full listing to illustrate one way of processing command-line arguments into multi-part patterns. (Please note: it's not the best way of handling command-line arguments, but I didn't want to introduce any more dependencies or complexities into the examples.)
+<P>
+<pre  class="code">
+<P>
+static void Main(string&#91;&#93; args)
+{
+  string directory = null;
+  List&lt;string&gt; patterns = new List<string>();
+  foreach(string arg in args)
+  {
+    if(0 != arg.Length && '-' == arg&#91;0&#93;)
+    {
+      switch(arg)
+      {
+        case "--help":
+          ShowUsageAndQuit(0);
+          break;
+        default:
+          Console.Error.WriteLine("FindLargestMatchingFile: unrecognised argument {0}; use --help for usage", arg);
+          break;
+      }
+    }
+    else
+    {
+      if(null == directory && arg.IndexOfAny(new char&#91;&#93; { '?', '*' }) &lt; 0)
+      {
+        directory = arg;
+      }
+      else
+      {
+        if(arg.IndexOfAny(new char&#91;&#93; { Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar } ) &gt;= 0)
+        {
+          Console.Error.WriteLine("invalid pattern: {0}", arg);
+          Environment.Exit(1);
+        }
+        else
+        {
+          patterns.Add(arg);
+        }
+      }
+    }
+  }
+  if(0 == patterns.Count)
+  {
+    patterns.Add(FileSearcher.WildcardsAll);
+  }
+  IEntry largest = null;
+  foreach(IEntry entry in FileSearcher.Search(directory
+    , String.Join("|", patterns.ToArray())
+    , SearchOptions.None))
+  {
+    if(null == largest || largest.Size &lt; entry.Size)
+    {
+      largest = entry;
+    }
+  }
+  if(null == largest)
+  {
+    Console.Out.WriteLine("no matching entries found");
+  }
+  else
+  {
+    Console.Out.WriteLine("largest entry is {0}, which is {1} bytes"
+      , largest.SearchRelativePath, largest.Size);
+  }
+}
+
+</pre>
+<div class="caption">
+<b>Listing 15: Find largest matching file.</b>
+</div>
+<P>
+
+<P>
+<b>FindCertainSmallExecutables (with LINQ)</b>
+<P>
+
+<P>
+This example (Listing 16) finds (the search-relative path of) executable modules that are smaller than 10k and read-only, and uses LINQ. 
+<P>
+<pre  class="code">
+<P>
+var files = FileSearcher.Search(null, "*.exe|*.dll", SearchOptions.Files);
+<P>
+var modules = from file in files
+              where file.Size &lt; 10240 && file.IsReadOnly
+              select file.SearchRelativePath;
+<P>
+foreach(var module in modules)
+{
+  Console.WriteLine("module: {0}", module);
+}
+
+</pre>
+<div class="caption">
+<b>Listing 16: Find small executables using LINQ.</b>
+</div>
+<P>
+
+<P>
+<b>StatAFile</b>
+<P>
+
+<P>
+The last example (Listing 17) illustrates the use of Stat() to elicit information about a single filesystem entity. Once again, I'll show the full listing.
+<P>
+<pre  class="code">
+<P>
+static void Main(string&#91;&#93; args)
+{
+  string path = Assembly.GetEntryAssembly().Location;
+  if(0 != args.Length)
+  {
+    path = args&#91;0&#93;;
+  }
+  IEntry entry = FileSearcher.Stat(path);
+  if(null == entry)
+  {
+    Console.Error.WriteLine("file not found");
+  }
+  else
+  {
+    Console.WriteLine("{0,20}:\t{1}", "Path", entry.Path);
+    Console.WriteLine("{0,20}:\t{1}", "SearchRelativePath", entry.SearchRelativePath);
+    Console.WriteLine("{0,20}:\t{1}", "Drive", entry.Drive);
+    Console.WriteLine("{0,20}:\t{1}", "DirectoryPath", entry.DirectoryPath);
+    Console.WriteLine("{0,20}:\t{1}", "Directory", entry.Directory);
+    Console.WriteLine("{0,20}:\t{1}", "SearchDirectory", entry.SearchDirectory);
+    Console.WriteLine("{0,20}:\t{1}", "UncDrive", entry.UncDrive);
+    Console.WriteLine("{0,20}:\t{1}", "File", entry.File);
+    Console.WriteLine("{0,20}:\t{1}", "FileName", entry.FileName);
+    Console.WriteLine("{0,20}:\t{1}", "FileExtension", entry.FileExtension);
+    Console.WriteLine("{0,20}:\t{1}", "CreationTime", entry.CreationTime);
+    Console.WriteLine("{0,20}:\t{1}", "ModificationTime", entry.ModificationTime);
+    Console.WriteLine("{0,20}:\t{1}", "LastAccessTime", entry.LastAccessTime);
+    Console.WriteLine("{0,20}:\t{1}", "LastStatusChangeTime", entry.LastStatusChangeTime);
+    Console.WriteLine("{0,20}:\t{1}", "Size", entry.Size);
+    Console.WriteLine("{0,20}:\t{1}", "Attributes", entry.Attributes);
+    Console.WriteLine("{0,20}:\t{1}", "IsReadOnly", entry.IsReadOnly);
+    Console.WriteLine("{0,20}:\t{1}", "IsDirectory", entry.IsDirectory);
+    Console.WriteLine("{0,20}:\t{1}", "IsUnc", entry.IsUnc);
+    Console.WriteLine("{0,20}:\t&#91;{1}&#93;", "DirectoryParts", String.Join(", ", entry.DirectoryParts.ToArray())); // Assumes "using System.Linq"
+  }
+}
+
+</pre>
+<div class="caption">
+<b>Listing 17: Stat() a file</b>
+</div>
+<P>
+
+<P>
+When run on my development system, I get the following output:
+<P>
+<pre  class="code">
+<P>
+                Path:   H:\freelibs\recls\100\recls.net\examples\StatASolutionFile\bin\Debug\StatASolutionFile.exe
+  SearchRelativePath:   StatASolutionFile.exe
+               Drive:   H:
+       DirectoryPath:   H:\freelibs\recls\100\recls.net\examples\StatASolutionFile\bin\Debug\
+           Directory:   \freelibs\recls\100\recls.net\examples\StatASolutionFile\bin\Debug\
+     SearchDirectory:   H:\freelibs\recls\100\recls.net\examples\StatASolutionFile\bin\Debug\
+            UncDrive:
+                File:   StatASolutionFile.exe
+            FileName:   StatASolutionFile
+       FileExtension:   .exe
+        CreationTime:   3/10/2009 6:53:23 AM
+    ModificationTime:   3/10/2009 8:05:59 AM
+      LastAccessTime:   3/10/2009 8:14:35 AM
+LastStatusChangeTime:   3/10/2009 8:05:59 AM
+                Size:   7168
+          Attributes:   Archive, Compressed
+          IsReadOnly:   False
+         IsDirectory:   False
+               IsUnc:   False
+      DirectoryParts:   &#91;\, freelibs\, recls\, 100\, recls.net\, examples\, StatASolutionFile\, bin\, Debug\&#93;
+
+</pre>
+
+
+    <h3>What recls.NET Offers Above .NET's Search Facilities</h3>
+<P>
+
+<P>
+You may be reading this and thinking "but there have been standard facilities for recursive filesystem search since CLR version 2". And you'd be right. <b>DirectoryInfo</b>'s <b>GetFiles()</b> and  <b>GetDirectories()</b> methods have a third overload that takes a parameter of type <b>System.IO.SearchOption</b>, which has the enumerators <b>TopDirectoryOnly</b> and <b>AllDirectories</b>. And it's the same for <b>Directory</b>'s <b>GetFiles()</b> and  <b>GetDirectories()</b> methods.
+<P>
+
+<P>
+So what does recls 100% .NET provide that is not available in the standard libraries? 
+<P>
+<ul>
+<li>Multi-part patterns. Passing "*.dll|*.exe" to Directory.GetFiles() will throw an argument exception, and passing "*.dll;*.exe" will simply return no results.
+<li>Depth-control. With the CLR facilities you have only two choices: no recursion or infinite recursion. 
+<li>IEntry - so you don't have to ask twice (DirectoryInfo.GetFiles()/GetDirectories() do return arrays of FileInfo/DirectoryInfo)
+<li>Filtering of hidden & system files. DirectoryInfo.GetFiles() always includes hidden and system files.
+<li>Ignoring inaccessible directories. An UnauthorizedAccessException is thrown by DirectoryInfo.GetFiles() when asking for all files for a directory that contains an inaccessible subdirectory (like the "System Volume Information" directory sitting in the root level on each local hard drive). Recls allows you to handle this, by specifying handler (via delegate or interface), or to skip any such items via specifying <b>SearchOptions.IgnoreInaccessibleNodes</b>.
+<li>Search-relative path. When I'm writing non-trivial filesystem manipulation programs -- such as recursive comparisons, recursive copying, and so on -- I find the <b>SearchRelativePath</b> invaluable. Writing such programs without it would be burdensome, to say the least.
+ </ul>
+<P>
+<h3>The Future</h3>
+<P>
+
+<P>
+As mentioned earlier, recls 100% .NET does not currently provide FTP searching. That's something that might be added in a later version, though at this stage it looks doubtful. Without a commercial imperative to do so it's likely to languish at the end of one of my long to-do lists.
+<P>
+
+<P>
+Also, the new version does not support the specification of multiple patterns where one or more includes a sub-directory, as in:
+<P>
+<pre  class="code">
+<P>
+FileSearcher.Search(@"C:\Windows", "system/*.dll|system32/*.dll");
+
+</pre>
+<P>
+
+<P>
+This will be added in a future version.
+<P>
+
+<P>
+I am considering a future facility to treat the patterns parameter as a regular expression, which would probably be indicated by a new <b>SearchOptions</b> flag. (The main reason I haven't yet is I'm still in two minds about whether (and how) to handle multiple patterns in that form. I'm definitely interested in opinions from users/readers on the subject.)
+<P>
+
+<P>
+Finally, other languages will be getting the recls 100% treatment, probably starting with Ruby or Python next year.
+<P>
+<h3>Obtaining recls 100% .NET</h3>
+<P>
+
+<P>
+recls 100% .NET is available, from http://recls.net. The download includes the library (which  incorporates all the core functionality discussed in this article) along with documentation (Intellisense XML and CHM), and example projects.
+<P>
+<h3>Acknowledgements</h3>
+<P>
+
+<P>
+I'd like to thank my .NET posse -- Chris Oldwood, Garth Lancaster, John O'Halloran and Joy Chan -- for their assistance in keeping me to the point and making it interesting. Any failures are my own fault for inadequately addressing their concerns.
+<P>
+<h3>References</h3>
+<P>
+
+<P>
+&#91;1&#93; The recls project; http://recls.org/
+<P>
+
+&#91;2&#93; http://en.wikipedia.org/wiki/FxCop
+<P>
+
+&#91;3&#93; <a href="http://www.ddj.com/cpp/184401727?pgno=3">Introducing recls</a>, Matthew Wilson, C/C++ Users Journal, November 2003
+<P>
+
+&#91;4&#93; Extended STL, volume 1: Collections and Iterators, Matthew Wilson, Addison-Wesley, 2007
+<P>
+
+&#91;5&#93; Quality Matters, Part 1: Introductions, and Nomenclature, Matthew Wilson, Overload 92, August 2009
+<P>
+
+&#91;6&#93; Code Complete, 2nd Edition, Steve McConnell, Microsoft Press, 2004
+<P>
+
+&#91;7&#93; <a href="http://www.ddj.com/cpp/201200278">An Enhanced ostream_iterator</a>, Matthew Wilson, Dr. Dobb's Journal, June 2007
+<P>
+
+&#91;8&#93; C# In Depth, Jon Skeet, Manning, 2008
+<P>
+
+&#91;9&#93; More Effective C#, Bill Wagner, Addison-Wesley, 2009
+<P>
+
+
+
+
